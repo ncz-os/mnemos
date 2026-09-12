@@ -2619,6 +2619,59 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
         finally:
             await _call(cursor.close)
 
+    async def get_queue_stats(self, tx: Transaction) -> dict[str, int]:
+        """Oracle 23ai stats snapshot for the v3.5 distillation worker.
+
+        Two SELECTs inside the supplied ``tx`` (one for the queue
+        status aggregates, one for the variant count). Oracle cannot
+        combine ``FOR UPDATE`` with ``FETCH FIRST`` and applies
+        ``ROWNUM`` before ``ORDER BY``, but a plain aggregate SELECT
+        (no row-locking, no ordering) needs none of those workarounds
+        so the dialect shape matches Postgres / SQLite directly.
+        Db2 inherits this implementation via the
+        ``_Db2AsyncCursor.execute`` rewrite hook (``SYSTIMESTAMP`` →
+        ``CURRENT TIMESTAMP``, ``:name`` named binds → ``?`` positional
+        binds) — Db2 has no Db2CompressionQueueRepository of its own
+        and never needed one because Oracle's aggregate SELECTs are
+        dialect-clean enough to round-trip through the rewrite.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
+                    COUNT(CASE WHEN status = 'running' THEN 1 END) AS running,
+                    COUNT(CASE WHEN status = 'done'    THEN 1 END) AS done,
+                    COUNT(CASE WHEN status = 'failed'  THEN 1 END) AS failed
+                FROM memory_compression_queue
+                """,
+            )
+            raw = await _call(cursor.fetchone)
+            cols = [d[0].lower() for d in cursor.description]
+            row = dict(zip(cols, raw)) if raw is not None else {}
+            await _call(
+                cursor.execute,
+                "SELECT COUNT(*) AS variants FROM memory_compressed_variants",
+            )
+            v_raw = await _call(cursor.fetchone)
+            v_cols = [d[0].lower() for d in cursor.description]
+            v_row = dict(zip(v_cols, v_raw)) if v_raw is not None else {}
+        finally:
+            await _call(cursor.close)
+
+        return {
+            "total": int(row.get("total") or 0),
+            "pending": int(row.get("pending") or 0),
+            "running": int(row.get("running") or 0),
+            "done": int(row.get("done") or 0),
+            "failed": int(row.get("failed") or 0),
+            "variants": int(v_row.get("variants") or 0),
+        }
+
 
 class OracleWebhookRepository(WebhookRepository):
     """Oracle webhook repo — full backend-neutral ``WebhookRepository`` (item 6/12).

@@ -12,6 +12,8 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
+from mnemos.persistence.sqlite import _fetch_all
+
 
 @pytest_asyncio.fixture
 async def backend(tmp_path):
@@ -164,3 +166,105 @@ async def test_sweep_infra_retry_resets_and_decrements(backend):
         row = await cur.fetchone()
     assert row["status"] == "pending"
     assert row["attempts"] == 2  # decremented from 3
+
+
+@pytest.mark.asyncio
+async def test_get_queue_stats_empty(backend):
+    """Empty backend: every counter is zero, no variants either."""
+    async with backend.transactional() as tx:
+        stats = await backend.compression_queue.get_queue_stats(tx)
+    assert stats == {
+        "total": 0,
+        "pending": 0,
+        "running": 0,
+        "done": 0,
+        "failed": 0,
+        "variants": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_queue_stats_after_enqueue_dequeue_done_failed(backend):
+    """End-to-end stats: drive rows through every status the ABC defines.
+
+    * 3 enqueue → 3 'pending'
+    * dequeue one (→ 'running' with attempts=1) — the contest claim
+    * mark one 'done' (no attempts bump from mark)
+    * mark another 'failed' (manually flip the third 'pending' to 'failed'
+      to exercise the failed branch; the running row stays running)
+    * insert a compressed variant row directly so 'variants' is non-zero
+
+    Expected totals: total=3, pending=0, running=1, done=1, failed=1,
+    variants=1.
+    """
+    await _add_memory(backend, "mem-st-1")
+    await _add_memory(backend, "mem-st-2")
+    await _add_memory(backend, "mem-st-3")
+
+    async with backend.transactional() as tx:
+        await backend.compression_queue.enqueue_compression(
+            tx,
+            memory_ids=["mem-st-1", "mem-st-2", "mem-st-3"],
+            reason="manual",
+            priority=0,
+            scoring_profile="balanced",
+        )
+
+    async with backend.transactional() as tx:
+        claimed = await backend.compression_queue.dequeue_compression(tx, limit=5)
+    assert len(claimed) == 3
+    running_qid = claimed[0]["id"]
+    done_qid = claimed[1]["id"]
+    failed_qid = claimed[2]["id"]
+
+    async with backend.transactional() as tx:
+        await backend.compression_queue.mark_compression_done(tx, queue_id=done_qid)
+    async with backend.transactional() as tx:
+        await backend.compression_queue.mark_compression_failed(
+            tx, queue_id=failed_qid, error="test: forced failure"
+        )
+
+    # Insert a compressed variant directly so the variants count is
+    # non-zero. The compression-queue ABC only counts; it doesn't
+    # insert variants itself. ``winner_candidate_id`` is NULL because
+    # no candidate row exists (the FK only fires when the column is
+    # NOT NULL).
+    async with backend.transactional() as tx:
+        await backend.compression.insert_compressed_variant(
+            tx,
+            memory_id="mem-st-1",
+            owner_id="alice",
+            winner_candidate_id=None,
+            engine_id="artemis",
+            engine_version="1.0",
+            compressed_content="compressed body",
+            compressed_tokens=10,
+            compression_ratio=0.5,
+            quality_score=0.9,
+            composite_score=0.85,
+            scoring_profile="balanced",
+            judge_model="judge-default",
+            selected_at=None,
+        )
+
+    async with backend.transactional() as tx:
+        stats = await backend.compression_queue.get_queue_stats(tx)
+
+    assert stats == {
+        "total": 3,
+        "pending": 0,
+        "running": 1,
+        "done": 1,
+        "failed": 1,
+        "variants": 1,
+    }
+    # The running row must be the one we left un-marked, not the done/failed
+    # rows — confirms the COUNT(CASE WHEN status=...) aggregate discriminates
+    # correctly when multiple statuses coexist in the same queue table.
+    async with backend.transactional() as tx:
+        running_rows = await _fetch_all(
+            tx.conn,
+            "SELECT id FROM memory_compression_queue WHERE status = 'running'",
+        )
+    assert len(running_rows) == 1
+    assert running_rows[0]["id"] == running_qid
