@@ -71,6 +71,7 @@ from mnemos.persistence.oracle import (
 from mnemos.persistence.schema import ensure_db2_schema
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter
+from mnemos.persistence.base import WebhookDeliveryIntent
 
 _LOG = logging.getLogger(__name__)
 
@@ -2720,7 +2721,7 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
         *,
         owner_id: str | None = None,
         namespace: str | None = None,
-    ) -> list[str]:
+    ) -> list[WebhookDeliveryIntent]:
         """Db2-native dispatch event.
 
         Mirrors :class:`OracleWebhookRepository.dispatch_event` exactly:
@@ -2745,10 +2746,6 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
             if namespace is not None:
                 sub_where.append("namespace = ?")
                 sub_params.append(namespace)
-            # Subscription opts in to an event by listing it in the JSON
-            # array stored in ``events``. Db2-native LOCATE keeps this
-            # driver-side positional and matches Oracle's quoted-token
-            # behavior for compact or pretty-printed arrays.
             sub_where.append("LOCATE(?, CAST(events AS VARCHAR(32672))) > 0")
             sub_params.append(f'"{event_type}"')
             sql_sub = (
@@ -2768,7 +2765,7 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
                 sort_keys=True,
             )
             body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-            delivery_ids: list[str] = []
+            intents: list[WebhookDeliveryIntent] = []
             for sub in subs:
                 d_id = _uuid.uuid4().hex
                 await _call(
@@ -2791,8 +2788,16 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
                         webhook_constants.NEW_CODE_WRITER_REVISION,
                     ),
                 )
-                delivery_ids.append(d_id)
-            return delivery_ids
+                intents.append(
+                    WebhookDeliveryIntent(
+                        delivery_id=d_id,
+                        subscription_id=str(sub["id"]),
+                        url=sub["url"],
+                        namespace=sub["namespace"],
+                        owner_id=sub["owner_id"],
+                    )
+                )
+            return intents
         finally:
             await _call(cursor.close)
 

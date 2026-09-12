@@ -1835,7 +1835,7 @@ async def create_memory(
             # that webhook_deliveries rows commit atomically with
             # the data write.
             if getattr(backend, "supports_webhooks", False):
-                delivery_ids = await backend.webhooks.dispatch_event(
+                delivery_ids = [intent.delivery_id for intent in await backend.webhooks.dispatch_event(
                     tx,
                     "memory.created",
                     {
@@ -1848,7 +1848,7 @@ async def create_memory(
                     },
                     owner_id=owner_id,
                     namespace=namespace,
-                )
+                )]
             else:
                 delivery_ids = []
             # Re-fetch the row inside the same tx so the response
@@ -2050,7 +2050,7 @@ async def bulk_create_memories(
                             writer_id=user.user_id,
                         )
                         if getattr(backend, "supports_webhooks", False):
-                            item_delivery_ids = await backend.webhooks.dispatch_event(
+                            item_delivery_ids = [intent.delivery_id for intent in await backend.webhooks.dispatch_event(
                                 tx,
                                 "memory.created",
                                 {
@@ -2063,7 +2063,7 @@ async def bulk_create_memories(
                                 },
                                 owner_id=owner_id,
                                 namespace=namespace,
-                            )
+                            )]
                         else:
                             item_delivery_ids = []
                 except Exception as e:
@@ -2178,7 +2178,7 @@ async def update_memory(
                 writer_id=user.user_id,
             )
             if getattr(backend, "supports_webhooks", False):
-                delivery_ids = await backend.webhooks.dispatch_event(
+                delivery_ids = [intent.delivery_id for intent in await backend.webhooks.dispatch_event(
                     tx,
                     "memory.updated",
                     {
@@ -2191,7 +2191,7 @@ async def update_memory(
                     },
                     owner_id=row["owner_id"],
                     namespace=row["namespace"],
-                )
+                )]
             else:
                 delivery_ids = []
     except HTTPException:
@@ -2273,7 +2273,7 @@ async def delete_memory(
                 writer_id=user.user_id,
             )
             if getattr(backend, "supports_webhooks", False):
-                delivery_ids = await backend.webhooks.dispatch_event(
+                delivery_ids = [intent.delivery_id for intent in await backend.webhooks.dispatch_event(
                     tx,
                     "memory.deleted",
                     {
@@ -2286,7 +2286,7 @@ async def delete_memory(
                     },
                     owner_id=row["owner_id"],
                     namespace=row["namespace"],
-                )
+                )]
             else:
                 delivery_ids = []
     except HTTPException:
