@@ -1,4 +1,15 @@
-"""Regression coverage for MORPHEUS extract run counters."""
+"""Regression coverage for MORPHEUS extract run counters.
+
+Item 11a (ABC migration): ``phase_extract`` internally calls
+``_get_backend()`` to dispatch ``update_counters`` through the new
+ABC on the early-exit branches (``run_row is None`` or
+``_extract_enabled`` is False). The current test takes the happy
+path so it doesn't trigger that lookup, but the autouse fixture
+below wires a no-op backend into the lifecycle for every test in
+defense-in-depth style so a future regression that adds a new
+``_get_backend()`` call site in the extract path doesn't break
+this test.
+"""
 from __future__ import annotations
 
 import pytest
@@ -20,6 +31,23 @@ def reset_morpheus_extract_settings(monkeypatch):
     core_config._reset_settings_for_tests()
     yield
     core_config._reset_settings_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _install_noop_morpheus_backend(monkeypatch):
+    """Wire a no-op backend into the lifecycle global for every test.
+
+    Item 11a: ``phase_extract`` internally calls ``_get_backend()`` to
+    dispatch ``update_counters`` through the new ABC. The lifecycle
+    global ``_persistence_backend`` is None by default in this test
+    process, so wire a no-op backend for the duration of each test
+    so a future regression that adds a new ``_get_backend()`` call
+    site in the extract path doesn't break this test.
+    """
+    from mnemos.core import lifecycle as _lifecycle
+    from tests.test_morpheus_extract import _Backend
+
+    monkeypatch.setattr(_lifecycle, "_persistence_backend", _Backend(_Conn()))
 
 
 @pytest.mark.asyncio

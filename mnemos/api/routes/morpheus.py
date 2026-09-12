@@ -352,8 +352,15 @@ async def rollback(
     try:
         from mnemos.domain.morpheus.runner import rollback_run
 
+        # Item 11a: rollback_run now takes the persistence backend
+        # (not a raw asyncpg.Pool) and routes through
+        # ``backend.morpheus.rollback_run``. The same callable works
+        # on Postgres / SQLite / MySQL / MariaDB / Oracle / Db2; the
+        # ``pg_backend`` retrieved above is the Postgres persistence
+        # backend — its ``.morpheus`` property is the
+        # ``PostgresMorpheusRepository`` we just wired into the ABC.
         n_deleted, _n_run = await rollback_run(
-            pg_backend._pool,
+            pg_backend,
             run_id,
             requested_by=user.user_id,
         )

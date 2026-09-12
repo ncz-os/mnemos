@@ -78,6 +78,7 @@ from mnemos.persistence.base import (
     KG_CAPABILITY,
     KGRepository,
     MemoryRepository,
+    MorpheusRepository,
     NatsDispatchLogRepository,
     OAuthRepository,
     STATE_CAPABILITY,
@@ -1141,6 +1142,73 @@ CREATE TABLE IF NOT EXISTS nats_dispatch_log (
 """
 
 
+# MORPHEUS run-lifecycle (item 11a): canonical 19-column ``morpheus_runs``
+# table for MySQL 9.0+. Mirrors the schema shipped for Postgres + SQLite
+# + Oracle + Db2 so the new ``MorpheusRepository`` ABC has the same shape
+# on every backend. See ``migrations_mysql/0061c_morpheus_runs.sql`` for
+# the migration-file mirror (this inline DDL is what MysqlBackend.open()
+# actually executes against the live DB).
+_DDL_MORPHEUS_RUNS = """
+CREATE TABLE IF NOT EXISTS morpheus_runs (
+    id                  CHAR(36)        NOT NULL DEFAULT (UUID()),
+    started_at          DATETIME(6)     NOT NULL DEFAULT NOW(6),
+    finished_at         DATETIME(6)         NULL,
+    status              VARCHAR(16)     NOT NULL DEFAULT 'running',
+    phase               VARCHAR(64)         NULL,
+    triggered_by        VARCHAR(32)     NOT NULL DEFAULT 'cron',
+
+    window_started_at   DATETIME(6)         NULL,
+    window_ended_at     DATETIME(6)         NULL,
+    window_hours        INT             NOT NULL DEFAULT 168,
+    cluster_min_size    INT             NOT NULL DEFAULT 3,
+
+    memories_scanned    INT             NOT NULL DEFAULT 0,
+    clusters_found      INT             NOT NULL DEFAULT 0,
+    summaries_created   INT             NOT NULL DEFAULT 0,
+
+    memories_consolidated    INT         NOT NULL DEFAULT 0,
+    clusters_consolidated    INT         NOT NULL DEFAULT 0,
+
+    triples_extracted               INT    NOT NULL DEFAULT 0,
+    memories_processed_for_extraction INT   NOT NULL DEFAULT 0,
+
+    error               TEXT                NULL,
+    config              JSON                NULL,
+    namespace           VARCHAR(256)        NULL,
+
+    PRIMARY KEY (id),
+    CONSTRAINT morpheus_runs_status_check
+        CHECK (status IN ('running','success','failed','rolled_back')),
+    CONSTRAINT morpheus_runs_triggered_by_check
+        CHECK (triggered_by IN ('cron','manual','api')),
+
+    -- Inline KEY indexes match Postgres's partial / ordering indexes.
+    -- MySQL 8 does NOT support CREATE INDEX IF NOT EXISTS, so the
+    -- indexes must be defined inline in CREATE TABLE on the MySQL arm.
+    -- CREATE TABLE IF NOT EXISTS already makes the whole table
+    -- (including these) idempotent.
+    KEY idx_morpheus_runs_status (status),
+    KEY idx_morpheus_runs_started (started_at DESC),
+    KEY idx_morpheus_runs_namespace (namespace)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+
+# MORPHEUS EXTRACT processed-memory sidecar (item 11a): the same
+# ``morpheus_extract_run_memories`` join table Postgres / SQLite /
+# Oracle / Db2 already ship, so the ABC's ``rollback_run`` can
+# SELECT-then-DELETE on every backend with the same SQL shape.
+_DDL_MORPHEUS_EXTRACT_RUN_MEMORIES = """
+CREATE TABLE IF NOT EXISTS morpheus_extract_run_memories (
+    run_id        CHAR(36)        NOT NULL,
+    memory_id     VARCHAR(64)     NOT NULL,
+    processed_at  DATETIME(6)     NOT NULL DEFAULT NOW(6),
+    PRIMARY KEY (run_id, memory_id),
+    KEY idx_morpheus_extract_run_memories_memory (memory_id, processed_at DESC)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+
 _INIT_DDLS = [
     _DDL_MEMORIES,
     _DDL_DELETION_REQUESTS,
@@ -1169,6 +1237,8 @@ _INIT_DDLS = [
     _DDL_CATEGORY_DECAY,
     _DDL_CATEGORY_DECAY_SEED,
     _DDL_NATS_DISPATCH_LOG,
+    _DDL_MORPHEUS_RUNS,
+    _DDL_MORPHEUS_EXTRACT_RUN_MEMORIES,
 ]
 
 
@@ -3241,6 +3311,347 @@ class MysqlCompressionRepository(CompressionRepository):
             average_compression_ratio=float(avg_ratio) if avg_ratio is not None else None,
             unreviewed_compressions=int(unreviewed or 0),
         )
+
+
+class MysqlMorpheusRepository(MorpheusRepository):
+    """MySQL 9.0+ impl of :class:`MorpheusRepository` (item 11a).
+
+    Translates the Postgres canonical SQL to MySQL's dialect. Notable
+    differences vs. the Postgres ABC:
+
+    * **UUID id generation**: MySQL stores ``id`` as ``CHAR(36)`` —
+      the migration creates the column with ``DEFAULT (UUID())``; the
+      Python impl never omits the id and lets the DB default kick in.
+    * **JSON operators**: ``memories.metadata`` is a ``JSON`` column
+      on MySQL 9.0+ — extraction uses ``JSON_EXTRACT`` /
+      ``JSON_UNQUOTE``; key-existence uses ``JSON_CONTAINS_PATH``;
+      key-deletion uses ``JSON_REMOVE`` (the inverse of the Postgres
+      ``COALESCE(metadata, '{}'::jsonb) - $1`` operator).
+    * **Multi-CTE UPDATE**: MySQL doesn't support writable CTEs
+      feeding an UPDATE, so ``rollback_run`` decomposes into
+      sequential statements inside the same ``tx`` (same pattern
+      SQLite / Oracle / Db2 use; consistent with item 7's
+      ``claim_due_deliveries`` decomposition).
+
+    MariaDB overrides this with ``MariadbMorpheusRepository`` that
+    drops any MySQL-specific JSON CAST since MariaDB stores JSON as
+    LONGTEXT.
+    """
+
+    _ORPHAN_TIMEOUT_ERROR = "orphan_timeout_sweep"
+    _PRE_CONSOLIDATE_PERMISSION_KEY = "pre_consolidate_permission_mode"
+
+    async def begin_run(
+        self,
+        tx: Transaction,
+        *,
+        triggered_by: str,
+        window_hours: int,
+        cluster_min_size: int,
+        config: dict | None,
+        namespace: str | None,
+    ) -> str:
+        conn = tx.conn
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        window_start = now - timedelta(hours=int(window_hours))
+        config_json = json.dumps(config or {})
+        async with conn.cursor() as cursor:
+            # ``id`` is omitted: the table's DEFAULT UUID() populates it.
+            # After the INSERT, MySQL has no RETURNING clause — fetch the
+            # freshly-inserted row back via started_at + triggered_by +
+            # window_hours. Single-writer semantics inside the caller's
+            # ``transactional()`` make the race window benign (a
+            # concurrent sweep/update would have already committed
+            # before we entered this tx).
+            await cursor.execute(
+                """
+                INSERT INTO morpheus_runs
+                    (triggered_by, started_at, window_started_at, window_ended_at,
+                     window_hours, cluster_min_size, config, namespace, status)
+                VALUES (%s, %s, %s, %s, %s, %s, CAST(%s AS JSON), %s, 'running')
+                """,
+                (
+                    triggered_by,
+                    now,
+                    window_start,
+                    now,
+                    int(window_hours),
+                    int(cluster_min_size),
+                    config_json,
+                    namespace,
+                ),
+            )
+            await cursor.execute(
+                """
+                SELECT id FROM morpheus_runs
+                 WHERE triggered_by = %s
+                   AND started_at = %s
+                   AND window_hours = %s
+                 ORDER BY started_at DESC
+                 LIMIT 1
+                """,
+                (triggered_by, now, int(window_hours)),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError("MySQL begin_run: failed to fetch inserted row id")
+        return str(row[0])
+
+    async def set_phase(self, tx: Transaction, run_id: str, phase: str) -> None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE morpheus_runs SET phase = %s WHERE id = %s",
+                (phase, run_id),
+            )
+
+    async def update_counters(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        memories_scanned: int | None = None,
+        clusters_found: int | None = None,
+        summaries_created: int | None = None,
+        memories_consolidated: int | None = None,
+        clusters_consolidated: int | None = None,
+        triples_extracted: int | None = None,
+        memories_processed_for_extraction: int | None = None,
+    ) -> None:
+        sets: list[str] = []
+        args: list[Any] = []
+        counter_map = (
+            ("memories_scanned", memories_scanned),
+            ("clusters_found", clusters_found),
+            ("summaries_created", summaries_created),
+            ("memories_consolidated", memories_consolidated),
+            ("clusters_consolidated", clusters_consolidated),
+            ("triples_extracted", triples_extracted),
+            ("memories_processed_for_extraction", memories_processed_for_extraction),
+        )
+        for column, value in counter_map:
+            if value is not None:
+                args.append(int(value))
+                sets.append(f"{column} = %s")
+        if not sets:
+            return
+        args.append(run_id)
+        sql = (
+            f"UPDATE morpheus_runs SET {', '.join(sets)} WHERE id = %s"
+        )
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(sql, tuple(args))
+
+    async def increment_extract_counters(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        triples_extracted: int,
+        memories_processed: int,
+    ) -> None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE morpheus_runs
+                   SET triples_extracted = COALESCE(triples_extracted, 0) + %s,
+                       memories_processed_for_extraction =
+                           COALESCE(memories_processed_for_extraction, 0) + %s
+                 WHERE id = %s
+                """,
+                (int(triples_extracted), int(memories_processed), run_id),
+            )
+
+    async def finish_run(self, tx: Transaction, run_id: str) -> None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE morpheus_runs SET status = 'success', "
+                "finished_at = CURRENT_TIMESTAMP WHERE id = %s",
+                (run_id,),
+            )
+
+    async def fail_run(self, tx: Transaction, run_id: str, error: str) -> None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE morpheus_runs SET status = 'failed', "
+                "finished_at = CURRENT_TIMESTAMP, error = %s WHERE id = %s",
+                (str(error)[:4000], run_id),
+            )
+
+    async def sweep_orphan_runs(
+        self,
+        tx: Transaction,
+        *,
+        threshold_hours: float,
+    ) -> list[Row]:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            # MySQL has no UPDATE ... RETURNING; emulate via SELECT after
+            # UPDATE inside the same tx (single-writer guarantees no race).
+            await cursor.execute(
+                """
+                UPDATE morpheus_runs
+                   SET status = 'failed',
+                       error = %s,
+                       finished_at = CURRENT_TIMESTAMP
+                 WHERE status = 'running'
+                   AND started_at < (CURRENT_TIMESTAMP - INTERVAL %s SECOND)
+                """,
+                (
+                    self._ORPHAN_TIMEOUT_ERROR,
+                    int(float(threshold_hours) * 3600),
+                ),
+            )
+            await cursor.execute(
+                """
+                SELECT id, started_at FROM morpheus_runs
+                 WHERE status = 'failed'
+                   AND error = %s
+                   AND finished_at >= CURRENT_TIMESTAMP
+                """,
+                (self._ORPHAN_TIMEOUT_ERROR,),
+            )
+            rows = await cursor.fetchall() or []
+        # mysql backend returns tuples; convert to dict-shaped rows.
+        return [{"id": r[0], "started_at": r[1]} for r in rows]
+
+    async def rollback_run(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        requested_by: str,
+    ) -> tuple[int, int]:
+        """MySQL impl of MORPHEUS rollback — see :class:`MorpheusRepository`."""
+        conn = tx.conn
+        # Step 1: delete kg_triples tagged with this run; collect memory_ids.
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM kg_triples WHERE extracted_by_run_id = %s",
+                (run_id,),
+            )
+            await cursor.execute(
+                "SELECT memory_id FROM kg_triples WHERE extracted_by_run_id = %s",
+                (run_id,),
+            )
+        # The first DELETE actually removed them; we need to track from
+        # morpheus_extract_run_memories instead (the second SELECT will
+        # be empty). Let's fetch from morpheus_extract_run_memories
+        # BEFORE deleting it.
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT memory_id FROM morpheus_extract_run_memories WHERE run_id = %s",
+                (run_id,),
+            )
+            run_mem_rows = await cursor.fetchall() or []
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM morpheus_extract_run_memories WHERE run_id = %s",
+                (run_id,),
+            )
+        affected_ids = {str(r[0]) for r in run_mem_rows if r and r[0] is not None}
+        # Step 3: clear triples_extracted_at on affected memories.
+        if affected_ids:
+            placeholders = ", ".join(["%s"] * len(affected_ids))
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"UPDATE memories SET triples_extracted_at = NULL "
+                    f"WHERE id IN ({placeholders})",
+                    tuple(affected_ids),
+                )
+        n_extract_reset = len(affected_ids)
+        # Step 4: restore consolidated originals from metadata audit key.
+        # MySQL JSON operators: JSON_UNQUOTE(JSON_EXTRACT(...)) for
+        # value extraction, JSON_CONTAINS_PATH for key-existence,
+        # JSON_REMOVE for key deletion. The key path is the literal
+        # string with quotes: '$.pre_consolidate_permission_mode'.
+        key_path = f"$.{self._PRE_CONSOLIDATE_PERMISSION_KEY}"
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE memories
+                   SET consolidated_into = NULL,
+                       consolidated_at = NULL,
+                       permission_mode = COALESCE(
+                           CAST(JSON_UNQUOTE(JSON_EXTRACT(metadata, %s)) AS UNSIGNED),
+                           permission_mode
+                       ),
+                       metadata = JSON_REMOVE(metadata, %s),
+                       morpheus_run_id = NULL
+                 WHERE morpheus_run_id = %s
+                   AND deleted_at IS NULL
+                   AND JSON_CONTAINS_PATH(metadata, 'one', %s)
+                """,
+                (key_path, key_path, run_id, key_path),
+            )
+        # Step 5: audit-log the run-created memories about to be deleted.
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT id, owner_id, namespace
+                  FROM memories
+                 WHERE morpheus_run_id = %s
+                   AND provenance = 'morpheus_local'
+                   AND deleted_at IS NULL
+                """,
+                (run_id,),
+            )
+            run_created = await cursor.fetchall() or []
+        for row in run_created:
+            mid, _owner_id, _namespace = row[0], row[1], row[2]
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    INSERT INTO deletion_log (
+                        memory_id, content_hash, owner_id, namespace,
+                        requested_by, requested_at, request_kind, reason, source
+                    )
+                    SELECT id,
+                           SHA2(COALESCE(content, ''), 256),
+                           owner_id, namespace,
+                           %s, CURRENT_TIMESTAMP, 'admin_purge', %s, %s
+                      FROM memories
+                     WHERE id = %s
+                       AND provenance = 'morpheus_local'
+                       AND deleted_at IS NULL
+                    """,
+                    (
+                        str(requested_by),
+                        f"MORPHEUS rollback {run_id}",
+                        f"morpheus.rollback,{run_id}",
+                        mid,
+                    ),
+                )
+        # Step 6: delete run-created memories.
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM memories WHERE morpheus_run_id = %s "
+                "AND provenance = 'morpheus_local' "
+                "AND deleted_at IS NULL",
+                (run_id,),
+            )
+            n_deleted = int(cursor.rowcount or 0)
+        # Step 7: flip the run row.
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE morpheus_runs SET status = 'rolled_back', "
+                "finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP) "
+                "WHERE id = %s",
+                (run_id,),
+            )
+            n_run = int(cursor.rowcount or 0)
+        _LOG.warning(
+            "[MORPHEUS] run %s rolled back: %d memories deleted, "
+            "%d extract markers reset",
+            run_id,
+            n_deleted,
+            n_extract_reset,
+        )
+        return n_deleted, n_run
 
 
 class MysqlCompressionQueueRepository(CompressionQueueRepository):
@@ -6505,6 +6916,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         self._memory_branches_repo = MysqlBranchRepository()
         self._compression_repo = MysqlCompressionRepository()
         self._compression_queue_repo = MysqlCompressionQueueRepository()
+        self._morpheus_repo = MysqlMorpheusRepository()
         self._nats_dispatch_log_repo = MysqlNatsDispatchLogRepository()
         self._consultations_audit_repo = MysqlConsultationAuditRepository()
         self._federation_repo = MysqlFederationRepository()
@@ -6839,6 +7251,10 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     @property
     def compression_queue(self) -> CompressionQueueRepository:
         return self._compression_queue_repo
+
+    @property
+    def morpheus(self) -> MorpheusRepository:
+        return self._morpheus_repo
 
     @property
     def webhooks(self) -> WebhookRepository:
