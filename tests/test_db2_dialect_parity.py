@@ -7,6 +7,7 @@ tests do NOT require ``ibm_db`` or a live Db2 DSN.
 
 from __future__ import annotations
 
+import datetime as _dt
 from types import SimpleNamespace
 from typing import Any
 
@@ -32,6 +33,28 @@ class _DeterministicUUID:
     def hex(self) -> str:
         self._idx += 1
         return f"delivery{self._idx:024d}"
+
+
+class _FixedDatetime:
+    """Drop-in replacement for ``datetime`` whose ``now()`` returns a
+    fixed UTC instant. Used by ``test_db2_webhook_dispatch_event_native_matches_compat``
+    to make the payload envelope deterministic across two consecutive
+    ``dispatch_event`` calls so the wrapped ``timestamp`` field
+    produces the same SHA-256 hash in both."""
+
+    _FIXED = _dt.datetime(2026, 9, 11, 21, 0, 0, tzinfo=_dt.timezone.utc)
+
+    @classmethod
+    def now(cls, tz: Any = None) -> _dt.datetime:
+        if tz is None:
+            return cls._FIXED
+        return cls._FIXED.astimezone(tz)
+
+    # Forward everything else to the real datetime so module-level use
+    # (``datetime.datetime(...)``, ``datetime.timedelta(...)``, etc.)
+    # continues to work. We only need to override ``now``.
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_dt.datetime, name)
 
 
 class _FakeSyncCursor:
@@ -101,6 +124,7 @@ async def _dispatch(repo: Any) -> tuple[list[str], list[dict[str, Any]]]:
 @pytest.mark.asyncio
 async def test_db2_webhook_dispatch_event_native_matches_compat(monkeypatch: pytest.MonkeyPatch) -> None:
     import uuid
+    from datetime import datetime as _datetime_cls, timezone
 
     from mnemos.persistence.db2 import Db2WebhookRepository, _Db2OraCompatMixin
     from mnemos.persistence.oracle import OracleWebhookRepository
@@ -108,7 +132,17 @@ async def test_db2_webhook_dispatch_event_native_matches_compat(monkeypatch: pyt
     class _CompatWebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
         pass
 
+    fixed_now = _datetime_cls(2026, 9, 11, 21, 0, 0, tzinfo=timezone.utc)
+
+    def _fixed_now(tz=None):
+        return fixed_now if tz is None else fixed_now.astimezone(tz)
+
     monkeypatch.setattr(uuid, "uuid4", _DeterministicUUID)
+    # Patch the ``datetime.now`` binding in BOTH the oracle and db2 modules
+    # so the dispatch_event payload envelope is identical between calls
+    # (the wrapped ``timestamp`` field is the only non-deterministic input).
+    monkeypatch.setattr("mnemos.persistence.oracle.datetime", _FixedDatetime)
+    monkeypatch.setattr("mnemos.persistence.db2.datetime", _FixedDatetime)
     compat_ids, compat_calls = await _dispatch(_CompatWebhookRepository())
 
     monkeypatch.setattr(uuid, "uuid4", _DeterministicUUID)
