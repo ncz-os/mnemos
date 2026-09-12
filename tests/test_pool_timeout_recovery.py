@@ -310,24 +310,43 @@ async def test_worker_process_contest_batch_swallows_content_error(
 async def test_worker_log_stats_reraises_infrastructure_error(monkeypatch):
     """log_stats's broad except must also propagate infra errors
     so the reconnect path can fire. Stats failures are otherwise
-    debug-logged."""
+    debug-logged.
+
+    v3.5 (item 10/12): log_stats now routes through the persistence
+    backend's ``compression_queue.get_queue_stats`` instead of raw
+    asyncpg SQL. The infra-error propagation contract is unchanged
+    — any infra error from the new ABC call must still bubble up to
+    the worker's reconnect path. We exercise it by stubbing
+    ``_persistence_backend`` on the lifecycle module with a backend
+    whose ``transactional()`` raises ``asyncio.TimeoutError`` (mirrors
+    the prior MagicMock-pool-acquire shape exactly).
+    """
+    import mnemos.core.lifecycle as _lifecycle
     from mnemos.workers.distillation import MemoryDistillationWorker
+
+    class _TimeoutBackend:
+        """Backend stub whose ``transactional()`` raises a TimeoutError
+        the moment a worker tries to open a stats transaction. Mirrors
+        the prior MagicMock-pool-acquire failure shape so the test
+        pins the same reconnect-propagation contract as before the
+        ABC migration."""
+
+        @staticmethod
+        def compression_queue():
+            return object()
+
+        @staticmethod
+        def transactional():
+            raise asyncio.TimeoutError("wedged pool")
 
     worker = MemoryDistillationWorker()
 
-    class _FakeAcquire:
-        async def __aenter__(self_):
-            raise asyncio.TimeoutError("wedged pool")
-
-        async def __aexit__(self_, *args):
-            return None
-
-    fake_pool = MagicMock()
-    fake_pool.acquire = MagicMock(return_value=_FakeAcquire())
-    worker.db_pool = fake_pool
-
-    with pytest.raises(asyncio.TimeoutError):
-        await worker.log_stats()
+    monkeypatch.setattr(_lifecycle, "_persistence_backend", _TimeoutBackend())
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await worker.log_stats()
+    finally:
+        monkeypatch.setattr(_lifecycle, "_persistence_backend", None)
 
 
 @pytest.mark.asyncio

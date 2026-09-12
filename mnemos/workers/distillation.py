@@ -365,50 +365,47 @@ class MemoryDistillationWorker:
         infrastructure errors propagate so the worker loop reconnects;
         anything else is debug-logged and ignored (stats are best-effort
         — we don't want a transient stats query to take down the worker).
+
+        v3.5 (job 019e7049 CHILD C): the prior implementation did its
+        own ``SELECT COUNT(...) ... FROM memory_compression_queue`` +
+        ``SELECT COUNT(*) FROM memory_compressed_variants`` raw SQL on
+        whatever ``tx.conn`` the backend handed it — that happened to
+        work on Postgres/SQLite (whose transaction wrapper exposes
+        ``fetchrow``/``fetchval``) but was not guaranteed on
+        Oracle/DB2's transaction shape and was already duplicated
+        verbatim in the legacy asyncpg-direct branch. Both branches
+        are now collapsed into a single ``get_queue_stats`` ABC call
+        so every backend (including Db2, which inherits
+        ``OracleCompressionQueueRepository``) reports identically.
         """
         from mnemos.core.pool import is_infrastructure_error
 
         try:
-            # Use the persistence backend's compression_queue when the
-            # worker is running inside the FastAPI lifecycle (which sets
-            # _lc._persistence_backend). Standalone workers (tests, CLI)
-            # fall back to the legacy asyncpg direct query.
+            stats: dict[str, int] | None = None
+            # Always go through the persistence backend's compression
+            # queue repo. Standalone workers (tests, CLI) and FastAPI
+            # lifecycle both reach this path; the worker loop sets
+            # ``_lc._persistence_backend`` when wired to the app, and
+            # standalone workers either fall back to a no-op stats
+            # query (debug-logged) or surface an infra error to the
+            # caller.
             import mnemos.core.lifecycle as _lc
 
-            backend = _lc._persistence_backend if self.db_pool is None else None
+            backend = _lc._persistence_backend
             if backend is not None and hasattr(backend, "compression_queue"):
                 async with backend.transactional() as tx:
-                    row = await tx.conn.fetchrow("""
-                        SELECT
-                            COUNT(*) AS total,
-                            COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
-                            COUNT(CASE WHEN status = 'running' THEN 1 END) AS running,
-                            COUNT(CASE WHEN status = 'done' THEN 1 END) AS done,
-                            COUNT(CASE WHEN status = 'failed' THEN 1 END) AS failed
-                        FROM memory_compression_queue
-                    """)
-                    variants = await tx.conn.fetchval(
-                        "SELECT COUNT(*) FROM memory_compressed_variants"
-                    )
+                    stats = await backend.compression_queue.get_queue_stats(tx)
             else:
-                async with self.db_pool.acquire() as conn:
-                    row = await conn.fetchrow("""
-                        SELECT
-                            COUNT(*) AS total,
-                            COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
-                            COUNT(CASE WHEN status = 'running' THEN 1 END) AS running,
-                            COUNT(CASE WHEN status = 'done' THEN 1 END) AS done,
-                            COUNT(CASE WHEN status = 'failed' THEN 1 END) AS failed
-                        FROM memory_compression_queue
-                    """)
-                    variants = await conn.fetchval(
-                        "SELECT COUNT(*) FROM memory_compressed_variants"
-                    )
+                logger.debug(
+                    "log_stats: no persistence backend wired; "
+                    "skipping stats query (standalone worker path)"
+                )
+                return
             logger.info(
                 "Compression queue: total=%s pending=%s running=%s done=%s "
                 "failed=%s variants=%s",
-                row["total"], row["pending"], row["running"], row["done"],
-                row["failed"], variants,
+                stats["total"], stats["pending"], stats["running"],
+                stats["done"], stats["failed"], stats["variants"],
             )
         except Exception as e:
             if is_infrastructure_error(e):
