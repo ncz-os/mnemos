@@ -37,13 +37,13 @@ async def test_sqlite_webhook_claim_retry_finalize_and_repair(tmp_path, monkeypa
                 owner_id="owner",
                 namespace="default",
             )
-            delivery_ids = await repo.dispatch_event(
+            _intents = await repo.dispatch_event(
                 tx,
                 "memory.created",
                 {"memory_id": "mem-1"},
                 owner_id="owner",
-                namespace="default",
-            )
+                namespace="default",)
+            delivery_ids = [intent.delivery_id for intent in _intents]
 
         assert subscription.description == "SQLite integration"
         assert len(delivery_ids) == 1

@@ -339,7 +339,18 @@ class _FakeWebhookRepo:
         )
         if self._raise is not None:
             raise self._raise
-        return list(self._delivery_ids)
+        from mnemos.persistence.base import WebhookDeliveryIntent
+
+        return [
+            WebhookDeliveryIntent(
+                delivery_id=did,
+                subscription_id="sub-fake",
+                url="https://example.com/hook",
+                namespace=namespace or "default",
+                owner_id=owner_id or "default",
+            )
+            for did in self._delivery_ids
+        ]
 
     def __getattr__(self, name: str) -> AsyncMock:
         return AsyncMock()

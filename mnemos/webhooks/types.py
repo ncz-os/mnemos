@@ -1,11 +1,21 @@
-"""Shared webhook delivery types, constants, and send concurrency state."""
+"""Shared webhook delivery types, constants, and send concurrency state.
+
+After item 7, no symbol in this module references asyncpg: the
+``_ClaimedDelivery`` wrapper now contains an attribute-style record
+view whose dataclass fields map 1:1 to the columns the sender used to
+read off an asyncpg ``Record``. The ``lease._RecordView`` adapter
+(see ``mnemos/webhooks/lease.py``) wraps the ABC's
+:class:`WebhookDeliveryRecord` so the existing
+``delivery["url"]``-style access keeps working transparently.
+"""
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
-import asyncpg
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    pass
 
 from mnemos.core.config import get_settings
 
@@ -97,6 +107,15 @@ class _PostHeaderDeliveryResult(_DeliveryResult):
 
 @dataclass(frozen=True)
 class _ClaimedDelivery:
-    delivery: asyncpg.Record
+    """One claimed delivery row plus its lease token.
+
+    Item 7: ``delivery`` is no longer an asyncpg ``Record`` — it is
+    whatever the persistence backend's claim method returned. The
+    sender reads it through the ``lease._RecordView`` adapter
+    (subscript-style) so the existing HTTP/DNS code keeps working
+    without raw DBAPI handles anywhere in the runtime.
+    """
+
+    delivery: Any
     lease_token: str
     pre_claim_monotonic: float

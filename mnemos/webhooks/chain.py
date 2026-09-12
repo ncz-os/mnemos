@@ -1,20 +1,34 @@
-"""Webhook retry-chain locking and successor management."""
+"""Webhook retry-chain locking and successor management.
+
+After item 7, every per-backend ``WebhookRepository`` implementation
+(Postgres / SQLite / MySQL / Oracle / DB2) owns the
+``claim_delivery`` / ``guard_delivery_claim`` / ``finalize_delivery``
+state machine as a single atomic statement. The ABC methods subsume
+the raw-asyncpg helpers that used to live here.
+
+These legacy helpers are kept in place because:
+
+- The ``test_webhook_retry_state.py`` suite still exercises them
+  directly while it migrates to the ABC. Keeping the symbols here
+  means the test suite keeps compiling; the production runtime never
+  reaches them after item 7.
+
+- The Postgres ``_delivery_chain_lock_key`` derivation is mirrored by
+  ``mnemos.persistence.postgres._delivery_chain_lock_key`` so in-flight
+  leases held by old code and the new ABC mutually exclude each other
+  during a rolling deploy.
+
+When the test suite is migrated, this file can be deleted. New code
+should call ``backend.webhooks.*`` directly.
+"""
 from __future__ import annotations
 
-import asyncio
 import hashlib
-from datetime import datetime
 from typing import Any, Optional
 
-import asyncpg
 
-from . import types as webhook_types
-from .nats_events import publish_delivery_queued, publish_webhook_outbox_insert
-from .types import _DeliveryResult
-
-
-async def _load_delivery_for_claim(conn: asyncpg.Connection, delivery_id: str) -> Optional[asyncpg.Record]:
-    """Load a due live delivery candidate for a short lease attempt."""
+async def _load_delivery_for_claim(conn: Any, delivery_id: str) -> Optional[Any]:
+    """Pre-item-7 raw-asyncpg claim loading."""
     return await conn.fetchrow(
         """
         SELECT d.id, d.subscription_id, d.event_type, d.payload,
@@ -29,17 +43,27 @@ async def _load_delivery_for_claim(conn: asyncpg.Connection, delivery_id: str) -
           AND d.status IN ('pending', 'retrying')
           AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())
         """,
-        delivery_id, webhook_types.MAX_ATTEMPTS,
+        delivery_id, 4,
     )
 
 
 async def _insert_successor_delivery(
-    conn: asyncpg.Connection,
-    delivery: asyncpg.Record,
+    conn: Any,
+    delivery: Any,
     next_attempt: int,
-    scheduled_at: datetime,
-) -> Optional[asyncpg.Record]:
-    """Insert the next live retry attempt if another writer has not already won."""
+    scheduled_at: Any,
+) -> Optional[Any]:
+    """Pre-item-7 successor insert via raw asyncpg.
+
+    The Postgres-specific ``ON CONFLICT … WHERE`` partial index relies
+    on a partial unique index (subscription_id, event_type, payload_hash,
+    attempt_num) WHERE status IN ('pending', 'retrying') AND NOT superseded.
+    Returns the inserted delivery id (uuid) row, or ``None`` when another
+    writer already won.
+    """
+    from .nats_events import publish_delivery_queued, publish_webhook_outbox_insert
+    from . import types as webhook_types
+
     row = await conn.fetchrow(
         """
         INSERT INTO webhook_deliveries
@@ -69,17 +93,17 @@ async def _insert_successor_delivery(
             "namespace": _record_value(delivery, "namespace"),
             "owner_id": _record_value(delivery, "owner_id"),
         }
-        await asyncio.gather(
-            publish_delivery_queued(**publish_args),
-            publish_webhook_outbox_insert(**publish_args),
-        )
+        await publish_delivery_queued(**publish_args)
+        await publish_webhook_outbox_insert(**publish_args)
     return row
 
 
-def _record_value(record: asyncpg.Record, key: str):
+def _record_value(record: Any, key: str) -> Any:
     try:
-        return record[key]
-    except (KeyError, TypeError):
+        if hasattr(record, "__getitem__") and not isinstance(record, type):
+            return record[key]
+        return getattr(record, key)
+    except (KeyError, AttributeError, TypeError):
         return None
 
 
@@ -88,15 +112,26 @@ def _is_sqlite_connection(conn: Any) -> bool:
     return module.startswith("sqlite3") or module.startswith("aiosqlite")
 
 
-async def _lock_delivery_chain(conn: asyncpg.Connection, delivery: asyncpg.Record) -> None:
-    """Serialize new-code recovery claims and successor inserts per chain."""
+async def _lock_delivery_chain(conn: Any, delivery: Any) -> None:
+    """Postgres-only transaction-scoped advisory lock per chain.
+
+    SQLite is single-writer at the connection level so no per-chain
+    lock is required (the SQLite ABC impl uses BEGIN IMMEDIATE).
+    """
     if _is_sqlite_connection(conn):
         return
     await conn.execute("SELECT pg_advisory_xact_lock($1)", _delivery_chain_lock_key(delivery))
 
 
-def _delivery_chain_lock_key(delivery: asyncpg.Record, _hashlib_mod=None) -> int:
-    """Stable signed-int64 lock key for one webhook retry chain."""
+def _delivery_chain_lock_key(delivery: Any, _hashlib_mod: Any = None) -> int:
+    """Stable signed-int64 advisory-lock key for one webhook retry chain.
+
+    MUST stay byte-for-byte identical to
+    :func:`mnemos.persistence.postgres._delivery_chain_lock_key` so
+    in-flight leases held by old code and the new ABC code mutually
+    exclude each other during a rolling deploy. The Postgres impl
+    derives the same int with this algorithm.
+    """
     if _hashlib_mod is None:
         _hashlib_mod = hashlib
     digest = _hashlib_mod.sha256(
@@ -111,8 +146,8 @@ def _delivery_chain_lock_key(delivery: asyncpg.Record, _hashlib_mod=None) -> int
     return key
 
 
-async def _has_successor_attempt(conn: asyncpg.Connection, delivery: asyncpg.Record) -> bool:
-    """Return whether a newer attempt already exists for this delivery chain."""
+async def _has_successor_attempt(conn: Any, delivery: Any) -> bool:
+    """Pre-item-7 raw-asyncpg successor-existence check."""
     return await conn.fetchval(
         """
         SELECT EXISTS (
@@ -131,8 +166,8 @@ async def _has_successor_attempt(conn: asyncpg.Connection, delivery: asyncpg.Rec
     )
 
 
-async def _has_live_successor_attempt(conn: asyncpg.Connection, delivery: asyncpg.Record) -> bool:
-    """Return whether a live newer attempt owns the chain's forward direction."""
+async def _has_live_successor_attempt(conn: Any, delivery: Any) -> bool:
+    """Pre-item-7 raw-asyncpg live-successor check."""
     return await conn.fetchval(
         """
         SELECT EXISTS (
@@ -154,11 +189,11 @@ async def _has_live_successor_attempt(conn: asyncpg.Connection, delivery: asyncp
 
 
 async def _has_succeeded_chain_attempt(
-    conn: asyncpg.Connection,
-    delivery: asyncpg.Record,
+    conn: Any,
+    delivery: Any,
     delivery_id: str,
 ) -> bool:
-    """Return whether any attempt already completed the chain."""
+    """Pre-item-7 raw-asyncpg succeeded-peer check."""
     return await conn.fetchval(
         """
         SELECT EXISTS (
@@ -179,11 +214,11 @@ async def _has_succeeded_chain_attempt(
 
 
 async def _abandon_owned_attempt_after_live_successor(
-    conn: asyncpg.Connection,
+    conn: Any,
     delivery_id: str,
     lease_token: str,
-) -> Optional[asyncpg.Record]:
-    """Terminalize an owned preclaimed attempt made obsolete before POST."""
+) -> Optional[Any]:
+    """Pre-item-7 raw-asyncpg abandoned-after-successor update."""
     return await conn.fetchrow(
         """
         UPDATE webhook_deliveries
@@ -205,10 +240,10 @@ async def _abandon_owned_attempt_after_live_successor(
 
 
 async def _abandon_current_attempt_after_succeeded_chain_peer(
-    conn: asyncpg.Connection,
+    conn: Any,
     delivery_id: str,
 ) -> None:
-    """Terminalize a lease-free attempt whose chain already converged."""
+    """Pre-item-7 raw-asyncpg self-abandonment (no lease token)."""
     await conn.execute(
         """
         UPDATE webhook_deliveries
@@ -227,14 +262,14 @@ async def _abandon_current_attempt_after_succeeded_chain_peer(
 
 
 async def _abandon_owned_attempt_after_succeeded_chain_peer(
-    conn: asyncpg.Connection,
+    conn: Any,
     delivery_id: str,
     lease_token: str,
-    result: _DeliveryResult,
+    result: Any,
     *,
     require_unexpired_lease: bool = True,
-) -> Optional[asyncpg.Record]:
-    """Finalize an active duplicate without extending a completed chain."""
+) -> Optional[Any]:
+    """Pre-item-7 raw-asyncpg abandon-after-peer (with result)."""
     if require_unexpired_lease:
         return await conn.fetchrow(
             """
@@ -285,10 +320,10 @@ async def _abandon_owned_attempt_after_succeeded_chain_peer(
 
 
 async def _find_live_unleased_successor_attempts(
-    conn: asyncpg.Connection,
-    delivery: asyncpg.Record,
-) -> list[asyncpg.Record]:
-    """Return all free live successors that would duplicate this success."""
+    conn: Any,
+    delivery: Any,
+) -> list[Any]:
+    """Pre-item-7 raw-asyncpg free-successor peeker."""
     return await conn.fetch(
         """
         SELECT newer.id
@@ -309,8 +344,8 @@ async def _find_live_unleased_successor_attempts(
     )
 
 
-async def _abandon_live_successor_attempt(conn: asyncpg.Connection, successor_id: str) -> None:
-    """Mark a free successor superseded after a predecessor has succeeded."""
+async def _abandon_live_successor_attempt(conn: Any, successor_id: str) -> None:
+    """Pre-item-7 raw-asyncpg successor abandonment."""
     await conn.execute(
         """
         UPDATE webhook_deliveries
@@ -326,3 +361,21 @@ async def _abandon_live_successor_attempt(conn: asyncpg.Connection, successor_id
         """,
         successor_id,
     )
+
+
+__all__ = (
+    "_load_delivery_for_claim",
+    "_insert_successor_delivery",
+    "_record_value",
+    "_is_sqlite_connection",
+    "_lock_delivery_chain",
+    "_delivery_chain_lock_key",
+    "_has_successor_attempt",
+    "_has_live_successor_attempt",
+    "_has_succeeded_chain_attempt",
+    "_abandon_owned_attempt_after_live_successor",
+    "_abandon_current_attempt_after_succeeded_chain_peer",
+    "_abandon_owned_attempt_after_succeeded_chain_peer",
+    "_find_live_unleased_successor_attempts",
+    "_abandon_live_successor_attempt",
+)

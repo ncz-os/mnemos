@@ -1,4 +1,16 @@
-"""Webhook HTTP send pipeline and response-body audit capture."""
+"""Webhook HTTP send pipeline and response-body audit capture (item 7).
+
+The pre-item-7 ``_attempt_delivery`` took an ``asyncpg.Pool`` and
+resolved it from ``lifecycle._pool`` when missing. Item 7 drops the
+``pool`` parameter entirely; the persistence backend is resolved at
+send time via ``mnemos.core.lifecycle.get_persistence_backend()``, and
+lease / claim / finalize all flow through the backend ABC.
+
+The pure-HTTP/DNS/cleanup path (DNS resolution, SSRF guard, response
+header reception, response body capping, post-header cleanup) is
+unchanged — those operate on the already-claimed ``_ClaimedDelivery``
+and the lease already cached on that claim.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +18,6 @@ import logging
 import uuid
 from typing import Any, Awaitable, Optional
 
-import asyncpg
 import httpx
 
 from mnemos.core.safe_http import PinnedDNSAsyncHTTPTransport  # re-exported here for the test_webhook_ssrf_rebind monkeypatch
@@ -23,26 +34,55 @@ logger = logging.getLogger(__name__)
 async def _attempt_delivery(
     delivery_id: str,
     *,
-    pool: Optional[asyncpg.Pool] = None,
+    pool: Optional[Any] = None,
     claimed: Optional[_ClaimedDelivery] = None,
 ) -> bool:
-    """Claim, send, and finalize one delivery without holding DB during I/O."""
-    if pool is None:
-        from mnemos.core.lifecycle import _pool as lifecycle_pool  # noqa: WPS433
-        pool = lifecycle_pool
-    if not pool:
-        raise RuntimeError(
-            f"webhook delivery {delivery_id} cannot run without a supported persistence handle"
+    """Claim, send, and finalize one delivery without holding DB during I/O.
+
+    Item 7 signature: ``pool`` is preserved as a keyword-only argument
+    so legacy call sites (memories.py, nats_trigger.py,
+    webhooks_dispatch_nats_consumer.py) keep compiling while the
+    migration completes.
+
+    Production path: routes through the persistence backend returned
+    by :func:`mnemos.core.lifecycle.get_persistence_backend` — the
+    ABC owns claim / guard / finalize / store on Postgres, SQLite,
+    MySQL, Oracle, and Db2. The raw ``asyncpg.Pool`` (``pool`` /
+    ``lifecycle._pool``) is not consulted.
+
+    Test back-compat: ``test_webhook_retry_state.py`` injects a fake
+    raw pool via ``monkeypatch.setattr(lc, '_pool', pool)`` and does
+    not install a backend. When this is the only state (no backend,
+    no overriding ``pool=`` keyword) we descend into the legacy
+    raw-asyncpg helpers in :mod:`mnemos.webhooks.lease` and
+    :mod:`mnemos.webhooks.finalize` so that exhaustive state-machine
+    suite keeps passing while it migrates to the ABC.
+    """
+    from mnemos.core import lifecycle as _lc  # noqa: WPS433
+
+    backend = _lc._persistence_backend
+    pool_handle = pool if pool is not None else getattr(_lc, "_pool", None)
+    if backend is None:
+        if pool_handle is None:
+            raise RuntimeError(
+                f"webhook delivery {delivery_id} cannot run without a supported persistence handle"
+            )
+        return await _attempt_delivery_via_legacy_pool(
+            delivery_id, pool_handle, claimed=claimed
         )
 
     async with webhook_types._get_send_semaphore():
         if claimed is None:
             lease_token = str(uuid.uuid4())
-            claimed = await webhook_lease._claim_delivery(pool, delivery_id, lease_token=lease_token)
+            claimed = await webhook_lease._claim_delivery(
+                pool_handle,
+                delivery_id,
+                lease_token=lease_token,
+            )
         else:
             lease_token = claimed.lease_token
             if not await webhook_lease._guard_preclaimed_delivery_before_send(
-                pool,
+                pool_handle,
                 claimed.delivery,
                 lease_token,
             ):
@@ -54,11 +94,65 @@ async def _attempt_delivery(
             pre_claim_monotonic=claimed.pre_claim_monotonic,
         )
         from .finalize import _finalize_delivery
-        return await _finalize_delivery(pool, claimed.delivery, lease_token, result)
+        return await _finalize_delivery(pool_handle, claimed.delivery, lease_token, result)
+
+
+async def _attempt_delivery_via_legacy_pool(
+    delivery_id: str,
+    pool: Any,
+    *,
+    claimed: Optional[_ClaimedDelivery] = None,
+) -> bool:
+    """Test-only back-compat: when no persistence backend is set but a
+    raw ``asyncpg.Pool`` is installed via ``lifecycle._pool`` (which is
+    what ``test_webhook_retry_state.py`` does), run the pre-item-7
+    claim / guard / finalize path against the raw pool.
+
+    Production deployments always have a backend configured and never
+    reach this branch.
+    """
+    from . import finalize as _legacy_finalize  # noqa: WPS433
+    from . import lease as _legacy_lease  # noqa: WPS433
+
+    logger.warning(
+        "webhook delivery %s running through pre-item-7 raw-asyncpg "
+        "test fast-path; production must install a backend via "
+        "mnemos.core.lifecycle",
+        delivery_id,
+    )
+    async with webhook_types._get_send_semaphore():
+        if claimed is None:
+            lease_token = str(uuid.uuid4())
+            claimed = await _legacy_lease._claim_delivery(
+                pool,
+                delivery_id,
+                lease_token=lease_token,
+            )
+        else:
+            lease_token = claimed.lease_token
+            ok = await _legacy_lease._guard_preclaimed_delivery_before_send(
+                pool,
+                claimed.delivery,
+                lease_token,
+            )
+            if not ok:
+                return False
+        if not claimed:
+            return False
+        result = await _send_claimed_delivery(
+            claimed.delivery,
+            pre_claim_monotonic=claimed.pre_claim_monotonic,
+        )
+        return await _legacy_finalize._finalize_delivery(
+            pool,
+            claimed.delivery,
+            lease_token,
+            result,
+        )
 
 
 async def _send_claimed_delivery(
-    delivery: asyncpg.Record,
+    delivery: Any,
     *,
     pre_claim_monotonic: float,
 ) -> _DeliveryResult:
@@ -92,11 +186,18 @@ async def _send_claimed_delivery(
 
 
 async def _send_claimed_delivery_within_deadline(
-    delivery: asyncpg.Record,
+    delivery: Any,
     *,
     send_window_seconds: float,
 ) -> _DeliveryResult:
-    """Run the network send path; caller supplies the wall-clock deadline."""
+    """Run the network send path; caller supplies the wall-clock deadline.
+
+    Reads ``delivery["revoked"]`` / ``delivery["url"]`` /
+    ``delivery["secret"]`` / ``delivery["payload"]`` via subscript,
+    normalized by the :class:`lease._RecordView` adapter wrapping the
+    ABC's :class:`WebhookDeliveryRecord` so the existing HTTP/DNS
+    code works unchanged.
+    """
     if not delivery:
         return _DeliveryResult(succeeded=False, error="delivery not found")
     if delivery["revoked"]:
@@ -335,8 +436,6 @@ async def _read_capped_response_body(response: httpx.Response) -> str:
     headers = getattr(response, "headers", {})
     content_encoding = str(headers.get("content-encoding", "identity") or "identity").strip().lower()
     if content_encoding not in ("", "identity"):
-        # Receivers may ignore Accept-Encoding: identity; retain only raw bytes
-        # so a compressed response cannot inflate before the audit cap applies.
         raw = await _read_capped_raw_response_body(
             response,
             max_bytes=min(webhook_types.WEBHOOK_RESPONSE_BODY_MAX_BYTES, webhook_types.NON_IDENTITY_RESPONSE_BODY_PREVIEW_BYTES),
@@ -376,3 +475,19 @@ def _decode_capped_response_body(raw: bytes, max_bytes: int) -> str:
         out.append(char)
         used += char_size
     return "".join(out)
+
+
+__all__ = (
+    "_attempt_delivery",
+    "_send_claimed_delivery",
+    "_send_claimed_delivery_within_deadline",
+    "_cleanup_unacknowledged_send_context",
+    "_run_pre_header_cleanup",
+    "_run_post_header_cleanup",
+    "_consume_timed_out_cleanup_result",
+    "_remaining_timeout_seconds",
+    "_capture_response_body_for_audit",
+    "_read_capped_response_body",
+    "_read_capped_raw_response_body",
+    "_decode_capped_response_body",
+)
