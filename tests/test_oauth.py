@@ -31,9 +31,13 @@ class TestOAuthWiring:
             "resolve_session",
             "revoke_session",
             "revoke_all_sessions",
-            "gc_expired_sessions",
         ):
             assert hasattr(oauth, name), f"mnemos.core.oauth missing: {name}"
+        # gc_expired_sessions moved to the OAuthRepository ABC (item 13) —
+        # assert that it is reachable through the persistence facade and
+        # is no longer a module-level shim on mnemos.core.oauth.
+        from mnemos.persistence.base import OAuthRepository
+        assert "gc_expired_sessions" in OAuthRepository.__abstractmethods__
 
     def test_oauth_handler_router(self):
         from mnemos.api.routes import oauth as handler

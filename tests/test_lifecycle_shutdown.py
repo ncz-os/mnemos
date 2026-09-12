@@ -58,7 +58,14 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
             assert app.state.pool is lifecycle._pool
             assert app.state.cache is None
             assert lifecycle._worker_status["distillation_worker"] == "disabled"
-            assert lifecycle._worker_tasks == set()
+            # Item 13 (OAuth GC onto the ABC) added a backend-neutral worker
+            # scheduled whenever ``_persistence_backend`` advertises the
+            # ``oauth`` capability. The default SQLite backend does advertise
+            # it, so expect exactly one running worker — the OAuth GC loop —
+            # and nothing else.
+            assert len(lifecycle._worker_tasks) == 1
+            (only_worker,) = lifecycle._worker_tasks
+            assert only_worker.get_coro().__name__ == "_oauth_gc_loop"
 
         assert lifecycle._cache is None
         if engine is not None:
