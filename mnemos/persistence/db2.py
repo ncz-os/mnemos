@@ -858,9 +858,30 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         tx: Any,
         memory_id: str,
         tags: Sequence[str],
-    ) -> None:
+        *,
+        visibility: VisibilityFilter | None = None,
+    ) -> bool:
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
+            where = ["m.id = ?", "m.deleted_at IS NULL"]
+            params: list[Any] = [memory_id]
+            if visibility is not None:
+                clause, vis_params = _render_visibility(visibility, table_alias="m")
+                if clause:
+                    where.append(_BIND_RE.sub("?", clause))
+                    params.extend(
+                        vis_params[match.group(1)]
+                        for match in _BIND_RE.finditer(clause)
+                    )
+            await _call(
+                cursor.execute,
+                "SELECT m.id FROM memories m WHERE "
+                + " AND ".join(where)
+                + " FOR UPDATE",
+                tuple(params),
+            )
+            if await _call(cursor.fetchone) is None:
+                return False
             await _call(cursor.execute, "DELETE FROM memory_tags WHERE memory_id = ?", (memory_id,))
             if tags:
                 await _call(
@@ -868,6 +889,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                     "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
                     [(memory_id, tag) for tag in tags],
                 )
+            return True
         finally:
             await _call(cursor.close)
 

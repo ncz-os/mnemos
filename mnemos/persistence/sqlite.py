@@ -948,8 +948,25 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         tx: Transaction,
         memory_id: str,
         tags: Sequence[str],
-    ) -> None:
+        *,
+        visibility: VisibilityFilter | None = None,
+    ) -> bool:
         conn = self._conn(tx)
+        params: list[Any] = [memory_id]
+        where = ["id = ?", "deleted_at IS NULL"]
+        if visibility is not None:
+            clause = _render_sqlite_visibility(visibility, params)
+            if clause:
+                where.append(clause)
+        # SqliteBackend.transactional() has already acquired BEGIN IMMEDIATE,
+        # the backend-equivalent parent-row write lock.
+        locked = await _fetch_one(
+            conn,
+            "SELECT id FROM memories WHERE " + " AND ".join(where),
+            params,
+        )
+        if locked is None:
+            return False
         await _execute(conn, "DELETE FROM memory_tags WHERE memory_id = ?", (memory_id,))
         if tags:
             await _call(
@@ -957,6 +974,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
                 [(memory_id, tag) for tag in tags],
             )
+        return True
 
     async def fetch_memory_tags(
         self,
