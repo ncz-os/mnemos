@@ -27,6 +27,7 @@ from mnemos.core import eligibility as _eligibility
 from mnemos.persistence.base import (
     BackendCapabilityMissing,
     BranchRepository,
+    ClusterCandidateRow,
     CORE_CAPABILITY,
     CompressionQueueRepository,
     CompressionRepository,
@@ -748,9 +749,20 @@ class MariadbMorpheusRepository(MysqlMorpheusRepository):
     to pass the JSON text directly — MariaDB stores it as LONGTEXT
     but treats it as JSON via the CHECK constraint at insert time.
 
+    Item 11b: MariaDB also stores embeddings in a separate
+    ``memory_embeddings`` join table (not inline on ``memories``,
+    unlike MySQL). The inherited ``fetch_cluster_candidates`` reads
+    ``FROM_VECTOR(m.embedding)`` which doesn't exist on MariaDB —
+    we override to LEFT JOIN ``memory_embeddings`` + ``VEC_ToText``
+    instead (the same pattern ``_python_cosine_search`` uses). The
+    inherited ``merge_run_config`` would also fail because of the
+    ``CAST(%s AS JSON)`` form — we override to write JSON text
+    directly so MariaDB's LONGTEXT column receives a valid JSON
+    string.
+
     All other MySQL impl methods (``update_counters``, ``set_phase``,
-    etc.) round-trip unchanged because ``UPDATE`` paths don't touch
-    the JSON CAST.
+    ``rollback_run``, etc.) round-trip unchanged because ``UPDATE``
+    paths don't touch the JSON CAST or the embedding column.
     """
 
     async def begin_run(
@@ -801,6 +813,161 @@ class MariadbMorpheusRepository(MysqlMorpheusRepository):
         if row is None:
             raise RuntimeError("MariaDB begin_run: failed to fetch inserted row id")
         return str(row[0])
+
+    async def fetch_cluster_candidates(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        max_input_count: int,
+    ) -> ClusterCandidateRow | None:
+        """MariaDB override of fetch_cluster_candidates — item 11b.
+
+        MariaDB stores embeddings in ``memory_embeddings`` (a join
+        table), so we LEFT JOIN it. ``VEC_ToText`` returns the
+        ``VECTOR`` as a JSON-encoded string — same ``json.loads``
+        decode the MySQL impl uses on the ``FROM_VECTOR`` output.
+        ``memories.embedding`` doesn't exist on MariaDB, so the
+        ``embedding IS NOT NULL`` filter has to apply to
+        ``me.embedding`` after the join.
+        """
+        conn = tx.conn
+        eligibility_clause = _eligibility.eligible_for_morpheus("m")
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT cluster_min_size, window_started_at, window_ended_at, namespace
+                  FROM morpheus_runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            run_row = await cursor.fetchone()
+            if run_row is None:
+                return None
+            await cursor.execute(
+                f"""
+                SELECT m.id, VEC_ToText(me.embedding) AS embedding_json
+                  FROM memories m
+                  JOIN memory_embeddings me ON me.memory_id = m.id
+                 WHERE m.created BETWEEN %s AND %s
+                   AND NOT (m.provenance <=> 'morpheus_local')
+                   AND m.morpheus_run_id IS NULL
+                   AND me.embedding IS NOT NULL
+                   AND {eligibility_clause}
+                   AND (%s IS NULL OR m.namespace = %s)
+                 ORDER BY m.created
+                 LIMIT %s
+                """,
+                (
+                    run_row[1],
+                    run_row[2],
+                    run_row[3],
+                    run_row[3],
+                    int(max_input_count),
+                ),
+            )
+            raw_rows = await cursor.fetchall() or []
+        candidates: list[tuple[str, list[float]]] = []
+        for row in raw_rows:
+            mid = row[0]
+            raw_embed = row[1]
+            if raw_embed is None:
+                continue
+            if isinstance(raw_embed, (list, tuple)):
+                try:
+                    vec = [float(value) for value in raw_embed]
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(raw_embed, (bytes, bytearray)):
+                try:
+                    parsed = json.loads(raw_embed.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(parsed, list):
+                    continue
+                try:
+                    vec = [float(value) for value in parsed]
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(raw_embed, str):
+                try:
+                    parsed = json.loads(raw_embed)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(parsed, list):
+                    continue
+                try:
+                    vec = [float(value) for value in parsed]
+                except (TypeError, ValueError):
+                    continue
+            else:
+                try:
+                    vec = [float(value) for value in raw_embed]
+                except (TypeError, ValueError):
+                    continue
+            if not vec:
+                continue
+            candidates.append((str(mid), vec))
+        return ClusterCandidateRow(
+            cluster_min_size=int(run_row[0]),
+            window_started_at=run_row[1],
+            window_ended_at=run_row[2],
+            namespace=run_row[3],
+            candidates=candidates,
+        )
+
+    async def merge_run_config(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        patch: dict[str, Any],
+    ) -> None:
+        """MariaDB override of merge_run_config — item 11b.
+
+        MariaDB's JSON column is a LONGTEXT alias with a
+        ``json_valid()`` CHECK, so the MySQL ``CAST(%s AS JSON)``
+        form is both unsupported and unnecessary. We write the JSON
+        text directly — MariaDB's CHECK constraint enforces the
+        same shape at insert time. RMW on the ``config`` column is
+        the same pattern the MySQL impl uses.
+        """
+        if not patch:
+            return
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT config FROM morpheus_runs WHERE id = %s",
+                (run_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return
+            raw_config = row[0]
+        if raw_config is None or raw_config == "":
+            merged: dict[str, Any] = {}
+        elif isinstance(raw_config, dict):
+            merged = dict(raw_config)
+        elif isinstance(raw_config, (bytes, bytearray)):
+            try:
+                parsed = json.loads(raw_config.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                parsed = {}
+            merged = parsed if isinstance(parsed, dict) else {}
+        elif isinstance(raw_config, str):
+            try:
+                parsed = json.loads(raw_config)
+            except json.JSONDecodeError:
+                parsed = {}
+            merged = parsed if isinstance(parsed, dict) else {}
+        else:
+            merged = {}
+        merged.update(patch)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE morpheus_runs SET config = %s WHERE id = %s",
+                (json.dumps(merged), run_id),
+            )
 
 
 class MariadbWebhookRepository(MysqlWebhookRepository):

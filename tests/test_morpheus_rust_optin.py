@@ -169,7 +169,16 @@ def _row(memory_id: str, vec: list[float]) -> dict[str, Any]:
 
 
 class _MorpheusNoOp:
-    """No-op ``backend.morpheus`` — every lifecycle method is a no-op."""
+    """No-op ``backend.morpheus`` — every lifecycle method is a no-op.
+
+    Item 11a added the lifecycle methods. Item 11b added
+    ``fetch_cluster_candidates`` and ``merge_run_config`` so
+    ``phase_cluster`` can route entirely through the ABC without
+    touching ``pool.acquire()`` itself. The no-op stubs here
+    return ``None`` for ``fetch_cluster_candidates`` (which causes
+    ``phase_cluster`` to early-exit with 0 clusters) and a no-op
+    ``merge_run_config``.
+    """
 
     async def begin_run(self, tx, **kwargs):
         return "00000000-0000-0000-0000-000000000000"
@@ -196,6 +205,12 @@ class _MorpheusNoOp:
 
     async def rollback_run(self, tx, run_id, *, requested_by):
         return 0, 1
+
+    async def fetch_cluster_candidates(self, tx, *, run_id, max_input_count):
+        return None
+
+    async def merge_run_config(self, tx, run_id, *, patch):
+        return None
 
 
 class _BackendNoOp:
@@ -242,25 +257,63 @@ async def test_phase_cluster_dispatches_row_vs_cluster_scoring_to_rust_batch(mon
     fake = types.SimpleNamespace(__version__="fake-0", cosine_batch=cosine_batch)
     runner_mod = _reload_runner_module(monkeypatch, hot_enabled=True, hot_module=fake)
 
-    run_row = {
-        "cluster_min_size": 2,
-        "window_started_at": "2026-04-25T00:00:00",
-        "window_ended_at": "2026-04-25T23:59:59",
-        "namespace": None,
-    }
-    rows = [
-        _row("mem_a", [1.0, 0.0]),
-        _row("mem_b", [1.0, 0.0]),
-    ]
-    conn = _MockConn(fetchrow_result=run_row, fetch_result=rows)
+    # Item 11b: ``phase_cluster`` consumes pre-materialised
+    # ``list[float]`` candidates via ``backend.morpheus.fetch_cluster_candidates``.
+    # Drive a custom backend mock so we can inject the test rows
+    # without standing up a real persistence backend.
+    from mnemos.persistence.base import ClusterCandidateRow
+
+    captured_candidates: list = []
+
+    class _ClusterMorpheus(_MorpheusNoOp):
+        async def fetch_cluster_candidates(self, tx, *, run_id, max_input_count):
+            return ClusterCandidateRow(
+                cluster_min_size=2,
+                window_started_at="2026-04-25T00:00:00",
+                window_ended_at="2026-04-25T23:59:59",
+                namespace=None,
+                candidates=[
+                    ("mem_a", [1.0, 0.0]),
+                    ("mem_b", [1.0, 0.0]),
+                ],
+            )
+
+        async def merge_run_config(self, tx, run_id, *, patch):
+            captured_candidates.append(patch)
+
+    class _BackendWithCluster:
+        def __init__(self):
+            self.morpheus = _ClusterMorpheus()
+
+        def transactional(self):
+
+            class _Ctx:
+                async def __aenter__(self_inner):
+                    return None
+
+                async def __aexit__(self_inner, *_exc):
+                    return False
+
+            return _Ctx()
+
+    from mnemos.core import lifecycle as _lifecycle
+
+    monkeypatch.setattr(_lifecycle, "_persistence_backend", _BackendWithCluster())
 
     n = await runner_mod.phase_cluster(
-        _MockPool(conn),
+        _MockPool(_MockConn(None, None)),  # pool is unused post-11b
         "00000000-0000-0000-0000-000000000084",
     )
 
     assert n == 1
+    # cosine_batch was called with the first candidate's vec against
+    # the second candidate's vec (single cluster centroid match).
     assert calls == [([1.0, 0.0], [[1.0, 0.0]])]
+    # The surviving cluster payload was merged into morpheus_runs.config.
+    assert len(captured_candidates) == 1
+    payload = captured_candidates[0]["clusters"]
+    assert len(payload) == 1
+    assert set(payload[0]["member_memory_ids"]) == {"mem_a", "mem_b"}
 
 
 def teardown_module(_):
