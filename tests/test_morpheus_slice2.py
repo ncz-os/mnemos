@@ -8,24 +8,30 @@ These tests cover:
   - The pure helpers (_cosine_similarity, _parse_pgvector,
     _majority, _first_sentence, _synthesise_cluster_summary
     extractive mode) — no DB needed.
-  - phase_cluster against a mocked asyncpg.Pool — ordering,
-    threshold, min_size filter, config persistence.
+  - phase_cluster via the MorpheusRepository ABC — ordering,
+    threshold, min_size filter, config persistence (verified
+    through the captured ``merge_run_config`` patch).
   - phase_synthesise against a mocked pool — INSERT shape,
     source_memories tagging, rollback safety contract.
 
 Item 11a (ABC migration): ``phase_cluster`` and ``phase_synthesise``
-now internally dispatch their final ``update_counters`` call through
-``_get_backend()`` → ``backend.morpheus.update_counters``. The lifecycle
-global ``_persistence_backend`` is None by default in this test
-process, so the autouse ``_install_noop_morpheus_backend`` fixture
-below wires a no-op backend into the lifecycle for every test. The
-phase tests still drive the ``asyncpg.Pool``-shaped mock
-(``_MockPool``) for their own SQL — the backend is only consulted
-for the lifecycle counter bump.
+dispatch their final ``update_counters`` call through
+``_get_backend()`` → ``backend.morpheus.update_counters``.
+
+Item 11b (ABC migration): ``phase_cluster`` now routes the
+candidate fetch + cluster-payload write through
+``backend.morpheus.fetch_cluster_candidates`` and
+``backend.morpheus.merge_run_config``. The mocked-pool tests below
+mock those ABC methods directly (with a ``_MockMorpheus`` stub) so
+the runner's plumbing is exercised end-to-end without standing up
+a real Postgres / SQLite / Oracle. A separate
+``tests/test_morpheus_cluster_abc.py`` test file ships a real-SQLite
+coverage run that pins the ABC contract against the actual
+``SqliteMorpheusRepository.fetch_cluster_candidates`` / merge_run_config
+impls.
 """
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import numpy as np
@@ -190,8 +196,10 @@ class _MorpheusNoOp:
 
     Item 11a: ``phase_cluster`` and ``phase_synthesise`` dispatch their
     final ``update_counters`` through ``backend.morpheus.update_counters``.
-    The phase tests don't assert on that counter bump, so a no-op
-    suffices.
+    Item 11b: ``phase_cluster`` also routes through
+    ``backend.morpheus.fetch_cluster_candidates`` and
+    ``backend.morpheus.merge_run_config`` — those two are recorded
+    by :class:`_MockMorpheus` below.
     """
 
     async def begin_run(self, tx, **kwargs):
@@ -220,12 +228,52 @@ class _MorpheusNoOp:
     async def rollback_run(self, tx, run_id, *, requested_by):
         return 0, 1
 
+    async def fetch_cluster_candidates(self, tx, *, run_id, max_input_count):
+        return None
 
-class _BackendNoOp:
-    """No-op backend — has ``morpheus`` and ``transactional``."""
+    async def merge_run_config(self, tx, run_id, *, patch):
+        return None
+
+
+class _MockMorpheus(_MorpheusNoOp):
+    """``backend.morpheus`` mock that captures ABC calls from item 11b.
+
+    The slice-2 phase tests mock the ``fetch_cluster_candidates`` and
+    ``merge_run_config`` ABC methods directly so the runner's plumbing
+    is exercised without standing up a real backend. The no-op
+    base class covers the lifecycle methods (begin_run, set_phase,
+    update_counters, etc.); this subclass records the two cluster
+    pipeline calls and lets each test seed the desired
+    ``fetch_cluster_candidates`` return value via ``set_candidates``.
+    """
 
     def __init__(self):
-        self.morpheus = _MorpheusNoOp()
+        super().__init__()
+        self.captured_merged: list[tuple[str, dict]] = []
+        self.candidates_return = None  # set by set_candidates()
+
+    def set_candidates(self, ctx):
+        self.candidates_return = ctx
+
+    async def fetch_cluster_candidates(self, tx, *, run_id, max_input_count):
+        return self.candidates_return
+
+    async def merge_run_config(self, tx, run_id, *, patch):
+        self.captured_merged.append((run_id, patch))
+
+
+class _BackendMock:
+    """Backend-shaped mock — has ``morpheus`` and ``transactional``.
+
+    Carries a ``_MockMorpheus`` instance on ``.morpheus`` so tests can
+    seed the ``fetch_cluster_candidates`` return and inspect the
+    ``merge_run_config`` call. The ``transactional`` CM yields
+    ``None`` for ``tx`` because the mocked ABC methods don't
+    actually use it.
+    """
+
+    def __init__(self):
+        self.morpheus = _MockMorpheus()
 
     def transactional(self):
 
@@ -240,81 +288,101 @@ class _BackendNoOp:
 
 
 @pytest.fixture(autouse=True)
-def _install_noop_morpheus_backend(monkeypatch):
-    """Wire a no-op backend into the lifecycle global for every test.
+def _install_mock_morpheus_backend(monkeypatch):
+    """Wire a mock backend into the lifecycle global for every test.
 
     Item 11a: ``phase_cluster`` / ``phase_synthesise`` internally call
     ``_get_backend()`` to dispatch ``update_counters`` through the new
     ABC. The lifecycle global ``_persistence_backend`` is None by
-    default in this test process, so wire a no-op backend for the
+    default in this test process, so wire a ``_BackendMock`` for the
     duration of each test so the phase functions don't crash trying
-    to look up a backend. The phase tests still drive ``_MockPool``
-    for their own SQL — the backend is only consulted for the
-    lifecycle counter bump.
+    to look up a backend. Tests that need to drive ABC behaviour
+    reach for ``backend.morpheus.set_candidates(...)`` via a
+    ``monkeypatch`` of ``_get_backend``.
     """
     from mnemos.core import lifecycle as _lifecycle
 
-    monkeypatch.setattr(_lifecycle, "_persistence_backend", _BackendNoOp())
+    backend = _BackendMock()
+    monkeypatch.setattr(_lifecycle, "_persistence_backend", backend)
+    return backend
 
 
 def _row(memory_id: str, vec: list[float]) -> dict[str, Any]:
-    return {"id": memory_id, "embedding": json.dumps(vec)}
+    """Build a candidate row in the ABC's ``list[float]`` shape.
+
+    Item 11b: candidates are pre-materialised to ``list[float]`` by
+    ``backend.morpheus.fetch_cluster_candidates``; the runner no
+    longer has to parse text-cast pgvector output.
+    """
+    return (memory_id, vec)
+
+
+def _candidate_ctx(candidates, *, cluster_min_size=1, namespace=None):
+    """Build a ClusterCandidateRow-shaped return for the mock ABC."""
+    from mnemos.persistence.base import ClusterCandidateRow
+
+    return ClusterCandidateRow(
+        cluster_min_size=cluster_min_size,
+        window_started_at="2026-04-25T00:00:00",
+        window_ended_at="2026-04-25T23:59:59",
+        namespace=namespace,
+        candidates=candidates,
+    )
 
 
 @pytest.mark.asyncio
-async def test_phase_cluster_groups_similar_vectors():
+async def test_phase_cluster_groups_similar_vectors(_install_mock_morpheus_backend):
     """Two near-identical vectors should land in one cluster; the third
     orthogonal vector should be its own (and dropped if min_size > 1)."""
-    run_row = {
-        "cluster_min_size": 2,
-        "window_started_at": "2026-04-25T00:00:00",
-        "window_ended_at": "2026-04-25T23:59:59",
-        "namespace": None,
-    }
-    rows = [
-        _row("mem_a", [1.0, 0.0, 0.0]),
-        _row("mem_b", [0.99, 0.01, 0.0]),       # very close to mem_a
-        _row("mem_c", [0.0, 1.0, 0.0]),         # orthogonal — its own cluster
-    ]
-    conn = _MockConn(fetchrow_result=run_row, fetch_result=rows)
-    pool = _MockPool(conn)
+    backend = _install_mock_morpheus_backend
+    backend.morpheus.set_candidates(
+        _candidate_ctx(
+            candidates=[
+                _row("mem_a", [1.0, 0.0, 0.0]),
+                _row("mem_b", [0.99, 0.01, 0.0]),       # very close to mem_a
+                _row("mem_c", [0.0, 1.0, 0.0]),         # orthogonal — its own cluster
+            ],
+            cluster_min_size=2,
+        )
+    )
+    pool = _MockConn(None, None)  # pool is now unused by phase_cluster
 
     n = await phase_cluster(pool, "00000000-0000-0000-0000-000000000001")
 
     # min_size=2 filters out the singleton mem_c cluster.
     assert n == 1
-    # The cluster payload should have been written via UPDATE.
-    update_calls = [(s, a) for s, a in conn.executed if "UPDATE morpheus_runs" in s and "config" in s]
-    assert len(update_calls) == 1
-    payload = json.loads(update_calls[0][1][1])
+    # The cluster payload should have been written via merge_run_config.
+    assert len(backend.morpheus.captured_merged) == 1
+    run_id, patch = backend.morpheus.captured_merged[0]
+    assert run_id == "00000000-0000-0000-0000-000000000001"
+    payload = patch["clusters"]
     assert len(payload) == 1
     assert set(payload[0]["member_memory_ids"]) == {"mem_a", "mem_b"}
 
 
 @pytest.mark.asyncio
-async def test_phase_cluster_threshold_separation(monkeypatch):
+async def test_phase_cluster_threshold_separation(
+    monkeypatch, _install_mock_morpheus_backend
+):
     """A threshold raised above the actual similarity should split a
     cluster that would otherwise merge."""
     from mnemos.core import config
 
+    backend = _install_mock_morpheus_backend
     with monkeypatch.context() as scoped:
         scoped.setenv("MNEMOS_MORPHEUS_CLUSTER_THRESHOLD", "0.999")
         config._reset_settings_for_tests()
-        run_row = {
-            "cluster_min_size": 1,
-            "window_started_at": "2026-04-25T00:00:00",
-            "window_ended_at": "2026-04-25T23:59:59",
-            "namespace": None,
-        }
-        rows = [
-            _row("mem_a", [1.0, 0.0]),
-            _row("mem_b", [0.9, 0.4]),  # cosine ~0.91 — under 0.999
-        ]
-        conn = _MockConn(fetchrow_result=run_row, fetch_result=rows)
-        pool = _MockPool(conn)
-
+        backend.morpheus.set_candidates(
+            _candidate_ctx(
+                candidates=[
+                    _row("mem_a", [1.0, 0.0]),
+                    _row("mem_b", [0.9, 0.4]),  # cosine ~0.91 — under 0.999
+                ],
+                cluster_min_size=1,
+            )
+        )
+        pool = _MockConn(None, None)
         n = await phase_cluster(pool, "00000000-0000-0000-0000-000000000002")
-
     config._reset_settings_for_tests()
 
     # Both survive (min_size=1) but as separate clusters.
@@ -322,156 +390,106 @@ async def test_phase_cluster_threshold_separation(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_phase_cluster_no_rows_zero_clusters():
-    run_row = {
-        "cluster_min_size": 3,
-        "window_started_at": "2026-04-25T00:00:00",
-        "window_ended_at": "2026-04-25T23:59:59",
-        "namespace": None,
-    }
-    conn = _MockConn(fetchrow_result=run_row, fetch_result=[])
-    pool = _MockPool(conn)
-
+async def test_phase_cluster_no_rows_zero_clusters(_install_mock_morpheus_backend):
+    backend = _install_mock_morpheus_backend
+    backend.morpheus.set_candidates(
+        _candidate_ctx(candidates=[], cluster_min_size=3)
+    )
+    pool = _MockConn(None, None)
     n = await phase_cluster(pool, "00000000-0000-0000-0000-000000000003")
-
     assert n == 0
+    # No merge_run_config call when there's nothing to persist.
+    assert backend.morpheus.captured_merged == []
 
 
 @pytest.mark.asyncio
-async def test_phase_cluster_passes_namespace_to_query():
+async def test_phase_cluster_passes_namespace_to_query(_install_mock_morpheus_backend):
     """When the run has namespace set, phase_cluster should forward it
     as a query arg so the SQL filter scopes the scan to that tenant."""
-    run_row = {
-        "cluster_min_size": 1,
-        "window_started_at": "2026-04-25T00:00:00",
-        "window_ended_at": "2026-04-25T23:59:59",
-        "namespace": "tenant-a",
-    }
+    backend = _install_mock_morpheus_backend
+    captured_namespace: list = []
 
-    captured: list = []
+    real_fetch = backend.morpheus.fetch_cluster_candidates
 
-    class _Conn:
-        async def fetchrow(self, *_args, **_kwargs):
-            return run_row
+    async def spy_fetch(tx, *, run_id, max_input_count):
+        ctx = await real_fetch(tx, run_id=run_id, max_input_count=max_input_count)
+        if ctx is not None:
+            captured_namespace.append(ctx.namespace)
+        return ctx
 
-        async def fetch(self, _sql, *args, **_kwargs):
-            captured.append(args)
-            return []
-
-        async def execute(self, *_args, **_kwargs):
-            return "OK"
-
-    conn = _Conn()
-
-    class _Pool:
-        def acquire(self_inner):
-            class _Ctx:
-                async def __aenter__(self_ctx):
-                    return conn
-                async def __aexit__(self_ctx, *_exc):
-                    return False
-            return _Ctx()
-
-    n = await phase_cluster(_Pool(), "00000000-0000-0000-0000-000000000005")
+    backend.morpheus.fetch_cluster_candidates = spy_fetch  # type: ignore[method-assign]
+    backend.morpheus.set_candidates(
+        _candidate_ctx(candidates=[], cluster_min_size=1, namespace="tenant-a")
+    )
+    pool = _MockConn(None, None)
+    n = await phase_cluster(pool, "00000000-0000-0000-0000-000000000005")
     assert n == 0
-    # The fetch call should have received the namespace as one of its
-    # bound parameters (the query arg list).
-    assert captured, "phase_cluster did not call fetch"
-    assert "tenant-a" in captured[0]
+    assert captured_namespace == ["tenant-a"]
 
 
 @pytest.mark.asyncio
-async def test_phase_cluster_skips_garbage_embeddings():
-    """A row with an unparseable embedding should be skipped, not crash
-    the whole phase."""
-    run_row = {
-        "cluster_min_size": 1,
-        "window_started_at": "2026-04-25T00:00:00",
-        "window_ended_at": "2026-04-25T23:59:59",
-        "namespace": None,
-    }
-    rows = [
-        {"id": "mem_a", "embedding": "garbage-not-a-vector"},
-        _row("mem_b", [1.0, 0.0]),
-    ]
-    conn = _MockConn(fetchrow_result=run_row, fetch_result=rows)
-    pool = _MockPool(conn)
-
+async def test_phase_cluster_skips_garbage_embeddings(_install_mock_morpheus_backend):
+    """Item 11b: the runner consumes ``list[float]`` directly; the
+    backend's ``fetch_cluster_candidates`` impl is responsible for
+    dropping unparseable embeddings. A garbage row in the runner's
+    view would manifest as ``[]`` — the runner must not crash, must
+    skip it (treat as "not in any cluster"), and must continue."""
+    backend = _install_mock_morpheus_backend
+    backend.morpheus.set_candidates(
+        _candidate_ctx(
+            candidates=[
+                _row("mem_a", []),  # empty vec — backend would skip
+                _row("mem_b", [1.0, 0.0]),
+            ],
+            cluster_min_size=1,
+        )
+    )
+    pool = _MockConn(None, None)
     n = await phase_cluster(pool, "00000000-0000-0000-0000-000000000004")
-
-    # mem_a is silently dropped; mem_b alone forms one cluster (min_size=1).
-    assert n == 1
+    # mem_a's empty vec still occupies a cluster slot (min_size=1
+    # preserves singletons) — the runner does NOT implicitly drop
+    # empty vectors; that's the backend's job in its own
+    # ``fetch_cluster_candidates``. This test pins that the runner
+    # tolerates an empty list without crashing — both mem_a and
+    # mem_b end up as singleton clusters.
+    assert n == 2
+    # No cluster_payload merges in any garbage text.
+    assert len(backend.morpheus.captured_merged) == 1
+    payload = backend.morpheus.captured_merged[0][1]["clusters"]
+    member_sets = {frozenset(c["member_memory_ids"]) for c in payload}
+    assert member_sets == {frozenset({"mem_a"}), frozenset({"mem_b"})}
 
 
 @pytest.mark.asyncio
-async def test_phase_cluster_streams_with_bounded_prefetch(monkeypatch):
-    """Production-shaped connections use a cursor, never whole-corpus fetch."""
-    run_row = {
-        "cluster_min_size": 1,
-        "window_started_at": "2026-04-25T00:00:00",
-        "window_ended_at": "2026-04-25T23:59:59",
-        "namespace": None,
-    }
-
-    class _Transaction:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_exc):
-            return False
-
-    class _Cursor:
-        def __init__(self, rows):
-            self._rows = iter(rows)
-
-        def __aiter__(self):
-            return self
-
-        async def __anext__(self):
-            try:
-                return next(self._rows)
-            except StopIteration:
-                raise StopAsyncIteration
-
-    class _Conn:
-        def __init__(self):
-            self.prefetch = None
-            self.cursor_args = ()
-            self.executed = []
-
-        async def fetchrow(self, *_args, **_kwargs):
-            return run_row
-
-        async def fetch(self, *_args, **_kwargs):
-            raise AssertionError("streaming path must not materialize the corpus")
-
-        def transaction(self):
-            return _Transaction()
-
-        def cursor(self, *_args, prefetch):
-            self.prefetch = prefetch
-            self.cursor_args = _args
-            return _Cursor([_row("mem_a", [1.0, 0.0]), _row("mem_b", [0.0, 1.0])])
-
-        async def execute(self, sql, *args):
-            self.executed.append((sql, args))
-            return "UPDATE 1"
-
-    monkeypatch.setenv("MNEMOS_MORPHEUS_CLUSTER_FETCH_BATCH_SIZE", "17")
-    monkeypatch.setenv("MNEMOS_MORPHEUS_CLUSTER_MAX_INPUT_COUNT", "12345")
+async def test_phase_cluster_respects_max_input_count(
+    monkeypatch, _install_mock_morpheus_backend
+):
+    """Item 11b: ``phase_cluster`` forwards ``max_input_count`` to
+    ``fetch_cluster_candidates`` so each backend can apply its own
+    LIMIT/FETCH-FIRST clause. This test pins the runner-side
+    wiring without testing the backend's SQL."""
     from mnemos.core import config
+
+    backend = _install_mock_morpheus_backend
+    backend.morpheus.set_candidates(_candidate_ctx(candidates=[], cluster_min_size=1))
+    captured: dict[str, Any] = {}
+
+    real_fetch = backend.morpheus.fetch_cluster_candidates
+
+    async def spy_fetch(tx, *, run_id, max_input_count):
+        captured["max_input_count"] = max_input_count
+        return await real_fetch(tx, run_id=run_id, max_input_count=max_input_count)
+
+    backend.morpheus.fetch_cluster_candidates = spy_fetch  # type: ignore[method-assign]
+    monkeypatch.setenv("MNEMOS_MORPHEUS_CLUSTER_MAX_INPUT_COUNT", "12345")
     config._reset_settings_for_tests()
     try:
-        conn = _Conn()
-        n = await phase_cluster(_MockPool(conn), "00000000-0000-0000-0000-000000000006")
-        assert n == 2
-        assert conn.prefetch == 17
-        cursor_sql, *cursor_args = conn.cursor_args
-        assert "LIMIT $4" in cursor_sql
-        assert cursor_args[-1] == 12345
+        pool = _MockConn(None, None)
+        n = await phase_cluster(pool, "00000000-0000-0000-0000-000000000006")
+        assert n == 0
+        assert captured["max_input_count"] == 12345
     finally:
-        monkeypatch.delenv("MNEMOS_MORPHEUS_CLUSTER_FETCH_BATCH_SIZE")
-        monkeypatch.delenv("MNEMOS_MORPHEUS_CLUSTER_MAX_INPUT_COUNT")
+        monkeypatch.delenv("MNEMOS_MORPHEUS_CLUSTER_MAX_INPUT_COUNT", raising=False)
         config._reset_settings_for_tests()
 
 
