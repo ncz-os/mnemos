@@ -123,7 +123,7 @@ def _federation_sync_worker(pool: Any):
     return federation_worker_loop(backend)
 
 
-def _deletion_request_worker(pool: Any):
+def _deletion_request_worker(_pool: Any):
     from mnemos.core.config import get_settings
 
     if not service_enabled(get_settings(), "deletion_request_worker"):
@@ -132,8 +132,8 @@ def _deletion_request_worker(pool: Any):
 
     from mnemos.workers.deletion_request_worker import deletion_request_worker_loop
 
-    # PostgreSQL supplies its asyncpg pool here; the backend-neutral lifecycle
-    # repository is used only when lifecycle has no PostgreSQL pool.
+    backend = lifecycle.get_persistence_backend()
+
     def success() -> None:
         lifecycle._worker_status["deletion_request_worker"] = "healthy"
         lifecycle._worker_status["deletion_request_worker_last_success"] = time.time()
@@ -146,14 +146,14 @@ def _deletion_request_worker(pool: Any):
 
     lifecycle._worker_status["deletion_request_worker"] = "starting"
     return deletion_request_worker_loop(
-        pool,
+        backend,
         on_started=lambda: lifecycle._worker_status.__setitem__("deletion_request_worker", "starting"),
         on_success=success,
         on_error=error,
     )
 
 
-def _hard_deletion_request_worker(pool: Any):
+def _hard_deletion_request_worker(_pool: Any):
     from mnemos.core.config import get_settings
 
     if not service_enabled(get_settings(), "deletion_request_worker"):
@@ -161,6 +161,8 @@ def _hard_deletion_request_worker(pool: Any):
         return None
 
     from mnemos.workers.deletion_request_worker import deletion_request_worker_loop
+
+    backend = lifecycle.get_persistence_backend()
 
     def success() -> None:
         lifecycle._worker_status["hard_deletion_request_worker"] = "healthy"
@@ -174,7 +176,7 @@ def _hard_deletion_request_worker(pool: Any):
 
     lifecycle._worker_status["hard_deletion_request_worker"] = "starting"
     return deletion_request_worker_loop(
-        pool,
+        backend,
         phase="hard_delete",
         on_started=lambda: lifecycle._worker_status.__setitem__("hard_deletion_request_worker", "starting"),
         on_success=success,

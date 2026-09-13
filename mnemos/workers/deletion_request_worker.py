@@ -21,16 +21,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from mnemos.db.deletion_log import log_target_memory_deletions
+from mnemos.persistence.base import PersistenceBackend
 from mnemos.persistence.deletion_ops import (
     _LIVE_ROW_COUNT_SQL,  # noqa: F401  re-exported: tests read it off this module
     _OWNER_NAMESPACE_SOFT_DELETE_SQL,
     _SOFT_DELETE_SQL,
     DEFAULT_VERIFY_ATTEMPTS,
-    _has_live_rows,
     _parse_update_count,
-    count_live_target_rows,
     invalidate_deletion_scope_caches,
-    soft_delete_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,60 +36,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_BATCH_SIZE = 10
 DEFAULT_CHECK_INTERVAL_SECONDS = 30.0
 RESTORE_GRACE_DAYS = 30
-
-_DEQUEUE_SQL = """
-SELECT id, target_user_id, target_namespace
-  FROM deletion_requests
- WHERE status = 'confirmed'
- ORDER BY confirmed_at ASC NULLS FIRST, requested_at ASC
- FOR UPDATE SKIP LOCKED
- LIMIT 1
-"""
-
-_DEQUEUE_HARD_DELETE_SQL = """
-SELECT id, target_user_id, target_namespace, requested_by, requested_at, notes
-  FROM deletion_requests
- WHERE status = 'soft_deleted'
-   AND restore_by < NOW()
- FOR UPDATE SKIP LOCKED
- LIMIT 1
-"""
-
-_MARK_SOFT_DELETED_SQL = """
-UPDATE deletion_requests
-   SET status = 'soft_deleted',
-       soft_deleted_at = NOW(),
-       restore_by = NOW() + ($2::int * INTERVAL '1 day')
- WHERE id = $1
-   AND status = 'sweep_verifying'
-RETURNING id, soft_deleted_at, restore_by
-"""
-
-_MARK_SWEEP_VERIFYING_SQL = """
-UPDATE deletion_requests
-   SET status = 'sweep_verifying'
- WHERE id = $1
-   AND status = 'confirmed'
-RETURNING id
-"""
-
-_REQUEUE_CONFIRMED_SQL = """
-UPDATE deletion_requests
-   SET status = 'confirmed'
- WHERE id = $1
-   AND status = 'sweep_verifying'
-RETURNING id
-"""
-
-_MARK_HARD_DELETED_SQL = """
-UPDATE deletion_requests
-   SET status = 'hard_deleted',
-       hard_deleted_at = NOW()
- WHERE id = $1
-   AND status = 'soft_deleted'
-RETURNING *
-"""
-
 
 # Hard-delete order is intentional for FK safety. Child tables go first
 # (memory_versions, memory_branches, session_messages,
@@ -349,54 +293,6 @@ class DeletionRequestResult:
     remaining_counts: dict[str, int] | None = None
 
 
-def _row_get(row: Any, key: str, default: Any = None) -> Any:
-    try:
-        return row[key]
-    except (KeyError, TypeError):
-        getter = getattr(row, "get", None)
-        if callable(getter):
-            return getter(key, default)
-        return default
-
-
-async def resweep_and_verify_target(
-    conn: Any,
-    target_user_id: str,
-    target_namespace: str | None,
-    *,
-    verify_attempts: int = DEFAULT_VERIFY_ATTEMPTS,
-    invalidate_cache: bool = False,
-) -> dict[str, int]:
-    """Re-run the soft-delete sweep + zero-live-row verify loop on the
-    deletion scope before the request is allowed to transition to
-    ``hard_deleted``.
-
-    The 30-day grace window gives writes time to land on the scope
-    after the first sweep. Without this resweep, rows committed between
-    the soft-delete phase and the hard-delete phase (a memory the user
-    added on day 7 of grace, for example) would be skipped by the
-    hard-delete -- it only removes rows already carrying
-    ``deleted_at IS NOT NULL`` -- and the request would be marked
-    complete while those rows survived forever. ``verify_attempts``
-    mirrors the soft-delete phase retry budget so a long-running writer
-    cannot starve the worker indefinitely.
-    """
-    last_remaining: dict[str, int] = {}
-    for _ in range(max(1, verify_attempts)):
-        await soft_delete_target(
-            conn,
-            target_user_id,
-            target_namespace,
-            invalidate_cache=invalidate_cache,
-        )
-        last_remaining = await count_live_target_rows(
-            conn, target_user_id, target_namespace
-        )
-        if not _has_live_rows(last_remaining):
-            return last_remaining
-    return last_remaining
-
-
 async def restore_soft_deleted_target(
     conn: Any,
     target_user_id: str,
@@ -446,220 +342,49 @@ async def hard_delete_target(
     return counts
 
 
-async def process_one_deletion_request(pool: Any) -> DeletionRequestResult | None:
-    """Process one confirmed request under ``FOR UPDATE SKIP LOCKED``.
+async def process_one_deletion_request(
+    backend: PersistenceBackend,
+) -> DeletionRequestResult | None:
+    """Process one confirmed request through the lifecycle-worker ABC."""
+    from mnemos.persistence.worker_lifecycle import process_one_deletion_request as process_backend
 
-    The lock, all target-table updates, and the request state
-    transition share one transaction. A mid-flight exception aborts
-    everything, leaving the request in ``confirmed`` for retry.
-    """
-    if hasattr(pool, "transactional") and not hasattr(pool, "acquire"):
-        from mnemos.persistence.worker_lifecycle import process_one_deletion_request as process_backend
-
-        payload = await process_backend(
-            pool,
-            verify_attempts=DEFAULT_VERIFY_ATTEMPTS,
-            restore_days=RESTORE_GRACE_DAYS,
-        )
-        if payload is None:
-            return None
-        result = DeletionRequestResult(**payload)
-        await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
-        return result
-
-    result: DeletionRequestResult | None = None
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            request = await conn.fetchrow(_DEQUEUE_SQL)
-            if request is None:
-                return None
-
-            counts = await soft_delete_target(
-                conn,
-                request["target_user_id"],
-                request["target_namespace"],
-                invalidate_cache=False,
-            )
-
-            verifying = await conn.fetchrow(_MARK_SWEEP_VERIFYING_SQL, request["id"])
-            if verifying is None:
-                raise RuntimeError(
-                    f"deletion request {request['id']} disappeared before verify transition"
-                )
-
-            remaining_counts: dict[str, int] = {}
-            for attempt in range(1, DEFAULT_VERIFY_ATTEMPTS + 1):
-                remaining_counts = await count_live_target_rows(
-                    conn,
-                    request["target_user_id"],
-                    request["target_namespace"],
-                )
-                if not _has_live_rows(remaining_counts):
-                    marked = await conn.fetchrow(
-                        _MARK_SOFT_DELETED_SQL,
-                        request["id"],
-                        RESTORE_GRACE_DAYS,
-                    )
-                    if marked is None:
-                        raise RuntimeError(
-                            f"deletion request {request['id']} disappeared before soft-delete transition"
-                        )
-                    result = DeletionRequestResult(
-                        request_id=str(request["id"]),
-                        target_user_id=request["target_user_id"],
-                        target_namespace=request["target_namespace"],
-                        status="soft_deleted",
-                        row_counts=counts,
-                        soft_deleted_at=marked["soft_deleted_at"],
-                        restore_by=marked["restore_by"],
-                        verification_attempts=attempt,
-                        remaining_counts=remaining_counts,
-                    )
-                    break
-
-                logger.warning(
-                    "deletion request %s verify pass %s found live rows after sweep: %s",
-                    request["id"],
-                    attempt,
-                    remaining_counts,
-                )
-                retry_counts = await soft_delete_target(
-                    conn,
-                    request["target_user_id"],
-                    request["target_namespace"],
-                    invalidate_cache=False,
-                )
-                for label, count in retry_counts.items():
-                    counts[label] = counts.get(label, 0) + count
-
-            if result is None:
-                requeued = await conn.fetchrow(_REQUEUE_CONFIRMED_SQL, request["id"])
-                if requeued is None:
-                    raise RuntimeError(
-                        f"deletion request {request['id']} disappeared before retry transition"
-                    )
-                result = DeletionRequestResult(
-                    request_id=str(request["id"]),
-                    target_user_id=request["target_user_id"],
-                    target_namespace=request["target_namespace"],
-                    status="confirmed",
-                    row_counts=counts,
-                    soft_deleted_at=None,
-                    restore_by=None,
-                    verification_attempts=DEFAULT_VERIFY_ATTEMPTS,
-                    remaining_counts=remaining_counts,
-                )
-
-    await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
-    return result
-
-
-async def hard_delete_soft_deleted_request(
-    conn: Any,
-    request: Any,
-    *,
-    invalidate_cache: bool = True,
-) -> DeletionRequestResult:
-    # Re-sweep before the irreversible delete. The 30-day grace window
-    # lets writes land on the scope after the soft-delete phase; without
-    # this fence, those rows would not carry ``deleted_at IS NOT NULL``
-    # when ``hard_delete_target`` runs and would be skipped forever,
-    # while the request is still marked ``hard_deleted`` -- so a memory
-    # added on day 7 of grace would survive past completion. The
-    # resweep/verify loop applies the soft-delete sweep one more time
-    # and refuses to advance the request if any live rows remain.
-    remaining = await resweep_and_verify_target(
-        conn,
-        request["target_user_id"],
-        request["target_namespace"],
+    payload = await process_backend(
+        backend,
         verify_attempts=DEFAULT_VERIFY_ATTEMPTS,
-        invalidate_cache=False,
+        restore_days=RESTORE_GRACE_DAYS,
     )
-    if _has_live_rows(remaining):
-        raise RuntimeError(
-            f"refusing to mark deletion request {request['id']} hard_deleted: "
-            f"{remaining} live rows still on scope after resweep+verify"
-        )
-    counts = await hard_delete_target(
-        conn,
-        request["target_user_id"],
-        request["target_namespace"],
-        requested_by=_row_get(request, "requested_by", "deletion_request_worker"),
-        requested_at=_row_get(request, "requested_at"),
-        request_kind="tombstone_collected",
-        reason=_row_get(request, "notes"),
-        source=["deletion_request_worker", str(request["id"])],
-        invalidate_cache=False,
-    )
-    # Final zero-live-row check covers the identity tables too -- the
-    # hard-delete target ran with ``deleted_at IS NOT NULL`` semantics
-    # only for the memory-graph rows; api_keys / oauth_sessions /
-    # oauth_identities / user_groups / users have no such column and
-    # are removed by separate statements that always run.
-    final_remaining = await count_live_target_rows(
-        conn, request["target_user_id"], request["target_namespace"]
-    )
-    if _has_live_rows(final_remaining):
-        raise RuntimeError(
-            f"refusing to mark deletion request {request['id']} hard_deleted: "
-            f"hard-delete left live rows on scope: {final_remaining}"
-        )
-    marked = await conn.fetchrow(_MARK_HARD_DELETED_SQL, request["id"])
-    if marked is None:
-        raise RuntimeError(
-            f"deletion request {request['id']} disappeared before hard-delete transition"
-        )
-    result = DeletionRequestResult(
-        request_id=str(marked["id"]),
-        target_user_id=marked["target_user_id"],
-        target_namespace=marked["target_namespace"],
-        status=marked["status"],
-        row_counts=counts,
-        soft_deleted_at=marked["soft_deleted_at"],
-        restore_by=marked["restore_by"],
-        hard_deleted_at=marked["hard_deleted_at"],
-        remaining_counts=final_remaining,
-    )
-    if invalidate_cache:
-        await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
-    return result
-
-
-async def process_one_hard_deletion_request(pool: Any) -> DeletionRequestResult | None:
-    """Hard-delete one expired soft-deleted request under SKIP LOCKED."""
-    if hasattr(pool, "transactional") and not hasattr(pool, "acquire"):
-        from mnemos.persistence.worker_lifecycle import (
-            process_one_hard_deletion_request as process_backend,
-        )
-
-        payload = await process_backend(pool)
-        if payload is None:
-            return None
-        result = DeletionRequestResult(**payload)
-        await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
-        return result
-
-    result: DeletionRequestResult | None = None
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            request = await conn.fetchrow(_DEQUEUE_HARD_DELETE_SQL)
-            if request is None:
-                return None
-            result = await hard_delete_soft_deleted_request(
-                conn,
-                request,
-                invalidate_cache=False,
-            )
-
+    if payload is None:
+        return None
+    result = DeletionRequestResult(**payload)
     await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
     return result
 
 
-async def process_deletion_requests(pool: Any, *, batch_size: int = DEFAULT_BATCH_SIZE) -> dict[str, int]:
+async def process_one_hard_deletion_request(
+    backend: PersistenceBackend,
+) -> DeletionRequestResult | None:
+    """Hard-delete one expired soft-deleted request through the lifecycle-worker ABC."""
+    from mnemos.persistence.worker_lifecycle import (
+        process_one_hard_deletion_request as process_backend,
+    )
+
+    payload = await process_backend(backend)
+    if payload is None:
+        return None
+    result = DeletionRequestResult(**payload)
+    await invalidate_deletion_scope_caches(result.target_user_id, result.target_namespace)
+    return result
+
+
+async def process_deletion_requests(
+    backend: PersistenceBackend,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> dict[str, int]:
     aggregate: Counter[str] = Counter()
     processed = 0
     for _ in range(batch_size):
-        result = await process_one_deletion_request(pool)
+        result = await process_one_deletion_request(backend)
         if result is None:
             break
         processed += 1
@@ -677,8 +402,7 @@ async def process_deletion_requests(pool: Any, *, batch_size: int = DEFAULT_BATC
             )
         else:
             logger.error(
-                "deletion_request=%s left in sweep_verifying after %s verify attempts; "
-                "remaining live rows=%s",
+                "deletion_request=%s left in sweep_verifying after %s verify attempts; remaining live rows=%s",
                 result.request_id,
                 result.verification_attempts,
                 result.remaining_counts,
@@ -689,21 +413,20 @@ async def process_deletion_requests(pool: Any, *, batch_size: int = DEFAULT_BATC
 
 
 async def process_hard_deletion_requests(
-    pool: Any,
+    backend: PersistenceBackend,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
 ) -> dict[str, int]:
     aggregate: Counter[str] = Counter()
     processed = 0
     for _ in range(batch_size):
-        result = await process_one_hard_deletion_request(pool)
+        result = await process_one_hard_deletion_request(backend)
         if result is None:
             break
         processed += 1
         aggregate.update(result.row_counts)
         logger.info(
-            "hard-deleted deletion_request=%s target_user_id=%s target_namespace=%s rows=%s "
-            "hard_deleted_at=%s",
+            "hard-deleted deletion_request=%s target_user_id=%s target_namespace=%s rows=%s hard_deleted_at=%s",
             result.request_id,
             result.target_user_id,
             result.target_namespace,
@@ -716,7 +439,7 @@ async def process_hard_deletion_requests(
 
 
 async def deletion_request_worker_loop(
-    pool: Any,
+    backend: PersistenceBackend,
     *,
     batch_size: int = DEFAULT_BATCH_SIZE,
     check_interval_seconds: float = DEFAULT_CHECK_INTERVAL_SECONDS,
@@ -728,16 +451,12 @@ async def deletion_request_worker_loop(
     """Perpetual lifecycle worker loop."""
     if phase not in {"soft_delete", "hard_delete"}:
         raise ValueError("phase must be 'soft_delete' or 'hard_delete'")
-    process_batch = (
-        process_hard_deletion_requests
-        if phase == "hard_delete"
-        else process_deletion_requests
-    )
+    process_batch = process_hard_deletion_requests if phase == "hard_delete" else process_deletion_requests
     if on_started is not None:
         on_started()
     while True:
         try:
-            counts = await process_batch(pool, batch_size=batch_size)
+            counts = await process_batch(backend, batch_size=batch_size)
             if on_success is not None:
                 on_success()
             if counts:
@@ -752,26 +471,14 @@ async def deletion_request_worker_loop(
 
 
 async def main(*, phase: str = "soft_delete") -> None:
-    import asyncpg
+    """Run against the configured backend, including PostgreSQL's timeout-wrapped pool."""
+    from mnemos.core.lifecycle import build_configured_persistence_backend
 
-    from mnemos.core.config import PG_CONFIG as _PG_CONFIG
-    from mnemos.core.pool import wrap_pool_with_timeout
-
-    raw_pool = await asyncpg.create_pool(
-        min_size=1,
-        max_size=3,
-        command_timeout=60,
-        user=_PG_CONFIG["user"],
-        password=_PG_CONFIG["password"],
-        database=_PG_CONFIG["database"],
-        host=_PG_CONFIG["host"],
-        port=_PG_CONFIG["port"],
-    )
-    pool = wrap_pool_with_timeout(raw_pool)
+    _backend_type, backend = await build_configured_persistence_backend()
     try:
-        await deletion_request_worker_loop(pool, phase=phase)
+        await deletion_request_worker_loop(backend, phase=phase)
     finally:
-        await pool.close()
+        await backend.close()
 
 
 def _parse_cli_args() -> Any:
