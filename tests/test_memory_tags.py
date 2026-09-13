@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 import mnemos.core.lifecycle as lifecycle
@@ -21,7 +24,7 @@ from mnemos.domain.models import (
 )
 from mnemos.mcp.tools import memory as mcp_memory
 from mnemos.persistence.sqlite import SqliteBackend
-from mnemos.persistence.visibility import VisibilityFilter
+from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 
 def _root() -> UserContext:
@@ -190,6 +193,84 @@ def test_tag_count_cap_is_enforced_on_create_update_and_search():
             model(**kwargs)
 
 
+def test_multibyte_tags_honor_the_255_character_api_contract():
+    tag = "é" * 255
+    assert len(tag) == 255
+    assert len(tag.encode("utf-8")) == 510
+    for model, kwargs in (
+        (MemoryCreateRequest, {"content": "x", "tags": [tag]}),
+        (MemoryUpdateRequest, {"tags": [tag]}),
+        (MemoryListRequest, {"tags": [tag]}),
+        (MemorySearchRequest, {"query": "x", "tags": [tag]}),
+    ):
+        assert model(**kwargs).tags == [tag]
+
+
+def test_tag_only_patch_rechecks_authorization_at_the_locked_write(monkeypatch):
+    class _Repo:
+        def __init__(self) -> None:
+            self.tags = ["before"]
+            self.visibility = None
+
+        async def get_memory(self, _tx, _memory_id, **_kwargs):
+            return {
+                "id": "mem-race",
+                "content": "payload",
+                "category": "facts",
+                "subcategory": None,
+                "created": datetime.now(timezone.utc),
+                "updated": datetime.now(timezone.utc),
+                "metadata": {},
+                "owner_id": "alice",
+                "namespace": "team",
+                "permission_mode": 700,
+            }
+
+        async def replace_memory_tags(
+            self,
+            _tx,
+            _memory_id,
+            tags,
+            *,
+            visibility=None,
+        ):
+            self.visibility = visibility
+            # Simulate an ownership transfer to bob committing immediately
+            # before alice reaches the parent-row lock.
+            if visibility is not None:
+                return False
+            self.tags = list(tags)
+            return True
+
+        async def fetch_memory_tags(self, _tx, memory_ids):
+            return {memory_id: list(self.tags) for memory_id in memory_ids}
+
+    class _Backend:
+        def __init__(self) -> None:
+            self.memories = _Repo()
+
+        @asynccontextmanager
+        async def transactional(self):
+            yield SimpleNamespace(conn=None)
+
+    async def _go() -> None:
+        backend = _Backend()
+        monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+        with pytest.raises(HTTPException) as exc_info:
+            await memories_route.update_memory(
+                "mem-race",
+                MemoryUpdateRequest(tags=["after"]),
+                user=_user("alice"),
+            )
+        assert exc_info.value.status_code == 404
+        assert backend.memories.tags == ["before"]
+        assert backend.memories.visibility.scope is VisibilityScope.OWN_ONLY
+        assert backend.memories.visibility.user_id == "alice"
+        assert backend.memories.visibility.namespace == "team"
+
+    asyncio.run(_go())
+
+
 def test_mcp_tools_forward_tags_to_shared_http_surface(monkeypatch):
     calls: list[tuple[str, object]] = []
 
@@ -239,3 +320,12 @@ def test_memory_tags_migration_parity(backend_dir):
     assert "primary key (memory_id, tag)" in lowered
     assert "on delete cascade" in lowered
     assert "idx_memory_tags_tag" in lowered
+
+
+def test_oracle_and_db2_tag_columns_use_character_length_units():
+    root = Path(__file__).resolve().parents[1] / "mnemos" / "db_migrations"
+    oracle = (root / "migrations_oracle" / "0054_memory_tags.sql").read_text()
+    db2 = (root / "migrations_db2" / "0054_memory_tags.sql").read_text()
+
+    assert "VARCHAR2(255 CHAR)" in oracle
+    assert "VARCHAR(255 CODEUNITS32)" in db2

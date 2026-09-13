@@ -2196,13 +2196,8 @@ async def update_memory(
                 except asyncpg.PostgresError as exc:
                     handle_trigger_pgerror(exc)
             else:
-                row = await backend.memories.get_memory(
-                    tx,
-                    memory_id,
-                    visibility=visibility,
-                    include_archived=True,
-                )
-            if not row:
+                row = None
+            if updates and not row:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Memory {memory_id} not found",
@@ -2216,7 +2211,29 @@ async def update_memory(
                 if row is None:
                     raise RuntimeError(f"post-write re-fetch missed just-vaulted memory {memory_id}")
             if replace_tags:
-                await backend.memories.replace_memory_tags(tx, memory_id, request.tags or [])
+                replaced = await backend.memories.replace_memory_tags(
+                    tx,
+                    memory_id,
+                    request.tags or [],
+                    visibility=None if updates else visibility,
+                )
+                if not replaced:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Memory {memory_id} not found",
+                    )
+                if not updates:
+                    row = await backend.memories.get_memory(
+                        tx,
+                        memory_id,
+                        visibility=visibility,
+                        include_archived=True,
+                    )
+                    if row is None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Memory {memory_id} not found",
+                        )
             row = await _attach_memory_tags_one(backend, tx, row)
             if updates:
                 await _write_memory_mutation_audit_entry(

@@ -1625,14 +1625,32 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         tx: Transaction,
         memory_id: str,
         tags: Sequence[str],
-    ) -> None:
+        *,
+        visibility: VisibilityFilter | None = None,
+    ) -> bool:
         async with tx.conn.cursor() as cursor:
+            where = ["m.id = %s", "m.deleted_at IS NULL"]
+            params: list[Any] = [memory_id]
+            if visibility is not None:
+                clause, vis_params = _render_visibility(visibility, table_alias="m")
+                if clause:
+                    where.append(clause)
+                    params.extend(vis_params)
+            await cursor.execute(
+                "SELECT m.id FROM memories m WHERE "
+                + " AND ".join(where)
+                + " FOR UPDATE",
+                tuple(params),
+            )
+            if await cursor.fetchone() is None:
+                return False
             await cursor.execute("DELETE FROM memory_tags WHERE memory_id = %s", (memory_id,))
             if tags:
                 await cursor.executemany(
                     "INSERT INTO memory_tags (memory_id, tag) VALUES (%s, %s)",
                     [(memory_id, tag) for tag in tags],
                 )
+        return True
 
     async def fetch_memory_tags(
         self,
@@ -4018,7 +4036,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
                                    THEN COALESCE(metadata, JSON_OBJECT())
                                    ELSE JSON_SET(
                                        COALESCE(metadata, JSON_OBJECT()), %s,
-                                       permission_mode)
+                                       %s)
                                END
                          WHERE id = %s AND deleted_at IS NULL AND archived_at IS NULL
                            AND consolidated_into IS NULL AND morpheus_run_id IS NULL
@@ -4030,6 +4048,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
                             run_id,
                             audit_path,
                             audit_path,
+                            int(row[3] or 0),
                             member_id,
                             namespace,
                             namespace,

@@ -3,7 +3,7 @@ BEGIN
     EXECUTE IMMEDIATE '
         CREATE TABLE memory_tags (
             memory_id VARCHAR2(100) NOT NULL,
-            tag       VARCHAR2(255) NOT NULL,
+            tag       VARCHAR2(255 CHAR) NOT NULL,
             added_at  TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
             CONSTRAINT pk_memory_tags PRIMARY KEY (memory_id, tag),
             CONSTRAINT fk_memory_tags_memory FOREIGN KEY (memory_id)

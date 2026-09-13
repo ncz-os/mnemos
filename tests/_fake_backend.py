@@ -277,14 +277,18 @@ class _FakeMemoryRepo:
         self.calls.append(("insert_memory", kwargs))
         return self._resolve("insert_memory", kwargs.get("memory_id"))
 
-    async def replace_memory_tags(self, tx, memory_id, tags):
+    async def replace_memory_tags(self, tx, memory_id, tags, *, visibility=None):
         self.calls.append(
             (
                 "replace_memory_tags",
-                {"memory_id": memory_id, "tags": list(tags)},
+                {
+                    "memory_id": memory_id,
+                    "tags": list(tags),
+                    "visibility": visibility,
+                },
             )
         )
-        return self._resolve("replace_memory_tags", None)
+        return self._resolve("replace_memory_tags", True)
 
     async def fetch_memory_tags(self, tx, memory_ids):
         return self._resolve(
@@ -714,8 +718,14 @@ class _PoolBackedMemoryRepo:
         }
         return memory_id
 
-    async def replace_memory_tags(self, tx, memory_id, tags):
+    async def replace_memory_tags(self, tx, memory_id, tags, *, visibility=None):
+        row = self._pool.state["memories"].get(memory_id)
+        if row is None or row.get("deleted_at") is not None:
+            return False
+        if visibility is not None and not self._visible(row, visibility):
+            return False
         self._tags[memory_id] = list(tags)
+        return True
 
     async def fetch_memory_tags(self, tx, memory_ids):
         return {memory_id: list(self._tags.get(memory_id, [])) for memory_id in memory_ids}

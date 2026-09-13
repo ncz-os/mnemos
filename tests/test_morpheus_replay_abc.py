@@ -8,6 +8,7 @@ runner's dispatch to the backend-owned transactional surface.
 from __future__ import annotations
 
 import inspect
+import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -148,6 +149,30 @@ def test_replay_scan_count_uses_item_11b_dialect_and_inheritance_precedent():
         SqliteMorpheusRepository.replay_scan_count
     )
     assert "NOT (m.provenance <=> 'morpheus_local')" in mysql
-    assert "NOT (m.provenance = 'morpheus_local' OR m.provenance IS NULL)" in oracle
+    assert "(m.provenance <> 'morpheus_local' OR m.provenance IS NULL)" in oracle
     assert MariadbMorpheusRepository.replay_scan_count is MysqlMorpheusRepository.replay_scan_count
     assert Db2MorpheusRepository.replay_scan_count is OracleMorpheusRepository.replay_scan_count
+
+
+def test_oracle_replay_predicate_includes_null_provenance_rows():
+    """Standard SQL three-valued logic reproduces the Oracle/Db2 defect."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE candidate (provenance TEXT)")
+        conn.executemany(
+            "INSERT INTO candidate (provenance) VALUES (?)",
+            [(None,), ("morpheus_local",), ("operator_created",)],
+        )
+        buggy = conn.execute(
+            "SELECT COUNT(*) FROM candidate "
+            "WHERE NOT (provenance = 'morpheus_local' OR provenance IS NULL)"
+        ).fetchone()[0]
+        fixed = conn.execute(
+            "SELECT COUNT(*) FROM candidate "
+            "WHERE provenance <> 'morpheus_local' OR provenance IS NULL"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert buggy == 1
+    assert fixed == 2

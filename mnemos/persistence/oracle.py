@@ -1308,9 +1308,30 @@ class OracleMemoryRepository(MemoryRepository):
         tx: Transaction,
         memory_id: str,
         tags: Sequence[str],
-    ) -> None:
+        *,
+        visibility: VisibilityFilter | None = None,
+    ) -> bool:
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
+            where = ["m.id = :memory_id", "m.deleted_at IS NULL"]
+            params: dict[str, Any] = {"memory_id": memory_id}
+            if visibility is not None:
+                clause, vis_params = _render_visibility(
+                    visibility,
+                    table_alias="m",
+                )
+                if clause:
+                    where.append(clause)
+                    params.update(vis_params)
+            await _call(
+                cursor.execute,
+                "SELECT m.id FROM memories m WHERE "
+                + " AND ".join(where)
+                + " FOR UPDATE",
+                params,
+            )
+            if await _call(cursor.fetchone) is None:
+                return False
             await _call(
                 cursor.execute,
                 "DELETE FROM memory_tags WHERE memory_id = :memory_id",
@@ -1322,6 +1343,7 @@ class OracleMemoryRepository(MemoryRepository):
                     "INSERT INTO memory_tags (memory_id, tag) VALUES (:memory_id, :tag)",
                     [{"memory_id": memory_id, "tag": tag} for tag in tags],
                 )
+            return True
         finally:
             await _call(cursor.close)
 
@@ -3005,11 +3027,11 @@ class OracleMorpheusRepository(MorpheusRepository):
     ) -> int:
         """Oracle implementation of the MORPHEUS REPLAY count — item 11d.
 
-        Oracle lacks ``IS DISTINCT FROM``.  This uses the same explicit
-        equality-plus-``IS NULL`` predicate established by item 11b's
-        ``fetch_cluster_candidates`` implementation.  Db2 inherits this
-        method through its Oracle-compatibility cursor layer; the count
-        needs no vector or backend-specific column handling.
+        Oracle lacks ``IS DISTINCT FROM``. The explicit inequality-plus-
+        ``IS NULL`` predicate includes ordinary NULL-provenance memories and
+        excludes only rows whose provenance is exactly ``morpheus_local``.
+        Db2 inherits this method through its Oracle-compatibility cursor
+        layer; the count needs no vector or backend-specific column handling.
         """
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -3021,7 +3043,7 @@ class OracleMorpheusRepository(MorpheusRepository):
                   FROM memories m
                   JOIN morpheus_runs r ON r.id = :run_id
                  WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
-                   AND NOT (m.provenance = 'morpheus_local' OR m.provenance IS NULL)
+                   AND (m.provenance <> 'morpheus_local' OR m.provenance IS NULL)
                    AND m.morpheus_run_id IS NULL
                    AND {_eligibility.eligible_for_morpheus('m')}
                    AND (r.namespace IS NULL OR m.namespace = r.namespace)
