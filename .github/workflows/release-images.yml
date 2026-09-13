@@ -319,11 +319,18 @@ jobs:
 
       - id: build
         name: Resolve enterprise digest
-        env:
-          BUILD_METADATA: ${{ steps.bake.outputs.metadata }}
         run: |
           set -euo pipefail
-          digest="$(jq -er '.enterprise["containerimage.digest"]' <<< "$BUILD_METADATA")"
+          # steps.bake.outputs.metadata carries full provenance+sbom
+          # attestations for 3 bake targets and can exceed 128KB (Linux
+          # MAX_ARG_STRLEN). Passing it through `env:` execs it as a
+          # single process argument and fails with "Argument list too
+          # long" -- write it to a file via heredoc instead, which goes
+          # through a normal shell redirect rather than execve.
+          cat > /tmp/bake-metadata.json <<'BAKE_METADATA_EOF'
+          ${{ steps.bake.outputs.metadata }}
+          BAKE_METADATA_EOF
+          digest="$(jq -er '.enterprise["containerimage.digest"]' /tmp/bake-metadata.json)"
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       # Artifact filenames omit the sha256: prefix because colons are invalid.
