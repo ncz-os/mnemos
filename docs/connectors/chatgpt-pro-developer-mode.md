@@ -230,7 +230,8 @@ ChatGPT → Settings → Developer Mode → Connectors → Add custom
 Click Save. ChatGPT will hit the URL, complete the SSE handshake, and
 list the available tools (search_memories, create_memory, get_memory,
 list_memories, kg_create_triple, kg_search, DAG tools, recommend_model, etc. —
-all 18).
+25 in total; fewer if optional extras like `pantheon`, `graeae`, or `kronos`
+aren't installed, since those tools are capability-filtered at startup).
 
 ### 4. Use it
 
