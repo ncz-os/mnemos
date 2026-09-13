@@ -429,6 +429,19 @@ the shared tool registry under `mnemos/mcp/tools/`. Tool manifest:
 | `diff_memory_commits` | DAG commit diff helper |
 | `checkout_memory`     | `GET /v1/memories/{id}/commits/{commit}` |
 | `recommend_model`     | `GET /v1/providers/recommend` |
+| `list_deletions`      | `GET /v1/deletion-requests` |
+| `pantheon_list_models`| `GET /pantheon/v1/models` — capability-filtered (needs `pantheon`) |
+| `pantheon_route_explain`| `GET /pantheon/v1/route/explain` — capability-filtered (needs `pantheon`) |
+| `graeae_consult`      | `POST /v1/consultations` — capability-filtered (needs the `graeae` extra) |
+| `graeae_get_consultation`| `GET /v1/consultations/{id}` — capability-filtered (needs the `graeae` extra) |
+| `kronos_anomalies`    | `GET /v1/kronos/anomalies` — capability-filtered (needs the `kronos` extra) |
+| `kronos_forecast`     | `GET /v1/kronos/forecast` — capability-filtered (needs the `kronos` extra) |
+
+The 6 capability-filtered tools above are removed from the registry at
+startup (`_filter_unavailable_tools` in `mnemos/mcp/tools/__init__.py`)
+when their backing extra isn't installed, so a given deployment may
+expose fewer than 25 — check `mnemos/mcp/tools/__init__.py`'s
+`_TOOL_ORDER` for the canonical full list.
 
 MCP contract-wire regression test: `tests/test_mcp_stdio_wire.py`.
 

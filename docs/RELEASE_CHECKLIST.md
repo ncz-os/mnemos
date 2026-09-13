@@ -53,32 +53,78 @@ sections that apply to what's shipping.
 
 ### Image build + fleet roll-out
 
-Skip if the release is docs-only.
+Skip if the release is docs-only. **This section describes the current
+GitHub Actions → ghcr.io pipeline** (`.github/workflows/release-images.yml`).
+The image is no longer hand-built with `podman build`/`save`/`scp` — pushing
+the tag is what triggers the build; there is nothing to do locally except
+watch it and then pull on each host.
 
-- [ ] Build the `full-hot` image on pg-host from the working-tree checkout:
-  ```bash
-  rsync -az --delete --exclude='.venv*' --exclude='__pycache__' /tmp/mnemos-work/ <user>@<host>:/tmp/mnemos-build-x.y.z/
-  ssh <user>@<host> 'cp /tmp/mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl /tmp/mnemos-build-x.y.z/ && cd /tmp/mnemos-build-x.y.z && podman build -f Dockerfile.full -t localhost/mnemos-os:x.y.z-full-hot .'
-  ```
-- [ ] Save + transfer to gpu-host + oracle-host:
-  ```bash
-  ssh <user>@<host> 'podman save -o /tmp/mnemos-os-x.y.z-full-hot.tar localhost/mnemos-os:x.y.z-full-hot && scp /tmp/mnemos-os-x.y.z-full-hot.tar <user>@<host>:/tmp/ && scp /tmp/mnemos-os-x.y.z-full-hot.tar <user>@<host>:/tmp/'
-  ```
-- [ ] Roll the **canary** (oracle-host) first:
-  - Stop + rename the old container as `_pre<version>` for rollback
-  - Start a new container against the same env-file with the new image
-  - Verify `/health` returns `version: x.y.z` and `database_connected: true`
-  - Check logs for migration apply success (any new SQL should run on first boot)
-- [ ] Roll **gpu-host** (HA standby + federation peer).
-- [ ] Roll **pg-host primary + MCP sidecar** last.
+- [ ] Push the tag to **both** `origin` (GitLab) and a `github` remote —
+      the release workflow only runs on GitHub Actions, not GitLab CI:
+      `git push origin vx.y.z && git push github vx.y.z`.
+- [ ] Watch the build: `gh run watch <run-id> --repo ncz-os/mnemos --exit-status`
+      (find the run id with `gh run list --repo ncz-os/mnemos --limit 1`).
+      It builds `linux/amd64` + `linux/arm64` natively (no cross-compile
+      emulation — `Dockerfile.core` deliberately refuses it) and publishes
+      only `ghcr.io/ncz-os/mnemos-enterprise:x.y.z` (also tagged
+      `x.y`, `x`, `latest`, `sha-<short-sha>`). The `mnemos-core` and
+      `mnemos` intermediate stages are chained build-context targets and
+      are **not** published as their own packages.
+- [ ] **If the build fails**: read the real job log
+      (`gh api repos/ncz-os/mnemos/actions/jobs/<job-id>/logs`), root-cause
+      it, fix it, and cut the **next patch version** — never retag or
+      force-push a version tag once pushed (immutable-tag convention). A
+      version that published no image gets a one-line CHANGELOG note
+      ("published no image and should not be used") and is otherwise left
+      alone.
+- [ ] Verify the published manifest is genuinely multi-arch before rolling
+      it out anywhere:
+      ```bash
+      GHCR_TOKEN=$(curl -s "https://ghcr.io/token?service=ghcr.io&scope=repository:ncz-os/mnemos-enterprise:pull" | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+      curl -s -H "Authorization: Bearer $GHCR_TOKEN" -H "Accept: application/vnd.oci.image.index.v1+json" \
+        "https://ghcr.io/v2/ncz-os/mnemos-enterprise/manifests/x.y.z" | python3 -c "
+      import json,sys; d=json.load(sys.stdin)
+      print([m['platform'] for m in d['manifests'] if m.get('platform',{}).get('os')!='unknown'])"
+      ```
+      Expect both `{'architecture':'arm64','os':'linux'}` and
+      `{'architecture':'amd64','os':'linux'}`.
+- [ ] **Test against a real instance of every backend this release touched
+      BEFORE broad fleet rollout, not just the SQLite/mocked local suite.**
+      This fleet runs one federated node per backend family precisely for
+      this (as of 2026-09-13): `pythia`=Oracle (production), `minos`=MariaDB,
+      `pegasus`=Db2, `achilles`/`proteus`=SQLite. Roll the new version to
+      ONE of the affected backend's nodes first, restart it **twice** in a
+      row (not once — a migration can succeed on the first-ever boot and
+      then crash on replay, since migrations here carry no applied-state
+      table and re-run in full every start), and confirm `/health` stays
+      `healthy` with the new `version` both times before rolling further.
+      Real, previously-undetectable defects found exactly this way in
+      `v6.3.4`–`v6.3.7` (see `docs/PERSISTENCE_ABC_STANDARDIZATION.md` Item 5
+      and `CHANGELOG.md`) — none of them were, or could have been, caught
+      by the local test suite.
+- [ ] Roll the rest of the fleet's federated nodes, then production last:
+      pull the new tag, recreate/restart the container in place (same
+      volume, same env), confirm `/health` reports the new `version` and
+      `database_connected: true`.
 - [ ] Run smoke checks across the fleet:
   ```bash
   for h in <host> <host> <host>; do
     ssh -n <user>@$h 'curl -s http://localhost:5002/health' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['version'], d['status'], d['database_connected'])"
   done
   ```
-- [ ] Cleanup `_pre<version>` containers + transfer tars only after
-      24 h soak with no error escalation.
+- [ ] **Keep only one version published on ghcr.io at a time** (operator
+      policy, 2026-09-13). Once the new version is confirmed healthy
+      fleet-wide, delete every prior `mnemos-enterprise` package version —
+      both the tagged multi-arch index and its untagged per-platform +
+      attestation children (a single release leaves 6 of these; they do
+      not get cleaned up automatically when the tagged parent is deleted):
+      ```bash
+      gh api /orgs/ncz-os/packages/container/mnemos-enterprise/versions \
+        --jq '.[] | select(.created_at < "<new-version-created_at>") | .id' \
+        | xargs -I{} gh api -X DELETE /orgs/ncz-os/packages/container/mnemos-enterprise/versions/{}
+      ```
+      Re-verify the manifest step above afterward — deleting the wrong
+      version id would silently break the surviving release.
 
 ### HA / replication
 
@@ -174,7 +220,9 @@ broken flows in the bug tracker before announcing GA.
 ### Cursor / Cline / Continue / Codex CLI / Zed
 
 - [ ] Each surface's MCP server registration is intact; the tool list
-      includes the canonical 23 MNEMOS tools.
+      includes the canonical 25 MNEMOS tools (fewer if optional extras
+      like `pantheon`, `graeae`, or `kronos` aren't installed on that
+      backend — see `mnemos/mcp/tools/__init__.py`'s `_TOOL_ORDER`).
 - [ ] One search query in each surface produces a result. Spot-check.
 
 ### ChatGPT (Pro Developer Mode)
@@ -264,12 +312,17 @@ For each runner that's part of the operator's stack:
   scp ops/bridge-tier2-nightly.sh <user>@<host>:/tmp/
   ssh <user>@<host> 'sudo install -m 755 /tmp/bridge-tier2-nightly.sh /usr/local/bin/bridge-tier2-nightly.sh'
   ```
-- The image build artifact for the `-full-hot` images (every release
-  since v5.0.6) is `Dockerfile.full` at the repo root. It pulls all
-  optional extras (morpheus + persephone + pantheon + kronos +
-  knossos + apollo + artemis + nats + edge) and the local
-  `mnemos_hot` Rust wheel, on top of the base `Dockerfile`. The
-  base `Dockerfile` is still the slim/edge image; `Dockerfile.full`
-  is what the fleet runs.
+- The published `ghcr.io/ncz-os/mnemos-enterprise` image (the one and
+  only package published by `release-images.yml`, 2026-09-13+) is built
+  from three chained Dockerfiles via Docker Buildx Bake, passed between
+  stages as in-memory named contexts so only the final image is pushed:
+  `Dockerfile.core` (architecture-specific native extension build, no
+  emulation) → `Dockerfile.everything` (all optional extras — morpheus,
+  persephone, pantheon, kronos, knossos, apollo, artemis, nats, edge —
+  plus the 4 split-out add-on wheels charon/graeae/knemon/pantheon,
+  pinned per-overlay in `.github/addons.lock.json`) → `Dockerfile.enterprise`
+  (final layer). `Dockerfile.full` and the base `Dockerfile` still exist
+  in the repo but are not what the release pipeline builds or the fleet
+  runs — do not update `Dockerfile.full` expecting it to affect a release.
 
-*Last updated: 2026-05-05*
+*Last updated: 2026-09-13*
