@@ -14,7 +14,7 @@
 # commented enterprise profile stubs.
 
 # Stage 1: Builder with uv (fast dependency installation)
-FROM python:3.11-slim as builder
+FROM python:3.13-slim as builder
 
 WORKDIR /app
 
@@ -36,7 +36,7 @@ COPY requirements.txt .
 RUN uv pip install --system -r requirements.txt
 
 # Stage 2: Runtime (minimal footprint)
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -79,7 +79,7 @@ RUN set -eux; \
     rm -rf /tmp/intel-icd /var/lib/apt/lists/*
 
 # Copy installed packages from builder (preserves installation with all deps)
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 
 # Copy application code
 COPY . .
