@@ -58,8 +58,41 @@ ALTER TABLE morpheus_runs ADD (namespace VARCHAR2(256));
 --       any production path; ``morpheus_runs.run_type`` was an early
 --       "what kind of dream is this" label that never reconciled with
 --       the Postgres canonical ``phase`` + ``triggered_by`` split.
-ALTER TABLE morpheus_runs DROP COLUMN run_type;
-ALTER TABLE morpheus_runs DROP COLUMN metrics;
+--
+--       Wrapped: Oracle has no ``DROP COLUMN IF EXISTS``, and migrations
+--       here carry no applied-state table and are replayed on every
+--       boot -- an unwrapped DROP COLUMN succeeds on the FIRST ever
+--       boot against a real database and then raises ORA-00904 "invalid
+--       identifier" on EVERY subsequent boot, because the column is
+--       already gone. Found live in production (2026-09-13): the first
+--       boot against real Oracle succeeded and dropped both columns;
+--       the very next restart crash-looped on this exact line. Same
+--       idiom as the DROP CONSTRAINT guards below.
+DECLARE
+    already_gone EXCEPTION;
+    PRAGMA EXCEPTION_INIT(already_gone, -904);  -- ORA-00904 invalid identifier
+BEGIN
+    EXECUTE IMMEDIATE 'ALTER TABLE morpheus_runs DROP COLUMN run_type';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -904 THEN
+            RAISE;
+        END IF;
+END;
+/
+
+DECLARE
+    already_gone EXCEPTION;
+    PRAGMA EXCEPTION_INIT(already_gone, -904);
+BEGIN
+    EXECUTE IMMEDIATE 'ALTER TABLE morpheus_runs DROP COLUMN metrics';
+EXCEPTION
+    WHEN OTHERS THEN
+        IF SQLCODE != -904 THEN
+            RAISE;
+        END IF;
+END;
+/
 
 -- ── 3. align status default to 'running' (Postgres canonical).
 ALTER TABLE morpheus_runs MODIFY (status DEFAULT 'running');
