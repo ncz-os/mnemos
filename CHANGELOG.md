@@ -57,6 +57,21 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.1] — 2026-09-13
+
+- **Fixed**: `v6.3.0`'s release build failed before publishing any image —
+  `.github/workflows/release-images.yml`'s "Stage add-on wheels" step
+  (`pip wheel --no-deps --no-build-isolation`) requires an ambient
+  `setuptools`, which `actions/setup-python@v5`'s Python 3.13 environment
+  does not provide by default (CPython 3.12+ dropped bundled distutils;
+  newer `setup-python` environments no longer pre-install setuptools).
+  This was latent in the workflow but only surfaced once the same-day
+  Python-3.13 floor bump also raised this step's `setup-python` version
+  from 3.11 (which happened to include it) to 3.13. Fixed with an explicit
+  `pip install --upgrade pip setuptools wheel` step before the add-on
+  wheel builds. `v6.3.0` published no image and should not be used; this
+  is the real first attempt at the 6.3 release content.
+
 ## [6.3.0] — 2026-09-13
 
 - **Added**: `memory_tags` — lightweight, multi-valued tags for multi-project
