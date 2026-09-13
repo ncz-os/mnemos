@@ -57,6 +57,41 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.7] — 2026-09-13
+
+- **Fixed**: `6.3.6`'s Db2 fix for `0061c_morpheus_runs_parity.sql` was
+  itself syntactically invalid against a real Db2 12.1.5 instance —
+  discovered rolling the fleet's federated MNEMOS nodes forward, the
+  first time this migration had ever run against real Db2 (a fed node
+  on Db2 had also been stuck on `6.2.4` since before item 11/11a).
+  `SQL0104N unexpected token "HANDLER" ... expected "CONDITION"`: this
+  Db2 instance rejects `DECLARE ... HANDLER` inside a `BEGIN ATOMIC`
+  compound statement outright. The pre-existing `DROP CONSTRAINT`
+  guards two sections below (unchanged since before this session) had
+  the identical defect — never caught because this file had never run
+  against real Db2 before either.
+- **Fix**: changed all four `BEGIN ATOMIC` blocks in
+  `migrations_db2/0061c_morpheus_runs_parity.sql` to plain `BEGIN` —
+  confirmed directly against a live Db2 instance (both forms tested).
+  Also corrected the `DROP COLUMN` guards' SQLSTATE from `42704`
+  (undefined object — correct for `DROP CONSTRAINT`) to `42703`
+  (undefined column/attribute — the actual code Db2 raises for a
+  missing column), also confirmed live.
+- Validated end-to-end against a real Db2 12.1.5 instance: ran the
+  corrected file against a legacy-shape table (full migration
+  succeeded) and again against the resulting canonical-shape table
+  (full idempotent replay — every statement either succeeded, hit an
+  already-known-benign "already exists" signal, or was silently
+  swallowed by the fixed handler).
+- **Process note**: this is the fourth real defect this release line
+  has surfaced purely by deploying to the fleet's actual database
+  instances (Oracle on `6.3.4`/`6.3.5`/`6.3.6`, now Db2 on `6.3.7`) —
+  every one of these was a migration path that had simply never been
+  exercised against its real backend before, because that backend's
+  fed node had been stuck on an old version since before the migration
+  was written. None of these were, or could have been, caught by the
+  SQLite/mocked local test suite.
+
 ## [6.3.6] — 2026-09-13
 
 - **Fixed**: rolling `6.3.4` back to `6.2.4` on a production Oracle
