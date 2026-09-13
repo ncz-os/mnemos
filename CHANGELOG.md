@@ -57,6 +57,25 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.2] — 2026-09-13
+
+- **Fixed**: `v6.3.1`'s release build still failed — pip's `everything`
+  stage install (`--constraint mnemos-core==6.3.1`) hit
+  `ResolutionImpossible`: all 4 pinned add-on wheels (charon, graeae,
+  knemon, pantheon) declared `mnemos-core>=6.2,<6.3`, which excludes the
+  6.3.x line entirely. This is the first mnemos-core minor version bump
+  since these packages were split out of the monorepo, so the
+  narrow-upper-bound constraint had never actually been exercised against
+  a real minor bump before. Widened all 4 add-ons' `mnemos-core`
+  constraint to `<6.4` (each add-on repo, `main` branch) and repinned
+  `.github/addons.lock.json` to the new commits. `v6.3.0` and `v6.3.1`
+  published no image and should not be used; this is the real first
+  successful attempt at the 6.3 release content.
+- **Process note**: bumping mnemos-core's minor version now requires
+  bumping the matching upper-bound constraint in every add-on repo
+  (charon, graeae, knemon, pantheon) that pins `mnemos-core<N.M` — this
+  was previously undocumented and untested since it had never happened.
+
 ## [6.3.1] — 2026-09-13
 
 - **Fixed**: `v6.3.0`'s release build failed before publishing any image —
