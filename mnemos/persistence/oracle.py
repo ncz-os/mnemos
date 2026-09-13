@@ -2901,6 +2901,42 @@ class OracleMorpheusRepository(MorpheusRepository):
             candidates=candidates,
         )
 
+    async def replay_scan_count(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> int:
+        """Oracle implementation of the MORPHEUS REPLAY count — item 11d.
+
+        Oracle lacks ``IS DISTINCT FROM``.  This uses the same explicit
+        equality-plus-``IS NULL`` predicate established by item 11b's
+        ``fetch_cluster_candidates`` implementation.  Db2 inherits this
+        method through its Oracle-compatibility cursor layer; the count
+        needs no vector or backend-specific column handling.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT COUNT(*) AS count
+                  FROM memories m
+                  JOIN morpheus_runs r ON r.id = :run_id
+                 WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
+                   AND NOT (m.provenance = 'morpheus_local' OR m.provenance IS NULL)
+                   AND m.morpheus_run_id IS NULL
+                   AND {_eligibility.eligible_for_morpheus('m')}
+                   AND (r.namespace IS NULL OR m.namespace = r.namespace)
+                """,
+                {"run_id": run_id},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+        return int((row or {}).get("count") or 0)
+
     async def merge_run_config(
         self,
         tx: Transaction,

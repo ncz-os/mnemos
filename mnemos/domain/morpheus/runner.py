@@ -20,11 +20,10 @@ from typing import Any, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 # asyncpg is still referenced for the ``pool: asyncpg.Pool`` type hints
-# on the phase functions (``phase_replay`` / ``phase_cluster`` /
-# ``phase_consolidate`` / ``phase_synthesise`` / ``phase_extract``)
-# and ``run_dream`` — those phases are out of scope for the item 11a
-# ABC migration (brief: "Do NOT touch phase_replay/...") and continue
-# to take a raw asyncpg.Pool for their own SQL.
+# on the raw-SQL phases (``phase_consolidate`` / ``phase_synthesise`` /
+# ``phase_extract``) and ``run_dream``.  ``phase_replay`` and
+# ``phase_cluster`` retain the parameter only for backwards compatibility;
+# their SQL now goes through ``backend.morpheus``.
 import asyncpg  # noqa: F401
 import numpy as np
 
@@ -513,28 +512,18 @@ async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
     When the run has `namespace` set, the scan is scoped to memories
     with that namespace; NULL means "all namespaces".
 
-    Item 11a: this phase still takes ``pool`` for its own raw SQL
-    (per-row tagging, vector column reads — out of scope for the ABC
-    migration). The counter bump at the end goes through the
-    ``backend.morpheus.update_counters`` ABC via
-    :func:`_get_backend`; tests ``monkeypatch`` ``lifecycle.
-``get_persistence_backend`` to return a backend mock.
+    Item 11d of the 12-item ABC migration: this is a count-only query,
+    with no embedding or pgvector reads.  It is dispatched through
+    ``backend.morpheus.replay_scan_count`` so the backend owns the
+    placeholder and ``IS DISTINCT FROM`` dialect differences.  ``pool``
+    remains a backwards-compatible parameter until the later raw-SQL
+    MORPHEUS phases are migrated; it is not dereferenced here.
     """
-    async with pool.acquire() as conn:
-        n = await conn.fetchval(
-            f"""
-            SELECT COUNT(*)
-            FROM memories m
-            JOIN morpheus_runs r ON r.id = $1::uuid
-            WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
-              AND m.provenance IS DISTINCT FROM 'morpheus_local'
-              AND m.morpheus_run_id IS NULL
-              AND {eligible_for_morpheus("m")}
-              AND (r.namespace IS NULL OR m.namespace = r.namespace)
-            """,
-            run_id,
-        )
-    await update_counters(_get_backend(), run_id, memories_scanned=int(n or 0))
+    _ = pool  # backwards-compat: phase-chain callers still pass a pool.
+    backend = _get_backend()
+    async with backend.transactional() as tx:
+        n = await backend.morpheus.replay_scan_count(tx, run_id=run_id)
+    await update_counters(backend, run_id, memories_scanned=int(n or 0))
     return int(n or 0)
 
 

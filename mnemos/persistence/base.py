@@ -2369,6 +2369,30 @@ class MorpheusRepository(ABC):
         ...
 
     @abstractmethod
+    async def replay_scan_count(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> int:
+        """Count memories eligible for the run's REPLAY window.
+
+        Item 11d of the 12-item ABC migration: ``phase_replay`` only
+        needs one scalar count; it does not read embeddings or any other
+        vector-specific column.  The implementation joins the run row to
+        obtain its inclusive ``window_started_at`` / ``window_ended_at``
+        bounds and namespace, then applies the canonical MORPHEUS
+        eligibility predicate.
+
+        Returns zero for a missing run, matching ``COUNT(*)`` semantics.
+        Implementations own their placeholder syntax and the portable
+        spelling of the provenance exclusion: Postgres/SQLite support
+        ``IS DISTINCT FROM``; MySQL/MariaDB use ``<=>``; Oracle/Db2 use
+        explicit equality plus ``IS NULL``.
+        """
+        ...
+
+    @abstractmethod
     async def merge_run_config(
         self,
         tx: Transaction,

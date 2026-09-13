@@ -5849,6 +5849,34 @@ class PostgresMorpheusRepository(MorpheusRepository):
             candidates=candidates,
         )
 
+    async def replay_scan_count(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> int:
+        """Postgres implementation of the MORPHEUS REPLAY count — item 11d.
+
+        This is the former ``phase_replay`` query verbatim except that the
+        transaction is supplied by the active persistence backend.  It has
+        no pgvector reads; ``IS DISTINCT FROM`` is native Postgres SQL.
+        """
+        conn = _postgres_tx(tx).conn
+        count = await conn.fetchval(
+            f"""
+            SELECT COUNT(*)
+              FROM memories m
+              JOIN morpheus_runs r ON r.id = $1::uuid
+             WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
+               AND m.provenance IS DISTINCT FROM 'morpheus_local'
+               AND m.morpheus_run_id IS NULL
+               AND {_eligibility.eligible_for_morpheus('m')}
+               AND (r.namespace IS NULL OR m.namespace = r.namespace)
+            """,
+            run_id,
+        )
+        return int(count or 0)
+
     async def merge_run_config(
         self,
         tx: Transaction,
