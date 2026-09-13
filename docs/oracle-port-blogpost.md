@@ -622,8 +622,16 @@ MNEMOS_PORT=5003                          # 5002 occupied by podman PG staging
 MNEMOS_API_KEY=<oracle-host-specific bearer>  # NOT shared with pg-host
 MNEMOS_FEDERATION_TRUSTED_PEERS=<peer-1>,<peer-2>
 MNEMOS_FEDERATION_TRUSTED_TOKEN_SHA256S=<sha256-of-peer-token>  # redacted; per-deployment value
+# NOTE (2026-09-13): neither of the two vars above resolves against current
+# code (mnemos/core/config.py) -- the real federation-peer vars are
+# MNEMOS_FEDERATION_ENABLED, MNEMOS_FEDERATION_PEERS, MNEMOS_FEDERATION_NATS_PEERS.
+# Re-verify before relying on this block.
 FEDERATION_ALLOW_PRIVATE=true             # LAN-only federation; remove for any cross-boundary deployment
-FEDERATION_ALLOW_INSECURE=true            # http:// between trusted LAN peers ONLY; defaults to false; do NOT enable for public/cross-boundary
+FEDERATION_ALLOW_INSECURE=true            # http:// between trusted LAN peers ONLY.
+# SECURITY NOTE (2026-09-13): both FEDERATION_ALLOW_INSECURE and
+# FEDERATION_ALLOW_PRIVATE default to TRUE in mnemos/core/config.py, not
+# false. Federation over plaintext HTTP to private/LAN peers is ON by
+# default; set BOTH to false explicitly for any cross-boundary deployment.
 GRAEAE_URL=http://<host>:5002     # consume pg-host's GRAEAE
 OLLAMA_EMBED_HOST=http://<host>:11434  # gpu-host embeddings
 ... (provider API keys: OPENAI, GEMINI, GROQ, PERPLEXITY, TOGETHER,
