@@ -82,9 +82,13 @@ is the operational scope it lives in (`default`, `production`,
 `research` namespace where Bob can read it; the search visibility
 matrix is filtered on both axes plus permission_mode.
 
-`group_id` exists as a tertiary axis but is reserved for v5.0+
-group-based ACLs; v4.x uses `(owner_id, namespace)` exclusively
-for visibility decisions.
+`group_id` is a live tertiary visibility axis: a memory at
+`permission_mode` ≥ 644 with a non-NULL `group_id` is visible to any
+principal in that group, per the read predicate in
+`mnemos/core/visibility.py`. Per-principal grants beyond
+owner/namespace/group are handled by the `memory_acl` join table and
+`mnemos/api/routes/acl.py` — see `docs/MULTIUSER_ACL_DESIGN.md` for
+the full ACL model.
 
 ### 3.2 Permission modes
 
@@ -140,36 +144,32 @@ The DAG carries:
 * `parent_version_id` — the version this one was derived from
   (NULL for roots).
 * `commit_hash` — content-addressed hash of the version's payload.
-* `dream_status` — `active`, `archived`, `tombstoned`.
+* `change_type` — what kind of write produced this version (create,
+  update, compress, branch, consolidate, ...).
 
 Tombstones are content-zero versions that record "this was
 deleted" without losing the parent chain. Federation honors
 tombstones — a peer pulling a tombstoned version sees the delete
 and applies its own.
 
-### 4.2 Audit chain
+### 4.2 Audit chains
 
-Separately from the DAG, there's a `graeae_audit_log` hash chain
-that runs across ALL writes (not just memory edits — also GRAEAE
-consultations, schema migrations, config changes). Each row
-contains:
+MNEMOS runs two independent hash chains, not one:
 
-* `chain_hash` — sha256 of the prior chain_hash + this row's data.
-* `prompt_hash` / `response_hash` — the inputs and outputs of the
-  triggering operation.
-* `prev_id` — pointer to the prior chain entry.
+**The memory write chain** (`memory_audit_chain` + `memory_audit_roots`)
+covers every memory-level write — create, update, delete, restore. Each
+row's hash covers the prior row's hash plus this write's data, giving
+tamper-evidence by construction. Verify via `/v1/audit/*`; see
+`docs/AUDIT_CHAIN.md` for the full contract.
 
-The genesis hash is the literal string
-`MNEMOS_AUDIT_GENESIS_v3` (preserved across v4.x for chain
-continuity). Verifying the chain is a server-side endpoint
-(`/v1/consultations/audit/verify`) that walks every entry from
-genesis forward; tamper-evidence is by construction (any single
-edit invalidates every subsequent hash).
+**The GRAEAE consultation chain** (`graeae_audit_log`) separately covers
+consultation requests/responses (`prompt_hash` / `response_hash` per row,
+genesis `MNEMOS_AUDIT_GENESIS_v3`), verified via
+`/v1/consultations/audit/verify`. This chain requires the `graeae` extra.
 
-The audit chain is NOT the version DAG. Versions track WHAT changed
-in a memory; the audit chain tracks WHEN something happened across
-the whole system. They reference each other by id but evolve
-independently.
+Neither chain is the version DAG. Versions track WHAT changed in a
+memory; the audit chains track WHEN a write or consultation happened.
+They reference each other by id but evolve independently.
 
 ### 4.3 Branching for dream-state
 
@@ -382,18 +382,18 @@ roll local state backward to an older version.
 
 ## 7. Persistence backends
 
-### 7.1 Four backends, one repository surface
+### 7.1 Six backends, one repository surface
 
-MNEMOS supports four persistence backends:
+MNEMOS supports six persistence backends:
 
 * **PostgreSQL** (`postgres` profile) — the original production target.
   pgvector HNSW for embeddings, asyncpg for I/O, full transactional
   semantics with optional RLS.
-* **Oracle Database 26ai** (enterprise) — HNSW INMEMORY NEIGHBOR GRAPH on the
+* **Oracle Database 23ai** (enterprise) — HNSW INMEMORY NEIGHBOR GRAPH on the
   native `VECTOR(768, FLOAT32)` type; JSON Duality View; TDE column
   encryption; oracledb thin-mode driver by default. Module:
   `mnemos/persistence/oracle.py`.
-* **IBM Db2 12.1.5 (Early Access Program)** (enterprise) — DiskANN vector
+* **IBM Db2 12.1.5** (enterprise) — DiskANN vector
   index on `VECTOR(768, FLOAT32)` with the `VECTOR_DISTANCE` function.
   Runtime app-path `semantic_search` is overridden in
   `Db2MemoryRepository` to emit
@@ -417,8 +417,16 @@ MNEMOS supports four persistence backends:
   laptops, edge appliances, single-binary builds. sqlite-vec
   for embeddings (or a Python UDF fallback when the native
   extension isn't loaded).
+* **MySQL 9.0+** (enterprise) — `VECTOR_DISTANCE` for vector search.
+  Vector functions ship only in MySQL Enterprise/HeatWave, not
+  Community. Module: `mnemos/persistence/mysql.py`.
+* **MariaDB 11.7+** (enterprise, free) — `VEC_DISTANCE_COSINE` with an
+  HNSW `VECTOR INDEX`; embeddings live in a `memory_embeddings` join
+  table since MariaDB requires NOT-NULL vector-indexed columns.
+  Subclasses the MySQL repositories, overriding only the vector
+  dialect. Module: `mnemos/persistence/mariadb.py`.
 
-All four backends implement the same `PersistenceBackend` ABC
+All six backends implement the same `PersistenceBackend` ABC
 (`mnemos/persistence/base.py`). API handlers and domain code
 target the abstract repository surface; the concrete backend is
 swapped at startup based on `MNEMOS_DATABASE_DSN`,
@@ -427,11 +435,12 @@ of precedence — see SPECIFICATION §9.1).
 
 ### 7.2 Persistence-parity discipline
 
-The four backends ship together with strict parity tests:
-`tests/test_persistence_parity.py` runs the same CRUD + search +
-versioning operations against each available backend (SQLite always,
-plus PostgreSQL, Oracle, and Db2 when their respective DSN env vars
-are set) and asserts identical output. This has caught:
+SQLite and PostgreSQL share the cross-backend harness,
+`tests/test_persistence_parity.py`, which runs the same CRUD + search +
+versioning operations against both and asserts identical output. Oracle,
+Db2, MySQL, and MariaDB are each covered by their own dedicated live
+suite instead (`tests/test_oracle_live.py`, `tests/test_db2_live.py`,
+etc.). The shared harness has caught:
 
 * asyncpg returning `Decimal` for NUMERIC columns where SQLite
   returns `float`. Fixed via `mnemos/core/numeric.py:safe_float`.
@@ -463,12 +472,12 @@ The trade-off: SQLite serialization-level concurrency is worse
 than Postgres MVCC, and pgvector's HNSW index outperforms
 sqlite-vec's LSH at scale. For 10k-memory edge deployments,
 SQLite is fine; for 10M-memory production, choose PostgreSQL,
-Oracle Database 26ai, or IBM Db2 12.1.5 — the three large-scale backends
-serve the MNEMOS workload identically,
-with vendor-specific value-adds (Oracle: HNSW INMEMORY NEIGHBOR
-GRAPH + JSON Duality + TDE; Db2: DiskANN + native column
-encryption; PostgreSQL: most permissive license, broadest
-tooling).
+Oracle Database 23ai, IBM Db2 12.1.5, MySQL 9.0+ Enterprise/HeatWave, or
+MariaDB 11.7+ — the five large-scale backends serve the MNEMOS workload
+identically, with vendor-specific value-adds (Oracle: HNSW INMEMORY
+NEIGHBOR GRAPH + JSON Duality + TDE; Db2: DiskANN + native column
+encryption; PostgreSQL: most permissive license, broadest tooling;
+MariaDB: free Community-edition vector support).
 
 ---
 
@@ -562,7 +571,7 @@ round-trip on the native subset.
 * **Vector index optimization at install time.** Vector-index
   parameter tuning is the operator's job; MNEMOS picks safe
   defaults but doesn't auto-tune. This applies across all
-  large-scale backends — pgvector HNSW (PostgreSQL), Oracle Database 26ai
+  large-scale backends — pgvector HNSW (PostgreSQL), Oracle Database 23ai
   HNSW INMEMORY NEIGHBOR GRAPH (Oracle), and DiskANN (Db2 12.1.5)
   each expose vendor-specific tuning knobs that the operator
   sizes against their corpus.
@@ -595,7 +604,7 @@ round-trip on the native subset.
 * `STREAMING_REPLICATION.md` — federation pull/push semantics.
 * `SQLITE_PROFILE.md` — edge-tier deployment guide.
 * `SCALING.md` — production sizing + horizontal scale.
-* `oracle-port-status.md` — Oracle Database 26ai backend status + parity coverage.
+* `oracle-port-status.md` — Oracle Database 23ai backend status + parity coverage.
 * `db2-oracle-ee-test-plan.md` — enterprise-backend test topology.
 
 ---
