@@ -372,6 +372,57 @@ async def test_oracle_pool_session_callback_sets_nls_decimal_separator() -> None
                 pass
 
 
+@_LIVE_SKIP
+async def test_oracle_pool_session_callback_pins_fixed_offset_not_named_zone() -> None:
+    """Verify the session callback pins TIME_ZONE to a fixed offset.
+
+    Regression guard for a real production incident (2026-09-13): the
+    session callback pinned ``ALTER SESSION SET TIME_ZONE = 'UTC'`` (a
+    NAMED zone). python-oracledb's thin mode (no Oracle Client libs) can
+    only decode ``TIMESTAMP WITH TIME ZONE`` values tagged with a fixed
+    offset -- one tagged with the named region 'UTC' raises
+    ``DPY-3022: named time zones are not supported in thin mode`` the
+    instant ANY later query in that session fetches a TSTZ column. This
+    took down every `GET /v1/memories` call in production (500 on every
+    request) and silently hid the `webhooks` persistence capability
+    (its probe query hit the same error and was swallowed as "absent").
+
+    Never caught before deployment because this file's live arms are the
+    only place that exercises real oracledb thin-mode TSTZ decoding --
+    the rest of the suite runs against SQLite/mocked Oracle, which never
+    hits this driver-level distinction between named zones and offsets.
+    """
+    from mnemos.persistence.oracle import create_oracle_pool
+
+    pool = await create_oracle_pool(ORACLE_DSN)
+    try:
+        async with pool.acquire() as conn:
+            with conn.cursor() as cur:
+                await cur.execute("SELECT SESSIONTIMEZONE FROM DUAL")
+                row = await cur.fetchone()
+                assert row is not None
+                session_tz = str(row[0])
+                assert session_tz in {"+00:00", "00:00"}, (
+                    f"SESSIONTIMEZONE is {session_tz!r}, not a fixed UTC offset -- "
+                    "the session callback is pinning a named zone again, which "
+                    "thin-mode cannot decode on the next TSTZ fetch."
+                )
+                # The real failure mode: fetching a TIMESTAMP WITH TIME ZONE
+                # value must not raise DPY-3022 in this session.
+                await cur.execute("SELECT SYSTIMESTAMP FROM DUAL")
+                ts_row = await cur.fetchone()
+                assert ts_row is not None
+    finally:
+        close = getattr(pool, "close", None)
+        if close is not None:
+            try:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                pass
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Driver-free contract guard — runs even when ORACLE_DSN is unset
 # ────────────────────────────────────────────────────────────────────────────
