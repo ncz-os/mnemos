@@ -21,6 +21,9 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
+from mnemos.persistence.sqlite import _execute as _sqlite_execute
+from mnemos.persistence.sqlite import _fetch_one as _sqlite_fetch_one
+
 
 # ── Backend detection ────────────────────────────────────────────────────────
 PG_URL = os.environ.get("MNEMOS_TEST_DB")
@@ -240,7 +243,8 @@ async def test_attempts_increment(backend_case):
     # Reset to pending so we can dequeue again (simulates retry)
     async with be.transactional() as tx:
         if arm == "sqlite":
-            await tx.conn.execute(
+            await _sqlite_execute(
+                tx.conn,
                 "UPDATE memory_compression_queue SET status='pending', started_at=NULL WHERE id=?",
                 (c1[0]["id"],),
             )
@@ -320,7 +324,8 @@ async def test_sweep_terminalization(backend_case):
     # Set attempts >= max with a real content error and an old started_at
     async with be.transactional() as tx:
         if arm == "sqlite":
-            await tx.conn.execute(
+            await _sqlite_execute(
+                tx.conn,
                 "UPDATE memory_compression_queue SET attempts=3, error='boom', "
                 "started_at=datetime('now','-1 hour') WHERE id=?",
                 (qid,),
@@ -351,8 +356,12 @@ async def test_sweep_terminalization(backend_case):
     # Verify terminalized
     async with be.transactional() as tx:
         if arm == "sqlite":
-            cur = await tx.conn.execute("SELECT status FROM memory_compression_queue WHERE id=?", (qid,))
-            st = (await cur.fetchone())["status"]
+            row = await _sqlite_fetch_one(
+                tx.conn,
+                "SELECT status FROM memory_compression_queue WHERE id=?",
+                (qid,),
+            )
+            st = row["status"]
         elif arm == "postgres":
             st = await tx.conn.fetchval("SELECT status FROM memory_compression_queue WHERE id=$1", str(qid))
         elif arm == "oracle":
@@ -383,7 +392,8 @@ async def test_sweep_infra_retry_reset(backend_case):
 
     async with be.transactional() as tx:
         if arm == "sqlite":
-            await tx.conn.execute(
+            await _sqlite_execute(
+                tx.conn,
                 "UPDATE memory_compression_queue SET attempts=3, error='infra_retry: x', "
                 "started_at=datetime('now','-1 hour') WHERE id=?",
                 (qid,),
@@ -414,10 +424,11 @@ async def test_sweep_infra_retry_reset(backend_case):
     # Verify reset to pending with decremented attempts
     async with be.transactional() as tx:
         if arm == "sqlite":
-            cur = await tx.conn.execute(
-                "SELECT status, attempts FROM memory_compression_queue WHERE id=?", (qid,)
+            row = await _sqlite_fetch_one(
+                tx.conn,
+                "SELECT status, attempts FROM memory_compression_queue WHERE id=?",
+                (qid,),
             )
-            row = await cur.fetchone()
         elif arm == "postgres":
             row = await tx.conn.fetchrow(
                 "SELECT status, attempts FROM memory_compression_queue WHERE id=$1", str(qid)
