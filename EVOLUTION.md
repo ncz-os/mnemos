@@ -507,7 +507,7 @@ test the Unix group-read bit directly with
 The later v3.5.0 passes made the same posture broader. Webhook delivery
 became lease-owned and retry-chain aware, with one terminal succeeded row
 enforced at the database layer. MCP stdio and HTTP/SSE now expose the same
-18-tool registry. The OpenAI-compatible gateway became pass-or-reject instead
+tool registry (18 tools at the time; 25 as of v6.3.7). The OpenAI-compatible gateway became pass-or-reject instead
 of silently dropping controls. State, journal, entities, sessions, and
 consultations picked up namespace-uniform tenancy. The old compression stack
 was cut down to the active APOLLO + ARTEMIS contest path; LETHE, ANAMNESIS,

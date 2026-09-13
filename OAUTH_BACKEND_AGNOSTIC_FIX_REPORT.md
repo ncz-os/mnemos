@@ -1,5 +1,9 @@
 # OAuth backend-agnostic persistence fix report
 
+**Merged to master; this is the current OAuth persistence architecture.**
+The blockers listed below were sandbox constraints at the time of writing
+(no Docker, no PyPI DNS, no external test DSNs), not open project gaps.
+
 Date: 2026-09-09 (America/New_York)
 Repository: `/tmp/mnemos-audit-clones/mnemos-oauth-backend-fix`
 Branch: `feat/oauth-backend-agnostic-store`

@@ -102,18 +102,19 @@ ruff check . --extend-exclude .venv-ci
 
 ### Backend-gated parity tests
 
-The `tests/test_persistence_parity.py` suite enumerates backend arms
-based on which DSN env vars are set. SQLite always runs; the other
-arms are skipped cleanly when their env var is absent:
+The `tests/test_persistence_parity.py` suite currently runs SQLite and
+PostgreSQL parity arms; the Oracle and Db2 arms are stubbed pending a
+backend-specific cleanup helper and skip even when their DSN is set. Live
+coverage for Oracle and Db2 comes from their own dedicated suites instead:
 
 ```bash
 # PostgreSQL parity arm
 export MNEMOS_TEST_DB='postgres://mnemos:<password>@localhost:5432/mnemos'
 
-# Oracle parity arm
+# Oracle live suite
 export ORACLE_DSN='oracle://MNEMOS:<password>@localhost:1521/ORCLPDB1'
 
-# IBM Db2 parity arm
+# IBM Db2 live suite
 export DB2_DSN='db2://MNEMOS:<password>@localhost:50000/MNEMOS'
 
 pytest -q tests/test_persistence_parity.py tests/test_oracle_live.py tests/test_db2_live.py

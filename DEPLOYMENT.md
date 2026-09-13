@@ -32,7 +32,7 @@ mnemos serve --profile dev
 ### Prerequisites
 - PostgreSQL 12+ for the `server` profile, or SQLite for `edge`/`dev`
 - Redis only if you run more than one worker — see [Runtime Scaling](#runtime-scaling)
-- Python 3.11+ when installing the Python package; none when running a container image
+- Python 3.13+ when installing the Python package; none when running a container image
 - LLM provider API keys (Together AI or Groq free tier recommended)
 - (Optional) GPU or local inference endpoint for APOLLO's LLM fallback and self-hosted LLMs
 

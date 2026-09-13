@@ -210,7 +210,8 @@ backend is live. Routes for absent subsystems return HTTP 503 with the exact
 - MariaDB has no extra of its own: it is wire-compatible with `aiomysql`, so
   install the `mysql` extra and use a `mariadb://` DSN.
 - Keep exactly ONE version tag live on ghcr.io/ncz-os/mnemos-enterprise at a
-  time (plus its `latest`/`sha-*` aliases). When cutting a new release, the
-  old version's package version is deleted from ghcr.io, not just superseded
-  by a new tag — see `.github/workflows/release-images.yml` (or wire this
-  into it if it isn't automated yet).
+  time (plus its `latest`/`sha-*` aliases). When cutting a new release,
+  delete the old version's package version from ghcr.io — both the tagged
+  multi-arch index and its untagged per-platform + attestation children —
+  rather than just superseding it with a new tag. This is a manual step;
+  `.github/workflows/release-images.yml` does not automate it.
