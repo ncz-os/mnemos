@@ -4,17 +4,17 @@
 
 | Version | Supported |
 |---|---|
-| 6.1.x | Yes — current release line |
-| 6.0.x | Security fixes only; upgrade to 6.1 |
+| 6.3.x | Yes — current release line |
+| 6.2.x | Security fixes only; upgrade to 6.3 |
 | Earlier | No |
 
-Only the most recent release line receives fixes. If you are on 6.0 or
-6.0.1, upgrade to 6.1 before reporting an issue so the report is against
+Only the most recent release line receives fixes. If you are on an
+earlier line, upgrade before reporting an issue so the report is against
 supported code.
 
 ## Current security invariants
 
-These hold in 6.1:
+These hold in 6.3:
 
 - Memory read visibility is symmetric across list/get/search/rehydrate,
   OpenAI-compatible gateway context, version history, DAG history, and MCP

@@ -415,7 +415,10 @@ Common codes:
 - `409` — conflict requiring operator action, including incompatible federation schema and `MN001` branch-state reconciliation
 - `413` — request body exceeds `MAX_BODY_BYTES` (default 5 MB)
 - `429` — rate-limited (when `RATE_LIMIT_ENABLED=true`)
-- `503` — database pool unavailable
+- `503` — database pool unavailable, OR the route's subsystem extra isn't
+  installed (the response body names the `pip install` command to fix it).
+  Consultations/Providers (GRAEAE) and Portability/Ingest (CHARON) routes
+  return 503 on a plain `mnemos-core` install without those extras.
 
 ---
 

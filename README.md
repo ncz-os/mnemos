@@ -1,7 +1,7 @@
 > ## 📍 Canonical source: GitLab
 > The authoritative source for this project lives on GitLab — always: **https://gitlab.com/ncz-os/mnemos**
 >
-> This GitHub repository is retained **only** to host container images on ghcr.io (`mnemos-core`, `mnemos`, `mnemos-enterprise`). Development, issues, and merge requests happen on GitLab.
+> This GitHub repository is retained **only** to host the `mnemos-enterprise` container image on ghcr.io. Development, issues, and merge requests happen on GitLab.
 
 ---
 
@@ -21,7 +21,7 @@ What is in the box:
 
 - a packaged **FastAPI runtime** with a CLI-first deployment surface
 - **EPIMONE**, the six-backend persistence layer — SQLite + sqlite-vec by
-  default, PostgreSQL + pgvector, Oracle Database 26ai, IBM Db2 12.1, MySQL 9.0
+  default, PostgreSQL + pgvector, Oracle Database 23ai, IBM Db2 12.1, MySQL 9.0
   Enterprise/HeatWave, and MariaDB 11.7+. Every backend self-provisions its
   schema on first connect. See [Persistence](#persistence).
 - the **GRAEAE** reasoning bus and **PANTHEON** unified LLM facade
@@ -34,12 +34,13 @@ What is in the box:
 
 > **How it is packaged.** MNEMOS ships as a small core (`mnemos-core`) plus
 > separately installable `mnemos.*` namespace subsystems (GRAEAE, PANTHEON,
-> KNEMON, CHARON) and the standalone STIPHOS hive service. Container images are
-> published to `ghcr.io/ncz-os` — `mnemos-core`, `mnemos` (amd64 + arm64), and
-> `mnemos-enterprise` (amd64, adds the Oracle/Db2/MySQL drivers). Pin the minor
-> line (`:6.1`) to keep a fleet on identical code. Install and DSN/driver setup
-> for each backend are in [docs/INSTALL.md](docs/INSTALL.md); the agent-facing
-> contract is in [AGENTS.md](AGENTS.md).
+> KNEMON, CHARON) and the standalone STIPHOS hive service. The published
+> container image is `ghcr.io/ncz-os/mnemos-enterprise` — a single multi-arch
+> (amd64 + arm64) manifest with every backend driver (Oracle, MySQL, MariaDB)
+> except Db2, which is amd64-only. Pin the minor line (`:6.3`) to keep a fleet
+> on identical code. Install and DSN/driver setup for each backend are in
+> [docs/INSTALL.md](docs/INSTALL.md); the agent-facing contract is in
+> [AGENTS.md](AGENTS.md).
 
 
 ## Quick Start
@@ -70,7 +71,7 @@ via extras). `mnemos` is the published **image** name, not a pip package.
 **Turnkey (container, any arch):**
 
 ```
-docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos:latest
+docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:latest
 # everything image: core + graeae + pantheon + knemon + charon. SQLite by default.
 # Point at a real DB with -e MNEMOS_DATABASE_DSN='postgres://…' (or oracle://… thin).
 ```
@@ -81,7 +82,7 @@ docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos:latest
 Install MNEMOS on this machine.
 
 Steps:
-1. pip install 'mnemos-core[server]'   # everything; arch-neutral (no openvino)
+1. pip install 'mnemos-core[full]'     # everything; arch-neutral (no openvino)
 2. mnemos init                         # scaffold config + token
 3. mnemos serve                        # start API on :5002
 4. mnemos doctor                       # verify subsystems
@@ -93,12 +94,12 @@ Single subsystem, e.g. reasoning: pip install 'mnemos-core[graeae]'
 Hive (STIPHOS) is a SEPARATE service: pip install 'mnemos-stiphos[mcp]' (port 8080)
 ```
 
-**Enterprise backends (Oracle Database 26ai, IBM Db2 12.1).**
-Turnkey is the **amd64-only** `mnemos-enterprise` image (everything + Oracle/Db2/
-MySQL drivers baked in). Note: Oracle uses the thin driver, so it also runs on
-the plain `mnemos` image and on arm64 — only Db2 actually requires enterprise.
-See [docs/INSTALL.md](docs/INSTALL.md) for full driver, DSN, and migration
-steps.
+**Enterprise backends (Oracle Database 23ai, IBM Db2 12.1).**
+`mnemos-enterprise` is a single multi-arch (amd64 + arm64) image with every
+backend driver baked in. The one asymmetry: Db2's driver has no arm64 wheel,
+so the Db2 backend is amd64-only — Oracle (thin driver), MySQL, and MariaDB
+all work on arm64 too. See [docs/INSTALL.md](docs/INSTALL.md) for full
+driver, DSN, and migration steps.
 
 ```
 # Turnkey (amd64):
@@ -107,7 +108,7 @@ docker run --platform linux/amd64 -p 5002:5002 \
   ghcr.io/ncz-os/mnemos-enterprise:latest
 
 # Or from source:
-git clone https://github.com/ncz-os/mnemos && cd mnemos
+git clone https://gitlab.com/ncz-os/mnemos && cd mnemos
 python -m pip install -e '.[server,enterprise]'   # or '.[server,oracle]' / '.[server,db2]'
 export MNEMOS_DATABASE_DSN='oracle://user:pass@host:1521/service_name'
 # or:  MNEMOS_DATABASE_DSN='db2://user:pass@host:50000/dbname'
@@ -159,7 +160,7 @@ Key MCP tools the agent gets:
 | **ZeroClaw** | Zeroclaw agent reads/writes memories via MCP | `integrations/zeroclaw/` + `mnemos serve mcp-stdio` in zeroclaw config |
 | **OpenClaw** | OpenClaw gateway routes memory ops through MCP | `integrations/openclaw/` + MCP server entry in `openclaw.json` |
 | **Hermes** | Optional memory skill mounts MNEMOS as a tool provider | `integrations/hermes/optional-skills/memory/mnemos/` |
-| **Webhooks (any)** | Push `memory.created`, `memory.updated`, `memory.deleted`, `consultation.completed` events to any HTTPS endpoint | `POST /api/webhooks/register` with `{"url": "...", "events": [...]}` |
+| **Webhooks (any)** | Push `memory.created`, `memory.updated`, `memory.deleted`, `consultation.completed` events to any HTTPS endpoint | `POST /v1/webhooks` with `{"url": "...", "events": [...]}` |
 | **Cursor / Cline / Continue.dev / Zed / Aider** | Any MCP-capable IDE connects via stdio or HTTP transport | See `docs/connectors/` |
 
 ---
@@ -185,7 +186,7 @@ implemented, in `mnemos/persistence/`:
 |---|---|---|
 | **SQLite + sqlite-vec** | `vec0` virtual table | Default. Edge and development installs; no server to run. |
 | **PostgreSQL + pgvector** | HNSW | **Recommended for vector and semantic workloads** — the most mature and predictable option, with broad managed-service support. |
-| **Oracle Database 26ai** | HNSW `INMEMORY NEIGHBOR GRAPH` | Also JSON Duality and TDE. Thin driver, so it runs on the standard `mnemos` image and on arm64. |
+| **Oracle Database 23ai** | HNSW `INMEMORY NEIGHBOR GRAPH` | Also JSON Duality and TDE. Thin driver, so it runs on the standard `mnemos` image and on arm64. |
 | **IBM Db2** | DiskANN | Hot paths emit native Db2 SQL — `VECTOR_DISTANCE(..., EUCLIDEAN)` with `FETCH APPROX FIRST`, engaging the DiskANN index on the user-facing query path. The default dialect (`MNEMOS_DB2_DIALECT=compat`) still translates inherited Oracle-shaped SQL at the cursor layer; set `MNEMOS_DB2_DIALECT=native` for the pass-through backend. amd64 only. |
 | **MySQL 9.0+** | `VECTOR_DISTANCE` | For the managed-cloud MySQL audience (RDS and Aurora MySQL, HeatWave). Note that the vector functions ship only in MySQL **Enterprise/HeatWave**, not Community. |
 | **MariaDB 11.7+** | `VEC_DISTANCE_COSINE` + HNSW `VECTOR INDEX` | The strongest *MySQL-family* option, and available in the **free Community** edition. Embeddings live in a `memory_embeddings` join table. Its vector engine is newer than pgvector's and correspondingly less battle-tested. |
@@ -193,9 +194,9 @@ implemented, in `mnemos/persistence/`:
 Every backend satisfies the same `PersistenceBackend` protocol set
 (`mnemos/persistence/base.py`) and self-provisions its schema idempotently on
 `backend.open()`, DSN-aware, with the dimension taken from
-`MNEMOS_EMBEDDING_DIM`. SQLite, PostgreSQL, Oracle, and Db2 share the
-cross-backend harness in `tests/test_persistence_parity.py`; MySQL and MariaDB
-are covered by their own live suites.
+`MNEMOS_EMBEDDING_DIM`. SQLite and PostgreSQL share the cross-backend harness
+in `tests/test_persistence_parity.py`; Oracle, Db2, MySQL, and MariaDB are
+each covered by their own live suite.
 
 ## Documentation
 

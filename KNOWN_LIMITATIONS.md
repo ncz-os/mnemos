@@ -1,4 +1,4 @@
-# Known limitations — v6.1
+# Known limitations — v6.3
 
 This file lists known operational caveats that aren't bugs in the strict
 sense but are worth surfacing for self-hosting operators. Each entry gives

@@ -1,5 +1,11 @@
 # MNEMOS OAuth/Morpheus Audit Fix Report
 
+**Merged to master.** The `PostgresOAuthStore`/dedicated-pool architecture
+described below was superseded by the backend-agnostic design in
+`OAUTH_BACKEND_AGNOSTIC_FIX_REPORT.md` — see that file for the current
+implementation. This report is retained as a historical record of the
+original fix.
+
 Date: 2026-09-09
 
 Branch: `feat/oauth-mcp-provider-agnostic-v2`
