@@ -94,7 +94,6 @@ Add to your `docker-compose.override.yml` (<pg-host> prod example):
 services:
   mnemos-mcp-http:
     image: ghcr.io/ncz-os/mnemos-enterprise:6.3.7
-    pull_policy: never
     depends_on:
       - mnemos
     restart: unless-stopped
@@ -121,7 +120,7 @@ export MNEMOS_MCP_TOKEN="$(openssl rand -hex 32)"
 Bring up the service:
 
 ```bash
-docker-compose up -d --build mnemos-mcp-http
+docker-compose up -d mnemos-mcp-http
 ```
 
 Verify:
