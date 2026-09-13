@@ -75,6 +75,16 @@ jobs:
         with:
           python-version: '3.13'
 
+      # setup-python's 3.13 environment does not ambiently include
+      # setuptools the way 3.11's did (CPython 3.12+ dropped bundled
+      # distutils and pip stopped assuming setuptools is present). The
+      # add-on wheel builds below use --no-build-isolation, which relies
+      # on setuptools already being importable in this environment --
+      # without this step, `pip wheel` fails with
+      # `BackendUnavailable: Cannot import 'setuptools.build_meta'`.
+      - name: Ensure setuptools is present for --no-build-isolation wheel builds
+        run: python -m pip install --upgrade pip setuptools wheel
+
       # Pre-build the four add-on wheels from their GitLab repos and stage them
       # into ./wheelhouse for Dockerfile.everything. They are pure-Python
       # (setuptools) so --no-deps wheel builds need no native toolchain and the
