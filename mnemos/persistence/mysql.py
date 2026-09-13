@@ -67,6 +67,7 @@ from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
 from mnemos.persistence.base import (
     BackendCapabilityMissing,
     BranchRepository,
+    ClusterCandidateRow,
     CompressionStatsRow,
     CompressionQueueRepository,
     CompressionRepository,
@@ -3652,6 +3653,160 @@ class MysqlMorpheusRepository(MorpheusRepository):
             n_extract_reset,
         )
         return n_deleted, n_run
+
+    async def fetch_cluster_candidates(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        max_input_count: int,
+    ) -> ClusterCandidateRow | None:
+        """MySQL impl of MORPHEUS fetch_cluster_candidates — item 11b.
+
+        Returns the run's cluster-window config + the candidate rows
+        pre-materialised to ``list[float]`` in a single transaction.
+        MySQL 9.0+ stores embeddings as a ``VECTOR`` column; we pull
+        them through ``FROM_VECTOR(m.embedding)`` (the same helper
+        ``_python_cosine_search`` and the federation ``feed_query``
+        path use) which returns a JSON-encoded string on the wire,
+        ``json.loads``'d into a ``list[float]`` here.
+
+        ``IS DISTINCT FROM`` is not portable to MySQL/MariaDB — use
+        the ``<=>`` null-safe equality operator: ``NOT (provenance
+        <=> 'morpheus_local')``. MariaDB's :class:`MariadbMorpheusRepository`
+        inherits this method unchanged (its override only touches
+        ``begin_run`` for the JSON CAST workaround).
+        """
+        conn = tx.conn
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT cluster_min_size, window_started_at, window_ended_at, namespace
+                  FROM morpheus_runs WHERE id = %s
+                """,
+                (run_id,),
+            )
+            run_row = await cursor.fetchone()
+            if run_row is None:
+                return None
+            await cursor.execute(
+                f"""
+                SELECT id, FROM_VECTOR(embedding) AS embedding_json
+                  FROM memories
+                 WHERE created BETWEEN %s AND %s
+                   AND NOT (provenance <=> 'morpheus_local')
+                   AND morpheus_run_id IS NULL
+                   AND embedding IS NOT NULL
+                   AND {eligibility_clause}
+                   AND (%s IS NULL OR namespace = %s)
+                 ORDER BY created
+                 LIMIT %s
+                """,
+                (
+                    run_row[1],
+                    run_row[2],
+                    run_row[3],
+                    run_row[3],
+                    int(max_input_count),
+                ),
+            )
+            raw_rows = await cursor.fetchall() or []
+        candidates: list[tuple[str, list[float]]] = []
+        for row in raw_rows:
+            mid = row[0]
+            raw_embed = row[1]
+            if raw_embed is None:
+                continue
+            if isinstance(raw_embed, (list, tuple)):
+                try:
+                    vec = [float(value) for value in raw_embed]
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(raw_embed, str):
+                try:
+                    parsed = json.loads(raw_embed)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(parsed, list):
+                    continue
+                try:
+                    vec = [float(value) for value in parsed]
+                except (TypeError, ValueError):
+                    continue
+            else:
+                # Some driver versions already materialise the VECTOR
+                # column as an array.array('f', ...) — accept that
+                # shape too rather than silently skipping the row.
+                try:
+                    vec = [float(value) for value in raw_embed]
+                except (TypeError, ValueError):
+                    continue
+            if not vec:
+                continue
+            candidates.append((str(mid), vec))
+        return ClusterCandidateRow(
+            cluster_min_size=int(run_row[0]),
+            window_started_at=run_row[1],
+            window_ended_at=run_row[2],
+            namespace=run_row[3],
+            candidates=candidates,
+        )
+
+    async def merge_run_config(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        patch: dict[str, Any],
+    ) -> None:
+        """MySQL impl of MORPHEUS merge_run_config — item 11b.
+
+        Read-modify-write on the ``config`` column. MySQL's
+        ``JSON_MERGE_PATCH`` is whole-document-level and would
+        clobber sibling keys the runner has been carrying (e.g. the
+        ``clusters`` payload survives subsequent re-cluster calls —
+        patching with a single key must not erase the rest). RMW is
+        safe here because the patch is bounded to
+        ``{"clusters": [...]}`` once per CLUSTER phase. ``MariadbMorpheusRepository``
+        inherits this method unchanged.
+        """
+        if not patch:
+            return
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT config FROM morpheus_runs WHERE id = %s",
+                (run_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return
+            raw_config = row[0]
+        if raw_config is None or raw_config == "":
+            merged: dict[str, Any] = {}
+        elif isinstance(raw_config, dict):
+            merged = dict(raw_config)
+        elif isinstance(raw_config, (bytes, bytearray)):
+            try:
+                parsed = json.loads(raw_config.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                parsed = {}
+            merged = parsed if isinstance(parsed, dict) else {}
+        elif isinstance(raw_config, str):
+            try:
+                parsed = json.loads(raw_config)
+            except json.JSONDecodeError:
+                parsed = {}
+            merged = parsed if isinstance(parsed, dict) else {}
+        else:
+            merged = {}
+        merged.update(patch)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE morpheus_runs SET config = CAST(%s AS JSON) WHERE id = %s",
+                (json.dumps(merged), run_id),
+            )
 
 
 class MysqlCompressionQueueRepository(CompressionQueueRepository):
