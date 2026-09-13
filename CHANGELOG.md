@@ -57,6 +57,45 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.6] — 2026-09-13
+
+- **Fixed**: rolling `6.3.4` back to `6.2.4` on a production Oracle
+  database crash-looped on a *different* migration than the one that
+  originally broke: `RuntimeError: ORACLE schema migration
+  0061c_morpheus_runs_parity.sql failed at ALTER TABLE morpheus_runs
+  DROP COLUMN run_type: ORA-00904: "RUN_TYPE": invalid identifier`.
+  Root cause: migrations in this codebase carry no applied-state
+  tracking table and are replayed **in full, every boot** — an
+  unguarded `DROP COLUMN` succeeds the first time it ever runs against
+  a real database, then raises "invalid identifier" on every subsequent
+  boot because the column is already gone. This is the same failure
+  class as `6.3.4`'s `nats_dispatch_log` fix, just in a different
+  migration file (`0061c_morpheus_runs_parity.sql`, item 11/11a's
+  `morpheus_runs` retcon) — it had simply never been exercised against
+  a real, already-migrated Oracle database before today, because
+  production had been stuck on `6.2.4` (predating this migration)
+  since 2026-09-10.
+- **Fix**: both `migrations_oracle/0061c_morpheus_runs_parity.sql` and
+  `migrations_db2/0061c_morpheus_runs_parity.sql` now wrap their
+  `DROP COLUMN run_type` / `DROP COLUMN metrics` statements in a
+  guarded block that treats "column does not exist" (Oracle ORA-00904,
+  Db2 SQLSTATE 42704) as a benign replay signal — the same idiom this
+  file already used for its `DROP CONSTRAINT` statements two sections
+  below.
+- Audited every Oracle and Db2 migration file for the same pattern
+  (unguarded `DROP COLUMN` / `RENAME COLUMN` / bare `DROP TABLE`
+  outside an already-idempotent guard) — no other instances found.
+- **Process note**: because migrations replay in full on every boot
+  with no applied-state tracking, EVERY one-shot, non-repeatable DDL
+  statement (drop column, rename column, drop table, one-time data
+  backfill) in an Oracle or Db2 migration is a landmine that will not
+  fire on a fresh database and WILL fire on the second real boot against
+  an already-migrated one. A fresh-database test run (which is what the
+  local suite and most manual testing exercises) cannot catch this
+  class of bug — only a REPLAY against an already-migrated real
+  database can, which is exactly what happened here for the first time
+  today.
+
 ## [6.3.5] — 2026-09-13
 
 - **Fixed**: deploying `6.3.4` to a production Oracle database made
