@@ -88,6 +88,7 @@ EXPECTED_MIGRATIONS = [
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
     "0048_memory_versions_visibility.sql",
+    "0054_memory_tags.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [
@@ -148,10 +149,12 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v6_3_api_keys_last_used_sqlite.sql",
     "migrations_v6_3_mcp_oauth_sqlite.sql",
     "migrations_v6_3_morpheus_runs_parity_sqlite.sql",  # item 11a: morpheus_runs canonical shape
+    "migrations_v6_3_morpheus_phase_parity_sqlite.sql",  # item 11c: source_memories parity
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
     "0048_memory_versions_visibility.sql",
+    "0054_memory_tags.sql",
 ]
 
 

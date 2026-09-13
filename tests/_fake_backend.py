@@ -62,6 +62,7 @@ class _FakeMemoryRepo:
         visibility,
         category=None,
         subcategory=None,
+        tags=None,
         limit=20,
         offset=0,
         include_archived=False,
@@ -74,6 +75,7 @@ class _FakeMemoryRepo:
                     "visibility": visibility,
                     "category": category,
                     "subcategory": subcategory,
+                    "tags": tags,
                     "limit": limit,
                     "offset": offset,
                     "include_archived": include_archived,
@@ -204,6 +206,7 @@ class _FakeMemoryRepo:
         visibility,
         category=None,
         subcategory=None,
+        tags=None,
         source_provider=None,
         source_model=None,
         source_agent=None,
@@ -221,6 +224,7 @@ class _FakeMemoryRepo:
                     "visibility": visibility,
                     "category": category,
                     "subcategory": subcategory,
+                    "tags": tags,
                     "source_provider": source_provider,
                     "source_model": source_model,
                     "source_agent": source_agent,
@@ -242,6 +246,7 @@ class _FakeMemoryRepo:
         visibility,
         category=None,
         subcategory=None,
+        tags=None,
         source_provider=None,
         source_model=None,
         source_agent=None,
@@ -257,6 +262,7 @@ class _FakeMemoryRepo:
                     "visibility": visibility,
                     "category": category,
                     "subcategory": subcategory,
+                    "tags": tags,
                     "source_provider": source_provider,
                     "source_model": source_model,
                     "source_agent": source_agent,
@@ -270,6 +276,25 @@ class _FakeMemoryRepo:
     async def insert_memory(self, tx, **kwargs):
         self.calls.append(("insert_memory", kwargs))
         return self._resolve("insert_memory", kwargs.get("memory_id"))
+
+    async def replace_memory_tags(self, tx, memory_id, tags, *, visibility=None):
+        self.calls.append(
+            (
+                "replace_memory_tags",
+                {
+                    "memory_id": memory_id,
+                    "tags": list(tags),
+                    "visibility": visibility,
+                },
+            )
+        )
+        return self._resolve("replace_memory_tags", True)
+
+    async def fetch_memory_tags(self, tx, memory_ids):
+        return self._resolve(
+            "fetch_memory_tags",
+            {memory_id: [] for memory_id in memory_ids},
+        )
 
     async def upsert_memory_embedding(self, tx, memory_id, embedding):
         self.calls.append(
@@ -515,6 +540,7 @@ class _PoolBackedTx(PostgresTransaction):
 class _PoolBackedMemoryRepo:
     def __init__(self, pool) -> None:
         self._pool = pool
+        self._tags: dict[str, list[str]] = {}
 
     def _visible(self, row: dict[str, Any], visibility) -> bool:
         from mnemos.persistence.visibility import VisibilityScope
@@ -546,6 +572,7 @@ class _PoolBackedMemoryRepo:
         *,
         category=None,
         subcategory=None,
+        tags=None,
         include_archived=False,
         exclude_superseded=False,
     ) -> list[dict[str, Any]]:
@@ -559,6 +586,9 @@ class _PoolBackedMemoryRepo:
             rows = [row for row in rows if row.get("category") == category]
         if subcategory is not None:
             rows = [row for row in rows if row.get("subcategory") == subcategory]
+        if tags:
+            wanted = set(tags)
+            rows = [row for row in rows if wanted.intersection(self._tags.get(row["id"], []))]
         return sorted(rows, key=lambda row: row.get("created"), reverse=True)
 
     async def list_memories(
@@ -568,6 +598,7 @@ class _PoolBackedMemoryRepo:
         visibility,
         category=None,
         subcategory=None,
+        tags=None,
         limit=20,
         offset=0,
         include_archived=False,
@@ -577,6 +608,7 @@ class _PoolBackedMemoryRepo:
             visibility,
             category=category,
             subcategory=subcategory,
+            tags=tags,
             include_archived=include_archived,
             exclude_superseded=exclude_superseded,
         )
@@ -601,6 +633,7 @@ class _PoolBackedMemoryRepo:
         visibility,
         category=None,
         subcategory=None,
+        tags=None,
         source_provider=None,
         source_model=None,
         source_agent=None,
@@ -614,6 +647,7 @@ class _PoolBackedMemoryRepo:
                 visibility,
                 category=category,
                 subcategory=subcategory,
+                tags=tags,
                 include_archived=include_archived,
                 exclude_superseded=exclude_superseded,
             )
@@ -630,6 +664,7 @@ class _PoolBackedMemoryRepo:
         visibility,
         category=None,
         subcategory=None,
+        tags=None,
         source_provider=None,
         source_model=None,
         source_agent=None,
@@ -642,6 +677,7 @@ class _PoolBackedMemoryRepo:
             visibility,
             category=category,
             subcategory=subcategory,
+            tags=tags,
             include_archived=include_archived,
             exclude_superseded=exclude_superseded,
         )
@@ -681,6 +717,18 @@ class _PoolBackedMemoryRepo:
             "consolidated_into": None,
         }
         return memory_id
+
+    async def replace_memory_tags(self, tx, memory_id, tags, *, visibility=None):
+        row = self._pool.state["memories"].get(memory_id)
+        if row is None or row.get("deleted_at") is not None:
+            return False
+        if visibility is not None and not self._visible(row, visibility):
+            return False
+        self._tags[memory_id] = list(tags)
+        return True
+
+    async def fetch_memory_tags(self, tx, memory_ids):
+        return {memory_id: list(self._tags.get(memory_id, [])) for memory_id in memory_ids}
 
     async def find_active_duplicate_by_content_hash(
         self,

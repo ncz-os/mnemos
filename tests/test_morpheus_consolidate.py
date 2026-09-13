@@ -1,19 +1,12 @@
 """Tests for MORPHEUS slice 3: CONSOLIDATE.
 
-Item 11a (ABC migration): ``phase_consolidate`` and ``phase_synthesise``
-still take a raw ``asyncpg.Pool`` (their own per-row SQL is out of
-scope), but the ``rollback_run`` helper now routes through
-``backend.morpheus.rollback_run``. The single rollback test at the
-bottom of this file therefore needs a backend-shaped mock with a
-``morpheus.rollback_run`` impl that performs the same SQL semantics
-the legacy raw-asyncpg path did — restore consolidated originals from
-their ``pre_consolidate_permission_mode`` metadata audit key, delete
-the synthesised run-created memories, and flip the run row to
-``status='rolled_back'``. The original ``_Pool`` / ``_Conn`` mocks are
-retained for the phase tests (which still take a pool) and the
-rollback impl delegates to the same in-memory helpers those mocks
-already expose.
+Item 11c routes CONSOLIDATE and SYNTHESISE persistence through
+``backend.morpheus``. The public runner signatures retain their pool
+argument for compatibility, while these backend-shaped fakes exercise
+the new transactional ABC calls and preserve the rollback audit-key
+contract established by item 11a.
 """
+
 from __future__ import annotations
 
 import json
@@ -172,11 +165,13 @@ class _Conn:
         row["consolidated_at"] = "now"
         row["permission_mode"] = permission_mode
         row["morpheus_run_id"] = run_id
-        self.memory_versions.append({
-            "memory_id": memory_id,
-            "permission_mode": permission_mode,
-            "metadata": dict(metadata),
-        })
+        self.memory_versions.append(
+            {
+                "memory_id": memory_id,
+                "permission_mode": permission_mode,
+                "metadata": dict(metadata),
+            }
+        )
         return "UPDATE 1"
 
     def _execute_restore(self, run_id: str, metadata_key: str) -> str:
@@ -198,7 +193,8 @@ class _Conn:
         doomed = [
             memory_id
             for memory_id, row in self.memories.items()
-            if row.get("morpheus_run_id") == run_id and row.get("deleted_at") is None
+            if row.get("morpheus_run_id") == run_id
+            and row.get("deleted_at") is None
             and row.get("provenance") == "morpheus_local"
         ]
         for memory_id in doomed:
@@ -209,6 +205,9 @@ class _Conn:
 class _Pool:
     def __init__(self, conn: _Conn):
         self.conn = conn
+        from mnemos.core import lifecycle as _lifecycle
+
+        _lifecycle._persistence_backend = _Backend(conn)
 
     def acquire(self):
         pool = self
@@ -256,9 +255,7 @@ class _Morpheus:
     async def update_counters(self, tx, run_id, **_kwargs):
         return None
 
-    async def increment_extract_counters(
-        self, tx, run_id, *, triples_extracted, memories_processed
-    ):
+    async def increment_extract_counters(self, tx, run_id, *, triples_extracted, memories_processed):
         return None
 
     async def finish_run(self, tx, run_id):
@@ -294,6 +291,106 @@ class _Morpheus:
                     row["status"] = "rolled_back"
         n_run = 1
         return n_deleted, n_run
+
+    async def phase_consolidate(self, tx, *, run_id: str, consolidated_permission_mode: int):
+        from mnemos.persistence.base import MorpheusConsolidationResult
+
+        run = self._conn.run_row
+        if run is None:
+            return None
+        config = run.get("config") or {}
+        clusters_done = 0
+        memories_done = 0
+        for cluster in config.get("clusters", []):
+            member_ids = list(cluster.get("member_memory_ids") or [])
+            namespace = run.get("namespace")
+            rows = [
+                self._conn.memories[memory_id]
+                for memory_id in member_ids
+                if memory_id in self._conn.memories
+                and self._conn.memories[memory_id].get("deleted_at") is None
+                and self._conn.memories[memory_id].get("archived_at") is None
+                and (namespace is None or self._conn.memories[memory_id].get("namespace") == namespace)
+            ]
+            if len(rows) < int(run.get("cluster_min_size") or 1):
+                continue
+            canonical = min(
+                rows,
+                key=lambda row: (
+                    -int(row.get("recall_count") or 0),
+                    row.get("created"),
+                    row["id"],
+                ),
+            )
+            changed = 0
+            for row in rows:
+                if row["id"] == canonical["id"]:
+                    continue
+                if row.get("consolidated_into") is None and row.get("morpheus_run_id") is None:
+                    status = self._conn._execute_consolidate_update(
+                        row["id"],
+                        canonical["id"],
+                        run_id,
+                        namespace,
+                        consolidated_permission_mode,
+                    )
+                    changed += int(status.endswith(" 1"))
+                elif (
+                    row.get("consolidated_into") == canonical["id"]
+                    and row.get("morpheus_run_id") == run_id
+                    and "pre_consolidate_permission_mode" in (row.get("metadata") or {})
+                ):
+                    changed += 1
+            if changed:
+                clusters_done += 1
+                memories_done += changed
+        return MorpheusConsolidationResult(memories_done, clusters_done)
+
+    async def phase_synthesise_load(self, tx, *, run_id: str):
+        from mnemos.persistence.base import MorpheusSynthesisCluster, MorpheusSynthesisMember
+
+        run = self._conn.run_row
+        if run is None:
+            return None
+        namespace = run.get("namespace")
+        out = []
+        for cluster in (run.get("config") or {}).get("clusters", []):
+            members = []
+            for memory_id in cluster.get("member_memory_ids") or []:
+                row = self._conn.memories.get(memory_id)
+                if row is None or row.get("deleted_at") is not None or row.get("archived_at") is not None:
+                    continue
+                if row.get("consolidated_into") is not None:
+                    continue
+                if namespace is not None and row.get("namespace") != namespace:
+                    continue
+                members.append(
+                    MorpheusSynthesisMember(
+                        id=row["id"],
+                        content=row.get("content") or "",
+                        category=row.get("category"),
+                        owner_id=row.get("owner_id"),
+                        namespace=row.get("namespace"),
+                    )
+                )
+            if members:
+                out.append(MorpheusSynthesisCluster(cluster.get("cluster_id", 0), members))
+        return out
+
+    async def phase_synthesise_store(self, tx, **kwargs):
+        memory_id = kwargs["memory_id"]
+        args = (
+            memory_id,
+            kwargs["content"],
+            kwargs["category"],
+            "morpheus_summary",
+            json.dumps(kwargs["metadata"]),
+            kwargs["owner_id"],
+            kwargs["namespace"],
+            kwargs["run_id"],
+            kwargs["source_memory_ids"],
+        )
+        await self._conn.execute("INSERT INTO memories (morpheus_run_id, source_memories) VALUES (...) ", *args)
 
 
 class _Backend:

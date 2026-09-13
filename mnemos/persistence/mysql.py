@@ -79,7 +79,13 @@ from mnemos.persistence.base import (
     KG_CAPABILITY,
     KGRepository,
     MemoryRepository,
+    MorpheusConsolidationResult,
+    MorpheusExtractBatch,
+    MorpheusExtractCandidate,
+    MorpheusExtractFailure,
     MorpheusRepository,
+    MorpheusSynthesisCluster,
+    MorpheusSynthesisMember,
     NatsDispatchLogRepository,
     OAuthRepository,
     STATE_CAPABILITY,
@@ -570,6 +576,10 @@ CREATE TABLE IF NOT EXISTS memories (
     consolidated_at   DATETIME(6),
     federation_last_pushed_at DATETIME(6),
     federation_push_peer VARCHAR(512),
+    morpheus_run_id  CHAR(36),
+    source_memories  JSON,
+    provenance       VARCHAR(64),
+    triples_extracted_at DATETIME(6),
     recall_count      INT           NOT NULL DEFAULT 0,
     last_recalled_at  DATETIME(6),
     archived_at       DATETIME(6),
@@ -584,6 +594,18 @@ CREATE TABLE IF NOT EXISTS memories (
     INDEX idx_memories_federation_remote (federation_source, federation_remote_updated),
     INDEX idx_memories_push (federation_source, federation_last_pushed_at),
     FULLTEXT INDEX idx_memories_ft (content)
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+_DDL_MEMORY_TAGS = """\
+CREATE TABLE IF NOT EXISTS memory_tags (
+    memory_id VARCHAR(64) NOT NULL,
+    tag       VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+    added_at  DATETIME(6) NOT NULL DEFAULT NOW(6),
+    PRIMARY KEY (memory_id, tag),
+    KEY idx_memory_tags_tag (tag),
+    CONSTRAINT fk_memory_tags_memory FOREIGN KEY (memory_id)
+        REFERENCES memories (id) ON DELETE CASCADE
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -700,6 +722,7 @@ CREATE TABLE IF NOT EXISTS kg_triples (
     created      DATETIME(6)  NOT NULL DEFAULT NOW(6),
     owner_id     VARCHAR(256) NOT NULL,
     namespace    VARCHAR(256),
+    extracted_by_run_id CHAR(36),
     deleted_at   DATETIME(6),
     PRIMARY KEY (id),
     INDEX idx_kg_memory  (memory_id),
@@ -1209,9 +1232,23 @@ CREATE TABLE IF NOT EXISTS morpheus_extract_run_memories (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
+_DDL_MORPHEUS_EXTRACT_FAILURES = """
+CREATE TABLE IF NOT EXISTS morpheus_extract_failures (
+    memory_id      VARCHAR(64) NOT NULL,
+    attempts       INT NOT NULL DEFAULT 1 CHECK (attempts >= 1),
+    status         VARCHAR(16) NOT NULL DEFAULT 'retryable',
+    last_error     TEXT NOT NULL,
+    last_failed_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+    PRIMARY KEY (memory_id),
+    KEY idx_morpheus_extract_failures_triage (status, last_failed_at DESC),
+    CHECK (status IN ('retryable', 'dead_letter'))
+) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
 
 _INIT_DDLS = [
     _DDL_MEMORIES,
+    _DDL_MEMORY_TAGS,
     _DDL_DELETION_REQUESTS,
     _DDL_DELETION_LOG,
     _DDL_MEMORY_ARCHIVE,
@@ -1240,6 +1277,7 @@ _INIT_DDLS = [
     _DDL_NATS_DISPATCH_LOG,
     _DDL_MORPHEUS_RUNS,
     _DDL_MORPHEUS_EXTRACT_RUN_MEMORIES,
+    _DDL_MORPHEUS_EXTRACT_FAILURES,
 ]
 
 
@@ -1582,6 +1620,58 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
             )
             return await _fetchone_dict(cursor)
 
+    async def replace_memory_tags(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        tags: Sequence[str],
+        *,
+        visibility: VisibilityFilter | None = None,
+    ) -> bool:
+        async with tx.conn.cursor() as cursor:
+            where = ["m.id = %s", "m.deleted_at IS NULL"]
+            params: list[Any] = [memory_id]
+            if visibility is not None:
+                clause, vis_params = _render_visibility(visibility, table_alias="m")
+                if clause:
+                    where.append(clause)
+                    params.extend(vis_params)
+            await cursor.execute(
+                "SELECT m.id FROM memories m WHERE "
+                + " AND ".join(where)
+                + " FOR UPDATE",
+                tuple(params),
+            )
+            if await cursor.fetchone() is None:
+                return False
+            await cursor.execute("DELETE FROM memory_tags WHERE memory_id = %s", (memory_id,))
+            if tags:
+                await cursor.executemany(
+                    "INSERT INTO memory_tags (memory_id, tag) VALUES (%s, %s)",
+                    [(memory_id, tag) for tag in tags],
+                )
+        return True
+
+    async def fetch_memory_tags(
+        self,
+        tx: Transaction,
+        memory_ids: Sequence[str],
+    ) -> dict[str, list[str]]:
+        if not memory_ids:
+            return {}
+        placeholders = ", ".join(["%s"] * len(memory_ids))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT memory_id, tag FROM memory_tags "
+                f"WHERE memory_id IN ({placeholders}) ORDER BY memory_id, tag",
+                list(memory_ids),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        result = {memory_id: [] for memory_id in memory_ids}
+        for row in rows:
+            result.setdefault(row["memory_id"], []).append(row["tag"])
+        return result
+
     async def set_suppress_version_snapshot(self, tx: Transaction) -> None:
         # MySQL schema has no version-snapshot trigger; suppression is implicit.
         return None
@@ -1629,6 +1719,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         limit: int = 20,
         offset: int = 0,
         include_archived: bool = False,
@@ -1651,6 +1742,13 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         if subcategory is not None:
             where.append("m.subcategory = %s")
             params.append(subcategory)
+        if tags:
+            placeholders = ", ".join(["%s"] * len(tags))
+            where.append(
+                "EXISTS (SELECT 1 FROM memory_tags mt "
+                f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+            )
+            params.extend(tags)
         where_sql = " AND ".join(where)
 
         async with conn.cursor() as cursor:
@@ -1895,6 +1993,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
@@ -1927,6 +2026,13 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
             if val is not None:
                 where.append(f"m.{col} = %s")
                 params.append(val)
+        if tags:
+            placeholders = ", ".join(["%s"] * len(tags))
+            where.append(
+                "EXISTS (SELECT 1 FROM memory_tags mt "
+                f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+            )
+            params.extend(tags)
 
         # MySQL 9.0 VECTOR_DISTANCE returns 0 for identical vectors and grows
         # with dissimilarity. Keep the SQL rank/order expression as the bare
@@ -2041,6 +2147,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
@@ -2070,6 +2177,13 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
             if val is not None:
                 where.append(f"m.{col} = %s")
                 params.append(val)
+        if tags:
+            placeholders = ", ".join(["%s"] * len(tags))
+            where.append(
+                "EXISTS (SELECT 1 FROM memory_tags mt "
+                f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+            )
+            params.extend(tags)
 
         conn = tx.conn
         async with conn.cursor() as cursor:
@@ -3333,10 +3447,13 @@ class MysqlMorpheusRepository(MorpheusRepository):
       sequential statements inside the same ``tx`` (same pattern
       SQLite / Oracle / Db2 use; consistent with item 7's
       ``claim_due_deliveries`` decomposition).
+    * **Item 11c phase writes**: cluster ids expand to ``IN (%s, ...)``;
+      CONSOLIDATE uses ``JSON_CONTAINS_PATH`` / ``JSON_SET`` and EXTRACT
+      uses ``ON DUPLICATE KEY UPDATE``.  Every multi-statement phase
+      operation remains inside the caller's transaction.
 
-    MariaDB overrides this with ``MariadbMorpheusRepository`` that
-    drops any MySQL-specific JSON CAST since MariaDB stores JSON as
-    LONGTEXT.
+    MariaDB overrides only writes that require MySQL's native JSON
+    ``CAST`` since MariaDB stores JSON as LONGTEXT.
     """
 
     _ORPHAN_TIMEOUT_ERROR = "orphan_timeout_sweep"
@@ -3437,9 +3554,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
         if not sets:
             return
         args.append(run_id)
-        sql = (
-            f"UPDATE morpheus_runs SET {', '.join(sets)} WHERE id = %s"
-        )
+        sql = f"UPDATE morpheus_runs SET {', '.join(sets)} WHERE id = %s"
         conn = tx.conn
         async with conn.cursor() as cursor:
             await cursor.execute(sql, tuple(args))
@@ -3469,8 +3584,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
         conn = tx.conn
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "UPDATE morpheus_runs SET status = 'success', "
-                "finished_at = CURRENT_TIMESTAMP WHERE id = %s",
+                "UPDATE morpheus_runs SET status = 'success', finished_at = CURRENT_TIMESTAMP WHERE id = %s",
                 (run_id,),
             )
 
@@ -3478,8 +3592,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
         conn = tx.conn
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "UPDATE morpheus_runs SET status = 'failed', "
-                "finished_at = CURRENT_TIMESTAMP, error = %s WHERE id = %s",
+                "UPDATE morpheus_runs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, error = %s WHERE id = %s",
                 (str(error)[:4000], run_id),
             )
 
@@ -3560,8 +3673,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
             placeholders = ", ".join(["%s"] * len(affected_ids))
             async with conn.cursor() as cursor:
                 await cursor.execute(
-                    f"UPDATE memories SET triples_extracted_at = NULL "
-                    f"WHERE id IN ({placeholders})",
+                    f"UPDATE memories SET triples_extracted_at = NULL WHERE id IN ({placeholders})",
                     tuple(affected_ids),
                 )
         n_extract_reset = len(affected_ids)
@@ -3646,8 +3758,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
             )
             n_run = int(cursor.rowcount or 0)
         _LOG.warning(
-            "[MORPHEUS] run %s rolled back: %d memories deleted, "
-            "%d extract markers reset",
+            "[MORPHEUS] run %s rolled back: %d memories deleted, %d extract markers reset",
             run_id,
             n_deleted,
             n_extract_reset,
@@ -3753,6 +3864,38 @@ class MysqlMorpheusRepository(MorpheusRepository):
             candidates=candidates,
         )
 
+    async def replay_scan_count(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> int:
+        """MySQL implementation of the MORPHEUS REPLAY count — item 11d.
+
+        MySQL/MariaDB do not support ``IS DISTINCT FROM``.  ``NOT
+        (provenance <=> 'morpheus_local')`` is its null-safe equivalent:
+        a NULL provenance remains eligible, exactly as it does under the
+        Postgres predicate.  MariaDB inherits this count unchanged; unlike
+        CLUSTER it does not touch MariaDB's separate embedding table.
+        """
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT COUNT(*)
+                  FROM memories m
+                  JOIN morpheus_runs r ON r.id = %s
+                 WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
+                   AND NOT (m.provenance <=> 'morpheus_local')
+                   AND m.morpheus_run_id IS NULL
+                   AND {_eligibility.eligible_for_morpheus('m')}
+                   AND (r.namespace IS NULL OR m.namespace = r.namespace)
+                """,
+                (run_id,),
+            )
+            row = await cursor.fetchone()
+        return int((row or (0,))[0] or 0)
+
     async def merge_run_config(
         self,
         tx: Transaction,
@@ -3807,6 +3950,359 @@ class MysqlMorpheusRepository(MorpheusRepository):
                 "UPDATE morpheus_runs SET config = CAST(%s AS JSON) WHERE id = %s",
                 (json.dumps(merged), run_id),
             )
+
+    async def phase_consolidate(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        consolidated_permission_mode: int,
+    ) -> MorpheusConsolidationResult | None:
+        """MySQL JSON/expanded-``IN`` CONSOLIDATE implementation."""
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT config, cluster_min_size, namespace FROM morpheus_runs WHERE id = %s FOR UPDATE",
+                (run_id,),
+            )
+            run_row = await cursor.fetchone()
+        if run_row is None:
+            return None
+        try:
+            config = run_row[0] if isinstance(run_row[0], dict) else json.loads(run_row[0] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        min_size = int(run_row[1])
+        namespace = run_row[2]
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        audit_path = "$.pre_consolidate_permission_mode"
+        memories_consolidated = 0
+        clusters_consolidated = 0
+        for cluster in clusters:
+            member_ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
+            if len(member_ids) < min_size:
+                continue
+            placeholders = ",".join("%s" for _ in member_ids)
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"""
+                    SELECT id, recall_count, created, permission_mode,
+                           consolidated_into, morpheus_run_id, metadata
+                      FROM memories
+                     WHERE id IN ({placeholders}) AND {eligibility_clause}
+                       AND (%s IS NULL OR namespace = %s)
+                     FOR UPDATE
+                    """,
+                    (*member_ids, namespace, namespace),
+                )
+                rows = await cursor.fetchall() or []
+            if not rows:
+                continue
+            canonical = sorted(
+                rows,
+                key=lambda row: (-int(row[1] or 0), row[2], str(row[0])),
+            )[0]
+            canonical_id = str(canonical[0])
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"""
+                    SELECT COUNT(*) FROM memories
+                     WHERE id IN ({placeholders})
+                       AND deleted_at IS NULL AND archived_at IS NULL
+                       AND consolidated_into = %s AND morpheus_run_id = %s
+                       AND JSON_CONTAINS_PATH(COALESCE(metadata, JSON_OBJECT()), 'one', %s)
+                       AND (%s IS NULL OR namespace = %s)
+                    """,
+                    (*member_ids, canonical_id, run_id, audit_path, namespace, namespace),
+                )
+                count_row = await cursor.fetchone()
+            cluster_count = int(count_row[0] if count_row else 0)
+            if len(rows) + cluster_count < min_size:
+                continue
+            for row in rows:
+                member_id = str(row[0])
+                if member_id == canonical_id:
+                    continue
+                async with conn.cursor() as cursor:
+                    await cursor.execute(
+                        """
+                        UPDATE memories
+                           SET consolidated_into = %s, consolidated_at = NOW(6),
+                               permission_mode = %s, morpheus_run_id = %s,
+                               metadata = CASE
+                                   WHEN JSON_CONTAINS_PATH(
+                                       COALESCE(metadata, JSON_OBJECT()), 'one', %s)
+                                   THEN COALESCE(metadata, JSON_OBJECT())
+                                   ELSE JSON_SET(
+                                       COALESCE(metadata, JSON_OBJECT()), %s,
+                                       %s)
+                               END
+                         WHERE id = %s AND deleted_at IS NULL AND archived_at IS NULL
+                           AND consolidated_into IS NULL AND morpheus_run_id IS NULL
+                           AND (%s IS NULL OR namespace = %s)
+                        """,
+                        (
+                            canonical_id,
+                            int(consolidated_permission_mode),
+                            run_id,
+                            audit_path,
+                            audit_path,
+                            int(row[3] or 0),
+                            member_id,
+                            namespace,
+                            namespace,
+                        ),
+                    )
+                    cluster_count += int(cursor.rowcount or 0)
+            if cluster_count:
+                memories_consolidated += cluster_count
+                clusters_consolidated += 1
+        await self.update_counters(
+            tx,
+            run_id,
+            memories_consolidated=memories_consolidated,
+            clusters_consolidated=clusters_consolidated,
+        )
+        return MorpheusConsolidationResult(memories_consolidated, clusters_consolidated)
+
+    async def phase_synthesise_load(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> list[MorpheusSynthesisCluster] | None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT config FROM morpheus_runs WHERE id = %s", (run_id,))
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        try:
+            config = row[0] if isinstance(row[0], dict) else json.loads(row[0] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        loaded: list[MorpheusSynthesisCluster] = []
+        for cluster in clusters:
+            member_ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
+            if not member_ids:
+                continue
+            placeholders = ",".join("%s" for _ in member_ids)
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"SELECT id, content, category, owner_id, namespace FROM memories "
+                    f"WHERE id IN ({placeholders}) AND {eligibility_clause}",
+                    tuple(member_ids),
+                )
+                rows = await cursor.fetchall() or []
+            members = tuple(
+                MorpheusSynthesisMember(
+                    id=str(item[0]),
+                    content=str(item[1] or ""),
+                    category=item[2],
+                    owner_id=item[3],
+                    namespace=item[4],
+                )
+                for item in rows
+            )
+            if members:
+                loaded.append(MorpheusSynthesisCluster(cluster.get("cluster_id"), members))
+        return loaded
+
+    async def phase_synthesise_store(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        content: str,
+        category: str | None,
+        owner_id: str,
+        namespace: str,
+        run_id: str,
+        source_memory_ids: Sequence[str],
+        metadata: Mapping[str, Any],
+    ) -> None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO memories
+                    (id, content, content_hash, category, subcategory, metadata,
+                     quality_rating, verbatim_content, owner_id, namespace,
+                     permission_mode, morpheus_run_id, source_memories, provenance)
+                VALUES (%s, %s, SHA2(%s, 256), %s, 'morpheus-synthesis', %s,
+                        75, %s, %s, %s, 600, %s, CAST(%s AS JSON), 'morpheus_local')
+                """,
+                (
+                    memory_id,
+                    content,
+                    content,
+                    category,
+                    json.dumps(dict(metadata)),
+                    content,
+                    owner_id,
+                    namespace,
+                    run_id,
+                    json.dumps(list(source_memory_ids)),
+                ),
+            )
+
+    async def phase_extract_load(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        min_chars: int,
+        max_input_count: int,
+    ) -> MorpheusExtractBatch | None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT config, namespace, window_ended_at FROM morpheus_runs WHERE id = %s",
+                (run_id,),
+            )
+            run_row = await cursor.fetchone()
+        if run_row is None:
+            return None
+        try:
+            config = run_row[0] if isinstance(run_row[0], dict) else json.loads(run_row[0] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        eligibility_clause = _eligibility.eligible_for_morpheus("m")
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT m.id, m.verbatim_content, m.owner_id, m.namespace
+                  FROM memories m
+                  LEFT JOIN morpheus_extract_failures failure ON failure.memory_id = m.id
+                 WHERE {eligibility_clause}
+                   AND m.created <= %s AND m.triples_extracted_at IS NULL
+                   AND m.verbatim_content IS NOT NULL
+                   AND CHAR_LENGTH(m.verbatim_content) >= %s
+                   AND (%s IS NULL OR m.namespace = %s)
+                   AND (failure.status IS NULL OR failure.status <> 'dead_letter')
+                 ORDER BY m.created, m.id LIMIT %s
+                """,
+                (run_row[2], int(min_chars), run_row[1], run_row[1], int(max_input_count)),
+            )
+            rows = await cursor.fetchall() or []
+        return MorpheusExtractBatch(
+            config,
+            run_row[1],
+            tuple(
+                MorpheusExtractCandidate(
+                    id=str(item[0]),
+                    verbatim_content=str(item[1] or ""),
+                    owner_id=str(item[2]),
+                    namespace=str(item[3]),
+                )
+                for item in rows
+            ),
+        )
+
+    async def phase_extract_failure(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        max_failures: int,
+        error: str,
+    ) -> MorpheusExtractFailure | None:
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT id FROM memories WHERE id = %s AND triples_extracted_at IS NULL FOR UPDATE",
+                (memory_id,),
+            )
+            if await cursor.fetchone() is None:
+                return None
+            await cursor.execute(
+                """
+                INSERT INTO morpheus_extract_failures
+                    (memory_id, attempts, status, last_error, last_failed_at)
+                VALUES (%s, 1,
+                        CASE WHEN %s <= 1 THEN 'dead_letter' ELSE 'retryable' END,
+                        %s, NOW(6))
+                ON DUPLICATE KEY UPDATE
+                    status = CASE WHEN attempts + 1 >= %s
+                                  THEN 'dead_letter' ELSE 'retryable' END,
+                    attempts = attempts + 1,
+                    last_error = VALUES(last_error),
+                    last_failed_at = VALUES(last_failed_at)
+                """,
+                (memory_id, int(max_failures), str(error)[:2000], int(max_failures)),
+            )
+            await cursor.execute(
+                "SELECT attempts, status FROM morpheus_extract_failures WHERE memory_id = %s",
+                (memory_id,),
+            )
+            row = await cursor.fetchone()
+        return MorpheusExtractFailure(int(row[0]), str(row[1]))
+
+    async def phase_extract_store(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        candidate: MorpheusExtractCandidate,
+        triples: Sequence[tuple[str, str, str, str, float]],
+    ) -> bool:
+        conn = tx.conn
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                UPDATE memories SET triples_extracted_at = NOW(6)
+                 WHERE id = %s AND triples_extracted_at IS NULL
+                   AND {eligibility_clause}
+                   AND (%s IS NULL OR namespace = %s)
+                """,
+                (candidate.id, candidate.namespace, candidate.namespace),
+            )
+            if int(cursor.rowcount or 0) == 0:
+                return False
+            await cursor.execute(
+                "DELETE FROM morpheus_extract_failures WHERE memory_id = %s",
+                (candidate.id,),
+            )
+            await cursor.execute(
+                """
+                INSERT INTO morpheus_extract_run_memories (run_id, memory_id)
+                VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE processed_at = NOW(6)
+                """,
+                (run_id, candidate.id),
+            )
+            for triple_id, subject, predicate, object_, confidence in triples:
+                await cursor.execute(
+                    """
+                    INSERT INTO kg_triples
+                        (id, subject, predicate, object, memory_id, confidence,
+                         extracted_by_run_id, owner_id, namespace)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        triple_id,
+                        subject,
+                        predicate,
+                        object_,
+                        candidate.id,
+                        float(confidence),
+                        run_id,
+                        candidate.owner_id,
+                        candidate.namespace,
+                    ),
+                )
+        await self.increment_extract_counters(
+            tx,
+            run_id,
+            triples_extracted=len(triples),
+            memories_processed=1,
+        )
+        return True
 
 
 class MysqlCompressionQueueRepository(CompressionQueueRepository):
@@ -4080,9 +4576,7 @@ class MysqlCompressionQueueRepository(CompressionQueueRepository):
                 """
             )
             row = await _fetchone_dict(cursor)
-            await cursor.execute(
-                "SELECT COUNT(*) AS variants FROM memory_compressed_variants"
-            )
+            await cursor.execute("SELECT COUNT(*) AS variants FROM memory_compressed_variants")
             variants_row = await _fetchone_dict(cursor)
 
         variants = (variants_row or {}).get("variants", 0)
@@ -4153,9 +4647,7 @@ class MysqlWebhookRepository(WebhookRepository):
             row = await _fetchone_dict(cursor)
         value = row["db_now"] if row else None
         if not isinstance(value, datetime):
-            raise RuntimeError(
-                f"mysql: expected NOW(6) datetime from SELECT, got {value!r}"
-            )
+            raise RuntimeError(f"mysql: expected NOW(6) datetime from SELECT, got {value!r}")
         if value.tzinfo is None:
             value = value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
@@ -4259,8 +4751,7 @@ class MysqlWebhookRepository(WebhookRepository):
             params.append(namespace)
         sql = (
             "SELECT id, url, events, description, owner_id, namespace, "
-            "created, revoked, revoked_at FROM webhook_subscriptions WHERE "
-            + " AND ".join(conditions)
+            "created, revoked, revoked_at FROM webhook_subscriptions WHERE " + " AND ".join(conditions)
         )
         async with conn.cursor() as cursor:
             await cursor.execute(sql, tuple(params))
@@ -4284,11 +4775,7 @@ class MysqlWebhookRepository(WebhookRepository):
             params.append(owner_id)
             conditions.append("namespace = %s")
             params.append(namespace)
-        sql = (
-            "UPDATE webhook_subscriptions "
-            "SET revoked = 1, revoked_at = NOW(6) "
-            "WHERE " + " AND ".join(conditions)
-        )
+        sql = "UPDATE webhook_subscriptions SET revoked = 1, revoked_at = NOW(6) WHERE " + " AND ".join(conditions)
         async with conn.cursor() as cursor:
             await cursor.execute(sql, tuple(params))
             return (await self._row_count(cursor)) > 0
@@ -4345,9 +4832,8 @@ class MysqlWebhookRepository(WebhookRepository):
         if namespace is not None:
             conditions.append("namespace = %s")
             params.append(namespace)
-        sql_sub = (
-            "SELECT id, url, owner_id, namespace, events FROM webhook_subscriptions WHERE "
-            + " AND ".join(conditions)
+        sql_sub = "SELECT id, url, owner_id, namespace, events FROM webhook_subscriptions WHERE " + " AND ".join(
+            conditions
         )
         async with conn.cursor() as cursor:
             await cursor.execute(sql_sub, tuple(params))
@@ -4439,8 +4925,7 @@ class MysqlWebhookRepository(WebhookRepository):
         # CTE-like construct (MySQL CTEs cannot be SELECTed in UPDATE for
         # multi-row use). Capture the current DB time once and pass it in.
         claim_now = await self._db_now(conn)
-        update_sql = (
-            """
+        update_sql = """
             UPDATE webhook_deliveries
             SET lease_token = %s,
                 lease_expires_at = %s + INTERVAL %s SECOND,
@@ -4467,7 +4952,6 @@ class MysqlWebhookRepository(WebhookRepository):
                 )
               )
             """
-        )
         params = (
             lease_token,
             claim_now,
@@ -4525,8 +5009,7 @@ class MysqlWebhookRepository(WebhookRepository):
         # (it filters by the column values on its own rows); the
         # correlated ``peer`` / ``newer`` checks reference the same
         # ``webhook_deliveries`` table inside EXISTS clauses.
-        update_sql = (
-            """
+        update_sql = """
             UPDATE webhook_deliveries d
             STRAIGHT_JOIN (
                 SELECT w_inner.id, w_inner.subscription_id, w_inner.event_type,
@@ -4564,7 +5047,6 @@ class MysqlWebhookRepository(WebhookRepository):
                 d.lease_expires_at = %s + INTERVAL %s SECOND,
                 d.status = CASE WHEN d.status = 'pending' THEN 'retrying' ELSE d.status END
             """
-        )
         params = (
             claim_now,
             int(max_attempts),
@@ -5309,9 +5791,7 @@ class MysqlWebhookRepository(WebhookRepository):
         conn = _mysql_tx(tx).conn
         if subscription_id is None:
             async with conn.cursor() as cursor:
-                await cursor.execute(
-                    "SELECT * FROM webhook_deliveries ORDER BY created ASC"
-                )
+                await cursor.execute("SELECT * FROM webhook_deliveries ORDER BY created ASC")
                 return await _fetch_all_dicts(cursor)
         async with conn.cursor() as cursor:
             await cursor.execute(
@@ -5339,8 +5819,7 @@ _MYSQL_WEBHOOK_CLAIM_SELECT = (
 def _validate_webhook_scope(owner_id: str | None, namespace: str | None, method: str) -> None:
     if (owner_id is None) != (namespace is None):
         raise ValueError(
-            f"{method} requires both owner_id and namespace to be set, "
-            "or both to be None for a root/operator view"
+            f"{method} requires both owner_id and namespace to be set, or both to be None for a root/operator view"
         )
 
 
@@ -5386,11 +5865,7 @@ def _mysql_webhook_subscription(row: Any) -> WebhookSubscriptionRecord:
         namespace=row["namespace"],
         created=_mysql_webhook_datetime(row["created"]),
         revoked=bool(row["revoked"]),
-        revoked_at=(
-            _mysql_webhook_datetime(row["revoked_at"])
-            if row.get("revoked_at") is not None
-            else None
-        ),
+        revoked_at=(_mysql_webhook_datetime(row["revoked_at"]) if row.get("revoked_at") is not None else None),
     )
 
 
@@ -5410,19 +5885,13 @@ def _mysql_webhook_delivery(row: Any) -> WebhookDeliveryRecord:
         response_body=row.get("response_body"),
         error=row.get("error"),
         scheduled_at=_mysql_webhook_datetime(row["scheduled_at"]),
-        delivered_at=(
-            _mysql_webhook_datetime(row["delivered_at"])
-            if row.get("delivered_at") is not None
-            else None
-        ),
+        delivered_at=(_mysql_webhook_datetime(row["delivered_at"]) if row.get("delivered_at") is not None else None),
         created=_mysql_webhook_datetime(row["created"]),
         status_updated_at=_mysql_webhook_datetime(row["status_updated_at"]),
         superseded=bool(row["superseded"]),
         lease_token=str(row["lease_token"]) if row.get("lease_token") is not None else None,
         lease_expires_at=(
-            _mysql_webhook_datetime(row["lease_expires_at"])
-            if row.get("lease_expires_at") is not None
-            else None
+            _mysql_webhook_datetime(row["lease_expires_at"]) if row.get("lease_expires_at") is not None else None
         ),
         writer_revision=int(row["writer_revision"] or 0),
     )
@@ -5437,9 +5906,7 @@ def _mysql_webhook_claim(row: Any, lease_token: str, claim_now: datetime) -> Web
     if row_token is None:
         row_token = row.get("lease_token_echo")
     if row_token is not None and str(row_token) != lease_token:
-        raise ValueError(
-            "mysql: lease_token returned by UPDATE does not match caller-supplied token"
-        )
+        raise ValueError("mysql: lease_token returned by UPDATE does not match caller-supplied token")
     delivery = _mysql_webhook_delivery(row)
     return WebhookDeliveryClaim(
         delivery=delivery,
@@ -5464,10 +5931,7 @@ def _mysql_webhook_chain_lock_name(delivery: Any) -> str:
     with a deterministic, short namespace tag to keep the lock name
     inside MySQL's 64-character limit.
     """
-    key = (
-        f"mnemos:webhook:chain:"
-        f"{delivery['subscription_id']}:{delivery['event_type']}:{delivery['payload_hash']}"
-    )
+    key = f"mnemos:webhook:chain:{delivery['subscription_id']}:{delivery['event_type']}:{delivery['payload_hash']}"
     # MySQL 5.7+ accepts up to 64 chars; the chain triple is well under.
     return key[:64]
 
@@ -5965,7 +6429,6 @@ class MysqlConsultationAuditRepository(ConsultationAuditRepository):
 
 
 class MysqlFederationRepository(FederationRepository):
-
     #: How a JSON-typed column is bound in an INSERT/UPDATE.
     #:
     #: MySQL has a real JSON type and wants the explicit cast. MariaDB does
@@ -6980,10 +7443,7 @@ class MysqlOAuthRepository(MysqlBrowserOAuthMixin, MCPOAuthRepositoryMixin, OAut
             # Opaque MCP identifiers use VARBINARY so PAD SPACE collations
             # cannot turn an altered client/code/token into a valid credential.
             if row is not None:
-                row = {
-                    key: value.decode("utf-8") if isinstance(value, bytes) else value
-                    for key, value in row.items()
-                }
+                row = {key: value.decode("utf-8") if isinstance(value, bytes) else value for key, value in row.items()}
             return row
 
     async def _mcp_execute(self, tx: Transaction, sql: str, params: tuple = ()) -> int:
@@ -7460,7 +7920,16 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                         "consolidated_at": "consolidated_at DATETIME(6)",
                         "federation_last_pushed_at": "federation_last_pushed_at DATETIME(6)",
                         "federation_push_peer": "federation_push_peer VARCHAR(512)",
+                        "morpheus_run_id": "morpheus_run_id CHAR(36)",
+                        "source_memories": "source_memories JSON",
+                        "provenance": "provenance VARCHAR(64)",
+                        "triples_extracted_at": "triples_extracted_at DATETIME(6)",
                     },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "kg_triples",
+                    {"extracted_by_run_id": "extracted_by_run_id CHAR(36)"},
                 )
                 await _ensure_mysql_columns(
                     conn,

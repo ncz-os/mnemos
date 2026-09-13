@@ -1,17 +1,9 @@
 """Tests for MORPHEUS slice 4: EXTRACT.
 
-Item 11a (ABC migration): ``phase_extract`` still takes a raw
-``asyncpg.Pool`` (its own per-row SQL is out of scope), but the
-``rollback_run`` helper now routes through
-``backend.morpheus.rollback_run``. The two rollback tests at the bottom
-of this file therefore need a backend-shaped mock with a
-``morpheus.rollback_run`` impl that performs the same SQL semantics
-the legacy raw-asyncpg path did — delete kg_triples tagged with the
-run, drop the morpheus_extract_run_memories rows, clear
-``triples_extracted_at`` on the affected memories, and flip the run row
-to ``status='rolled_back'``. The original ``_Pool`` / ``_Conn`` mocks
-are retained for the ``phase_extract`` tests (which still take a
-pool).
+Item 11c routes EXTRACT candidate loading, retry upserts, atomic source
+claims, triple inserts, and counters through ``backend.morpheus``. The
+runner retains its pool parameter for compatibility; these backend-shaped
+fakes pin the new transaction boundaries and item 11a rollback semantics.
 """
 
 from __future__ import annotations
@@ -234,6 +226,9 @@ class _Conn:
 class _Pool:
     def __init__(self, conn: _Conn):
         self.conn = conn
+        from mnemos.core import lifecycle as _lifecycle
+
+        _lifecycle._persistence_backend = _Backend(conn)
 
     def acquire(self):
         pool = self
@@ -273,9 +268,7 @@ class _Morpheus:
     async def update_counters(self, tx, run_id, **_kwargs):
         return None
 
-    async def increment_extract_counters(
-        self, tx, run_id, *, triples_extracted, memories_processed
-    ):
+    async def increment_extract_counters(self, tx, run_id, *, triples_extracted, memories_processed):
         return None
 
     async def finish_run(self, tx, run_id):
@@ -302,15 +295,9 @@ class _Morpheus:
             if row["run_id"] == run_id and row.get("memory_id")
         )
         # (b) Delete the kg_triples tagged with this run.
-        self._conn.kg_triples = [
-            row for row in self._conn.kg_triples
-            if row.get("extracted_by_run_id") != run_id
-        ]
+        self._conn.kg_triples = [row for row in self._conn.kg_triples if row.get("extracted_by_run_id") != run_id]
         # (c) Delete the morpheus_extract_run_memories rows.
-        self._conn.extract_run_memories = [
-            row for row in self._conn.extract_run_memories
-            if row["run_id"] != run_id
-        ]
+        self._conn.extract_run_memories = [row for row in self._conn.extract_run_memories if row["run_id"] != run_id]
         # (d) Reset triples_extracted_at on the affected memories.
         for memory_id in affected_memory_ids:
             row = self._conn.memories.get(memory_id)
@@ -330,6 +317,92 @@ class _Morpheus:
                     row["status"] = "rolled_back"
         n_run = 1
         return n_deleted, n_run
+
+    async def phase_extract_load(self, tx, *, run_id: str, min_chars: int, max_input_count: int):
+        from mnemos.persistence.base import MorpheusExtractBatch, MorpheusExtractCandidate
+
+        run = self._conn.run_row
+        if run is None:
+            return None
+        candidates = []
+        for row in sorted(self._conn.memories.values(), key=lambda item: (item["created"], item["id"])):
+            content = row.get("verbatim_content")
+            if row.get("deleted_at") is not None or row.get("archived_at") is not None:
+                continue
+            if row.get("consolidated_into") is not None or row.get("namespace") == "vault":
+                continue
+            if row.get("triples_extracted_at") is not None:
+                continue
+            if self._conn.extract_failures.get(row["id"], {}).get("status") == "dead_letter":
+                continue
+            if content is None or len(content) < min_chars:
+                continue
+            namespace = run.get("namespace")
+            if namespace is not None and row.get("namespace") != namespace:
+                continue
+            if row["created"] > run["window_ended_at"]:
+                continue
+            candidates.append(MorpheusExtractCandidate(row["id"], content, row["owner_id"], row["namespace"]))
+        return MorpheusExtractBatch(
+            dict(run.get("config") or {}),
+            run.get("namespace"),
+            tuple(candidates[:max_input_count]),
+        )
+
+    async def phase_extract_failure(self, tx, *, memory_id: str, max_failures: int, error: str):
+        from mnemos.persistence.base import MorpheusExtractFailure
+
+        memory = self._conn.memories.get(memory_id)
+        if memory is None or memory.get("triples_extracted_at") is not None:
+            return None
+        attempts = self._conn.extract_failures.get(memory_id, {}).get("attempts", 0) + 1
+        status = "dead_letter" if attempts >= max_failures else "retryable"
+        self._conn.extract_failures[memory_id] = {
+            "memory_id": memory_id,
+            "attempts": attempts,
+            "status": status,
+            "last_error": error,
+            "last_failed_at": "now",
+        }
+        return MorpheusExtractFailure(attempts, status)
+
+    async def phase_extract_store(self, tx, *, run_id: str, candidate, triples):
+        memory = self._conn.memories.get(candidate.id)
+        if memory is None or memory.get("triples_extracted_at") is not None:
+            return False
+        if memory.get("deleted_at") is not None or memory.get("archived_at") is not None:
+            return False
+        if memory.get("consolidated_into") is not None or memory.get("namespace") == "vault":
+            return False
+        if self._conn.run_row.get("namespace") is not None and memory.get("namespace") != self._conn.run_row.get(
+            "namespace"
+        ):
+            return False
+        memory["triples_extracted_at"] = "now"
+        for triple_id, subject, predicate, object_, confidence in triples:
+            self._conn.kg_triples.append(
+                {
+                    "id": triple_id,
+                    "subject": subject,
+                    "predicate": predicate,
+                    "object": object_,
+                    "memory_id": candidate.id,
+                    "confidence": confidence,
+                    "extracted_by_run_id": run_id,
+                    "owner_id": candidate.owner_id,
+                    "namespace": candidate.namespace,
+                }
+            )
+        self._conn.extract_run_memories = [
+            row
+            for row in self._conn.extract_run_memories
+            if not (row["run_id"] == run_id and row["memory_id"] == candidate.id)
+        ]
+        self._conn.extract_run_memories.append({"run_id": run_id, "memory_id": candidate.id, "processed_at": "now"})
+        self._conn.extract_failures.pop(candidate.id, None)
+        self._conn.run_row["triples_extracted"] += len(triples)
+        self._conn.run_row["memories_processed_for_extraction"] += 1
+        return True
 
 
 class _Backend:
