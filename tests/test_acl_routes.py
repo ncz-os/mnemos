@@ -356,7 +356,7 @@ def test_revoke_404_does_not_invalidate_search_cache(monkeypatch):
 
 
 def test_sqlite_acl_grant_widens_read_within_namespace(tmp_path):
-    from mnemos.persistence.sqlite import SqliteBackend
+    from mnemos.persistence.sqlite import SqliteBackend, _commit, _execute
     from mnemos.persistence.visibility import VisibilityFilter
 
     class _S:
@@ -399,11 +399,12 @@ def test_sqlite_acl_grant_widens_read_within_namespace(tmp_path):
             # Insert a per-principal grant directly (SQLite has no mgmt API).
             async with backend.transactional() as tx:
                 conn = tx.conn if hasattr(tx, "conn") else tx._conn  # type: ignore[attr-defined]
-                await conn.execute(
+                await _execute(
+                    conn,
                     "INSERT INTO memory_acl (memory_id, principal, perm, granted_by) VALUES (?, ?, ?, ?)",
                     ("m-acl", "user:alice", 4, "bob"),
                 )
-                await conn.commit()
+                await _commit(conn)
 
             async with backend.transactional() as tx:
                 after = await backend.memories.get_memory(tx, "m-acl", visibility=vis)

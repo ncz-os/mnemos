@@ -7,12 +7,21 @@ of 768 (nomic-embed-text default) when no settings are wired.
 """
 from __future__ import annotations
 
+from contextlib import closing
 import logging
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
 
 from mnemos.persistence.sqlite import SqliteBackend
+
+
+def _seed_database(db_path, *statements: str) -> None:
+    with closing(sqlite3.connect(db_path)) as conn:
+        for statement in statements:
+            conn.execute(statement)
+        conn.commit()
 
 
 def _make_settings(dim):
@@ -83,14 +92,11 @@ async def test_existing_vec_table_dim_parses_ddl_correctly(tmp_path):
     preserved verbatim, which is enough to exercise the regex parser
     without depending on sqlite-vec being loadable.
     """
-    import aiosqlite
-
     db_path = tmp_path / "manual.sqlite3"
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await conn.execute(
-            "CREATE TABLE memory_embedding_vec (id INT, marker TEXT DEFAULT 'float[1024]')"
-        )
-        await conn.commit()
+    _seed_database(
+        db_path,
+        "CREATE TABLE memory_embedding_vec (id INT, marker TEXT DEFAULT 'float[1024]')",
+    )
 
     backend = SqliteBackend(db_path, _make_settings(1024))
     await backend.open()
@@ -126,14 +132,11 @@ async def test_vec0_dim_mismatch_raises_with_migration_instructions(tmp_path):
     rows in memory_embeddings (cosine garbage). The right behavior is to
     refuse to start so the operator runs the documented migration.
     """
-    import aiosqlite
-
     db_path = tmp_path / "mismatch.sqlite3"
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await conn.execute(
-            "CREATE TABLE memory_embedding_vec (id INT, marker TEXT DEFAULT 'float[768]')"
-        )
-        await conn.commit()
+    _seed_database(
+        db_path,
+        "CREATE TABLE memory_embedding_vec (id INT, marker TEXT DEFAULT 'float[768]')",
+    )
 
     backend = SqliteBackend(db_path, _make_settings(512))
     with pytest.raises(RuntimeError) as exc_info:
@@ -154,22 +157,21 @@ async def test_fallback_dim_mismatch_raises_with_migration_instructions(tmp_path
     and search uses the fallback shadow table. Stale-dim rows + new-dim
     queries = garbage cosine scores; refuse to start.
     """
-    import aiosqlite
-
     db_path = tmp_path / "fb_mismatch.sqlite3"
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await conn.execute(
+    _seed_database(
+        db_path,
+        (
             "CREATE TABLE memory_embeddings ("
             "memory_id TEXT PRIMARY KEY, "
             "embedding TEXT NOT NULL, "
             "updated_at TEXT)"
-        )
+        ),
         # Stash a 5-element JSON array (dim=5 to keep the fixture small)
-        await conn.execute(
+        (
             "INSERT INTO memory_embeddings(memory_id, embedding, updated_at) "
             "VALUES ('mem1', '[0.1, 0.2, 0.3, 0.4, 0.5]', '2026-05-06')"
-        )
-        await conn.commit()
+        ),
+    )
 
     backend = SqliteBackend(db_path, _make_settings(512))
     with pytest.raises(RuntimeError) as exc_info:
@@ -188,31 +190,30 @@ async def test_fallback_mixed_dim_rows_fail_closed(tmp_path):
     Round-3 codex finding: a single-row sample could miss this. The fix scans
     all rows; even if 99 rows match and 1 doesn't, startup must fail.
     """
-    import aiosqlite
-
     db_path = tmp_path / "mixed_fb.sqlite3"
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await conn.execute(
+    _seed_database(
+        db_path,
+        (
             "CREATE TABLE memory_embeddings ("
             "memory_id TEXT PRIMARY KEY, "
             "embedding TEXT NOT NULL, "
             "updated_at TEXT)"
-        )
+        ),
         # 2 rows at the configured dim (3) — small fixture for fast test.
-        await conn.execute(
+        (
             "INSERT INTO memory_embeddings(memory_id, embedding, updated_at) "
             "VALUES ('match1', '[0.1, 0.2, 0.3]', '2026-05-06')"
-        )
-        await conn.execute(
+        ),
+        (
             "INSERT INTO memory_embeddings(memory_id, embedding, updated_at) "
             "VALUES ('match2', '[0.4, 0.5, 0.6]', '2026-05-06')"
-        )
+        ),
         # 1 stale row at dim=5.
-        await conn.execute(
+        (
             "INSERT INTO memory_embeddings(memory_id, embedding, updated_at) "
             "VALUES ('stale1', '[0.7, 0.8, 0.9, 1.0, 1.1]', '2026-05-05')"
-        )
-        await conn.commit()
+        ),
+    )
 
     backend = SqliteBackend(db_path, _make_settings(3))
     with pytest.raises(RuntimeError) as exc_info:
@@ -228,36 +229,35 @@ async def test_fallback_mixed_dim_rows_fail_closed(tmp_path):
 @pytest.mark.asyncio
 async def test_scan_fallback_dims_returns_histogram(tmp_path):
     """The scan helper returns {dim: count} so the guard can describe shape."""
-    import aiosqlite
-
     db_path = tmp_path / "histogram.sqlite3"
-    async with aiosqlite.connect(str(db_path)) as conn:
-        await conn.execute(
+    _seed_database(
+        db_path,
+        (
             "CREATE TABLE memory_embeddings ("
             "memory_id TEXT PRIMARY KEY, "
             "embedding TEXT NOT NULL, "
             "updated_at TEXT)"
-        )
-        await conn.execute(
+        ),
+        (
             "INSERT INTO memory_embeddings(memory_id, embedding, updated_at) "
             "VALUES ('a', '[0.1, 0.2]', '2026-05-06')"
-        )
-        await conn.execute(
+        ),
+        (
             "INSERT INTO memory_embeddings(memory_id, embedding, updated_at) "
             "VALUES ('b', '[0.3, 0.4]', '2026-05-06')"
-        )
-        await conn.execute(
+        ),
+        (
             "INSERT INTO memory_embeddings(memory_id, embedding, updated_at) "
             "VALUES ('c', '[0.5, 0.6, 0.7]', '2026-05-06')"
-        )
-        await conn.commit()
+        ),
+    )
 
     # Use a backend pointed at the prepared DB but don't trip the guard yet —
     # call _scan_fallback_embedding_dims directly via a fresh connection.
     backend = SqliteBackend(db_path, _make_settings(2))
     # Open in a way that bypasses the guard for this isolated helper test —
     # make a side connection.
-    async with aiosqlite.connect(str(db_path)) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.row_factory = lambda c, r: {col[0]: r[i] for i, col in enumerate(c.description)}
         histogram = await backend._scan_fallback_embedding_dims(conn)
     assert histogram == {2: 2, 3: 1}

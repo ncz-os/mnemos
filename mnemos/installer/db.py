@@ -645,6 +645,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0039_subscription_plan_current_limits.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0043_memory_acl.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0048_memory_versions_visibility.sql",
+        repo_path / "mnemos" / "db_migrations" / "migrations" / "0054_memory_tags.sql",
     ]
 
     if selected_components:

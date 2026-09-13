@@ -47,6 +47,7 @@ from mnemos.domain.models import (
     DEFAULT_SEMANTIC_FLOOR,
     DEFAULT_SEMANTIC_MARGIN_FLOOR,
     METRIC_COSINE_DISTANCE,
+    MAX_TAGS_PER_REQUEST,
     SEMANTIC_SCORE_KEY,
     is_ood_result_set,
     BulkCreateRequest,
@@ -66,6 +67,25 @@ from mnemos.domain.models import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["memories"])
+
+
+async def _attach_memory_tags(backend, tx, rows: list) -> list[dict]:
+    """Attach sorted tag lists without backend-specific aggregation SQL."""
+    if not rows:
+        return []
+    materialized = [dict(row.items()) if hasattr(row, "items") else dict(row) for row in rows]
+    tags_by_id = await backend.memories.fetch_memory_tags(
+        tx,
+        [str(row["id"]) for row in materialized],
+    )
+    for row in materialized:
+        row["tags"] = tags_by_id.get(str(row["id"]), [])
+    return materialized
+
+
+async def _attach_memory_tags_one(backend, tx, row):
+    rows = await _attach_memory_tags(backend, tx, [row] if row is not None else [])
+    return rows[0] if rows else None
 
 
 @dataclass
@@ -772,6 +792,7 @@ async def _bump_recall_counters(memory_ids: list) -> None:
 async def list_memories(
     category: Optional[str] = None,
     subcategory: Optional[str] = None,
+    tags: Optional[list[str]] = Query(None, max_length=MAX_TAGS_PER_REQUEST),
     namespace: Optional[str] = None,
     include_archived: bool = False,
     exclude_superseded: bool = False,
@@ -821,9 +842,12 @@ async def list_memories(
         limit = 20
     if not isinstance(offset, int):
         offset = 0
+    if not isinstance(tags, list):
+        tags = None
     list_request = MemoryListRequest(
         category=category,
         subcategory=subcategory,
+        tags=tags,
         namespace=namespace,
         include_archived=include_archived,
         exclude_superseded=exclude_superseded,
@@ -833,6 +857,7 @@ async def list_memories(
         operational=operational,
     )
     exclude_superseded_effective = bool(list_request.exclude_superseded or list_request.current_only)
+    tags = list_request.tags
 
     async with backend.transactional() as tx:
         await _maybe_set_pg_rls(tx, user)
@@ -841,11 +866,13 @@ async def list_memories(
             visibility=visibility,
             category=category,
             subcategory=subcategory,
+            tags=tags,
             limit=limit,
             offset=offset,
             include_archived=include_archived,
             exclude_superseded=exclude_superseded_effective,
         )
+        rows = await _attach_memory_tags(backend, tx, rows)
     redact = _should_redact_secrets(user, namespace=effective_namespace)
     frame = _should_frame_data(user, operational=operational)
     return MemoryListResponse(
@@ -922,6 +949,7 @@ async def get_memory(
         )
         if not row:
             raise HTTPException(status_code=404, detail="Memory not found")
+        row = await _attach_memory_tags_one(backend, tx, row)
         archived_at = _row_archived_at(row)
         if archived_at is not None:
             if restore:
@@ -995,6 +1023,7 @@ async def get_memory(
             )
             if not row:
                 raise HTTPException(status_code=404, detail="Memory not found after restore")
+            row = await _attach_memory_tags_one(backend, tx, row)
             if narrate_format is not None:
                 from mnemos.api.routes.narrate import build_narration_body
 
@@ -1325,6 +1354,7 @@ async def search_memories(
         request_limit,
         request.category,
         request.subcategory,
+        sorted(request.tags or []),
         "semantic" if request.semantic else "fts",
         request.source_provider,
         request.source_model,
@@ -1401,6 +1431,7 @@ async def search_memories(
                 visibility=visibility,
                 category=request.category,
                 subcategory=request.subcategory,
+                tags=request.tags,
                 source_provider=request.source_provider,
                 source_model=request.source_model,
                 source_agent=request.source_agent,
@@ -1431,6 +1462,7 @@ async def search_memories(
                         visibility=visibility,
                         category=request.category,
                         subcategory=request.subcategory,
+                        tags=request.tags,
                         source_provider=request.source_provider,
                         source_model=request.source_model,
                         source_agent=request.source_agent,
@@ -1548,6 +1580,8 @@ async def search_memories(
                             rows = []
         else:
             rows = await _fts_fallback()
+
+        rows = await _attach_memory_tags(backend, tx, rows)
 
     _log_search_phase(search_trace_id, search_started_at, "metadata_fetch")
     # Redact-at-retrieval: mask credential spans unless this is a root
@@ -1754,6 +1788,7 @@ async def create_memory(
                         status_code=409,
                         content=duplicate_content_error_body(dedup.existing_id),
                     )
+                row = await _attach_memory_tags_one(backend, tx, row)
                 response.status_code = 200
                 return _row_to_memory(row)
             # The Postgres trg_memory_version_insert trigger writes
@@ -1820,6 +1855,8 @@ async def create_memory(
                 created=None,
                 updated=None,
             )
+            if request.tags:
+                await backend.memories.replace_memory_tags(tx, mem_id, request.tags)
             await _write_memory_mutation_audit_entry(
                 backend,
                 tx,
@@ -1860,6 +1897,7 @@ async def create_memory(
             )
             if row is None:
                 raise RuntimeError(f"post-write re-fetch missed just-created memory {mem_id}")
+            row = await _attach_memory_tags_one(backend, tx, row)
     except DuplicateMemoryError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except HTTPException:
@@ -2036,6 +2074,8 @@ async def bulk_create_memories(
                             created=None,
                             updated=None,
                         )
+                        if mem.tags:
+                            await backend.memories.replace_memory_tags(tx, mid, mem.tags)
                         if vec:
                             await backend.memories.upsert_memory_embedding(tx, mid, vec)
                         await _write_memory_mutation_audit_entry(
@@ -2110,7 +2150,8 @@ async def update_memory(
         updates["verbatim_content"] = request.verbatim_content
     if request.permission_mode is not None:
         updates["permission_mode"] = _validate_permission_mode(request.permission_mode)
-    if not updates:
+    replace_tags = request.tags is not None
+    if not updates and not replace_tags:
         raise HTTPException(status_code=422, detail="No fields to update")
 
     # Classify PATCH text variants before persistence. If the PATCH turns an
@@ -2144,15 +2185,23 @@ async def update_memory(
     try:
         async with backend.transactional() as tx:
             await _maybe_set_pg_rls(tx, user)
-            try:
-                row = await backend.memories.update_memory(
+            if updates:
+                try:
+                    row = await backend.memories.update_memory(
+                        tx,
+                        memory_id,
+                        visibility=visibility,
+                        fields=updates,
+                    )
+                except asyncpg.PostgresError as exc:
+                    handle_trigger_pgerror(exc)
+            else:
+                row = await backend.memories.get_memory(
                     tx,
                     memory_id,
                     visibility=visibility,
-                    fields=updates,
+                    include_archived=True,
                 )
-            except asyncpg.PostgresError as exc:
-                handle_trigger_pgerror(exc)
             if not row:
                 raise HTTPException(
                     status_code=404,
@@ -2166,18 +2215,22 @@ async def update_memory(
                 )
                 if row is None:
                     raise RuntimeError(f"post-write re-fetch missed just-vaulted memory {memory_id}")
-            await _write_memory_mutation_audit_entry(
-                backend,
-                tx,
-                op="update",
-                memory_id=memory_id,
-                content=row["content"],
-                category=row["category"],
-                subcategory=row["subcategory"],
-                metadata=_metadata_for_audit(row["metadata"]),
-                writer_id=user.user_id,
-            )
-            if getattr(backend, "supports_webhooks", False):
+            if replace_tags:
+                await backend.memories.replace_memory_tags(tx, memory_id, request.tags or [])
+            row = await _attach_memory_tags_one(backend, tx, row)
+            if updates:
+                await _write_memory_mutation_audit_entry(
+                    backend,
+                    tx,
+                    op="update",
+                    memory_id=memory_id,
+                    content=row["content"],
+                    category=row["category"],
+                    subcategory=row["subcategory"],
+                    metadata=_metadata_for_audit(row["metadata"]),
+                    writer_id=user.user_id,
+                )
+            if updates and getattr(backend, "supports_webhooks", False):
                 delivery_ids = [intent.delivery_id for intent in await backend.webhooks.dispatch_event(
                     tx,
                     "memory.updated",
@@ -2209,17 +2262,18 @@ async def update_memory(
     from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
 
-    safe_ns = safe_subject_segment(namespace)
-    await _nats_publish_event(
-        f"mnemos.memory.updated.{safe_ns}",
-        {
-            "memory_id": memory_id,
-            "namespace": namespace,
-            "category": row["category"],
-            "source_node": _nats_get_node_name(),
-        },
-        msg_id=f"{memory_id}.updated.{updated_suffix}",
-    )
+    if updates:
+        safe_ns = safe_subject_segment(namespace)
+        await _nats_publish_event(
+            f"mnemos.memory.updated.{safe_ns}",
+            {
+                "memory_id": memory_id,
+                "namespace": namespace,
+                "category": row["category"],
+                "source_node": _nats_get_node_name(),
+            },
+            msg_id=f"{memory_id}.updated.{updated_suffix}",
+        )
     await _invalidate_caches_after_mutation()
     return _row_to_memory(row)
 
