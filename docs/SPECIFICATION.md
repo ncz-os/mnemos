@@ -399,7 +399,7 @@ All REST endpoints use Pydantic request/response models (defined in
 session cookie. Non-root writes are owner+namespace gated; memory reads
 use the live or per-snapshot visibility predicates described in §10.2.
 
-Rate limiting: SlowAPI, opt-in via `RATE_LIMIT_ENABLED=true`.
+Rate limiting: SlowAPI, on by default (300/minute); disable with `RATE_LIMIT_ENABLED=false`.
 
 Body size: default 5 MB, `MAX_BODY_BYTES` override. Chunked-transfer
 aware streaming limiter (not just Content-Length check).
@@ -876,7 +876,7 @@ Raw metrics at v5.0.1, measured from the checked-out tree unless noted.
 | Test files | 146 | Unit + integration + live-gated E2E |
 | Test count | 1055+ passing cases in the doc-sweep tier | `pytest` collection includes parametrized cases; DB-gated tests are selectively ignored in CI/doc sweeps |
 | REST endpoints | 102 mounted application routes | Across 21 routers; excludes generated FastAPI docs/openapi routes |
-| MCP tools | 23 registered | Memory CRUD + KG + stats + DAG + model recommendation + PANTHEON + deletions + KRONOS; optional PANTHEON/KRONOS tools are filtered from `tools/list` when their extras are unavailable |
+| MCP tools | 25 registered | Memory CRUD + KG + stats + DAG + model recommendation + PANTHEON + GRAEAE + deletions + KRONOS; optional PANTHEON/GRAEAE/KRONOS tools are filtered from `tools/list` when their extras are unavailable |
 | DB tables | 32 | See §4.1 |
 | Migrations | 51 Postgres SQL files + 40-file SQLite mirror chain | Idempotent, ordered |
 | Named concepts | ~40 | See Appendix H |
@@ -885,7 +885,7 @@ Raw metrics at v5.0.1, measured from the checked-out tree unless noted.
 | Optional dep groups | 6 | build, sqlite, tracing, structlog, docling, full/phi |
 | Env vars (MNEMOS_ prefix) | ~30 | See §9.1 |
 | FK edges | 22+ | Explicit ON DELETE on every edge |
-| Invariants | 10 | See §4.4 |
+| Invariants | 15 | See §4.4 |
 | State machines | 5 | Circuit breaker, queue, DAG, OAuth state, audit hash-chain |
 
 Registered MCP tools in `mnemos/mcp/tools/__init__.py`: `search_memories`,
@@ -893,8 +893,9 @@ Registered MCP tools in `mnemos/mcp/tools/__init__.py`: `search_memories`,
 `list_memories`, `get_stats`, `kg_create_triple`, `kg_search`, `kg_timeline`,
 `update_triple`, `delete_triple`, `bulk_create_memories`, `log_memory`,
 `branch_memory`, `diff_memory_commits`, `checkout_memory`, `recommend_model`,
-`pantheon_list_models`, `pantheon_route_explain`, `list_deletions`,
-`kronos_anomalies`, `kronos_forecast`.
+`pantheon_list_models`, `pantheon_route_explain`, `graeae_consult`,
+`graeae_get_consultation`, `list_deletions`, `kronos_anomalies`,
+`kronos_forecast`.
 
 ### 12.1 Effort-estimation dimensions (for a scoping tool)
 
