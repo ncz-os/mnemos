@@ -48,7 +48,13 @@ from mnemos.persistence.base import (
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
+    MorpheusConsolidationResult,
+    MorpheusExtractBatch,
+    MorpheusExtractCandidate,
+    MorpheusExtractFailure,
     MorpheusRepository,
+    MorpheusSynthesisCluster,
+    MorpheusSynthesisMember,
     NatsDispatchLogRepository,
     OAuthRepository,
     SessionsRepository,
@@ -83,6 +89,8 @@ _FEDERATION_NATS_MEMORY_ROW_COLS = (
     "source_model, source_provider, source_session, source_agent, archived_at, "
     "federation_source, deleted_at, consolidated_into"
 )
+
+
 def _log_search_phase(
     trace_id: str | None,
     started_at: float | None,
@@ -2706,9 +2714,7 @@ class PostgresWebhookRepository(WebhookRepository):
             assert namespace is not None  # guarded above
             args.append(owner_id)
             args.append(namespace)
-            scope_clause = (
-                f" AND s.owner_id = ${len(args) - 1} AND s.namespace = ${len(args)}"
-            )
+            scope_clause = f" AND s.owner_id = ${len(args) - 1} AND s.namespace = ${len(args)}"
         args.append(int(limit))
         rows = await conn.fetch(
             f"""
@@ -3508,11 +3514,7 @@ def _row_to_delivery(row: Any) -> WebhookDeliveryRecord:
         status_updated_at=_ensure_aware_utc(row["status_updated_at"]),
         superseded=bool(row["superseded"]),
         lease_token=str(row["lease_token"]) if row["lease_token"] is not None else None,
-        lease_expires_at=(
-            _ensure_aware_utc(row["lease_expires_at"])
-            if row["lease_expires_at"] is not None
-            else None
-        ),
+        lease_expires_at=(_ensure_aware_utc(row["lease_expires_at"]) if row["lease_expires_at"] is not None else None),
         writer_revision=int(row["writer_revision"] or 0),
     )
 
@@ -3540,9 +3542,7 @@ def _row_to_claim(row: Any, lease_token: str) -> WebhookDeliveryClaim:
     elif str(row_lease_token) != lease_token:
         # The DB-projected lease_token (claim_due_deliveries path) must
         # match the caller's input. Mismatch is a programming error.
-        raise ValueError(
-            "lease_token returned by UPDATE does not match caller-supplied token"
-        )
+        raise ValueError("lease_token returned by UPDATE does not match caller-supplied token")
     else:
         delivery_lease_token = lease_token
     return WebhookDeliveryClaim(
@@ -3558,9 +3558,7 @@ def _row_to_claim(row: Any, lease_token: str) -> WebhookDeliveryClaim:
             response_body=row["response_body"],
             error=row["error"],
             scheduled_at=_ensure_aware_utc(row["scheduled_at"]),
-            delivered_at=(
-                _ensure_aware_utc(row["delivered_at"]) if row["delivered_at"] is not None else None
-            ),
+            delivered_at=(_ensure_aware_utc(row["delivered_at"]) if row["delivered_at"] is not None else None),
             created=_ensure_aware_utc(row["created"]),
             status_updated_at=_ensure_aware_utc(row["status_updated_at"]),
             superseded=bool(row["superseded"]),
@@ -3598,10 +3596,9 @@ def _delivery_chain_lock_key(delivery: Any) -> int:
     chain without reaching into the webhook module graph.
     """
     digest = hashlib.sha256(
-        (
-            "webhook-chain:"
-            f"{delivery['subscription_id']}:{delivery['event_type']}:{delivery['payload_hash']}"
-        ).encode("utf-8")
+        (f"webhook-chain:{delivery['subscription_id']}:{delivery['event_type']}:{delivery['payload_hash']}").encode(
+            "utf-8"
+        )
     ).digest()[:8]
     key = int.from_bytes(digest, "big", signed=False)
     if key >= 2**63:
@@ -3929,9 +3926,7 @@ class PostgresOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
             session_id,
         )
 
-    async def lookup_api_key(
-        self, tx: Transaction, key_hash: str
-    ) -> Row | None:
+    async def lookup_api_key(self, tx: Transaction, key_hash: str) -> Row | None:
         return await _postgres_tx(tx).conn.fetchrow(
             "SELECT ak.id, ak.user_id, ak.revoked, u.role, u.namespace, "
             "       ug.group_ids "
@@ -3946,13 +3941,9 @@ class PostgresOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
         )
 
     async def touch_api_key(self, tx: Transaction, key_id: Any) -> None:
-        await _postgres_tx(tx).conn.execute(
-            "UPDATE api_keys SET last_used=NOW() WHERE id=$1", key_id
-        )
+        await _postgres_tx(tx).conn.execute("UPDATE api_keys SET last_used=NOW() WHERE id=$1", key_id)
 
-    async def resolve_active_session(
-        self, tx: Transaction, session_id: str, *, now: Any
-    ) -> Row | None:
+    async def resolve_active_session(self, tx: Transaction, session_id: str, *, now: Any) -> Row | None:
         conn = _postgres_tx(tx).conn
         row = await conn.fetchrow(
             "SELECT user_id, identity_id::text AS identity_id, expires_at, revoked "
@@ -5512,6 +5503,12 @@ class PostgresMorpheusRepository(MorpheusRepository):
     the multi-CTE ``rollback_run`` body both run inside the caller-
     supplied ``tx`` so a partial rollback cannot leak across the
     caller's transaction boundary.
+
+    Item 11c keeps Postgres as the canonical native dialect: JSONB audit
+    writes use ``?`` / ``jsonb_set`` / ``to_jsonb`` and cluster member
+    predicates use ``ANY(text[])``.  EXTRACT retry state uses
+    ``ON CONFLICT`` and successful source claims, triples, and counters
+    share the supplied transaction.
     """
 
     _SWEEP_ORPHAN_RUNS_SQL = """
@@ -5630,15 +5627,13 @@ class PostgresMorpheusRepository(MorpheusRepository):
 
     async def finish_run(self, tx: Transaction, run_id: str) -> None:
         await _postgres_tx(tx).conn.execute(
-            "UPDATE morpheus_runs SET status = 'success', finished_at = now() "
-            "WHERE id = $1::uuid",
+            "UPDATE morpheus_runs SET status = 'success', finished_at = now() WHERE id = $1::uuid",
             run_id,
         )
 
     async def fail_run(self, tx: Transaction, run_id: str, error: str) -> None:
         await _postgres_tx(tx).conn.execute(
-            "UPDATE morpheus_runs SET status = 'failed', finished_at = now(), "
-            "error = $2 WHERE id = $1::uuid",
+            "UPDATE morpheus_runs SET status = 'failed', finished_at = now(), error = $2 WHERE id = $1::uuid",
             run_id,
             str(error)[:4000],
         )
@@ -5886,12 +5881,366 @@ class PostgresMorpheusRepository(MorpheusRepository):
             i += 2
         assignments = ", ".join(pairs)
         await _postgres_tx(tx).conn.execute(
-            f"UPDATE morpheus_runs "
-            f"SET config = config || jsonb_build_object({assignments}) "
-            f"WHERE id = $1::uuid",
+            f"UPDATE morpheus_runs SET config = config || jsonb_build_object({assignments}) WHERE id = $1::uuid",
             run_id,
             *args,
         )
+
+    async def phase_consolidate(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        consolidated_permission_mode: int,
+    ) -> MorpheusConsolidationResult | None:
+        """Postgres-native CONSOLIDATE persistence for item 11c.
+
+        The run row is locked for the phase.  JSONB key existence and
+        ``jsonb_set`` preserve the exact audit key consumed by
+        :meth:`rollback_run`; member lists use native ``ANY(text[])``.
+        """
+        conn = _postgres_tx(tx).conn
+        run_row = await conn.fetchrow(
+            "SELECT config, cluster_min_size, namespace FROM morpheus_runs WHERE id = $1::uuid FOR UPDATE",
+            run_id,
+        )
+        if run_row is None:
+            return None
+        config = run_row["config"]
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except json.JSONDecodeError:
+                config = {}
+        clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        min_size = int(run_row["cluster_min_size"])
+        namespace = run_row["namespace"]
+        memories_consolidated = 0
+        clusters_consolidated = 0
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        for cluster in clusters:
+            member_ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
+            if len(member_ids) < min_size:
+                continue
+            rows = list(
+                await conn.fetch(
+                    f"""
+                    SELECT id, recall_count, created, permission_mode,
+                           consolidated_into, morpheus_run_id, metadata
+                      FROM memories
+                     WHERE id = ANY($1::text[])
+                       AND {eligibility_clause}
+                       AND ($2::text IS NULL OR namespace = $2)
+                     FOR UPDATE
+                    """,
+                    member_ids,
+                    namespace,
+                )
+            )
+            if not rows:
+                continue
+            canonical = sorted(
+                rows,
+                key=lambda row: (
+                    -int(row["recall_count"] or 0),
+                    row["created"],
+                    str(row["id"]),
+                ),
+            )[0]
+            canonical_id = str(canonical["id"])
+            cluster_count = int(
+                await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM memories
+                     WHERE id = ANY($1::text[])
+                       AND deleted_at IS NULL AND archived_at IS NULL
+                       AND consolidated_into = $2
+                       AND morpheus_run_id = $3::uuid
+                       AND COALESCE(metadata, '{}'::jsonb)
+                           ? 'pre_consolidate_permission_mode'
+                       AND ($4::text IS NULL OR namespace = $4)
+                    """,
+                    member_ids,
+                    canonical_id,
+                    run_id,
+                    namespace,
+                )
+                or 0
+            )
+            if len(rows) + cluster_count < min_size:
+                continue
+            for row in rows:
+                member_id = str(row["id"])
+                if member_id == canonical_id:
+                    continue
+                result = await conn.execute(
+                    """
+                    UPDATE memories
+                       SET consolidated_into = $2,
+                           consolidated_at = NOW(),
+                           permission_mode = $5,
+                           morpheus_run_id = $3::uuid,
+                           metadata = CASE
+                               WHEN COALESCE(metadata, '{}'::jsonb)
+                                    ? 'pre_consolidate_permission_mode'
+                               THEN COALESCE(metadata, '{}'::jsonb)
+                               ELSE jsonb_set(
+                                   COALESCE(metadata, '{}'::jsonb),
+                                   '{pre_consolidate_permission_mode}',
+                                   to_jsonb(permission_mode), true
+                               )
+                           END
+                     WHERE id = $1
+                       AND deleted_at IS NULL AND archived_at IS NULL
+                       AND consolidated_into IS NULL AND morpheus_run_id IS NULL
+                       AND ($4::text IS NULL OR namespace = $4)
+                    """,
+                    member_id,
+                    canonical_id,
+                    run_id,
+                    namespace,
+                    int(consolidated_permission_mode),
+                )
+                cluster_count += _pg_result_count(result)
+            if cluster_count:
+                memories_consolidated += cluster_count
+                clusters_consolidated += 1
+
+        await self.update_counters(
+            tx,
+            run_id,
+            memories_consolidated=memories_consolidated,
+            clusters_consolidated=clusters_consolidated,
+        )
+        return MorpheusConsolidationResult(memories_consolidated, clusters_consolidated)
+
+    async def phase_synthesise_load(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> list[MorpheusSynthesisCluster] | None:
+        conn = _postgres_tx(tx).conn
+        config = await conn.fetchval("SELECT config FROM morpheus_runs WHERE id = $1::uuid", run_id)
+        if config is None:
+            return None
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except json.JSONDecodeError:
+                config = {}
+        clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        loaded: list[MorpheusSynthesisCluster] = []
+        for cluster in clusters:
+            member_ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
+            if not member_ids:
+                continue
+            rows = await conn.fetch(
+                f"""
+                SELECT id, content, category, owner_id, namespace
+                  FROM memories
+                 WHERE id = ANY($1::text[]) AND {eligibility_clause}
+                """,
+                member_ids,
+            )
+            members = tuple(
+                MorpheusSynthesisMember(
+                    id=str(row["id"]),
+                    content=str(row["content"] or ""),
+                    category=row["category"],
+                    owner_id=row["owner_id"],
+                    namespace=row["namespace"],
+                )
+                for row in rows
+            )
+            if members:
+                loaded.append(MorpheusSynthesisCluster(cluster.get("cluster_id"), members))
+        return loaded
+
+    async def phase_synthesise_store(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        content: str,
+        category: str | None,
+        owner_id: str,
+        namespace: str,
+        run_id: str,
+        source_memory_ids: Sequence[str],
+        metadata: Mapping[str, Any],
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            INSERT INTO memories
+                (id, content, category, subcategory, metadata,
+                 quality_rating, verbatim_content, owner_id, namespace,
+                 permission_mode, morpheus_run_id, source_memories, provenance)
+            VALUES ($1, $2, $3, 'morpheus-synthesis', $4::jsonb,
+                    75, $2, $5, $6, 600, $7::uuid, $8::text[], 'morpheus_local')
+            """,
+            memory_id,
+            content,
+            category,
+            json.dumps(dict(metadata)),
+            owner_id,
+            namespace,
+            run_id,
+            list(source_memory_ids),
+        )
+
+    async def phase_extract_load(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        min_chars: int,
+        max_input_count: int,
+    ) -> MorpheusExtractBatch | None:
+        conn = _postgres_tx(tx).conn
+        run_row = await conn.fetchrow(
+            "SELECT config, namespace, window_ended_at FROM morpheus_runs WHERE id = $1::uuid",
+            run_id,
+        )
+        if run_row is None:
+            return None
+        config = run_row["config"]
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except json.JSONDecodeError:
+                config = {}
+        if not isinstance(config, dict):
+            config = {}
+        eligibility_clause = _eligibility.eligible_for_morpheus("m")
+        rows = await conn.fetch(
+            f"""
+            SELECT m.id, m.verbatim_content, m.owner_id, m.namespace
+              FROM memories m
+              LEFT JOIN morpheus_extract_failures failure ON failure.memory_id = m.id
+             WHERE {eligibility_clause}
+               AND m.created <= $1
+               AND m.triples_extracted_at IS NULL
+               AND m.verbatim_content IS NOT NULL
+               AND length(m.verbatim_content) >= $2
+               AND ($3::text IS NULL OR m.namespace = $3)
+               AND (failure.status IS NULL OR failure.status <> 'dead_letter')
+             ORDER BY m.created, m.id
+             LIMIT $4
+            """,
+            run_row["window_ended_at"],
+            int(min_chars),
+            run_row["namespace"],
+            int(max_input_count),
+        )
+        candidates = tuple(
+            MorpheusExtractCandidate(
+                id=str(row["id"]),
+                verbatim_content=str(row["verbatim_content"] or ""),
+                owner_id=str(row["owner_id"]),
+                namespace=str(row["namespace"]),
+            )
+            for row in rows
+        )
+        return MorpheusExtractBatch(config, run_row["namespace"], candidates)
+
+    async def phase_extract_failure(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        max_failures: int,
+        error: str,
+    ) -> MorpheusExtractFailure | None:
+        conn = _postgres_tx(tx).conn
+        pending = await conn.fetchval(
+            "SELECT id FROM memories WHERE id = $1 AND triples_extracted_at IS NULL FOR UPDATE",
+            memory_id,
+        )
+        if pending is None:
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO morpheus_extract_failures
+                (memory_id, attempts, status, last_error, last_failed_at)
+            VALUES ($1, 1,
+                    CASE WHEN $2 <= 1 THEN 'dead_letter' ELSE 'retryable' END,
+                    $3, NOW())
+            ON CONFLICT (memory_id) DO UPDATE
+            SET attempts = morpheus_extract_failures.attempts + 1,
+                status = CASE
+                    WHEN morpheus_extract_failures.attempts + 1 >= $2
+                    THEN 'dead_letter' ELSE 'retryable' END,
+                last_error = EXCLUDED.last_error,
+                last_failed_at = EXCLUDED.last_failed_at
+            RETURNING attempts, status
+            """,
+            memory_id,
+            int(max_failures),
+            str(error)[:2000],
+        )
+        return MorpheusExtractFailure(int(row["attempts"]), str(row["status"]))
+
+    async def phase_extract_store(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        candidate: MorpheusExtractCandidate,
+        triples: Sequence[tuple[str, str, str, str, float]],
+    ) -> bool:
+        conn = _postgres_tx(tx).conn
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        marked_id = await conn.fetchval(
+            f"""
+            UPDATE memories SET triples_extracted_at = NOW()
+             WHERE id = $1 AND triples_extracted_at IS NULL
+               AND {eligibility_clause}
+               AND ($2::text IS NULL OR namespace = $2)
+            RETURNING id
+            """,
+            candidate.id,
+            candidate.namespace,
+        )
+        if marked_id is None:
+            return False
+        await conn.execute("DELETE FROM morpheus_extract_failures WHERE memory_id = $1", candidate.id)
+        await conn.execute(
+            """
+            INSERT INTO morpheus_extract_run_memories (run_id, memory_id)
+            VALUES ($1::uuid, $2)
+            ON CONFLICT (run_id, memory_id) DO UPDATE
+            SET processed_at = EXCLUDED.processed_at
+            """,
+            run_id,
+            candidate.id,
+        )
+        for triple_id, subject, predicate, object_, confidence in triples:
+            await conn.execute(
+                """
+                INSERT INTO kg_triples
+                    (id, subject, predicate, object, memory_id, confidence,
+                     extracted_by_run_id, owner_id, namespace)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, $8, $9)
+                """,
+                triple_id,
+                subject,
+                predicate,
+                object_,
+                candidate.id,
+                float(confidence),
+                run_id,
+                candidate.owner_id,
+                candidate.namespace,
+            )
+        await self.increment_extract_counters(
+            tx,
+            run_id,
+            triples_extracted=len(triples),
+            memories_processed=1,
+        )
+        return True
 
 
 class PostgresNatsDispatchLogRepository(NatsDispatchLogRepository):

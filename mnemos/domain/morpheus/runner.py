@@ -647,286 +647,82 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
 
 
 async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
-    """Soft-merge duplicate cluster members into a canonical memory.
+    """Soft-merge duplicate cluster members through the persistence ABC.
 
-    Reads the cluster payload written by phase_cluster. For each
-    cluster at or above cluster_min_size, the canonical is the live,
-    unconsolidated member with highest recall_count, tie-broken by the
-    earliest created timestamp. Non-canonical live members are updated
-    in place to point at the canonical, made owner-read-only, and tagged
-    with the run id for rollback.
-
-    Returns the number of memories newly or previously consolidated by
-    this run. Running the phase again for the same run does not mutate
-    rows a second time and leaves counters stable.
+    Item 11c moves canonical selection, JSON metadata auditing, idempotent
+    member updates, and counter writes into
+    :meth:`MorpheusRepository.phase_consolidate`.  The retained ``pool``
+    argument is a backwards-compatible runner surface only.
     """
-    async with pool.acquire() as conn:
-        run_row = await conn.fetchrow(
-            "SELECT config, cluster_min_size, namespace FROM morpheus_runs WHERE id=$1::uuid",
-            run_id,
+    _ = pool
+    backend = _get_backend()
+    async with backend.transactional() as tx:
+        result = await backend.morpheus.phase_consolidate(
+            tx,
+            run_id=run_id,
+            consolidated_permission_mode=_CONSOLIDATED_PERMISSION_MODE,
         )
-    if run_row is None:
-        await update_counters(
-            _get_backend(),
-            run_id,
-            memories_consolidated=0,
-            clusters_consolidated=0,
-        )
+    if result is None:
         return 0
-
-    config = _parse_run_config(run_row["config"])
-    clusters = config.get("clusters", []) if isinstance(config, dict) else []
-    if not clusters:
-        await update_counters(
-            _get_backend(),
-            run_id,
-            memories_consolidated=0,
-            clusters_consolidated=0,
-        )
-        return 0
-
-    min_size = int(run_row["cluster_min_size"])
-    namespace = run_row["namespace"]
-    memories_consolidated = 0
-    clusters_consolidated = 0
-
-    for cluster in clusters:
-        member_ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
-        if len(member_ids) < min_size:
-            continue
-
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                f"""
-                SELECT id, recall_count, created, permission_mode,
-                       consolidated_into, morpheus_run_id, metadata
-                FROM memories
-                WHERE id = ANY($1::text[])
-                  AND {eligible_for_morpheus("")}
-                  AND ($2::text IS NULL OR namespace = $2)
-                """,
-                member_ids,
-                namespace,
-            )
-        if len(rows) < min_size:
-            already_count = 0
-            if len(rows) == 1:
-                async with pool.acquire() as conn:
-                    already_count = int(
-                        await conn.fetchval(
-                            """
-                        SELECT COUNT(*)
-                        FROM memories
-                        WHERE id = ANY($1::text[])
-                          AND deleted_at IS NULL
-                          AND archived_at IS NULL
-                          AND consolidated_into=$2
-                          AND morpheus_run_id=$3::uuid
-                          AND COALESCE(metadata, '{}'::jsonb)
-                              ? 'pre_consolidate_permission_mode'
-                          AND ($4::text IS NULL OR namespace=$4)
-                        """,
-                            member_ids,
-                            str(rows[0]["id"]),
-                            run_id,
-                            namespace,
-                        )
-                        or 0
-                    )
-            if len(rows) + already_count < min_size:
-                continue
-
-        canonical = sorted(
-            rows,
-            key=lambda row: (
-                -int(row["recall_count"] or 0),
-                row["created"],
-                str(row["id"]),
-            ),
-        )[0]
-        canonical_id = str(canonical["id"])
-        async with pool.acquire() as conn:
-            cluster_count = int(
-                await conn.fetchval(
-                    """
-                SELECT COUNT(*)
-                FROM memories
-                WHERE id = ANY($1::text[])
-                  AND deleted_at IS NULL
-                  AND archived_at IS NULL
-                  AND consolidated_into=$2
-                  AND morpheus_run_id=$3::uuid
-                  AND COALESCE(metadata, '{}'::jsonb)
-                      ? 'pre_consolidate_permission_mode'
-                  AND ($4::text IS NULL OR namespace=$4)
-                """,
-                    member_ids,
-                    canonical_id,
-                    run_id,
-                    namespace,
-                )
-                or 0
-            )
-
-        for row in rows:
-            member_id = str(row["id"])
-            if member_id == canonical_id:
-                continue
-
-            async with pool.acquire() as conn:
-                result = await conn.execute(
-                    """
-                    UPDATE memories
-                    SET consolidated_into=$2,
-                        consolidated_at=NOW(),
-                        permission_mode=$5,
-                        morpheus_run_id=$3::uuid,
-                        metadata = CASE
-                            WHEN COALESCE(metadata, '{}'::jsonb)
-                                 ? 'pre_consolidate_permission_mode'
-                            THEN COALESCE(metadata, '{}'::jsonb)
-                            ELSE jsonb_set(
-                                COALESCE(metadata, '{}'::jsonb),
-                                '{pre_consolidate_permission_mode}',
-                                to_jsonb(permission_mode),
-                                true
-                            )
-                        END
-                    WHERE id=$1
-                      AND deleted_at IS NULL
-                      AND archived_at IS NULL
-                      AND consolidated_into IS NULL
-                      AND morpheus_run_id IS NULL
-                      AND ($4::text IS NULL OR namespace=$4)
-                    """,
-                    member_id,
-                    canonical_id,
-                    run_id,
-                    namespace,
-                    _CONSOLIDATED_PERMISSION_MODE,
-                )
-            cluster_count += _command_count(result)
-
-        if cluster_count:
-            memories_consolidated += cluster_count
-            clusters_consolidated += 1
-
-    await update_counters(
-        _get_backend(),
-        run_id,
-        memories_consolidated=memories_consolidated,
-        clusters_consolidated=clusters_consolidated,
-    )
     logger.info(
         "[MORPHEUS] run %s consolidated %d memor%s across %d cluster(s)",
         run_id,
-        memories_consolidated,
-        "y" if memories_consolidated == 1 else "ies",
-        clusters_consolidated,
+        result.memories_consolidated,
+        "y" if result.memories_consolidated == 1 else "ies",
+        result.clusters_consolidated,
     )
-    return memories_consolidated
+    return result.memories_consolidated
 
 
 async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
-    """Generate summary memories per cluster. Returns count created.
+    """Generate one summary memory per persisted cluster.
 
-    Reads the cluster payload phase_cluster wrote to morpheus_runs.config.
-    For each cluster:
-
-      1. Fetches member contents + category + owner_id from memories.
-      2. Synthesises a summary string (deterministic by default;
-         LLM-driven when MNEMOS_MORPHEUS_USE_LLM=true — matches the
-         APOLLO LLM-fallback gate pattern).
-      3. Inserts a new memory with:
-           - morpheus_run_id        = run_id
-           - source_memories        = [member ids]
-           - provenance             = 'morpheus_local'
-           - category / owner / ns  = inherited from cluster majority
-           - subcategory            = 'morpheus-synthesis'
-
-    All inserts are append-only and tagged with morpheus_run_id, so
-    rollback_run() can delete them without touching user originals.
+    Item 11c materialises cluster members through
+    ``phase_synthesise_load``, closes that read transaction, performs any
+    provider call, then stores each append-only summary in a fresh short
+    transaction.  No LLM latency is held inside a database transaction.
     """
+    _ = pool
     use_llm = get_settings().morpheus.use_llm
-
-    async with pool.acquire() as conn:
-        config_raw = await conn.fetchval(
-            "SELECT config FROM morpheus_runs WHERE id=$1::uuid",
-            run_id,
-        )
-    if config_raw is None:
-        await update_counters(_get_backend(), run_id, summaries_created=0)
-        return 0
-    config = _parse_run_config(config_raw)
-    clusters = config.get("clusters", []) if isinstance(config, dict) else []
+    backend = _get_backend()
+    async with backend.transactional() as tx:
+        clusters = await backend.morpheus.phase_synthesise_load(tx, run_id=run_id)
     if not clusters:
-        await update_counters(_get_backend(), run_id, summaries_created=0)
+        await update_counters(backend, run_id, summaries_created=0)
         return 0
 
     n_created = 0
     for cluster in clusters:
-        member_ids = cluster.get("member_memory_ids", [])
-        if not member_ids:
-            continue
-
-        async with pool.acquire() as conn:
-            members = await conn.fetch(
-                f"""
-                SELECT id, content, category, owner_id, namespace
-                FROM memories
-                WHERE id = ANY($1::text[])
-                  AND {eligible_for_morpheus("")}
-                """,
-                member_ids,
-            )
-        if not members:
-            continue
-        visible_member_ids = [str(m["id"]) for m in members]
-
+        members = cluster.members
         summary = await _synthesise_cluster_summary(
-            [m["content"] for m in members],
+            [member.content for member in members],
             use_llm=use_llm,
         )
-
-        # Inherit category/owner/namespace from the cluster majority,
-        # tie-broken by first-occurrence so rollback is deterministic.
-        category = _majority([m["category"] for m in members])
-        owner_id = _majority([m["owner_id"] for m in members]) or "default"
-        namespace = _majority([m["namespace"] for m in members]) or "default"
-
-        new_id = new_memory_id()
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO memories
-                    (id, content, category, subcategory, metadata,
-                     quality_rating, verbatim_content,
-                     owner_id, namespace, permission_mode,
-                     morpheus_run_id, source_memories, provenance)
-                VALUES ($1, $2, $3, $4, $5::jsonb, 75, $2,
-                        $6, $7, 600,
-                        $8::uuid, $9::text[], 'morpheus_local')
-                """,
-                new_id,
-                summary,
-                category,
-                "morpheus-synthesis",
-                json.dumps(
-                    {
-                        "morpheus_run_id": run_id,
-                        "cluster_id": cluster.get("cluster_id"),
-                        "member_count": len(visible_member_ids),
-                        "synthesis_mode": "llm" if use_llm else "extractive",
-                    }
-                ),
-                owner_id,
-                namespace,
-                run_id,
-                visible_member_ids,
+        category = _majority([member.category for member in members])
+        owner_id = _majority([member.owner_id for member in members]) or "default"
+        namespace = _majority([member.namespace for member in members]) or "default"
+        visible_member_ids = [member.id for member in members]
+        metadata = {
+            "morpheus_run_id": run_id,
+            "cluster_id": cluster.cluster_id,
+            "member_count": len(visible_member_ids),
+            "synthesis_mode": "llm" if use_llm else "extractive",
+        }
+        async with backend.transactional() as tx:
+            await backend.morpheus.phase_synthesise_store(
+                tx,
+                memory_id=new_memory_id(),
+                content=summary,
+                category=category,
+                owner_id=owner_id,
+                namespace=namespace,
+                run_id=run_id,
+                source_memory_ids=visible_member_ids,
+                metadata=metadata,
             )
         n_created += 1
 
-    await update_counters(_get_backend(), run_id, summaries_created=n_created)
+    await update_counters(backend, run_id, summaries_created=n_created)
     logger.info(
         "[MORPHEUS] run %s synthesised %d summary memor%s (mode=%s)",
         run_id,
@@ -938,69 +734,37 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
 
 
 async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
-    """Extract latent KG triples from unprocessed prose memories.
+    """Extract latent KG triples using transactional repository stages.
 
-    The phase is opt-in via run config (`extract=true`) or
-    MNEMOS_MORPHEUS_EXTRACT. Each source memory is processed at most
-    once on success by the durable `triples_extracted_at` guard. Pending
-    rows are selected without the replay window's moving lower bound, so
-    a capped backlog cannot age out between runs. The LLM calls happen
-    outside DB transactions; the timestamp mark and all triple inserts
-    for one memory commit atomically.
+    Candidate reads, retry upserts, source claiming, triple inserts, and
+    counters are backend-owned as of item 11c.  Extraction and verification
+    calls remain outside transactions; one source's successful database
+    effects still commit atomically.
     """
+    _ = pool
     settings = get_settings().morpheus
     min_chars = max(0, int(settings.extract_min_chars))
-
-    async with pool.acquire() as conn:
-        run_row = await conn.fetchrow(
-            "SELECT config, namespace, window_started_at, window_ended_at FROM morpheus_runs WHERE id=$1::uuid",
-            run_id,
-        )
-    if run_row is None:
-        await update_counters(
-            _get_backend(),
-            run_id,
-            triples_extracted=0,
-            memories_processed_for_extraction=0,
-        )
-        return 0
-
-    config = _parse_run_config(run_row["config"])
-    if not _extract_enabled(config):
-        await update_counters(
-            _get_backend(),
-            run_id,
-            triples_extracted=0,
-            memories_processed_for_extraction=0,
-        )
-        return 0
-
-    namespace = run_row["namespace"]
-    verify = _extract_verify_enabled(config)
     max_input_count = settings.extract_max_input_count
     max_failures = settings.extract_max_failures
-    async with pool.acquire() as conn:
-        candidates = await conn.fetch(
-            f"""
-            SELECT m.id, m.verbatim_content, m.owner_id, m.namespace
-            FROM memories m
-            LEFT JOIN morpheus_extract_failures failure ON failure.memory_id = m.id
-            WHERE {eligible_for_morpheus("m")}
-              AND m.created <= $1
-              AND m.triples_extracted_at IS NULL
-              AND m.verbatim_content IS NOT NULL
-              AND length(m.verbatim_content) >= $2
-              AND ($3::text IS NULL OR m.namespace = $3)
-              AND (failure.status IS NULL OR failure.status <> 'dead_letter')
-            ORDER BY m.created, m.id
-            LIMIT $4
-            """,
-            run_row["window_ended_at"],
-            min_chars,
-            namespace,
-            max_input_count,
+    backend = _get_backend()
+    async with backend.transactional() as tx:
+        batch = await backend.morpheus.phase_extract_load(
+            tx,
+            run_id=run_id,
+            min_chars=min_chars,
+            max_input_count=max_input_count,
         )
+    if batch is None or not _extract_enabled(batch.config):
+        await update_counters(
+            backend,
+            run_id,
+            triples_extracted=0,
+            memories_processed_for_extraction=0,
+        )
+        return 0
 
+    candidates = batch.candidates
+    verify = _extract_verify_enabled(batch.config)
     if len(candidates) >= max_input_count:
         logger.warning(
             "[MORPHEUS] run %s extracted from only the first %d candidate(s) "
@@ -1012,134 +776,60 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
 
     memories_processed = 0
     triples_extracted = 0
-
-    for row in candidates:
-        memory_id = str(row["id"])
-        content = str(row["verbatim_content"] or "")
+    for candidate in candidates:
         try:
-            triples = await _extract_triples_from_prose(content)
+            triples = await _extract_triples_from_prose(candidate.verbatim_content)
             if verify and triples:
-                triples = await _verify_extracted_triples(content, triples)
+                triples = await _verify_extracted_triples(
+                    candidate.verbatim_content,
+                    triples,
+                )
         except MorpheusExtractionError as exc:
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    still_pending = await conn.fetchval(
-                        """
-                        SELECT id
-                        FROM memories
-                        WHERE id = $1 AND triples_extracted_at IS NULL
-                        FOR UPDATE
-                        """,
-                        memory_id,
-                    )
-                    if still_pending is None:
-                        continue
-                    failure = await conn.fetchrow(
-                        """
-                        INSERT INTO morpheus_extract_failures
-                            (memory_id, attempts, status, last_error, last_failed_at)
-                        VALUES (
-                            $1,
-                            1,
-                            CASE WHEN $2 <= 1 THEN 'dead_letter' ELSE 'retryable' END,
-                            $3,
-                            NOW()
-                        )
-                        ON CONFLICT (memory_id) DO UPDATE
-                        SET attempts = morpheus_extract_failures.attempts + 1,
-                            status = CASE
-                                WHEN morpheus_extract_failures.attempts + 1 >= $2
-                                    THEN 'dead_letter'
-                                ELSE 'retryable'
-                            END,
-                            last_error = EXCLUDED.last_error,
-                            last_failed_at = EXCLUDED.last_failed_at
-                        RETURNING attempts, status
-                        """,
-                        memory_id,
-                        max_failures,
-                        str(exc)[:2000],
-                    )
-            attempts = int(failure["attempts"])
-            if failure["status"] == "dead_letter":
+            async with backend.transactional() as tx:
+                failure = await backend.morpheus.phase_extract_failure(
+                    tx,
+                    memory_id=candidate.id,
+                    max_failures=max_failures,
+                    error=str(exc),
+                )
+            if failure is None:
+                continue
+            if failure.status == "dead_letter":
                 logger.error(
                     "[MORPHEUS] extraction dead-lettered memory %s after %d consecutive failures: %s",
-                    memory_id,
-                    attempts,
+                    candidate.id,
+                    failure.attempts,
                     exc,
                 )
             else:
                 logger.warning(
                     "[MORPHEUS] extraction failed for memory %s (attempt %d/%d); leaving it retryable: %s",
-                    memory_id,
-                    attempts,
+                    candidate.id,
+                    failure.attempts,
                     max_failures,
                     exc,
                 )
             continue
 
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                marked_id = await conn.fetchval(
-                    f"""
-                    UPDATE memories
-                    SET triples_extracted_at = NOW()
-                    WHERE id=$1
-                      AND triples_extracted_at IS NULL
-                      AND {eligible_for_morpheus("")}
-                      AND ($2::text IS NULL OR namespace = $2)
-                    RETURNING id
-                    """,
-                    memory_id,
-                    namespace,
-                )
-                if marked_id is None:
-                    continue
-
-                await conn.execute(
-                    "DELETE FROM morpheus_extract_failures WHERE memory_id = $1",
-                    memory_id,
-                )
-
-                await conn.execute(
-                    """
-                    INSERT INTO morpheus_extract_run_memories
-                        (run_id, memory_id)
-                    VALUES ($1::uuid, $2)
-                    ON CONFLICT (run_id, memory_id) DO UPDATE
-                    SET processed_at = EXCLUDED.processed_at
-                    """,
-                    run_id,
-                    memory_id,
-                )
-
-                for triple in triples:
-                    await conn.execute(
-                        """
-                        INSERT INTO kg_triples
-                            (id, subject, predicate, object,
-                             memory_id, confidence, extracted_by_run_id,
-                             owner_id, namespace)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, $8, $9)
-                        """,
-                        _new_kg_triple_id(),
-                        triple.subject,
-                        triple.predicate,
-                        triple.object,
-                        memory_id,
-                        triple.confidence,
-                        run_id,
-                        row["owner_id"],
-                        row["namespace"],
-                    )
-
-                await increment_extract_counters(
-                    conn,
-                    run_id,
-                    triples_extracted=len(triples),
-                    memories_processed=1,
-                )
-
+        stored = [
+            (
+                _new_kg_triple_id(),
+                triple.subject,
+                triple.predicate,
+                triple.object,
+                triple.confidence,
+            )
+            for triple in triples
+        ]
+        async with backend.transactional() as tx:
+            claimed = await backend.morpheus.phase_extract_store(
+                tx,
+                run_id=run_id,
+                candidate=candidate,
+                triples=stored,
+            )
+        if not claimed:
+            continue
         memories_processed += 1
         triples_extracted += len(triples)
 

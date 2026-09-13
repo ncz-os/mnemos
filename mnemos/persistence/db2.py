@@ -2658,7 +2658,7 @@ class Db2CompressionRepository(_Db2OraCompatMixin, OracleCompressionRepository):
 class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
     """Db2 12.1.5 (Oracle Compat) impl of :class:`MorpheusRepository` (item 11a).
 
-    Inherits every method from :class:`OracleMorpheusRepository` because
+    Inherits most methods from :class:`OracleMorpheusRepository` because
     the cursor layer in :class:`_Db2AsyncCursor.execute` rewrites
     Oracle→Db2 dialect tokens (``SYSTIMESTAMP``→``CURRENT TIMESTAMP``,
     ``:name``→``?``, ``TIMESTAMP WITH TIME ZONE``→``TIMESTAMP``)
@@ -2689,7 +2689,18 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
     ``0061c_morpheus_runs_parity.sql`` — the canonical 19-column
     Postgres shape retconned onto Db2 with TIMESTAMP (not TIMESTAMP
     WITH TIME ZONE) and CLOB config/namespace columns.
+
+    Item 11c's Oracle parent already uses locked read-modify-write for
+    CONSOLIDATE and ``MERGE`` for EXTRACT, both accepted by Db2's
+    compatibility cursor.  The only new driver gap is Oracle CLOB bind
+    sizing; ``_set_morpheus_clob_inputs`` is therefore a no-op here
+    because ``ibm_db_dbi`` binds Python strings to CLOB directly.
     """
+
+    @staticmethod
+    def _set_morpheus_clob_inputs(cursor: Any, **names: Any) -> None:
+        """Db2 binds Python strings to CLOB without python-oracledb hints."""
+        _ = cursor, names
 
     async def rollback_run(
         self,

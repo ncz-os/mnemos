@@ -52,7 +52,13 @@ from mnemos.persistence.base import (
     FULL_STORAGE_CAPABILITY_DETAILS,
     KGRepository,
     MemoryRepository,
+    MorpheusConsolidationResult,
+    MorpheusExtractBatch,
+    MorpheusExtractCandidate,
+    MorpheusExtractFailure,
     MorpheusRepository,
+    MorpheusSynthesisCluster,
+    MorpheusSynthesisMember,
     NatsDispatchLogRepository,
     OAuthRepository,
     SessionsRepository,
@@ -763,6 +769,7 @@ class OracleKGRepository(KGRepository):
             raise
         finally:
             await _call(cursor.close)
+
         return "INSERT 0 1" if affected else "INSERT 0 0"
 
     async def fetch_kg_triple_by_id(self, tx: Transaction, triple_id: str) -> Row | None:
@@ -2371,9 +2378,21 @@ class OracleMorpheusRepository(MorpheusRepository):
       12c but not the writable CTE-feeding-UPDATE pattern Postgres
       uses; we decompose ``rollback_run`` into portable sequential
       statements inside the supplied ``tx``.
+    * **Item 11c phase writes**: member lists expand to named ``IN``
+      binds and EXTRACT upserts use ``MERGE``.  CONSOLIDATE uses the
+      established locked read-modify-write CLOB fallback so its audit
+      key is byte-for-byte compatible with ``rollback_run``.
     """
 
     _ORPHAN_TIMEOUT_ERROR = "orphan_timeout_sweep"
+
+    @staticmethod
+    def _set_morpheus_clob_inputs(cursor: Any, **names: Any) -> None:
+        """Force Oracle CLOB binds; Db2 overrides this driver-only hook."""
+        import oracledb
+
+        cursor.setinputsizes(**{name: oracledb.DB_TYPE_CLOB for name in names})
+
     _PRE_CONSOLIDATE_PERMISSION_KEY = "pre_consolidate_permission_mode"
 
     async def begin_run(
@@ -2510,8 +2529,7 @@ class OracleMorpheusRepository(MorpheusRepository):
         try:
             await _call(
                 cursor.execute,
-                "UPDATE morpheus_runs SET status = 'success', "
-                "finished_at = SYSTIMESTAMP WHERE id = :id",
+                "UPDATE morpheus_runs SET status = 'success', finished_at = SYSTIMESTAMP WHERE id = :id",
                 {"id": run_id},
             )
         finally:
@@ -2523,8 +2541,7 @@ class OracleMorpheusRepository(MorpheusRepository):
         try:
             await _call(
                 cursor.execute,
-                "UPDATE morpheus_runs SET status = 'failed', "
-                "finished_at = SYSTIMESTAMP, error = :err WHERE id = :id",
+                "UPDATE morpheus_runs SET status = 'failed', finished_at = SYSTIMESTAMP, error = :err WHERE id = :id",
                 {"err": str(error)[:4000], "id": run_id},
             )
         finally:
@@ -2609,8 +2626,7 @@ class OracleMorpheusRepository(MorpheusRepository):
             try:
                 await _call(
                     cursor.execute,
-                    f"UPDATE memories SET triples_extracted_at = NULL "
-                    f"WHERE id IN ({placeholders})",
+                    f"UPDATE memories SET triples_extracted_at = NULL WHERE id IN ({placeholders})",
                     binds,
                 )
             finally:
@@ -2971,6 +2987,409 @@ class OracleMorpheusRepository(MorpheusRepository):
             )
         finally:
             await _call(cursor.close)
+
+    async def phase_consolidate(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        consolidated_permission_mode: int,
+    ) -> MorpheusConsolidationResult | None:
+        """Oracle locked metadata read-modify-write CONSOLIDATE path."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT config, cluster_min_size, namespace FROM morpheus_runs WHERE id = :id FOR UPDATE",
+                {"id": run_id},
+            )
+            run_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+        if run_row is None:
+            return None
+        try:
+            config = json.loads(run_row["config"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        min_size = int(run_row["cluster_min_size"])
+        namespace = run_row["namespace"]
+        eligible = _eligibility.eligible_for_morpheus("")
+        memories_consolidated = clusters_consolidated = 0
+        for cluster in clusters:
+            ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
+            if len(ids) < min_size:
+                continue
+            placeholders, params = _in_placeholders(ids, "member")
+            params["ns"] = namespace
+            cursor = await _call(conn.cursor)
+            try:
+                await _call(
+                    cursor.execute,
+                    f"SELECT id, recall_count, created, permission_mode, metadata "
+                    f"FROM memories WHERE id IN ({placeholders}) AND {eligible} "
+                    "AND (:ns IS NULL OR namespace = :ns) FOR UPDATE",
+                    params,
+                )
+                rows = await _fetch_all_dicts(cursor)
+            finally:
+                await _call(cursor.close)
+            if not rows:
+                continue
+            canonical_id = str(
+                sorted(rows, key=lambda r: (-int(r["recall_count"] or 0), r["created"], str(r["id"])))[0]["id"]
+            )
+            count_params = {**params, "canonical": canonical_id, "run_id": run_id}
+            cursor = await _call(conn.cursor)
+            try:
+                await _call(
+                    cursor.execute,
+                    f"SELECT metadata FROM memories WHERE id IN ({placeholders}) "
+                    "AND deleted_at IS NULL AND archived_at IS NULL "
+                    "AND consolidated_into = :canonical AND morpheus_run_id = :run_id "
+                    "AND (:ns IS NULL OR namespace = :ns)",
+                    count_params,
+                )
+                prior_rows = await _call(cursor.fetchall) or []
+            finally:
+                await _call(cursor.close)
+            cluster_count = 0
+            for prior in prior_rows:
+                raw = await _materialize_value(prior[0])
+                try:
+                    prior_metadata = json.loads(raw or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    prior_metadata = {}
+                cluster_count += int(
+                    isinstance(prior_metadata, dict) and "pre_consolidate_permission_mode" in prior_metadata
+                )
+            if len(rows) + cluster_count < min_size:
+                continue
+            for row in rows:
+                member_id = str(row["id"])
+                if member_id == canonical_id:
+                    continue
+                try:
+                    metadata = json.loads(row["metadata"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                metadata.setdefault("pre_consolidate_permission_mode", int(row["permission_mode"] or 0))
+                cursor = await _call(conn.cursor)
+                try:
+                    self._set_morpheus_clob_inputs(cursor, metadata=True)
+                    await _call(
+                        cursor.execute,
+                        """
+                        UPDATE memories SET consolidated_into = :canonical,
+                            consolidated_at = SYSTIMESTAMP, permission_mode = :mode,
+                            morpheus_run_id = :run_id, metadata = :metadata
+                        WHERE id = :id AND deleted_at IS NULL AND archived_at IS NULL
+                          AND consolidated_into IS NULL AND morpheus_run_id IS NULL
+                          AND (:ns IS NULL OR namespace = :ns)
+                        """,
+                        {
+                            "canonical": canonical_id,
+                            "mode": int(consolidated_permission_mode),
+                            "run_id": run_id,
+                            "metadata": json.dumps(metadata),
+                            "id": member_id,
+                            "ns": namespace,
+                        },
+                    )
+                    cluster_count += int(getattr(cursor, "rowcount", 0) or 0)
+                finally:
+                    await _call(cursor.close)
+            if cluster_count:
+                memories_consolidated += cluster_count
+                clusters_consolidated += 1
+        await self.update_counters(
+            tx,
+            run_id,
+            memories_consolidated=memories_consolidated,
+            clusters_consolidated=clusters_consolidated,
+        )
+        return MorpheusConsolidationResult(memories_consolidated, clusters_consolidated)
+
+    async def phase_synthesise_load(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> list[MorpheusSynthesisCluster] | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(cursor.execute, "SELECT config FROM morpheus_runs WHERE id = :id", {"id": run_id})
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+        if row is None:
+            return None
+        try:
+            config = json.loads(row["config"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        eligible = _eligibility.eligible_for_morpheus("")
+        loaded: list[MorpheusSynthesisCluster] = []
+        for cluster in clusters:
+            ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
+            if not ids:
+                continue
+            placeholders, params = _in_placeholders(ids, "member")
+            cursor = await _call(conn.cursor)
+            try:
+                await _call(
+                    cursor.execute,
+                    f"SELECT id, content, category, owner_id, namespace FROM memories "
+                    f"WHERE id IN ({placeholders}) AND {eligible}",
+                    params,
+                )
+                rows = await _fetch_all_dicts(cursor)
+            finally:
+                await _call(cursor.close)
+            members = tuple(
+                MorpheusSynthesisMember(
+                    str(item["id"]),
+                    str(item["content"] or ""),
+                    item["category"],
+                    item["owner_id"],
+                    item["namespace"],
+                )
+                for item in rows
+            )
+            if members:
+                loaded.append(MorpheusSynthesisCluster(cluster.get("cluster_id"), members))
+        return loaded
+
+    async def phase_synthesise_store(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        content: str,
+        category: str | None,
+        owner_id: str,
+        namespace: str,
+        run_id: str,
+        source_memory_ids: Sequence[str],
+        metadata: Mapping[str, Any],
+    ) -> None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            self._set_morpheus_clob_inputs(cursor, content=True, metadata=True, source_memories=True)
+            await _call(
+                cursor.execute,
+                """
+                INSERT INTO memories
+                    (id, content, category, subcategory, metadata, quality_rating,
+                     verbatim_content, owner_id, namespace, permission_mode,
+                     morpheus_run_id, source_memories, provenance)
+                VALUES (:id, :content, :category, 'morpheus-synthesis', :metadata,
+                        75, :content, :owner_id, :namespace, 600,
+                        :run_id, :source_memories, 'morpheus_local')
+                """,
+                {
+                    "id": memory_id,
+                    "content": content,
+                    "category": category,
+                    "metadata": json.dumps(dict(metadata)),
+                    "owner_id": owner_id,
+                    "namespace": namespace,
+                    "run_id": run_id,
+                    "source_memories": json.dumps(list(source_memory_ids)),
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def phase_extract_load(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        min_chars: int,
+        max_input_count: int,
+    ) -> MorpheusExtractBatch | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT config, namespace, window_ended_at FROM morpheus_runs WHERE id = :id",
+                {"id": run_id},
+            )
+            run_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+        if run_row is None:
+            return None
+        try:
+            config = json.loads(run_row["config"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        eligible = _eligibility.eligible_for_morpheus("m")
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id, m.verbatim_content, m.owner_id, m.namespace
+                FROM memories m
+                LEFT JOIN morpheus_extract_failures failure ON failure.memory_id = m.id
+                WHERE {eligible} AND m.created <= :window_end
+                  AND m.triples_extracted_at IS NULL AND m.verbatim_content IS NOT NULL
+                  AND LENGTH(m.verbatim_content) >= :min_chars
+                  AND (:ns IS NULL OR m.namespace = :ns)
+                  AND (failure.status IS NULL OR failure.status <> 'dead_letter')
+                ORDER BY m.created, m.id FETCH FIRST :max_rows ROWS ONLY
+                """,
+                {
+                    "window_end": run_row["window_ended_at"],
+                    "min_chars": int(min_chars),
+                    "ns": run_row["namespace"],
+                    "max_rows": int(max_input_count),
+                },
+            )
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        candidates = tuple(
+            MorpheusExtractCandidate(
+                str(item["id"]),
+                str(item["verbatim_content"] or ""),
+                str(item["owner_id"]),
+                str(item["namespace"]),
+            )
+            for item in rows
+        )
+        return MorpheusExtractBatch(config, run_row["namespace"], candidates)
+
+    async def phase_extract_failure(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        max_failures: int,
+        error: str,
+    ) -> MorpheusExtractFailure | None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT id FROM memories WHERE id = :id AND triples_extracted_at IS NULL FOR UPDATE",
+                {"id": memory_id},
+            )
+            if await _call(cursor.fetchone) is None:
+                return None
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO morpheus_extract_failures failure
+                USING (SELECT :memory_id AS memory_id FROM dual) source
+                ON (failure.memory_id = source.memory_id)
+                WHEN MATCHED THEN UPDATE SET attempts = failure.attempts + 1,
+                    status = CASE WHEN failure.attempts + 1 >= :max_failures
+                                  THEN 'dead_letter' ELSE 'retryable' END,
+                    last_error = :error, last_failed_at = SYSTIMESTAMP
+                WHEN NOT MATCHED THEN INSERT
+                    (memory_id, attempts, status, last_error, last_failed_at)
+                VALUES (:memory_id, 1,
+                    CASE WHEN :max_failures <= 1 THEN 'dead_letter' ELSE 'retryable' END,
+                    :error, SYSTIMESTAMP)
+                """,
+                {
+                    "memory_id": memory_id,
+                    "max_failures": int(max_failures),
+                    "error": str(error)[:2000],
+                },
+            )
+            await _call(
+                cursor.execute,
+                "SELECT attempts, status FROM morpheus_extract_failures WHERE memory_id = :id",
+                {"id": memory_id},
+            )
+            row = await _call(cursor.fetchone)
+        finally:
+            await _call(cursor.close)
+        return MorpheusExtractFailure(int(row[0]), str(row[1]))
+
+    async def phase_extract_store(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        candidate: MorpheusExtractCandidate,
+        triples: Sequence[tuple[str, str, str, str, float]],
+    ) -> bool:
+        conn = _conn_from_tx(tx)
+        eligible = _eligibility.eligible_for_morpheus("")
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"UPDATE memories SET triples_extracted_at = SYSTIMESTAMP "
+                f"WHERE id = :id AND triples_extracted_at IS NULL AND {eligible} "
+                "AND (:ns IS NULL OR namespace = :ns)",
+                {"id": candidate.id, "ns": candidate.namespace},
+            )
+            if int(getattr(cursor, "rowcount", 0) or 0) == 0:
+                return False
+            await _call(
+                cursor.execute,
+                "DELETE FROM morpheus_extract_failures WHERE memory_id = :id",
+                {"id": candidate.id},
+            )
+            await _call(
+                cursor.execute,
+                """
+                MERGE INTO morpheus_extract_run_memories target
+                USING (SELECT :run_id AS run_id, :memory_id AS memory_id FROM dual) source
+                ON (target.run_id = source.run_id AND target.memory_id = source.memory_id)
+                WHEN MATCHED THEN UPDATE SET processed_at = SYSTIMESTAMP
+                WHEN NOT MATCHED THEN INSERT (run_id, memory_id, processed_at)
+                VALUES (source.run_id, source.memory_id, SYSTIMESTAMP)
+                """,
+                {"run_id": run_id, "memory_id": candidate.id},
+            )
+            for triple_id, subject, predicate, object_, confidence in triples:
+                await _call(
+                    cursor.execute,
+                    """
+                    INSERT INTO kg_triples
+                        (id, subject, predicate, object, memory_id, confidence,
+                         extracted_by_run_id, owner_id, namespace)
+                    VALUES (:id, :subject, :predicate, :object, :memory_id,
+                            :confidence, :run_id, :owner_id, :namespace)
+                    """,
+                    {
+                        "id": triple_id,
+                        "subject": subject,
+                        "predicate": predicate,
+                        "object": object_,
+                        "memory_id": candidate.id,
+                        "confidence": float(confidence),
+                        "run_id": run_id,
+                        "owner_id": candidate.owner_id,
+                        "namespace": candidate.namespace,
+                    },
+                )
+        finally:
+            await _call(cursor.close)
+        await self.increment_extract_counters(
+            tx,
+            run_id,
+            triples_extracted=len(triples),
+            memories_processed=1,
+        )
+        return True
 
 
 class OracleCompressionQueueRepository(CompressionQueueRepository):
@@ -3613,7 +4032,7 @@ class OracleWebhookRepository(WebhookRepository):
                 f"""
                 UPDATE webhook_subscriptions
                 SET revoked = 1, revoked_at = CAST(SYSTIMESTAMP AS TIMESTAMP WITH TIME ZONE)
-                WHERE {' AND '.join(conditions)}
+                WHERE {" AND ".join(conditions)}
                 RETURNING id INTO :rid
                 """,
                 {**params, "rid": rid_var},
@@ -3690,9 +4109,8 @@ class OracleWebhookRepository(WebhookRepository):
                 sub_params["namespace"] = namespace
             sub_conditions.append("DBMS_LOB.INSTR(events, :ev_token) > 0")
             sub_params["ev_token"] = f'"{event_type}"'
-            sql_sub = (
-                "SELECT id, url, owner_id, namespace FROM webhook_subscriptions WHERE "
-                + " AND ".join(sub_conditions)
+            sql_sub = "SELECT id, url, owner_id, namespace FROM webhook_subscriptions WHERE " + " AND ".join(
+                sub_conditions
             )
             await _call(cursor.execute, sql_sub, sub_params)
             subs = await _fetch_all_dicts(cursor)
@@ -3986,10 +4404,7 @@ class OracleWebhookRepository(WebhookRepository):
                 id_params,
             )
             rows = await _call(cursor.fetchall) or []
-            result = [
-                _oracle_webhook_claim(await _row_to_dict(cursor, raw), lease_token, claim_now)
-                for raw in rows
-            ]
+            result = [_oracle_webhook_claim(await _row_to_dict(cursor, raw), lease_token, claim_now) for raw in rows]
         finally:
             await _call(cursor.close)
         return result
@@ -4296,7 +4711,8 @@ class OracleWebhookRepository(WebhookRepository):
                     )
                     if int(getattr(cursor, "rowcount", 0) or 0) > 0:
                         return WebhookFinalizationResult(
-                            applied=True, status="abandoned",
+                            applied=True,
+                            status="abandoned",
                         )
                     await _call(
                         cursor.execute,
@@ -4717,9 +5133,7 @@ def _oracle_webhook_json_events(value: Any) -> tuple[str, ...]:
     return tuple(str(event) for event in parsed)
 
 
-def _oracle_webhook_subscription(
-    row: dict[str, Any], *, events_value: Any | None = None
-) -> WebhookSubscriptionRecord:
+def _oracle_webhook_subscription(row: dict[str, Any], *, events_value: Any | None = None) -> WebhookSubscriptionRecord:
     """Normalize a webhook_subscriptions row into a backend-neutral record."""
     events_raw = events_value if events_value is not None else row.get("events")
     events = _oracle_webhook_json_events(events_raw)
@@ -4733,11 +5147,7 @@ def _oracle_webhook_subscription(
         namespace=row["namespace"],
         created=_oracle_webhook_datetime(created_raw),
         revoked=bool(row.get("revoked")),
-        revoked_at=(
-            _oracle_webhook_datetime(row["revoked_at"])
-            if row.get("revoked_at") is not None
-            else None
-        ),
+        revoked_at=(_oracle_webhook_datetime(row["revoked_at"]) if row.get("revoked_at") is not None else None),
     )
 
 
@@ -4759,27 +5169,17 @@ def _oracle_webhook_delivery(row: dict[str, Any]) -> WebhookDeliveryRecord:
         response_body=row.get("response_body"),
         error=row.get("error"),
         scheduled_at=_oracle_webhook_datetime(row["scheduled_at"]),
-        delivered_at=(
-            _oracle_webhook_datetime(row["delivered_at"])
-            if row.get("delivered_at") is not None
-            else None
-        ),
+        delivered_at=(_oracle_webhook_datetime(row["delivered_at"]) if row.get("delivered_at") is not None else None),
         created=_oracle_webhook_datetime(row.get("created_at") or row.get("created")),
         status_updated_at=_oracle_webhook_datetime(row["status_updated_at"]),
         superseded=bool(row.get("superseded")),
         lease_token=str(lease_token) if lease_token is not None else None,
-        lease_expires_at=(
-            _oracle_webhook_datetime(lease_expires_at)
-            if lease_expires_at is not None
-            else None
-        ),
+        lease_expires_at=(_oracle_webhook_datetime(lease_expires_at) if lease_expires_at is not None else None),
         writer_revision=int(row.get("writer_revision") or 0),
     )
 
 
-def _oracle_webhook_claim(
-    row: dict[str, Any], lease_token: str, claim_now: datetime
-) -> WebhookDeliveryClaim:
+def _oracle_webhook_claim(row: dict[str, Any], lease_token: str, claim_now: datetime) -> WebhookDeliveryClaim:
     """Build a ``WebhookDeliveryClaim`` from the post-claim SELECT row.
 
     ``claim_now`` arrives naive (see ``_oracle_now`` docstring) -- promote
@@ -4790,9 +5190,7 @@ def _oracle_webhook_claim(
     delivery = _oracle_webhook_delivery(row)
     claim_now_aware = _oracle_webhook_datetime(claim_now)
     lease_expires_at = (
-        _oracle_webhook_datetime(row["lease_expires_at"])
-        if row.get("lease_expires_at") is not None
-        else None
+        _oracle_webhook_datetime(row["lease_expires_at"]) if row.get("lease_expires_at") is not None else None
     )
     return WebhookDeliveryClaim(
         delivery=delivery,
@@ -5296,8 +5694,7 @@ class OracleOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
                 try:
                     await _call(
                         cursor.execute,
-                        "INSERT INTO users (id, display_name, email, role) "
-                        "VALUES (:id, :display_name, :email, 'user')",
+                        "INSERT INTO users (id, display_name, email, role) VALUES (:id, :display_name, :email, 'user')",
                         {"id": user_id, "display_name": display_name, "email": email},
                     )
                 except Exception as exc:  # noqa: BLE001 — re-raised unless it's the dup race
@@ -5416,9 +5813,7 @@ class OracleOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
         finally:
             await _call(cursor.close)
 
-    async def lookup_api_key(
-        self, tx: Transaction, key_hash: str
-    ) -> Row | None:
+    async def lookup_api_key(self, tx: Transaction, key_hash: str) -> Row | None:
         # Oracle's api_keys schema differs from the Postgres canonical:
         # it stores last_used_at + revoked_at rather than last_used/revoked,
         # and tracks ownership via owner_id+namespace rather than user_id.
@@ -5459,15 +5854,12 @@ class OracleOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
         finally:
             await _call(cursor.close)
 
-    async def resolve_active_session(
-        self, tx: Transaction, session_id: str, *, now: Any
-    ) -> Row | None:
+    async def resolve_active_session(self, tx: Transaction, session_id: str, *, now: Any) -> Row | None:
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
             await _call(
                 cursor.execute,
-                "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions "
-                "WHERE session_id = :session_id",
+                "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions WHERE session_id = :session_id",
                 {"session_id": session_id},
             )
             row = await _row_to_dict(cursor, await _call(cursor.fetchone))
@@ -5483,8 +5875,7 @@ class OracleOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
                 return None
             await _call(
                 cursor.execute,
-                "UPDATE oauth_sessions SET last_used_at = SYSTIMESTAMP "
-                "WHERE session_id = :session_id",
+                "UPDATE oauth_sessions SET last_used_at = SYSTIMESTAMP WHERE session_id = :session_id",
                 {"session_id": session_id},
             )
             return row
@@ -6054,8 +6445,13 @@ class OracleConsultationsRepository(ConsultationsRepository):
         return consultation, refs
 
     async def fetch_consultation_full(
-        self, tx: Transaction, consultation_id: str,
-        *, root: bool = False, user_id: str | None = None, namespace: str | None = None,
+        self,
+        tx: Transaction,
+        consultation_id: str,
+        *,
+        root: bool = False,
+        user_id: str | None = None,
+        namespace: str | None = None,
     ) -> dict[str, Any] | None:
         """Oracle port of PostgresConsultationsRepository.fetch_consultation_full.
 

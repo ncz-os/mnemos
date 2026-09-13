@@ -63,6 +63,7 @@ from mnemos.persistence.mysql import (
     _DDL_KG_TRIPLES,
     _DDL_MODEL_REGISTRY,
     _DDL_MODEL_REGISTRY_SYNC_LOG,
+    _DDL_MORPHEUS_EXTRACT_FAILURES,
     _DDL_SESSIONS,
     _DDL_SESSION_MESSAGES,
     _DDL_STATE,
@@ -128,6 +129,10 @@ CREATE TABLE IF NOT EXISTS memories (
     federation_remote_updated DATETIME(6),
     consolidated_into VARCHAR(64),
     consolidated_at   DATETIME(6),
+    morpheus_run_id   CHAR(36),
+    source_memories   LONGTEXT CHECK (source_memories IS NULL OR JSON_VALID(source_memories)),
+    provenance        VARCHAR(64),
+    triples_extracted_at DATETIME(6),
     federation_last_pushed_at DATETIME(6),
     federation_push_peer VARCHAR(512),
     recall_count      INT           NOT NULL DEFAULT 0,
@@ -411,6 +416,7 @@ _INIT_DDLS = [
     _DDL_CATEGORY_DECAY_SEED,
     _DDL_MORPHEUS_RUNS,
     _DDL_MORPHEUS_EXTRACT_RUN_MEMORIES,
+    _DDL_MORPHEUS_EXTRACT_FAILURES,
 ]
 
 
@@ -760,9 +766,11 @@ class MariadbMorpheusRepository(MysqlMorpheusRepository):
     directly so MariaDB's LONGTEXT column receives a valid JSON
     string.
 
-    All other MySQL impl methods (``update_counters``, ``set_phase``,
-    ``rollback_run``, etc.) round-trip unchanged because ``UPDATE``
-    paths don't touch the JSON CAST or the embedding column.
+    Item 11c adds one analogous override for ``phase_synthesise_store``:
+    ``source_memories`` is valid JSON text in LONGTEXT rather than a
+    MySQL ``CAST(... AS JSON)`` value.  CONSOLIDATE's JSON functions,
+    EXTRACT's locking/upsert dialect, and all remaining MySQL methods
+    are compatible and inherit unchanged.
     """
 
     async def begin_run(
@@ -967,6 +975,44 @@ class MariadbMorpheusRepository(MysqlMorpheusRepository):
             await cursor.execute(
                 "UPDATE morpheus_runs SET config = %s WHERE id = %s",
                 (json.dumps(merged), run_id),
+            )
+
+    async def phase_synthesise_store(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        content: str,
+        category: str | None,
+        owner_id: str,
+        namespace: str,
+        run_id: str,
+        source_memory_ids: Sequence[str],
+        metadata: Mapping[str, Any],
+    ) -> None:
+        """MariaDB LONGTEXT-JSON override; MySQL's ``CAST AS JSON`` is invalid."""
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                INSERT INTO memories
+                    (id, content, content_hash, category, subcategory, metadata,
+                     quality_rating, verbatim_content, owner_id, namespace,
+                     permission_mode, morpheus_run_id, source_memories, provenance)
+                VALUES (%s, %s, SHA2(%s, 256), %s, 'morpheus-synthesis', %s,
+                        75, %s, %s, %s, 600, %s, %s, 'morpheus_local')
+                """,
+                (
+                    memory_id,
+                    content,
+                    content,
+                    category,
+                    json.dumps(dict(metadata)),
+                    content,
+                    owner_id,
+                    namespace,
+                    run_id,
+                    json.dumps(list(source_memory_ids)),
+                ),
             )
 
 
@@ -1288,7 +1334,16 @@ class MariadbBackend(MysqlBackend):
                         "consolidated_at": "consolidated_at DATETIME(6)",
                         "federation_last_pushed_at": "federation_last_pushed_at DATETIME(6)",
                         "federation_push_peer": "federation_push_peer VARCHAR(512)",
+                        "morpheus_run_id": "morpheus_run_id CHAR(36)",
+                        "source_memories": "source_memories LONGTEXT",
+                        "provenance": "provenance VARCHAR(64)",
+                        "triples_extracted_at": "triples_extracted_at DATETIME(6)",
                     },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "kg_triples",
+                    {"extracted_by_run_id": "extracted_by_run_id CHAR(36)"},
                 )
                 await _ensure_mysql_columns(
                     conn,
