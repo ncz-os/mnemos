@@ -76,23 +76,35 @@ ALTER TABLE morpheus_runs ADD COLUMN namespace VARCHAR(256)
 --       any production path.
 --
 --       Wrapped: an unwrapped DROP COLUMN succeeds on the FIRST ever
---       boot against a real database and then raises SQLSTATE 42704
---       (undefined column) on EVERY subsequent boot, because the
---       column is already gone -- migrations here carry no
+--       boot against a real database and then raises SQLSTATE 42703
+--       (undefined column/attribute) on EVERY subsequent boot, because
+--       the column is already gone -- migrations here carry no
 --       applied-state table and are replayed on every boot. Found live
 --       in production on the Oracle sibling of this file (2026-09-13):
 --       the first boot succeeded and dropped both columns; the very
 --       next restart crash-looped on this exact statement. Same idiom
 --       as the DROP CONSTRAINT guards below.
-BEGIN ATOMIC
-    DECLARE CONTINUE HANDLER FOR SQLSTATE '42704'
+--
+--       MUST be plain ``BEGIN ... END``, never ``BEGIN ATOMIC``: this
+--       Db2 12.1.5 instance rejects ``DECLARE ... HANDLER`` inside an
+--       ATOMIC compound statement outright --
+--       ``SQL0104N unexpected token "HANDLER" ... expected "CONDITION"``
+--       -- confirmed by testing both forms directly against a live
+--       instance (2026-09-13); ``BEGIN ATOMIC`` here had never actually
+--       been exercised until this session's first real Db2 boot past
+--       item 11/11a. The SQLSTATE for a missing COLUMN is 42703, not
+--       42704 (42704 is undefined TABLE/object; the DROP CONSTRAINT
+--       guards below correctly use 42704 since a missing CONSTRAINT is
+--       an undefined object) -- confirmed the same way.
+BEGIN
+    DECLARE CONTINUE HANDLER FOR SQLSTATE '42703'
         BEGIN END;
     EXECUTE IMMEDIATE 'ALTER TABLE morpheus_runs DROP COLUMN run_type';
 END
 @
 
-BEGIN ATOMIC
-    DECLARE CONTINUE HANDLER FOR SQLSTATE '42704'
+BEGIN
+    DECLARE CONTINUE HANDLER FOR SQLSTATE '42703'
         BEGIN END;
     EXECUTE IMMEDIATE 'ALTER TABLE morpheus_runs DROP COLUMN metrics';
 END
@@ -107,7 +119,12 @@ ALTER TABLE morpheus_runs ALTER COLUMN status SET DEFAULT 'running'
 --       ``DROP CONSTRAINT IF EXISTS`` and the migration applier only
 --       swallows SQLSTATE 42710 / 42P07 / 42701, not SQLSTATE 42704
 --       (undefined object).
-BEGIN ATOMIC
+--
+--       Plain ``BEGIN ... END``, not ``BEGIN ATOMIC`` -- see the
+--       DROP COLUMN comment above for why (confirmed against a live
+--       instance 2026-09-13; this was ALSO broken before that session,
+--       just never exercised).
+BEGIN
     DECLARE CONTINUE HANDLER FOR SQLSTATE '42704'
         BEGIN END;
     EXECUTE IMMEDIATE 'ALTER TABLE morpheus_runs DROP CONSTRAINT morpheus_runs_status_check';
@@ -118,7 +135,7 @@ ALTER TABLE morpheus_runs ADD CONSTRAINT morpheus_runs_status_check
     CHECK (status IN ('running','success','failed','rolled_back'))
 @
 
-BEGIN ATOMIC
+BEGIN
     DECLARE CONTINUE HANDLER FOR SQLSTATE '42704'
         BEGIN END;
     EXECUTE IMMEDIATE 'ALTER TABLE morpheus_runs DROP CONSTRAINT morpheus_runs_triggered_by_check';
