@@ -57,6 +57,50 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.4] — 2026-09-13
+
+- **Fixed**: deploying `6.3.3` to PYTHIA's production Oracle database
+  crash-looped `mnemos serve` on every restart:
+  `RuntimeError: ORACLE schema migration 0013_nats_dispatch_log.sql failed
+  at CREATE INDEX idx_nats_dispatch_log_dispatched_at:
+  ORA-00904: "DISPATCHED_AT": invalid identifier`. Root cause: item 9
+  retconned `0013_nats_dispatch_log.sql`'s Oracle/Db2 `CREATE TABLE` from
+  a legacy `(id, subject, payload, published_at, acked_at)` shape to the
+  canonical `(event_id, subject, dispatched_at)` shape by editing the
+  same migration file in place, rather than adding a new migration. A
+  database that had already provisioned the table under the pre-retcon
+  shape (PYTHIA's prod Oracle, provisioned months before the retcon)
+  hits `ORA-00955`/`table already exists` on the `CREATE TABLE`, which
+  the migration runner's benign-error handling correctly treats as an
+  idempotent replay and skips — but the table is still in the OLD shape,
+  so the very next statement, `CREATE INDEX ... (dispatched_at DESC)`,
+  fails for real: there is no such column. MySQL/MariaDB never shipped
+  this table before item 9, so they had no legacy shape to collide with;
+  only Oracle and Db2 carried the gap.
+- **Fix**: both `migrations_oracle/0013_nats_dispatch_log.sql` and
+  `migrations_db2/0013_nats_dispatch_log.sql` now check the live schema
+  (`user_tab_columns` / `SYSCAT.COLUMNS`) for the canonical
+  `dispatched_at` column before creating the table, and `DROP TABLE`
+  first if the table exists but is still in the legacy shape. The legacy
+  columns were never read by any production code (dedupe-log rows only;
+  the docstring already established this), so dropping and recreating
+  loses only in-flight dedupe markers — worst case one NATS event gets
+  redelivered and reprocessed once, which every consumer already
+  tolerates as an at-least-once bus.
+- **Process note**: rewriting an already-shipped numbered migration's
+  `CREATE TABLE` in place to change an existing table's shape is only
+  safe for backends where the table is brand new in the same change
+  (MySQL/MariaDB here). Any backend where the table predates the retcon
+  needs the migration itself to detect and handle the legacy shape,
+  because migrations in this codebase have no applied-state tracking
+  table and are replayed on every start — "table already exists" alone
+  cannot distinguish an already-canonical replay from a still-legacy one.
+- PYTHIA's `mnemos-api.service` (root-managed Podman quadlet,
+  `/etc/containers/systemd/mnemos-api.container`) was rolled back to
+  `6.2.4` immediately on hitting the crash loop and confirmed healthy
+  before this fix was written, to avoid an extended production outage
+  while root-causing.
+
 ## [6.3.3] — 2026-09-13
 
 - **Fixed**: `v6.3.2`'s release build failed on both arch legs at the
