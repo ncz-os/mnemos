@@ -21,7 +21,7 @@ backend). Pi 4 class is the intended floor for the embedded tier.
 
 ## Baseline requirements (all tiers)
 
-* **Python**: 3.11+ (`tomllib` stdlib dependency)
+* **Python**: 3.13+
 * **Database**: SQLite for `edge`/`dev`; Postgres 15+ with `pgvector`
   extension for `server`. Server multi-worker deployments also need Redis.
 * **Disk**: corpus + manifests + backups.
@@ -73,7 +73,7 @@ running the API without compression queue draining. No multi-engine
 contest, no GPU required.
 
 * **CPU**: 2 cores.
-* **RAM**: 4 GB. Postgres + Python API server + worker fit here;
+* **RAM**: 4 GB. SQLite + Python API server + worker fit here;
   leave 1 GB headroom for the OS.
 * **Disk**: 10 GB for the corpus + rolling 7-day backup.
 * **GPU**: explicitly none. Set `MNEMOS_CONTEST_ENABLED=false` to skip
@@ -85,7 +85,7 @@ contest, no GPU required.
   - memory_compression_candidates / memory_compressed_variants tables
     migrate cleanly but stay empty
 
-## Environment knobs (v3.x)
+## Environment knobs
 
 These env vars control which features a running worker will exercise.
 Defaults are the server-tier shape.
@@ -182,7 +182,7 @@ API workers and size disk for corpus growth plus rolling backups.
 
 Common first checks:
 
-* `python3 --version` reports Python 3.11+.
+* `python3 --version` reports Python 3.13+.
 * `psql --version` reports a supported PostgreSQL client when using `server`.
 * Docker and Compose report supported versions for container deployments.
 * `mnemos doctor` passes after initialization.

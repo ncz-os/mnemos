@@ -11,10 +11,10 @@ run the container image. Use SQLite for `edge`/`dev`, or PostgreSQL 16 for
 ## Container (Fastest Deploy)
 
 ```bash
-docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos:6.1
+docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:6.3
 ```
 
-SQLite-backed, zero configuration, no host Python. Pin the minor line (`:6.1`)
+SQLite-backed, zero configuration, no host Python. Pin the minor line (`:6.3`)
 to keep a fleet on identical code.
 
 **Total Time**: ~2 minutes
@@ -72,7 +72,7 @@ curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER
 
 # 2. Clone and configure (5 minutes)
-git clone https://github.com/ncz-os/mnemos
+git clone https://gitlab.com/ncz-os/mnemos
 cd mnemos
 cp .env.example .env
 # Edit .env if needed
@@ -315,7 +315,7 @@ kill -9 <PID>
 |------|---------|
 | `SYSTEM_REQUIREMENTS.md` | Complete system requirements (this expanded version) |
 | `DEPLOYMENT.md` | How to deploy to production |
-| `VERIFICATION_GUIDE.md` | How to verify deployment works |
+| `docs/OPERATIONS.md` | Runbooks and verification via `mnemos doctor` / `/health` |
 | `.env.example` | Configuration template |
 | `README.md` | General project info |
 
@@ -323,12 +323,10 @@ kill -9 <PID>
 
 ## Support
 
-- **GitHub Issues**: https://github.com/ncz-os/mnemos/issues
-- **Documentation**: https://github.com/ncz-os/mnemos#readme
+- **Issues**: https://gitlab.com/ncz-os/mnemos/-/issues
+- **Documentation**: https://gitlab.com/ncz-os/mnemos#readme
 - **Community**: Discord/Slack (if applicable)
 
 ---
 
 **Version**: v6.3.7
-**Updated**: 2026-07-10
-**Accuracy**: Production-verified

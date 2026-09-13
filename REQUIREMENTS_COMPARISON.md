@@ -3,7 +3,7 @@
 **Quick comparison between bare metal and Docker deployments**
 
 > The bare-metal vs Docker tradeoffs and resource floors below are current
-> for 6.1.
+> for 6.3.
 
 ---
 
@@ -53,11 +53,11 @@ Recommended: Ubuntu 22.04 LTS with Docker Engine
 
 ### Bare Metal
 ```
-Requirement: Python 3.11+
-Install:    apt install python3.11 (Linux)
-            brew install python@3.11 (macOS)
-            python-3.11-installer.exe (Windows)
-Virtual Env: python3.11 -m venv venv (required)
+Requirement: Python 3.13+
+Install:    apt install python3.13 (Linux)
+            brew install python@3.13 (macOS)
+            python-3.13-installer.exe (Windows)
+Virtual Env: python3.13 -m venv venv (required)
 Size:       ~500 MB + packages (~200 MB)
 ```
 
@@ -426,7 +426,7 @@ Alerting:
 ### Bare Metal
 ```
 MNEMOS Update:
-  1. git pull origin main
+  1. git pull origin master
   2. pip install -e . (reinstall dependencies)
   3. systemctl restart mnemos
   4. Manual database migrations

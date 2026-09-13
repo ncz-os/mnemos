@@ -1,5 +1,10 @@
 # MNEMOS OAuth audit fix report — round 2 — 2026-09-09
 
+**Merged to master.** The dedicated-OAuth-pool architecture described below
+was superseded by the backend-agnostic design in
+`OAUTH_BACKEND_AGNOSTIC_FIX_REPORT.md` — see that file for the current
+implementation. This report is retained as a historical record.
+
 ## Scope and outcome
 
 Work was performed directly in `/tmp/mnemos-audit-clones/mnemos-oauth-fix`

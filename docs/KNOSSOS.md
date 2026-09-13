@@ -74,7 +74,7 @@ the MemPalace tool-response shape.
 
 ## What you gain by moving
 
-| Capability | MemPalace 3.3.x | MNEMOS v4.0 via KNOSSOS |
+| Capability | MemPalace 3.3.x | MNEMOS via KNOSSOS |
 |---|---|---|
 | Multi-user memory | ❌ | ✅ — `owner_id`, `group_id`, `permission_mode` |
 | HTTP API | ❌ | ✅ — `/v1/memories/*`, `/v1/kg/*`, `/v1/export`, `/v1/import` |
@@ -108,13 +108,13 @@ export MNEMOS_BASE=http://mnemos.internal:5002
 export MNEMOS_API_KEY=$TEAM_API_KEY           # bearer token, issued per user
 export KNOSSOS_WING_AXIS=namespace             # default; 'owner_id' is also accepted
 
-python -m tools.knossos_mcp                   # stdio MCP server
+python -m mnemos.tools.knossos_mcp                   # stdio MCP server
 ```
 
 Or register with Claude Code:
 
 ```bash
-claude mcp add knossos -- python -m tools.knossos_mcp
+claude mcp add knossos -- python -m mnemos.tools.knossos_mcp
 ```
 
 The existing `mempalace_*` tool names keep working in your agent's
@@ -123,7 +123,7 @@ prompts and harnesses; no code change in the agent.
 ### 3. (Optional) Migrate an existing palace
 
 ```bash
-python -m tools.knossos_mcp migrate \
+python -m mnemos.tools.knossos_mcp migrate \
     --from-palace ~/.mempalace/palace \
     --endpoint $MNEMOS_BASE \
     --api-key $MNEMOS_API_KEY \
@@ -200,7 +200,7 @@ MPF envelopes (`mnemos/tools/memory_import.py`, `mnemos/tools/memory_export.py`,
 `docs/MEMORY_EXPORT_FORMAT.md`). A full MemPalace → MNEMOS migration uses both:
 
 1. CHARON one-time bulk import of the existing palace (via
-   `tools.knossos_mcp migrate --from-palace`).
+   `mnemos.tools.knossos_mcp migrate --from-palace`).
 2. KNOSSOS ongoing MCP traffic going forward.
 
 Other memory systems get the same pattern — CHARON for bulk
