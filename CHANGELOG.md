@@ -57,6 +57,32 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.3] — 2026-09-13
+
+- **Fixed**: `v6.3.2`'s release build failed on both arch legs at the
+  "Resolve enterprise digest" step — `##[error]An error occurred trying
+  to start process '/usr/bin/bash' ... Argument list too long`. Root
+  cause: that step mapped `steps.bake.outputs.metadata` (full
+  provenance+sbom attestation JSON for all 3 bake targets, ~150KB) into
+  the step's `env:` block. GitHub Actions execs the step process with
+  that value as a literal environment-variable argument, and Linux's
+  `MAX_ARG_STRLEN` caps any single exec argument/env value at 128KB —
+  exceeding it is a hard kernel-level `E2BIG`, not something either arch
+  legitimately produced or something raising the workflow's timeout
+  could fix. `v6.3.0`, `v6.3.1`, and `v6.3.2` published no image and
+  should not be used.
+- **Fix**: write `steps.bake.outputs.metadata` to a file via a `run:`
+  heredoc instead of passing it through `env:` — GitHub Actions
+  substitutes `${{ }}` expressions directly into the step's script file
+  on disk, which is a normal file write with no `MAX_ARG_STRLEN`
+  constraint, rather than an execve argument.
+- **Process note**: `docker/bake-action`'s `metadata` output is not
+  bounded in size — anything derived from it (digest lookups, tag
+  extraction) should always go to a file, never through `env:` or a
+  GitHub Actions output that a later step maps into `env:`, once
+  `attest = ["type=provenance", "type=sbom"]` is enabled on more than a
+  couple of targets.
+
 ## [6.3.2] — 2026-09-13
 
 - **Fixed**: `v6.3.1`'s release build still failed — pip's `everything`
