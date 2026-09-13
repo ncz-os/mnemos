@@ -37,6 +37,7 @@ from mnemos.persistence.base import (
     AuditChainRepository,
     BranchRepository,
     BackendCapabilityMissing,
+    ClusterCandidateRow,
     CompressionQueueRepository,
     CompressionRepository,
     CompressionStatsRow,
@@ -2555,6 +2556,134 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
             n_extract_reset,
         )
         return n_deleted, n_run
+
+    async def fetch_cluster_candidates(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        max_input_count: int,
+    ) -> ClusterCandidateRow | None:
+        """SQLite impl of MORPHEUS fetch_cluster_candidates — item 11b.
+
+        Returns the run's cluster-window config + the candidate rows
+        pre-materialised to ``list[float]`` in a single transaction.
+        Embeddings live on ``memories.embedding`` as TEXT (JSON
+        encoded), so ``_parse_embedding`` (the helper shared with
+        SQLite's ``semantic_search`` fallback path) handles every
+        shape the row may take — string, list, ``Iterable``.
+
+        SQLite uses ``?`` placeholders; ``IS DISTINCT FROM`` works in
+        SQLite ≥3.35 (the version ``_check_sqlite_version`` already
+        enforces), so the eligibility predicate stays a 1:1 copy of
+        the canonical Postgres shape.
+        """
+        conn = self._conn(tx)
+        run_row = await _fetch_one(
+            conn,
+            """
+            SELECT cluster_min_size, window_started_at, window_ended_at, namespace
+              FROM morpheus_runs WHERE id = ?
+            """,
+            (run_id,),
+        )
+        if run_row is None:
+            return None
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        rows = await _fetch_all(
+            conn,
+            f"""
+            SELECT id, embedding
+              FROM memories
+             WHERE created BETWEEN ? AND ?
+               AND provenance IS DISTINCT FROM 'morpheus_local'
+               AND morpheus_run_id IS NULL
+               AND embedding IS NOT NULL
+               AND {eligibility_clause}
+               AND (? IS NULL OR namespace = ?)
+             ORDER BY created
+             LIMIT ?
+            """,
+            (
+                run_row["window_started_at"],
+                run_row["window_ended_at"],
+                run_row["namespace"],
+                run_row["namespace"],
+                int(max_input_count),
+            ),
+        )
+        candidates: list[tuple[str, list[float]]] = []
+        for row in rows:
+            if isinstance(row, dict):
+                mid = row["id"]
+                raw_embed = row["embedding"]
+            else:
+                mid, raw_embed = row[0], row[1]
+            vec = _parse_embedding(raw_embed)
+            if not vec:
+                continue
+            candidates.append((str(mid), vec))
+        return ClusterCandidateRow(
+            cluster_min_size=int(run_row["cluster_min_size"]),
+            window_started_at=run_row["window_started_at"],
+            window_ended_at=run_row["window_ended_at"],
+            namespace=run_row["namespace"],
+            candidates=candidates,
+        )
+
+    async def merge_run_config(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        patch: dict[str, Any],
+    ) -> None:
+        """SQLite impl of MORPHEUS merge_run_config — item 11b.
+
+        Read-modify-write on the ``config`` column (SQLite stores
+        it as TEXT, not JSONB). The pre-11b runner-side ``UPDATE ...
+        config || jsonb_build_object(...)`` path is Postgres-only;
+        SQLite has no native JSONB ``||`` operator, so we read the
+        existing config, merge ``patch`` keys in Python, and write it
+        back. Both the SELECT and UPDATE live inside the supplied
+        ``tx`` so a partial write cannot leak.
+
+        ``cluster_payload`` is the only writer in item 11b; the patch
+        size is bounded by ``cluster_min_size`` survivors so RMW is
+        not a hot-path concern.
+        """
+        if not patch:
+            return
+        conn = self._conn(tx)
+        existing = await _fetch_one(
+            conn,
+            "SELECT config FROM morpheus_runs WHERE id = ?",
+            (run_id,),
+        )
+        if existing is None:
+            return
+        if isinstance(existing, dict):
+            raw_config = existing.get("config")
+        else:
+            raw_config = existing[0]
+        if raw_config is None or raw_config == "":
+            merged: dict[str, Any] = {}
+        elif isinstance(raw_config, dict):
+            merged = dict(raw_config)
+        elif isinstance(raw_config, str):
+            try:
+                parsed = json.loads(raw_config)
+            except json.JSONDecodeError:
+                parsed = {}
+            merged = parsed if isinstance(parsed, dict) else {}
+        else:
+            merged = {}
+        merged.update(patch)
+        await _execute(
+            conn,
+            "UPDATE morpheus_runs SET config = ? WHERE id = ?",
+            (json.dumps(merged), run_id),
+        )
 
 
 class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueRepository):
