@@ -74,9 +74,28 @@ ALTER TABLE morpheus_runs ADD COLUMN namespace VARCHAR(256)
 -- ── 2. drop legacy ``run_type`` + ``metrics`` columns (Db2 12.1
 --       supports DROP COLUMN). Greps confirm neither column is read by
 --       any production path.
-ALTER TABLE morpheus_runs DROP COLUMN run_type
+--
+--       Wrapped: an unwrapped DROP COLUMN succeeds on the FIRST ever
+--       boot against a real database and then raises SQLSTATE 42704
+--       (undefined column) on EVERY subsequent boot, because the
+--       column is already gone -- migrations here carry no
+--       applied-state table and are replayed on every boot. Found live
+--       in production on the Oracle sibling of this file (2026-09-13):
+--       the first boot succeeded and dropped both columns; the very
+--       next restart crash-looped on this exact statement. Same idiom
+--       as the DROP CONSTRAINT guards below.
+BEGIN ATOMIC
+    DECLARE CONTINUE HANDLER FOR SQLSTATE '42704'
+        BEGIN END;
+    EXECUTE IMMEDIATE 'ALTER TABLE morpheus_runs DROP COLUMN run_type';
+END
 @
-ALTER TABLE morpheus_runs DROP COLUMN metrics
+
+BEGIN ATOMIC
+    DECLARE CONTINUE HANDLER FOR SQLSTATE '42704'
+        BEGIN END;
+    EXECUTE IMMEDIATE 'ALTER TABLE morpheus_runs DROP COLUMN metrics';
+END
 @
 
 -- ── 3. align status default to 'running' (Postgres canonical).
