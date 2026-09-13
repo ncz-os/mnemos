@@ -16,7 +16,7 @@
 #     -e MNEMOS_PERSISTENCE_BACKEND=oracle \
 #     mnemos-os:oracle
 
-FROM python:3.11-slim AS builder
+FROM python:3.13-slim AS builder
 
 WORKDIR /app
 
@@ -33,7 +33,7 @@ COPY requirements.txt .
 RUN uv pip install --system -r requirements.txt && \
     uv pip install --system "oracledb>=4.0.1"
 
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -41,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 libgomp1 curl && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 COPY . .
