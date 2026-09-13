@@ -76,11 +76,13 @@ prints only the fields you want in Aider's prompt.
 ## Verification — one curl or one tool-list call that proves registration worked
 
 ```bash
-curl -fsS -H "Authorization: Bearer $MNEMOS_TOKEN" http://<mnemos-host>:5002/health
+curl -fsS -H "Authorization: Bearer $MNEMOS_TOKEN" "http://<mnemos-host>:5002/v1/memories?limit=1"
 ```
 
-REST direct has no MCP registration to list; a healthy authenticated REST
-call is the proof point for Aider.
+`/health` is unauthenticated, so it doesn't prove the token works — use an
+authenticated endpoint like the one above. REST direct has no MCP
+registration to list; a successful authenticated call is the proof point
+for Aider.
 
 ## Common gotchas — 2-4 bullets of real failure modes
 
