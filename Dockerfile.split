@@ -28,7 +28,7 @@ ARG MNEMOS_KNEMON_REF=unknown
 ARG MNEMOS_GRAEAE_REF=unknown
 ARG MNEMOS_CHARON_REF=unknown
 
-FROM python:3.11-slim AS builder
+FROM python:3.13-slim AS builder
 
 WORKDIR /app
 
@@ -79,7 +79,7 @@ RUN python -m pip wheel --no-deps --no-build-isolation --wheel-dir /wheelhouse \
     ./graeae \
     ./charon
 
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 ARG MNEMOS_CORE_REF
 ARG MNEMOS_PANTHEON_REF
@@ -116,7 +116,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # missing gcc. Instead carry the builder's installed site-packages + console
 # scripts forward (the proven Dockerfile.oracle builder->runtime handoff) and
 # only (re)install the first-party split wheels with --no-deps --no-index.
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /wheelhouse /wheelhouse
 COPY --from=builder /app/scripts/resolve_split_wheels.py /tmp/resolve_split_wheels.py
