@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import pytest
 
@@ -12,6 +13,15 @@ from mnemos.domain import federation as federation_domain
 from mnemos.federation import nats_consumer as consumer
 
 pytestmark = pytest.mark.asyncio
+
+_NATS_API_AVAILABLE = importlib.util.find_spec("nats") is not None
+_requires_nats_api = pytest.mark.skipif(
+    not _NATS_API_AVAILABLE,
+    reason=(
+        "nats-py is required for ConsumerConfig assertions; install the "
+        "pyproject 'nats' extra with pip install 'mnemos-core[nats]'"
+    ),
+)
 
 
 class _PoolCtx:
@@ -296,6 +306,7 @@ async def test_queue_durable_name_collision_resistant_under_long_inputs():
     assert d_created != other
 
 
+@_requires_nats_api
 async def test_subscribe_with_queue_group_sets_queue_and_deliver_group():
     """v4.2.0a8: Audit Finding 5 — multi-replica federation receiver
     via JetStream queue-group sharding.

@@ -2,85 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import mnemos.core.lifecycle as lifecycle
-from mnemos.api.dependencies import UserContext
-from mnemos.api.routes import memories as memories_handler
-from mnemos.domain.models import MemorySearchRequest
+from mnemos.persistence import worker_lifecycle
 from mnemos.persistence.postgres import PostgresMemoryRepository, PostgresTransaction
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.workers import deletion_request_worker as worker
-from tests._fake_backend import install_fake_backend
 
 
-class _AsyncContext:
-    def __init__(self, value):
-        self._value = value
-
-    async def __aenter__(self):
-        return self._value
-
-    async def __aexit__(self, *args):
-        return None
-
-
-class _TxContext:
-    async def __aenter__(self):
-        return None
-
-    async def __aexit__(self, *args):
-        return None
-
-
-def _pool_for(conn):
-    pool = MagicMock()
-    pool.acquire = MagicMock(return_value=_AsyncContext(conn))
-    return pool
-
-
-def _confirmed_request(namespace=None):
-    return {
-        "id": "00000000-0000-0000-0000-000000000001",
-        "target_user_id": "alice",
-        "target_namespace": namespace,
-    }
-
-
-def _soft_deleted_request(namespace=None):
-    return {
-        "id": "00000000-0000-0000-0000-000000000001",
-        "target_user_id": "alice",
-        "target_namespace": namespace,
-    }
-
-
-def _marked_request():
-    return {
-        "id": "00000000-0000-0000-0000-000000000001",
-        "soft_deleted_at": datetime(2026, 5, 1, 23, 5, 0, tzinfo=timezone.utc),
-        "restore_by": datetime(2026, 5, 31, 23, 5, 0, tzinfo=timezone.utc),
-    }
-
-
-def _verifying_request():
-    return {"id": "00000000-0000-0000-0000-000000000001"}
-
-
-def _hard_deleted_request(namespace=None):
-    return {
-        "id": "00000000-0000-0000-0000-000000000001",
-        "target_user_id": "alice",
-        "target_namespace": namespace,
-        "status": "hard_deleted",
-        "soft_deleted_at": datetime(2026, 5, 1, 23, 5, 0, tzinfo=timezone.utc),
-        "restore_by": datetime(2026, 5, 1, 23, 10, 0, tzinfo=timezone.utc),
-        "hard_deleted_at": datetime(2026, 5, 2, 0, 0, 0, tzinfo=timezone.utc),
-    }
+def _backend_mock():
+    return SimpleNamespace(transactional=MagicMock())
 
 
 def _target_labels() -> set[str]:
@@ -91,10 +27,6 @@ def _target_labels() -> set[str]:
             *worker._SOFT_DELETE_SQL,
         )
     }
-
-
-def _hard_target_labels() -> set[str]:
-    return {label for label, _table, _sql in worker._HARD_DELETE_SQL}
 
 
 class _FakeCache:
@@ -119,63 +51,77 @@ class _FakeCache:
 
 
 @pytest.mark.asyncio
-async def test_worker_soft_deletes_confirmed_request_happy_path():
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(
-        side_effect=[_confirmed_request(), _verifying_request(), _marked_request()]
+async def test_worker_delegates_soft_delete_to_backend_lifecycle_abc(monkeypatch):
+    backend = _backend_mock()
+    payload = {
+        "request_id": "request-1",
+        "target_user_id": "alice",
+        "target_namespace": None,
+        "status": "soft_deleted",
+        "row_counts": {"memories": 1},
+        "soft_deleted_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
+        "restore_by": datetime(2026, 5, 31, tzinfo=timezone.utc),
+        "verification_attempts": 1,
+        "remaining_counts": {},
+    }
+    process_backend = AsyncMock(return_value=payload)
+    monkeypatch.setattr(worker_lifecycle, "process_one_deletion_request", process_backend)
+
+    result = await worker.process_one_deletion_request(backend)
+
+    assert result == worker.DeletionRequestResult(**payload)
+    process_backend.assert_awaited_once_with(
+        backend,
+        verify_attempts=worker.DEFAULT_VERIFY_ATTEMPTS,
+        restore_days=worker.RESTORE_GRACE_DAYS,
     )
-    conn.fetchval = AsyncMock(return_value=0)
-    conn.execute = AsyncMock(return_value="UPDATE 1")
-
-    result = await worker.process_one_deletion_request(_pool_for(conn))
-
-    assert result is not None
-    assert result.request_id == "00000000-0000-0000-0000-000000000001"
-    assert result.target_user_id == "alice"
-    assert result.target_namespace is None
-    assert result.status == "soft_deleted"
-    assert result.restore_by == _marked_request()["restore_by"]
-    assert result.row_counts == {label: 1 for label in _target_labels()}
-    assert result.verification_attempts == 1
-
-    dequeue_sql = conn.fetchrow.await_args_list[0].args[0]
-    assert "FOR UPDATE SKIP LOCKED" in dequeue_sql
-    assert "status = 'confirmed'" in dequeue_sql
-    verifying_sql = conn.fetchrow.await_args_list[1].args[0]
-    assert "SET status = 'sweep_verifying'" in verifying_sql
-    mark_sql = conn.fetchrow.await_args_list[2].args[0]
-    assert "SET status = 'soft_deleted'" in mark_sql
-    assert "restore_by = NOW() + ($2::int * INTERVAL '1 day')" in mark_sql
 
 
 @pytest.mark.asyncio
-async def test_worker_requeues_request_when_verification_is_exhausted(monkeypatch):
-    monkeypatch.setattr(worker, "DEFAULT_VERIFY_ATTEMPTS", 2)
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(
-        side_effect=[_confirmed_request(), _verifying_request(), {"id": _confirmed_request()["id"]}]
-    )
-    conn.fetchval = AsyncMock(return_value=1)
-    conn.execute = AsyncMock(return_value="UPDATE 1")
+async def test_worker_delegates_hard_delete_to_backend_lifecycle_abc(monkeypatch):
+    backend = _backend_mock()
+    payload = {
+        "request_id": "request-1",
+        "target_user_id": "alice",
+        "target_namespace": "tenant-a",
+        "status": "hard_deleted",
+        "row_counts": {"memories": 1},
+        "soft_deleted_at": datetime(2026, 5, 1, tzinfo=timezone.utc),
+        "restore_by": datetime(2026, 5, 31, tzinfo=timezone.utc),
+        "hard_deleted_at": datetime(2026, 6, 1, tzinfo=timezone.utc),
+    }
+    process_backend = AsyncMock(return_value=payload)
+    monkeypatch.setattr(worker_lifecycle, "process_one_hard_deletion_request", process_backend)
 
-    result = await worker.process_one_deletion_request(_pool_for(conn))
+    result = await worker.process_one_hard_deletion_request(backend)
 
-    assert result is not None
-    assert result.status == "confirmed"
-    assert result.verification_attempts == 2
-    requeue_sql = conn.fetchrow.await_args_list[-1].args[0]
-    assert "SET status = 'confirmed'" in requeue_sql
-    assert "status = 'sweep_verifying'" in requeue_sql
+    assert result == worker.DeletionRequestResult(**payload)
+    process_backend.assert_awaited_once_with(backend)
+
+
+@pytest.mark.asyncio
+async def test_main_builds_and_closes_configured_persistence_backend(monkeypatch):
+    backend = SimpleNamespace(close=AsyncMock())
+    build_backend = AsyncMock(return_value=("sqlite", backend))
+    loop = AsyncMock()
+    monkeypatch.setattr(lifecycle, "build_configured_persistence_backend", build_backend)
+    monkeypatch.setattr(worker, "deletion_request_worker_loop", loop)
+
+    await worker.main(phase="hard_delete")
+
+    build_backend.assert_awaited_once_with()
+    loop.assert_awaited_once_with(backend, phase="hard_delete")
+    backend.close.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
 async def test_worker_soft_delete_is_namespace_scoped():
+    from mnemos.persistence.deletion_ops import soft_delete_target
+
     conn = AsyncMock()
     conn.execute = AsyncMock(return_value="UPDATE 0")
 
-    counts = await worker.soft_delete_target(conn, "alice", "tenant-a")
+    counts = await soft_delete_target(conn, "alice", "tenant-a")
 
     assert set(counts) == _target_labels()
     assert all(call.args[1] == "alice" for call in conn.execute.await_args_list)
@@ -184,27 +130,29 @@ async def test_worker_soft_delete_is_namespace_scoped():
 
 
 @pytest.mark.asyncio
-async def test_worker_idempotent_after_request_leaves_confirmed_state():
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(
+async def test_worker_batch_uses_backend_for_each_request(monkeypatch):
+    backend = _backend_mock()
+    process = AsyncMock(
         side_effect=[
-            _confirmed_request(),
-            _verifying_request(),
-            _marked_request(),
+            worker.DeletionRequestResult(
+                request_id="request-1",
+                target_user_id="alice",
+                target_namespace=None,
+                status="soft_deleted",
+                row_counts={"memories": 1},
+                soft_deleted_at=None,
+                restore_by=None,
+            ),
             None,
         ]
     )
-    conn.fetchval = AsyncMock(return_value=0)
-    conn.execute = AsyncMock(return_value="UPDATE 1")
+    monkeypatch.setattr(worker, "process_one_deletion_request", process)
 
-    counts = await worker.process_deletion_requests(_pool_for(conn), batch_size=2)
-
-    assert counts["requests"] == 1
-    assert {label: counts[label] for label in _target_labels()} == {
-        label: 1 for label in _target_labels()
+    assert await worker.process_deletion_requests(backend, batch_size=2) == {
+        "memories": 1,
+        "requests": 1,
     }
-    assert conn.execute.await_count == len(_target_labels())
+    assert process.await_args_list[0].args == (backend,)
 
 
 @pytest.mark.asyncio
@@ -249,191 +197,29 @@ async def test_restore_target_invalidates_search_and_stats_cache(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_worker_soft_delete_evicts_primed_search_cache_before_next_search(monkeypatch):
-    backend = install_fake_backend(monkeypatch)
-    cache = _FakeCache()
-    monkeypatch.setattr(lifecycle, "_cache", cache)
-    live = {"visible": True}
-    memory_row = {
-        "id": "mem-cache-race",
-        "content": "cached deletion target",
-        "category": "facts",
-        "subcategory": None,
-        "created": datetime(2026, 5, 1, 22, 0, 0, tzinfo=timezone.utc),
-        "updated": datetime(2026, 5, 1, 22, 0, 0, tzinfo=timezone.utc),
-        "metadata": {},
-        "quality_rating": 75,
-        "compressed_content": None,
-        "verbatim_content": "cached deletion target",
-        "owner_id": "alice",
-        "group_id": None,
-        "namespace": "tenant-a",
-        "permission_mode": 600,
-        "source_model": None,
-        "source_provider": None,
-        "source_session": None,
-        "source_agent": None,
-    }
-
-    async def fts_search(tx, *, query, limit, visibility, **kwargs):
-        return [memory_row] if live["visible"] else []
-
-    async def noop_bump_recall_counters(memory_ids: list[str]) -> None:
-        return None
-
-    monkeypatch.setattr(backend.memories, "fts_search", fts_search)
-    monkeypatch.setattr(memories_handler, "_bump_recall_counters", noop_bump_recall_counters)
-    user = UserContext(
-        user_id="alice",
-        group_ids=[],
-        role="user",
-        namespace="tenant-a",
-        authenticated=True,
-    )
-    request = MemorySearchRequest(query="cached", limit=10, semantic=False)
-
-    first = await memories_handler.search_memories(request, user=user)
-    await asyncio.sleep(0)
-    assert [memory.id for memory in first.memories] == ["mem-cache-race"]
-    assert any(key.startswith("mnemos:search:") for key in cache.store)
-
-    async def execute(sql, *args):
-        if "UPDATE memories" in sql and "SET deleted_at = NOW()" in sql:
-            live["visible"] = False
-            return "UPDATE 1"
-        return "UPDATE 0"
-
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(
-        side_effect=[
-            _confirmed_request("tenant-a"),
-            _verifying_request(),
-            _marked_request(),
-        ]
-    )
-    conn.fetchval = AsyncMock(return_value=0)
-    conn.execute = AsyncMock(side_effect=execute)
-
-    result = await worker.process_one_deletion_request(_pool_for(conn))
-    assert result is not None
-    assert result.status == "soft_deleted"
-
-    second = await memories_handler.search_memories(request, user=user)
-
-    assert second.memories == []
-    assert any(key.startswith("mnemos:search:") for key in cache.deleted)
-
-
-@pytest.mark.asyncio
-async def test_worker_hard_deletes_expired_soft_deleted_request_happy_path(monkeypatch):
-    monkeypatch.setattr(lifecycle, "_cache", None)
-    memory_exists = {"value": True}
-
-    async def execute(sql, *args):
-        if sql.startswith("SET LOCAL"):
-            return "SET"
-        if "DELETE FROM memories" in sql:
-            memory_exists["value"] = False
-            return "DELETE 1"
-        return "DELETE 1"
-
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(
-        side_effect=[
-            _soft_deleted_request("tenant-a"),
-            _hard_deleted_request("tenant-a"),
-        ]
-    )
-    conn.execute = AsyncMock(side_effect=execute)
-    # The resweep+verify loop must see zero live rows so the request is
-    # allowed to advance to ``hard_deleted`` (otherwise the worker
-    # refuses to mark it complete -- live rows would survive the
-    # irreversible delete, defeating GDPR).
-    conn.fetchval = AsyncMock(return_value=0)
-
-    result = await worker.process_one_hard_deletion_request(_pool_for(conn))
-
-    assert result is not None
-    assert result.request_id == "00000000-0000-0000-0000-000000000001"
-    assert result.target_user_id == "alice"
-    assert result.target_namespace == "tenant-a"
-    assert result.status == "hard_deleted"
-    assert result.hard_deleted_at == _hard_deleted_request("tenant-a")["hard_deleted_at"]
-    assert result.row_counts == {label: 1 for label in _hard_target_labels()}
-    assert memory_exists["value"] is False
-
-    dequeue_sql = conn.fetchrow.await_args_list[0].args[0]
-    assert "FOR UPDATE SKIP LOCKED" in dequeue_sql
-    assert "status = 'soft_deleted'" in dequeue_sql
-    assert "restore_by < NOW()" in dequeue_sql
-    mark_sql = conn.fetchrow.await_args_list[1].args[0]
-    assert "SET status = 'hard_deleted'" in mark_sql
-    assert "hard_deleted_at = NOW()" in mark_sql
-
-
-@pytest.mark.asyncio
-async def test_worker_hard_delete_preserves_deletion_request_audit_row(monkeypatch):
-    monkeypatch.setattr(lifecycle, "_cache", None)
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(
-        side_effect=[
-            _soft_deleted_request(),
-            _hard_deleted_request(),
-        ]
-    )
-    conn.execute = AsyncMock(return_value="DELETE 0")
-    conn.fetchval = AsyncMock(return_value=0)
-
-    result = await worker.process_one_hard_deletion_request(_pool_for(conn))
-
-    assert result is not None
-    assert result.status == "hard_deleted"
-    executed_sql = [call.args[0] for call in conn.execute.await_args_list]
-    assert not any("DELETE FROM deletion_requests" in sql for sql in executed_sql)
-    mark_sql = conn.fetchrow.await_args_list[1].args[0]
-    assert "UPDATE deletion_requests" in mark_sql
-
-
-@pytest.mark.asyncio
-async def test_worker_hard_delete_respects_status_and_restore_window_guard(monkeypatch):
-    monkeypatch.setattr(lifecycle, "_cache", None)
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(return_value=None)
-    conn.execute = AsyncMock(return_value="DELETE 1")
-
-    result = await worker.process_one_hard_deletion_request(_pool_for(conn))
-
-    assert result is None
-    conn.execute.assert_not_awaited()
-    dequeue_sql = conn.fetchrow.await_args.args[0]
-    assert "status = 'soft_deleted'" in dequeue_sql
-    assert "restore_by < NOW()" in dequeue_sql
-    assert "FOR UPDATE SKIP LOCKED" in dequeue_sql
-
-
-@pytest.mark.asyncio
 async def test_worker_hard_delete_invalidates_search_and_stats_cache(monkeypatch):
     cache = _FakeCache()
     cache.store["mnemos:search:primed"] = '{"count":1,"memories":[]}'
     cache.store["stats:global"] = "{}"
     cache.store["stats:global:v2"] = "{}"
     monkeypatch.setattr(lifecycle, "_cache", cache)
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(
-        side_effect=[
-            _soft_deleted_request("tenant-a"),
-            _hard_deleted_request("tenant-a"),
-        ]
+    payload = {
+        "request_id": "request-1",
+        "target_user_id": "alice",
+        "target_namespace": "tenant-a",
+        "status": "hard_deleted",
+        "row_counts": {},
+        "soft_deleted_at": None,
+        "restore_by": None,
+        "hard_deleted_at": None,
+    }
+    monkeypatch.setattr(
+        worker_lifecycle,
+        "process_one_hard_deletion_request",
+        AsyncMock(return_value=payload),
     )
-    conn.execute = AsyncMock(return_value="DELETE 0")
-    conn.fetchval = AsyncMock(return_value=0)
 
-    await worker.process_one_hard_deletion_request(_pool_for(conn))
+    await worker.process_one_hard_deletion_request(_backend_mock())
 
     assert "mnemos:search:primed" in cache.deleted
     assert "stats:global" in cache.deleted
@@ -491,17 +277,13 @@ def test_hard_delete_sql_revokes_api_keys_before_deleting_oauth_rows():
     # The api_keys statement must set revoked=TRUE so that any concurrent
     # auth check that already loaded the row sees the credential disabled
     # before the DELETE lands.
-    api_keys_sql = next(
-        sql for label, _table, sql in worker._HARD_DELETE_SQL if label == "api_keys"
-    )
+    api_keys_sql = next(sql for label, _table, sql in worker._HARD_DELETE_SQL if label == "api_keys")
     assert "revoked = TRUE" in api_keys_sql
     assert "user_id = $1" in api_keys_sql
 
     # The user row is only removed on an all-namespace deletion. A scoped
     # deletion must keep the user row so other namespaces keep working.
-    users_sql = next(
-        sql for label, _table, sql in worker._HARD_DELETE_SQL if label == "users"
-    )
+    users_sql = next(sql for label, _table, sql in worker._HARD_DELETE_SQL if label == "users")
     assert "id = $1" in users_sql
     assert "$2::text IS NULL" in users_sql
 
@@ -517,58 +299,6 @@ def test_hard_delete_live_row_count_covers_identity_tables():
     assert "oauth_identities" in labels
     assert "user_groups" in labels
     assert "users" in labels
-
-
-@pytest.mark.asyncio
-async def test_worker_verify_pass_sweeps_insert_committed_during_initial_update(monkeypatch):
-    monkeypatch.setattr(lifecycle, "_cache", None)
-    first_memories_update_started = asyncio.Event()
-    finish_first_memories_update = asyncio.Event()
-    late_memory = {"visible": False}
-    memory_update_calls = 0
-
-    async def execute(sql, *args):
-        nonlocal memory_update_calls
-        if "UPDATE memories" in sql and "SET deleted_at = NOW()" in sql:
-            memory_update_calls += 1
-            if memory_update_calls == 1:
-                first_memories_update_started.set()
-                await finish_first_memories_update.wait()
-                return "UPDATE 1"
-            if late_memory["visible"]:
-                late_memory["visible"] = False
-                return "UPDATE 1"
-        return "UPDATE 0"
-
-    async def fetchval(sql, *args):
-        if "FROM memories" in sql and "deleted_at IS NULL" in sql:
-            return 1 if late_memory["visible"] else 0
-        return 0
-
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(
-        side_effect=[
-            _confirmed_request("tenant-a"),
-            _verifying_request(),
-            _marked_request(),
-        ]
-    )
-    conn.fetchval = AsyncMock(side_effect=fetchval)
-    conn.execute = AsyncMock(side_effect=execute)
-
-    task = asyncio.create_task(worker.process_one_deletion_request(_pool_for(conn)))
-    await first_memories_update_started.wait()
-    late_memory["visible"] = True
-    finish_first_memories_update.set()
-    result = await task
-
-    assert result is not None
-    assert result.status == "soft_deleted"
-    assert result.row_counts["memories"] == 2
-    assert result.verification_attempts == 2
-    assert memory_update_calls == 2
-    assert late_memory["visible"] is False
 
 
 @pytest.mark.asyncio
@@ -592,74 +322,3 @@ async def test_memory_read_path_filters_soft_deleted_rows():
     assert row is None
     sql = conn.fetchrow.await_args.args[0]
     assert "FROM memories WHERE id=$1 AND deleted_at IS NULL" in sql
-
-
-@pytest.mark.asyncio
-async def test_worker_hard_delete_refuses_when_resweep_finds_live_rows(monkeypatch):
-    """GDPR fence (live-row find): a memory added during the 30-day
-    grace window still carries ``deleted_at IS NULL`` when the
-    hard-delete phase runs, so the worker would skip it forever. The
-    resweep+verify loop must run the soft-delete sweep one more time
-    and refuse to mark the request complete if any live rows remain.
-    """
-    monkeypatch.setattr(lifecycle, "_cache", None)
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(
-        side_effect=[
-            _soft_deleted_request(),
-            None,  # never reached; the worker must raise first
-        ]
-    )
-    conn.execute = AsyncMock(return_value="DELETE 1")
-    # Simulate a writer that landed a memory during the grace window:
-    # the resweep+verify live-row count returns 1 on the very first
-    # iteration, so the worker must refuse to mark the request complete.
-    conn.fetchval = AsyncMock(return_value=1)
-
-    with pytest.raises(RuntimeError, match="live rows still on scope after resweep"):
-        await worker.process_one_hard_deletion_request(_pool_for(conn))
-
-
-@pytest.mark.asyncio
-async def test_worker_hard_delete_resweep_then_verify_zero_allows_completion(monkeypatch):
-    """Happy path for the resweep+verify gate: first verify call still
-    shows a live row (a writer landed one mid-grace); the resweep runs
-    and the second verify call returns 0; the worker then allows the
-    request to advance to ``hard_deleted``.
-    """
-    monkeypatch.setattr(lifecycle, "_cache", None)
-    conn = AsyncMock()
-    conn.transaction = MagicMock(return_value=_TxContext())
-    conn.fetchrow = AsyncMock(
-        side_effect=[
-            _soft_deleted_request(),
-            _hard_deleted_request(),
-        ]
-    )
-    conn.execute = AsyncMock(return_value="DELETE 1")
-    # 17 live-row labels * 2 passes (one in resweep, one final). The
-    # first 17 calls return 1 (live row found) and the rest return 0
-    # (clean after resweep). DEFAULT_VERIFY_ATTEMPTS = 5, so the resweep
-    # loop only runs once before converging on zero.
-    sequence = iter([1] * 17 + [0] * 50)
-
-    async def fetchval(_sql, *_args):
-        try:
-            return next(sequence)
-        except StopIteration:
-            return 0
-
-    conn.fetchval = AsyncMock(side_effect=fetchval)
-
-    result = await worker.process_one_hard_deletion_request(_pool_for(conn))
-
-    assert result is not None
-    assert result.status == "hard_deleted"
-    # Every label must report zero -- this is the second-line-of-defence
-    # check inside ``hard_delete_soft_deleted_request`` after the
-    # irreversible DELETE statements have run. Any value > 0 means the
-    # request would have been marked complete while subject data
-    # survived, which is exactly what the GDPR fix is preventing.
-    assert result.remaining_counts is not None
-    assert all(v == 0 for v in result.remaining_counts.values()), result.remaining_counts

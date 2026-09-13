@@ -8,7 +8,7 @@ import mnemos.core.lifecycle as lifecycle
 from mnemos.api.dependencies import UserContext
 from mnemos.api.routes import memories as memories_handler
 from mnemos.domain.models import MemorySearchRequest
-from mnemos.persistence.sqlite import SqliteBackend
+from mnemos.persistence.sqlite import SqliteBackend, _execute
 from mnemos.persistence.visibility import VisibilityFilter
 
 pytestmark = pytest.mark.asyncio
@@ -83,7 +83,7 @@ async def test_sqlite_fts_zero_rows_falls_back_to_exact_content_like(tmp_path):
     try:
         await _insert_memory(backend, memory_id=memory_id, content=content)
         async with backend.transactional() as tx:
-            await tx.conn.execute("DELETE FROM memories_fts")
+            await _execute(tx.conn, "DELETE FROM memories_fts")
             rows = await backend.memories.fts_search(
                 tx,
                 query=content,

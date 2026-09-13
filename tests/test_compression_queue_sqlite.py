@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
-from mnemos.persistence.sqlite import _fetch_all
+from mnemos.persistence.sqlite import _execute, _fetch_all, _fetch_one
 
 
 @pytest_asyncio.fixture
@@ -131,7 +131,8 @@ async def test_sweep_terminalization(backend):
 
     # attempts >= max + real content error + stale -> failed.
     async with backend.transactional() as tx:
-        await tx.conn.execute(
+        await _execute(
+            tx.conn,
             "UPDATE memory_compression_queue SET attempts=3, error='boom', "
             "started_at=datetime('now','-1 hour') WHERE id=?",
             (qid,),
@@ -139,8 +140,12 @@ async def test_sweep_terminalization(backend):
         swept = await backend.compression_queue.sweep_stale_compression(tx, stale_threshold_secs=600, max_attempts=3)
     assert swept == 1
     async with backend.transactional() as tx:
-        cur = await tx.conn.execute("SELECT status FROM memory_compression_queue WHERE id=?", (qid,))
-        st = (await cur.fetchone())["status"]
+        row = await _fetch_one(
+            tx.conn,
+            "SELECT status FROM memory_compression_queue WHERE id=?",
+            (qid,),
+        )
+        st = row["status"]
     assert st == "failed"
 
 
@@ -154,7 +159,8 @@ async def test_sweep_infra_retry_resets_and_decrements(backend):
         claimed = await backend.compression_queue.dequeue_compression(tx, limit=1)
     qid = claimed[0]["id"]
     async with backend.transactional() as tx:
-        await tx.conn.execute(
+        await _execute(
+            tx.conn,
             "UPDATE memory_compression_queue SET attempts=3, error='infra_retry: x', "
             "started_at=datetime('now','-1 hour') WHERE id=?",
             (qid,),
@@ -162,8 +168,11 @@ async def test_sweep_infra_retry_resets_and_decrements(backend):
         swept = await backend.compression_queue.sweep_stale_compression(tx, stale_threshold_secs=600, max_attempts=3)
     assert swept == 1
     async with backend.transactional() as tx:
-        cur = await tx.conn.execute("SELECT status, attempts FROM memory_compression_queue WHERE id=?", (qid,))
-        row = await cur.fetchone()
+        row = await _fetch_one(
+            tx.conn,
+            "SELECT status, attempts FROM memory_compression_queue WHERE id=?",
+            (qid,),
+        )
     assert row["status"] == "pending"
     assert row["attempts"] == 2  # decremented from 3
 

@@ -6,6 +6,7 @@ a silent no-op.
 """
 
 import asyncio
+import importlib.util
 import sys
 from types import SimpleNamespace
 
@@ -13,6 +14,15 @@ import pytest
 
 from mnemos.nats import client as nats_client
 from mnemos.nats.publisher import publish_event
+
+_NATS_API_AVAILABLE = importlib.util.find_spec("nats") is not None
+_requires_nats_api = pytest.mark.skipif(
+    not _NATS_API_AVAILABLE,
+    reason=(
+        "nats-py is required for JetStream StreamConfig assertions; install the "
+        "pyproject 'nats' extra with pip install 'mnemos-core[nats]'"
+    ),
+)
 
 
 @pytest.fixture(autouse=True)
@@ -137,6 +147,7 @@ _CANONICAL_SUBJECTS = {
 }
 
 
+@_requires_nats_api
 def test_ensure_streams_returns_true_when_existing_matches(monkeypatch):
     """The classic idempotent case — operator's redeploy ships the
     SAME config that's already declared.
@@ -167,6 +178,7 @@ def test_ensure_streams_returns_true_when_existing_matches(monkeypatch):
     )
 
 
+@_requires_nats_api
 def test_ensure_streams_returns_false_when_existing_drifts(monkeypatch, caplog):
     """A redeploy with drifted max_bytes (or any retention dim) must
     return False so connect_nats disables publishing — operator sees
@@ -211,6 +223,7 @@ def test_ensure_streams_returns_false_when_existing_drifts(monkeypatch, caplog):
     )
 
 
+@_requires_nats_api
 def test_ensure_streams_max_bytes_smaller_treated_as_storage_fallback(monkeypatch, caplog):
     """The 1GB insufficient-storage fallback is documented runtime
     behavior; on next boot the existing 1GB stream must NOT trip the
@@ -254,6 +267,7 @@ def test_ensure_streams_max_bytes_smaller_treated_as_storage_fallback(monkeypatc
     )
 
 
+@_requires_nats_api
 def test_ensure_streams_storage_or_retention_drift_disables_publishing(monkeypatch, caplog):
     """Codex round-6 finding: retention and storage policies must be
     part of the drift surface. A broker with MEMORY storage where
@@ -293,6 +307,7 @@ def test_ensure_streams_storage_or_retention_drift_disables_publishing(monkeypat
     )
 
 
+@_requires_nats_api
 def test_ensure_streams_fail_closed_on_unexplained_rejection(monkeypatch, caplog):
     """Codex rounds 7+8: if add_stream raises duplicate-rejection on
     BOTH the canonical config AND the 1 GiB fallback config, the
@@ -344,6 +359,7 @@ def test_ensure_streams_fail_closed_on_unexplained_rejection(monkeypatch, caplog
     )
 
 
+@_requires_nats_api
 def test_ensure_streams_smaller_non_fallback_max_bytes_disables_publishing(monkeypatch, caplog):
     """Codex round-7: only the EXACT 1 GiB fallback this code creates
     is allowed to coexist with a 10 GiB desired stream. An operator
@@ -380,6 +396,7 @@ def test_ensure_streams_smaller_non_fallback_max_bytes_disables_publishing(monke
     )
 
 
+@_requires_nats_api
 def test_ensure_streams_non_duplicate_badrequest_fails_closed(monkeypatch, caplog):
     """Codex round-9: BadRequestError can mean LOTS of things in
     JetStream — max-streams quota, subject conflict with another
@@ -423,6 +440,7 @@ def test_ensure_streams_non_duplicate_badrequest_fails_closed(monkeypatch, caplo
     )
 
 
+@_requires_nats_api
 def test_ensure_streams_transient_fallback_failure_does_not_say_drift(monkeypatch, caplog):
     """Codex round-9: when the fallback probe fails for a transient
     reason (timeout, broker drop), don't mislead operator with
