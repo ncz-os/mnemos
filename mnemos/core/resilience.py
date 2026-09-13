@@ -1044,9 +1044,10 @@ class InProcessRateLimiterPool:
 
 
 # NATS rate-limiter constants
-_NATS_RATE_LIMITER_BUCKET = "MNEMOS_GRAEAE_DISPATCH"
-_NATS_RATE_LIMITER_PREFIX = "rl:"
+_NATS_RATE_LIMITER_BUCKET = "MNEMOS_GRAEAE_RATE_LIMIT"
+_NATS_RATE_LIMITER_PREFIX = "rl."
 _NATS_RATE_LIMITER_RETRIES = 8
+_NATS_RATE_LIMITER_WINDOW_SECONDS = 60.0
 
 
 _NATS_VIS_EPOCH_BUCKET = "mnemos_vis_epoch"
@@ -1252,14 +1253,14 @@ class NatsVisibilityEpoch:
 class NatsRateLimiter:
     """Sliding-window rate limiter backed by NATS JetStream KV.
 
-    Uses CAS-with-retry to serialize counter updates across workers.
-    Each provider has a dedicated KV key; the entry is a JSON object
-    carrying the request count and window-start timestamp.  When the
-    configured RPM is reached, subsequent requests within the window
-    are rejected until the window advances.
+    JetStream KV has no sorted-set equivalent to Redis' range pruning, so each
+    provider stores a JSON timestamp log in one KV value. Every CAS mutation
+    drops timestamps outside the rolling minute before admitting a request.
+    Only admitted requests are stored, which bounds the value to the configured
+    RPM while preserving exact sliding-window semantics.
 
-    When NATS KV is unavailable (connection error, missing bucket, etc.)
-    the limiter degrades gracefully (returns True).
+    When NATS KV is unavailable, the limiter follows NatsCircuitBreaker's
+    degradation policy and uses a bounded in-process limiter.
     """
 
     def __init__(
@@ -1337,52 +1338,86 @@ class NatsRateLimiter:
             return None
 
     async def _kv(self) -> Any | None:
-        return await asyncio.wrap_future(self._kv_future)
+        try:
+            return await asyncio.wrap_future(self._kv_future)
+        except Exception:
+            return None
 
     def _key(self, provider: str) -> str:
         return f"{self.key_prefix}{provider}"
 
-    async def acquire(self, provider: str) -> bool:
+    async def _run_bounded(self, coro: Any, fallback: Any = None) -> Any:
+        future = self._loop.submit(coro)
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=_NATS_SYNC_TIMEOUT_SECONDS)
+        except (TimeoutError, asyncio.TimeoutError):
+            future.cancel()
+            logger.warning("NATS rate-limiter operation timed out; using local fallback")
+            return fallback
+
+    def _fallback_allowed(self, provider: str, rpm: int) -> bool:
         with self._lock:
-            self._seen[provider] += 1
-        kv = await self._kv()
-        if kv is None:
             fallback = self._local_fallback._get(provider)
-            if fallback.rpm != self.rpm:
-                fallback = InProcessRateLimiter(provider, self.rpm)
+            if fallback.rpm != rpm:
+                fallback = InProcessRateLimiter(provider, rpm)
                 self._local_fallback._limiters[provider] = fallback
             return fallback.is_allowed()
-        key = self._key(provider)
+
+    async def acquire(self, provider: str) -> bool:
+        return await self._acquire_for_limit(provider, self.rpm)
+
+    async def _acquire_for_limit(self, provider: str, rpm: int) -> bool:
+        with self._lock:
+            self._seen[provider] += 1
         try:
-            return await self._acquire_with_retry(kv, key, provider)
+            result = await self._run_bounded(self._acquire_shared(provider, rpm), fallback=None)
         except Exception as exc:
             logger.warning("[RL] %s: NATS operation failed; using in-process limit: %s", provider, exc)
-            return self._local_fallback._get(provider).is_allowed()
+            result = None
+        if result is None:
+            return self._fallback_allowed(provider, rpm)
+        return bool(result)
+
+    async def _acquire_shared(self, provider: str, rpm: int) -> bool | None:
+        kv = await self._kv()
+        if kv is None:
+            return None
+        return await self._acquire_with_retry(kv, self._key(provider), provider, rpm)
 
     async def _acquire_with_retry(self, kv: Any, key: str, provider: str, rpm: int | None = None) -> bool:
         effective_rpm = self.rpm if rpm is None else rpm
-        now = time.time()
         for _attempt in range(_NATS_RATE_LIMITER_RETRIES):
             try:
                 entry = await _nats_maybe_await(kv.get(key))
-            except Exception:
+            except Exception as exc:
+                if not _nats_missing_key(exc):
+                    raise
                 entry = None
 
+            now = time.time()
+            cutoff = now - _NATS_RATE_LIMITER_WINDOW_SECONDS
             if entry is None:
-                # First call for this key — create it with count=1
-                new_payload = {"count": 1, "window_start": now}
+                timestamps: list[float] = []
+                changed = False
                 revision = None
             else:
                 payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
                 revision = _nats_entry_revision(entry)
-                window_start = payload.get("window_start", now)
-                count = payload.get("count", 0)
-                # Reset window if expired (1 minute sliding window)
-                if now - window_start >= 60:
-                    window_start = now
-                    count = 0
-                count += 1
-                new_payload = {"window_start": window_start, "count": count}
+                raw_timestamps = payload.get("timestamps", [])
+                if not isinstance(raw_timestamps, list):
+                    raise ValueError("NATS rate-limiter timestamps must be a list")
+                timestamps = [float(timestamp) for timestamp in raw_timestamps if float(timestamp) > cutoff]
+                changed = len(timestamps) != len(raw_timestamps)
+
+            allowed = len(timestamps) < effective_rpm
+            if allowed:
+                timestamps.append(now)
+                changed = True
+            elif not changed:
+                logger.warning("[RL] %s: NATS rate limit reached (%d rpm)", provider, effective_rpm)
+                return False
+
+            new_payload = {"timestamps": timestamps}
 
             try:
                 if revision is None:
@@ -1395,12 +1430,10 @@ class NatsRateLimiter:
             except Exception as exc:
                 if not _nats_wrong_revision(exc):
                     raise
-                continue  # retry with fresh revision
-            # CAS succeeded — check if we exceeded the limit
-            if new_payload.get("count", 0) > effective_rpm:
+                continue
+            if not allowed:
                 logger.warning("[RL] %s: NATS rate limit reached (%d rpm)", provider, effective_rpm)
-                return False
-            return True
+            return allowed
         logger.warning("[RL] %s: CAS retries exhausted; denying request", provider)
         return False
 
@@ -1421,7 +1454,7 @@ class NatsRateLimiterPool:
     def __init__(
         self,
         kv_or_js: Any | None,
-        key_prefix: str = "rl:",
+        key_prefix: str = _NATS_RATE_LIMITER_PREFIX,
         overrides: dict[str, int] | None = None,
         *,
         bucket: str = _NATS_RATE_LIMITER_BUCKET,
@@ -1445,23 +1478,7 @@ class NatsRateLimiterPool:
 
     async def is_allowed(self, provider: str) -> bool:
         self._remember(provider)
-        # Delegate directly to the shared limiter — no per-call instance
-        # creation. The limiter's KV is shared across all pool instances
-        # that share the same key_prefix.
-        self._limiter._seen[provider] += 1
-        kv = await self._limiter._kv()
-        if kv is None:
-            return self._fallback.is_allowed(provider)
-        try:
-            return await self._limiter._acquire_with_retry(
-                kv,
-                self._limiter._key(provider),
-                provider,
-                self._get_rpm(provider),
-            )
-        except Exception as exc:
-            logger.warning("[RL] %s: NATS operation failed; using in-process limit: %s", provider, exc)
-            return self._fallback.is_allowed(provider)
+        return await self._limiter._acquire_for_limit(provider, self._get_rpm(provider))
 
     def _get_rpm(self, provider: str) -> int:
         return self._overrides.get(provider, _PROVIDER_RPM.get(provider, _DEFAULT_RPM))
@@ -1542,8 +1559,8 @@ class InProcessConcurrencyLimiterPool:
 
 
 # NATS concurrency-limiter constants
-_NATS_CONCURRENCY_LIMITER_BUCKET = "MNEMOS_GRAEAE_DISPATCH"
-_NATS_CONCURRENCY_LIMITER_PREFIX = "conc:"
+_NATS_CONCURRENCY_LIMITER_BUCKET = "MNEMOS_GRAEAE_CONCURRENCY"
+_NATS_CONCURRENCY_LIMITER_PREFIX = "conc."
 _NATS_CONCURRENCY_LIMITER_RETRIES = 8
 
 
@@ -1554,18 +1571,20 @@ _NATS_CONCURRENCY_LIMITER_RETRIES = 8
 # the limiter over-admits. The interval must stay comfortably below the TTL.
 _NATS_CONCURRENCY_LEASE_TTL_SECONDS = 300
 _NATS_CONCURRENCY_HEARTBEAT_SECONDS = 30.0
+_NATS_BACKEND_UNAVAILABLE = object()
 
 
 class NatsConcurrencyLimiter:
-    """Slot-based concurrency limiter backed by NATS JetStream KV.
+    """Lease-based concurrency limiter backed by NATS JetStream KV.
 
-    Each provider has a dedicated KV key whose value is an integer
-    representing the number of *available* slots.  ``acquire`` reads the
-    current count, and attempts to atomically decrement it via CAS.
-    ``release`` atomically increments the count back.
+    A provider's single JSON value contains exact ``token -> expires_at``
+    leases. CAS serializes pruning, acquisition, renewal, and release. The
+    ledger is bounded by the provider's concurrency limit and, unlike an
+    aggregate counter whose bucket TTL is refreshed by any live caller, a dead
+    caller's individual lease expires even while peer leases are renewed.
 
-    When NATS KV is unavailable, the limiter degrades gracefully by
-    allowing requests (no-op).
+    When NATS KV is unavailable, the limiter follows NatsCircuitBreaker's
+    degradation policy and uses a bounded in-process limiter.
     """
 
     def __init__(
@@ -1574,21 +1593,25 @@ class NatsConcurrencyLimiter:
         key_prefix: str,
         max_concurrent: int,
         *,
+        lease_seconds: int = _NATS_CONCURRENCY_LEASE_TTL_SECONDS,
         bucket: str = _NATS_CONCURRENCY_LIMITER_BUCKET,
         settings: Any | None = None,
     ):
         self.key_prefix = key_prefix
         self.max_concurrent = max_concurrent
+        self.lease_seconds = max(1, int(lease_seconds))
+        self._heartbeat_seconds = max(0.1, self.lease_seconds / 3)
         self.bucket = bucket
         self._settings = settings
         self._loop = _NatsLoopThread(name="mnemos-nats-conc")
         self._kv_future = self._loop.submit(self._ensure_kv(kv_or_js))
         self._lock = threading.Lock()
         self._in_flight: dict[str, int] = defaultdict(int)
-        self._local_fallback = InProcessConcurrencyLimiterPool()
         self._local_tokens: set[str] = set()
+        self._local_in_flight: dict[str, int] = defaultdict(int)
         # token -> heartbeat future renewing that token's slot-record TTL.
         self._heartbeats: dict[str, Any] = {}
+        self._token_limits: dict[str, tuple[str, int]] = {}
 
     async def _ensure_kv(self, source: Any | None) -> Any | None:
         if source is None:
@@ -1606,12 +1629,16 @@ class NatsConcurrencyLimiter:
             from nats.js.api import KeyValueConfig  # type: ignore[import-not-found]
 
             return await _nats_maybe_await(
-                source.create_key_value(config=KeyValueConfig(bucket=self.bucket, history=1, ttl=_NATS_CONCURRENCY_LEASE_TTL_SECONDS))
+                source.create_key_value(
+                    config=KeyValueConfig(bucket=self.bucket, history=1, ttl=self.lease_seconds)
+                )
             )
         except ImportError:
-            return await _nats_maybe_await(source.create_key_value(bucket=self.bucket, ttl=_NATS_CONCURRENCY_LEASE_TTL_SECONDS))
+            return await _nats_maybe_await(
+                source.create_key_value(bucket=self.bucket, ttl=self.lease_seconds)
+            )
         except TypeError:
-            return await _nats_maybe_await(source.create_value(self.bucket))
+            return await _nats_maybe_await(source.create_key_value(self.bucket))
         except Exception as exc:
             if _nats_missing_key(exc):
                 raise
@@ -1654,149 +1681,194 @@ class NatsConcurrencyLimiter:
     def _key(self, provider: str) -> str:
         return f"{self.key_prefix}{provider}"
 
+    async def _run_bounded(self, coro: Any, fallback: Any = _NATS_BACKEND_UNAVAILABLE) -> Any:
+        future = self._loop.submit(coro)
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=_NATS_SYNC_TIMEOUT_SECONDS)
+        except (TimeoutError, asyncio.TimeoutError):
+            future.cancel()
+            logger.warning("NATS concurrency-limiter operation timed out; using local fallback")
+            return fallback
+
+    def _active_leases(self, payload: dict[str, Any], now: float, max_concurrent: int) -> dict[str, float]:
+        raw_leases = payload.get("leases")
+        if isinstance(raw_leases, dict):
+            return {
+                str(token): float(expires_at)
+                for token, expires_at in raw_leases.items()
+                if float(expires_at) > now
+            }
+
+        # Compatibility with the earlier aggregate-counter prototype. Preserve
+        # its occupied slots conservatively until one lease interval elapses;
+        # the next CAS write upgrades the record to the exact-token format.
+        available = max(0, min(max_concurrent, int(payload.get("available", max_concurrent))))
+        occupied = max_concurrent - available
+        expires_at = now + self.lease_seconds
+        return {f"legacy:{index}": expires_at for index in range(occupied)}
+
+    async def _read_leases(
+        self,
+        kv: Any,
+        key: str,
+        max_concurrent: int,
+    ) -> tuple[dict[str, float], int | None, bool]:
+        try:
+            entry = await _nats_maybe_await(kv.get(key))
+        except Exception as exc:
+            if _nats_missing_key(exc):
+                return {}, None, False
+            raise
+        payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
+        raw_leases = payload.get("leases")
+        leases = self._active_leases(payload, time.time(), max_concurrent)
+        changed = not isinstance(raw_leases, dict) or len(leases) != len(raw_leases)
+        return leases, _nats_entry_revision(entry), changed
+
     async def acquire(self, provider: str, max_concurrent: int | None = None) -> str | None:
         effective_max = self.max_concurrent if max_concurrent is None else max_concurrent
-        with self._lock:
-            self._in_flight[provider] += 1
-        kv = await self._kv()
-        if kv is None:
+        token = uuid.uuid4().hex
+        try:
+            result = await self._run_bounded(self._acquire_shared(provider, token, effective_max))
+        except Exception as exc:
+            logger.warning("[CONC] %s: NATS operation failed; using in-process limit: %s", provider, exc)
+            result = _NATS_BACKEND_UNAVAILABLE
+
+        if result is _NATS_BACKEND_UNAVAILABLE:
             with self._lock:
-                self._in_flight[provider] -= 1
-            fallback = self._local_fallback._get(provider)
-            if fallback.max_concurrent != effective_max:
-                fallback = InProcessProviderConcurrencyLimiter(provider, effective_max)
-                self._local_fallback._limiters[provider] = fallback
-            if not await fallback.acquire():
-                return None
-            token = str(uuid.uuid4().hex)
-            self._local_tokens.add(token)
-            with self._lock:
-                self._in_flight[provider] += 1
-            return token
-        key = self._key(provider)
-        token = str(uuid.uuid4().hex)
-        for _attempt in range(_NATS_CONCURRENCY_LIMITER_RETRIES):
-            try:
-                entry = await _nats_maybe_await(kv.get(key))
-            except Exception:
-                entry = None
-            if entry is None:
-                # First acquire for this key — create with max_concurrent-1 available
-                new_payload = {"available": effective_max - 1}
-                revision = None
-            else:
-                payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
-                available = payload.get("available", effective_max)
-                if available <= 0:
-                    with self._lock:
-                        self._in_flight[provider] -= 1
+                if self._local_in_flight[provider] >= effective_max:
                     logger.info(
-                        "[CONC] %s: all %d NATS slots occupied; skipping",
+                        "[CONC] %s: all %d local fallback slots occupied; skipping",
                         provider,
                         effective_max,
                     )
                     return None
-                new_payload = {"available": available - 1}
-                revision = _nats_entry_revision(entry)
+                self._local_in_flight[provider] += 1
+                self._local_tokens.add(token)
+                self._in_flight[provider] += 1
+            return token
+
+        if result is None:
+            return None
+        with self._lock:
+            self._in_flight[provider] += 1
+        self._start_heartbeat(provider, token, effective_max)
+        return token
+
+    async def _acquire_shared(self, provider: str, token: str, max_concurrent: int) -> str | None | object:
+        kv = await self._kv()
+        if kv is None:
+            return _NATS_BACKEND_UNAVAILABLE
+        key = self._key(provider)
+        for _attempt in range(_NATS_CONCURRENCY_LIMITER_RETRIES):
+            leases, revision, changed = await self._read_leases(kv, key, max_concurrent)
+            if len(leases) >= max_concurrent and not changed:
+                logger.info(
+                    "[CONC] %s: all %d NATS slots occupied; skipping",
+                    provider,
+                    max_concurrent,
+                )
+                return None
+
+            allowed = len(leases) < max_concurrent
+            if allowed:
+                leases[token] = time.time() + self.lease_seconds
+            new_payload = {"leases": leases}
             try:
                 if revision is None:
                     try:
                         await _nats_kv_create(kv, key, _nats_json(new_payload))
                     except AttributeError:
                         await _nats_kv_put(kv, key, _nats_json(new_payload))
-                    # CAS succeeded for new key
-                    self._start_heartbeat(provider, token)
-                    return token
                 else:
                     await _nats_kv_update(kv, key, _nats_json(new_payload), revision)
-                    self._start_heartbeat(provider, token)
-                    return token
+                if not allowed:
+                    logger.info(
+                        "[CONC] %s: all %d NATS slots occupied; skipping",
+                        provider,
+                        max_concurrent,
+                    )
+                    return None
+                return token
             except Exception as exc:
                 if not _nats_wrong_revision(exc):
                     raise
-                continue  # retry with fresh revision
-        with self._lock:
-            self._in_flight[provider] -= 1
+                continue
         logger.warning("[CONC] %s: CAS retries exhausted; denying request", provider)
         return None
 
-    async def _refresh_slot_record(self, provider: str) -> None:
-        """Refresh the slot record's TTL while a provider call still holds it.
+    async def _refresh_slot_record(
+        self,
+        provider: str,
+        token: str | None = None,
+        max_concurrent: int | None = None,
+    ) -> bool:
+        """Renew one exact lease, or all locally held leases for ``provider``."""
+        if token is None:
+            with self._lock:
+                owned = [
+                    (owned_token, limit)
+                    for owned_token, (owned_provider, limit) in self._token_limits.items()
+                    if owned_provider == provider
+                ]
+            results = [
+                await self._refresh_slot_record(provider, owned_token, limit)
+                for owned_token, limit in owned
+            ]
+            return all(results)
 
-        The KV bucket carries a TTL so a worker that dies mid-call cannot pin a
-        slot forever. That same TTL will happily expire a record belonging to a
-        call that is still running, which silently hands the capacity back and
-        lets the limiter over-admit. Re-touching the record inside the TTL is
-        what makes a long call safe.
-        """
+        effective_max = self.max_concurrent if max_concurrent is None else max_concurrent
         kv = await self._kv()
         if kv is None:
             raise RuntimeError("NATS concurrency-limiter KV became unavailable")
         key = self._key(provider)
         for _attempt in range(_NATS_CONCURRENCY_LIMITER_RETRIES):
+            leases, revision, _changed = await self._read_leases(kv, key, effective_max)
+            if token not in leases:
+                logger.error("[CONC] %s: NATS reservation lease was lost", provider)
+                return False
+            now = time.time()
+            leases[token] = now + self.lease_seconds
             try:
-                entry = await _nats_maybe_await(kv.get(key))
-            except Exception as exc:
-                if not _nats_missing_key(exc):
-                    raise
-                # Expiry must never silently restore capacity while the call is
-                # still in flight. Recreate fail-closed: ordinary releases and
-                # eventual bucket expiry recover the capacity safely.
-                try:
-                    await _nats_kv_create(kv, key, _nats_json({"available": 0}))
-                    logger.error(
-                        "NATS concurrency slot record expired while %s was in flight; recreated fail-closed",
-                        provider,
-                        exc_info=True,
-                    )
-                    return
-                except Exception as create_exc:
-                    if _nats_wrong_revision(create_exc):
-                        continue
-                    raise
-            payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
-            revision = _nats_entry_revision(entry)
-            try:
-                # Rewriting the identical value is enough to reset the TTL; the
-                # CAS revision guard keeps a concurrent acquire/release from
-                # being clobbered by the refresh.
-                if revision is None:
-                    await _nats_kv_put(kv, key, _nats_json(payload))
-                else:
-                    await _nats_kv_update(kv, key, _nats_json(payload), revision)
-                return
+                await _nats_kv_update(kv, key, _nats_json({"leases": leases}), revision)
+                return True
             except Exception as exc:
                 if not _nats_wrong_revision(exc):
                     raise
                 continue
+        logger.error("[CONC] %s: NATS reservation renewal CAS retries exhausted", provider)
+        return False
 
-    async def _heartbeat(self, provider: str, token: str) -> None:
+    async def _heartbeat(self, provider: str, token: str, max_concurrent: int) -> None:
         while True:
             try:
-                await asyncio.sleep(_NATS_CONCURRENCY_HEARTBEAT_SECONDS)
-                await self._refresh_slot_record(provider)
+                await asyncio.sleep(self._heartbeat_seconds)
+                if not await self._refresh_slot_record(provider, token, max_concurrent):
+                    return
             except asyncio.CancelledError:
                 raise
             except Exception:
-                # A transient renewal error must not permanently stop the
-                # watchdog. If the record expires before NATS recovers, the
-                # next iteration recreates it fail-closed.
+                # Transient renewal errors are retried. If the lease expires
+                # before recovery, the next iteration observes the loss and
+                # stops instead of resurrecting an expired reservation.
                 logger.exception(
                     "NATS concurrency heartbeat failed for %s token %s",
                     provider,
                     token,
                 )
 
-    def _start_heartbeat(self, provider: str, token: str) -> None:
-        heartbeat = self._loop.submit(self._heartbeat(provider, token))
+    def _start_heartbeat(self, provider: str, token: str, max_concurrent: int) -> None:
+        heartbeat = self._loop.submit(self._heartbeat(provider, token, max_concurrent))
         with self._lock:
             self._heartbeats[token] = heartbeat
+            self._token_limits[token] = (provider, max_concurrent)
 
-    async def _stop_heartbeat(self, token: str) -> None:
+    async def _stop_heartbeat(self, token: str) -> int | None:
         with self._lock:
             heartbeat = self._heartbeats.pop(token, None)
+            ownership = self._token_limits.pop(token, None)
         if heartbeat is None:
-            return
+            return None
         heartbeat.cancel()
         try:
             await asyncio.wrap_future(heartbeat)
@@ -1804,41 +1876,55 @@ class NatsConcurrencyLimiter:
             pass
         except Exception:
             logger.debug("NATS concurrency heartbeat teardown raised", exc_info=True)
+        return ownership[1] if ownership is not None else self.max_concurrent
 
     async def release(self, provider: str, token: str) -> None:
-        await self._stop_heartbeat(token)
-        if token in self._local_tokens:
-            self._local_tokens.remove(token)
-            self._local_fallback.release(provider)
+        shared_limit = await self._stop_heartbeat(token)
+        with self._lock:
+            local_token = token in self._local_tokens
+            if local_token:
+                self._local_tokens.remove(token)
+        if local_token:
             with self._lock:
+                self._local_in_flight[provider] = max(
+                    0,
+                    self._local_in_flight.get(provider, 0) - 1,
+                )
                 self._in_flight[provider] = max(0, self._in_flight.get(provider, 0) - 1)
+            return
+        if shared_limit is None:
             return
         with self._lock:
             self._in_flight[provider] = max(0, self._in_flight.get(provider, 0) - 1)
+        try:
+            await self._run_bounded(self._release_shared(provider, token, shared_limit), fallback=None)
+        except Exception as exc:
+            logger.error(
+                "[CONC] %s: NATS release failed; lease will expire: %s",
+                provider,
+                exc,
+                exc_info=True,
+            )
+
+    async def _release_shared(self, provider: str, token: str, max_concurrent: int) -> None:
         kv = await self._kv()
         if kv is None:
             return
         key = self._key(provider)
         for _attempt in range(_NATS_CONCURRENCY_LIMITER_RETRIES):
-            try:
-                entry = await _nats_maybe_await(kv.get(key))
-            except Exception:
+            leases, revision, changed = await self._read_leases(kv, key, max_concurrent)
+            if revision is None:
                 return
-            payload = json.loads(_nats_entry_value(entry).decode("utf-8"))
-            new_payload = {"available": payload.get("available", 0) + 1}
-            revision = _nats_entry_revision(entry)
+            removed = leases.pop(token, None) is not None
+            if not removed and not changed:
+                return
             try:
-                if revision is None:
-                    try:
-                        await _nats_kv_create(kv, key, _nats_json(new_payload))
-                    except AttributeError:
-                        await _nats_kv_put(kv, key, _nats_json(new_payload))
-                else:
-                    await _nats_kv_update(kv, key, _nats_json(new_payload), revision)
+                await _nats_kv_update(kv, key, _nats_json({"leases": leases}), revision)
                 return
             except Exception as exc:
                 if not _nats_wrong_revision(exc):
                     raise
+        logger.warning("[CONC] %s: release CAS retries exhausted; lease will expire", provider)
 
     @asynccontextmanager
     async def reserve(self, provider: str):
@@ -1855,6 +1941,7 @@ class NatsConcurrencyLimiter:
         with self._lock:
             heartbeats = list(self._heartbeats.values())
             self._heartbeats.clear()
+            self._token_limits.clear()
         for heartbeat in heartbeats:
             heartbeat.cancel()
         self._loop.close()
@@ -1871,9 +1958,10 @@ class NatsConcurrencyLimiterPool:
     def __init__(
         self,
         kv_or_js: Any | None,
-        key_prefix: str = "conc:",
+        key_prefix: str = _NATS_CONCURRENCY_LIMITER_PREFIX,
         overrides: dict[str, int] | None = None,
         *,
+        lease_seconds: int = _NATS_CONCURRENCY_LEASE_TTL_SECONDS,
         bucket: str = _NATS_CONCURRENCY_LIMITER_BUCKET,
         settings: Any | None = None,
     ):
@@ -1881,10 +1969,12 @@ class NatsConcurrencyLimiterPool:
             kv_or_js,
             key_prefix,
             _DEFAULT_SLOTS,
+            lease_seconds=lease_seconds,
             bucket=bucket,
             settings=settings,
         )
         self._providers: set[str] = set()
+        self._providers_lock = threading.Lock()
         # provider -> outstanding acquire tokens, so release() gives back the
         # slot it actually took.
         self._tokens: dict[str, list[str]] = {}
@@ -1895,12 +1985,15 @@ class NatsConcurrencyLimiterPool:
         return self._overrides.get(provider, _PROVIDER_SLOTS.get(provider, _DEFAULT_SLOTS))
 
     def _remember(self, provider: str) -> None:
-        self._providers.add(provider)
+        with self._providers_lock:
+            self._providers.add(provider)
 
     def is_available(self, provider: str) -> bool:
         self._remember(provider)
-        kv = asyncio.get_event_loop().run_until_complete(self._limiter._kv()) if True else None
-        return kv is not None
+        # Like Redis, availability can only be decided atomically by acquire().
+        # A synchronous preflight read would race and cannot safely drive the
+        # async NATS client (especially from inside a running event loop).
+        return True
 
     async def acquire(self, provider: str) -> bool:
         self._remember(provider)
@@ -1931,20 +2024,33 @@ class NatsConcurrencyLimiterPool:
 
     @asynccontextmanager
     async def reserve(self, provider: str):
-        acquired = await self.acquire(provider)
+        self._remember(provider)
+        token = await self._limiter.acquire(provider, self._max_concurrent(provider))
+        acquired = token is not None
+        if token is not None:
+            with self._token_lock:
+                self._tokens.setdefault(provider, []).append(token)
         try:
             yield acquired
         finally:
-            if acquired:
-                await self.release(provider)
+            if token is not None:
+                with self._token_lock:
+                    try:
+                        self._tokens.get(provider, []).remove(token)
+                        owned = True
+                    except ValueError:
+                        owned = False
+                if owned:
+                    await self._limiter.release(provider, token)
 
     def status(self) -> dict[str, dict[str, int]]:
+        with self._providers_lock:
+            providers = sorted(self._providers)
+        with self._limiter._lock:
+            in_flight = dict(self._limiter._in_flight)
         return {
-            provider: {
-                "in_flight": self._limiter._in_flight.get(provider, 0),
-                "max": self._max_concurrent(provider),
-            }
-            for provider in sorted(self._providers)
+            provider: {"in_flight": in_flight.get(provider, 0), "max": self._max_concurrent(provider)}
+            for provider in providers
         }
 
     def close(self) -> None:
@@ -2023,7 +2129,7 @@ def make_rate_limiter_pool(
             allow_fallback=_allow_in_process_fallback(settings),
         )
     if _nats_configured(settings):
-        prefix = getattr(settings.resilience, "rate_limiter_nats_prefix", "rl:")
+        prefix = getattr(settings.resilience, "rate_limiter_nats_prefix", _NATS_RATE_LIMITER_PREFIX)
         return NatsRateLimiterPool(
             nats_kv,
             prefix,
@@ -2050,11 +2156,12 @@ def make_concurrency_limiter(
             allow_fallback=_allow_in_process_fallback(settings),
         )
     if _nats_configured(settings):
-        prefix = getattr(settings.resilience, "concurrency_nats_prefix", "conc:")
+        prefix = getattr(settings.resilience, "concurrency_nats_prefix", _NATS_CONCURRENCY_LIMITER_PREFIX)
         return NatsConcurrencyLimiterPool(
             nats_kv,
             prefix,
             overrides=overrides,
+            lease_seconds=int(getattr(settings.resilience, "concurrency_lease_seconds", 300)),
             settings=settings,
         )
     _warn_fallback(settings, "NATS not configured and no Redis resilience backend configured")
