@@ -787,14 +787,36 @@ class PostgresMemoryRepository(MemoryRepository):
         tx: Transaction,
         memory_id: str,
         tags: Sequence[str],
-    ) -> None:
+        *,
+        visibility: VisibilityFilter | None = None,
+    ) -> bool:
         conn = _postgres_tx(tx).conn
+        params: list[Any] = [memory_id]
+        where = ["m.id = $1", "m.deleted_at IS NULL"]
+        if visibility is not None:
+            clause, vis_params, _ = _render_postgres_visibility(
+                visibility,
+                start_idx=2,
+                table_alias="m",
+            )
+            if clause:
+                where.append(clause)
+                params.extend(vis_params)
+        locked = await conn.fetchrow(
+            "SELECT m.id FROM memories m WHERE "
+            + " AND ".join(where)
+            + " FOR UPDATE",
+            *params,
+        )
+        if locked is None:
+            return False
         await conn.execute("DELETE FROM memory_tags WHERE memory_id = $1", memory_id)
         if tags:
             await conn.executemany(
                 "INSERT INTO memory_tags (memory_id, tag) VALUES ($1, $2)",
                 [(memory_id, tag) for tag in tags],
             )
+        return True
 
     async def fetch_memory_tags(
         self,

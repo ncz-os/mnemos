@@ -90,7 +90,10 @@ async def test_claim_still_orders_by_queue_priority():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("dialect", "expected"),
-    [("mysql", "LIMIT 1 FOR UPDATE SKIP LOCKED"), ("postgres", "LIMIT 1")],
+    [
+        ("mysql", "LIMIT 1 FOR UPDATE SKIP LOCKED"),
+        ("postgres", "LIMIT 1 FOR UPDATE SKIP LOCKED"),
+    ],
 )
 async def test_other_dialects_are_unchanged(dialect, expected):
     """The Oracle fix must not disturb the backends that already worked."""

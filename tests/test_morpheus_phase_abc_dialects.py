@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import inspect
+import json
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -85,6 +88,87 @@ def test_mysql_and_mariadb_share_phase_dialect_except_longtext_json_store():
     assert "CAST(%s AS JSON)" not in inspect.getsource(
         MariadbMorpheusRepository.phase_synthesise_store
     )
+
+
+class _MysqlConsolidateCursor:
+    def __init__(self, connection):
+        self.connection = connection
+        self.rowcount = 0
+        self._one = None
+        self._all = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def execute(self, sql, params):
+        normalized = " ".join(sql.split())
+        self.rowcount = 0
+        if normalized.startswith("SELECT config, cluster_min_size"):
+            self._one = (
+                json.dumps(
+                    {
+                        "clusters": [
+                            {"member_memory_ids": ["canonical", "member"]}
+                        ]
+                    }
+                ),
+                2,
+                None,
+            )
+        elif normalized.startswith("SELECT id, recall_count"):
+            now = datetime.now(timezone.utc)
+            self._all = [
+                ("canonical", 10, now, 600, None, None, "{}"),
+                ("member", 1, now, 644, None, None, "{}"),
+            ]
+        elif normalized.startswith("SELECT COUNT(*) FROM memories"):
+            self._one = (0,)
+        elif normalized.startswith("UPDATE memories"):
+            # Emulate MySQL's left-to-right assignment behavior. The buggy
+            # query reads the column after permission_mode was assigned and
+            # therefore snapshots 400; the fixed query binds locked row[3].
+            new_mode = int(params[1])
+            original_mode_bind = int(params[5]) if len(params) == 9 else None
+            self.connection.permission_mode = new_mode
+            self.connection.metadata["pre_consolidate_permission_mode"] = (
+                original_mode_bind
+                if original_mode_bind is not None
+                else self.connection.permission_mode
+            )
+            self.rowcount = 1
+
+    async def fetchone(self):
+        return self._one
+
+    async def fetchall(self):
+        return self._all
+
+
+class _MysqlConsolidateConnection:
+    def __init__(self):
+        self.permission_mode = 644
+        self.metadata = {}
+
+    def cursor(self):
+        return _MysqlConsolidateCursor(self)
+
+
+@pytest.mark.asyncio
+async def test_mysql_consolidate_snapshots_original_permission_mode():
+    conn = _MysqlConsolidateConnection()
+    result = await MysqlMorpheusRepository().phase_consolidate(
+        SimpleNamespace(conn=conn),
+        run_id="run-1",
+        consolidated_permission_mode=400,
+    )
+
+    assert result is not None
+    assert result.memories_consolidated == 1
+    assert conn.permission_mode == 400
+    assert conn.metadata["pre_consolidate_permission_mode"] == 644
 
 
 def test_oracle_merge_and_db2_inheritance_keep_rmw_json_fallback():

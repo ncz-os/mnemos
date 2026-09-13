@@ -25,6 +25,8 @@ def backend_dialect(backend: Any) -> str:
     name = type(backend).__name__.lower()
     if "sqlite" in name:
         return "sqlite"
+    if "postgres" in name:
+        return "postgres"
     if "mariadb" in name:
         return "mysql"
     if "mysql" in name:
@@ -64,7 +66,18 @@ class _Ops:
         self.dialect = dialect
 
     def sql(self, template: str) -> str:
-        marker = "?" if self.dialect in {"sqlite", "db2"} else "%s" if self.dialect == "mysql" else ":{}"
+        if self.dialect == "postgres":
+            # asyncpg cannot infer the type of a parameter used only by
+            # ``IS NULL``. Every such lifecycle parameter is a namespace,
+            # matching the established deletion_ops ``$N::text`` convention.
+            template = template.replace("? IS NULL", "?::text IS NULL")
+            marker = "${}"
+        elif self.dialect in {"sqlite", "db2"}:
+            marker = "?"
+        elif self.dialect == "mysql":
+            marker = "%s"
+        else:
+            marker = ":{}"
         index = 0
         pieces: list[str] = []
         for piece in template.split("?")[:-1]:
@@ -77,12 +90,20 @@ class _Ops:
     async def _cursor(self, sql: str, params: tuple[Any, ...]) -> Any:
         if self.dialect == "sqlite":
             return await _await(self.conn.execute(self.sql(sql), params))
+        if self.dialect == "postgres":
+            raise TypeError("asyncpg operations do not use DB-API cursors")
         cursor = self.conn.cursor()
         cursor = await _await(cursor)
         await _await(cursor.execute(self.sql(sql), params))
         return cursor
 
     async def execute(self, sql: str, *params: Any) -> int:
+        if self.dialect == "postgres":
+            result = await self.conn.execute(self.sql(sql), *params)
+            try:
+                return max(0, int(str(result).rsplit(" ", 1)[-1]))
+            except (IndexError, ValueError):
+                return 0
         cursor = await self._cursor(sql, tuple(params))
         try:
             return max(0, int(getattr(cursor, "rowcount", 0) or 0))
@@ -92,6 +113,9 @@ class _Ops:
                 await _await(close())
 
     async def fetchone(self, sql: str, *params: Any) -> dict[str, Any] | None:
+        if self.dialect == "postgres":
+            row = await self.conn.fetchrow(self.sql(sql), *params)
+            return dict(row) if row is not None else None
         cursor = await self._cursor(sql, tuple(params))
         try:
             row = await _await(cursor.fetchone())
@@ -111,6 +135,9 @@ class _Ops:
         return next(iter(row.values())) if row else None
 
     async def fetchall(self, sql: str, *params: Any) -> list[dict[str, Any]]:
+        if self.dialect == "postgres":
+            rows = await self.conn.fetch(self.sql(sql), *params)
+            return [dict(row) for row in rows]
         cursor = await self._cursor(sql, tuple(params))
         try:
             rows = await _await(cursor.fetchall())
@@ -249,7 +276,7 @@ async def _claim(ops: _Ops, *, hard: bool) -> dict[str, Any] | None:
         order = "confirmed_at ASC, requested_at ASC"
         params = ()
     base_sql = f"SELECT * FROM deletion_requests WHERE {where} ORDER BY {order}"
-    if ops.dialect == "mysql":
+    if ops.dialect in {"mysql", "postgres"}:
         sql = base_sql + " LIMIT 1 FOR UPDATE SKIP LOCKED"
     elif ops.dialect == "db2":
         # Native Db2. ROWNUM exists only under DB2_COMPATIBILITY_VECTOR=ORA,
@@ -384,6 +411,10 @@ async def _hard_delete_scope(ops: _Ops, request: dict[str, Any]) -> dict[str, in
     user_id = request["target_user_id"]
     namespace = request.get("target_namespace")
     counts: dict[str, int] = {}
+    if ops.dialect == "postgres":
+        # Match the native Postgres hard-delete path: prevent the version
+        # snapshot trigger from preserving rows being irreversibly erased.
+        await ops.execute("SET LOCAL mnemos.suppress_version_snapshot = '1'")
     memories = await ops.fetchall(
         f"SELECT id, content, owner_id, namespace FROM memories WHERE {_scope('owner_id')} "
         "AND deleted_at IS NOT NULL",
@@ -393,12 +424,14 @@ async def _hard_delete_scope(ops: _Ops, request: dict[str, Any]) -> dict[str, in
     )
     for memory in memories:
         content_hash = hashlib.sha256(str(memory.get("content") or "").encode()).hexdigest()
+        source = request.get("source") or ["deletion_request_worker", str(request["id"])]
+        source_value = list(source) if ops.dialect == "postgres" else json.dumps(source)
         values = (
             memory["id"], content_hash, memory.get("owner_id"), memory.get("namespace"),
             request.get("requested_by") or "deletion_request_worker",
             request.get("requested_at") or datetime.now(timezone.utc),
             request.get("request_kind") or "tombstone_collected", request.get("notes"),
-            json.dumps(request.get("source") or ["deletion_request_worker", str(request["id"])]),
+            source_value,
         )
         columns = (
             "memory_id, content_hash, owner_id, namespace, requested_by, requested_at, "
@@ -413,7 +446,7 @@ async def _hard_delete_scope(ops: _Ops, request: dict[str, Any]) -> dict[str, in
         else:
             await ops.execute(
                 f"INSERT INTO deletion_log (id, {columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                uuid.uuid4().hex,
+                uuid.uuid4() if ops.dialect == "postgres" else uuid.uuid4().hex,
                 *values,
             )
     for table, fk, parent, parent_id, owner_col in _RELATED_TABLES:
@@ -607,24 +640,19 @@ async def sweep_for_archival(
             "AND consolidated_into IS NULL AND (last_recalled_at IS NULL OR last_recalled_at < ?) "
             "AND created < ? AND namespace = ? ORDER BY created ASC"
         )
-        if dialect == "mysql":
+        if dialect in {"mysql", "postgres"}:
             claim_sql = base_sql + " LIMIT ? FOR UPDATE SKIP LOCKED"
         elif dialect in {"oracle", "db2"}:
             claim_sql = f"SELECT id FROM ({base_sql}) WHERE ROWNUM <= ? FOR UPDATE SKIP LOCKED"
         else:
             claim_sql = base_sql + " LIMIT ?"
-        cursor = await ops._cursor(
+        rows = await ops.fetchall(
             claim_sql,
-            (cutoff, cutoff, namespace, int(batch_size)),
+            cutoff,
+            cutoff,
+            namespace,
+            int(batch_size),
         )
-        try:
-            raw_rows = await _await(cursor.fetchall())
-            keys = [str(col[0]).lower() for col in (cursor.description or ())]
-            rows = [row if isinstance(row, dict) else dict(zip(keys, row)) for row in raw_rows]
-        finally:
-            close = getattr(cursor, "close", None)
-            if close is not None:
-                await _await(close())
 
         archived = 0
         for item in rows:

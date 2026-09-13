@@ -304,11 +304,16 @@ class MemoryRepository(ABC):
         tx: Transaction,
         memory_id: str,
         tags: Sequence[str],
-    ) -> None:
+        *,
+        visibility: VisibilityFilter | None = None,
+    ) -> bool:
         """Replace a memory's complete tag set inside the caller's transaction.
 
         Tags are mutable retrieval metadata stored in ``memory_tags``; this
         operation must not update ``memories`` or create a version snapshot.
+        Implementations lock the active parent row before replacing tags so
+        concurrent complete-set writes serialize. When ``visibility`` is
+        supplied, authorization is evaluated by that same locking read.
         """
         ...
 
