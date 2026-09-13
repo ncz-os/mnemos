@@ -1,17 +1,19 @@
 # Claude Code → MNEMOS
 
-Claude Code can use MNEMOS as a shared memory layer by SSH-spawning the MNEMOS stdio MCP server from `~/.claude.json`.
+Claude Code runs the MNEMOS stdio MCP server locally and points it at your
+MNEMOS instance's REST API over the network — no SSH hop required.
 
 ## Requirements
 
 - MNEMOS bearer token (see `~/.api_keys_master.json` or your shell env)
-- MNEMOS REST reachable at `http://<mnemos-host>:5002`
-- SSH access from Claude Code machine to `<mnemos-host>`
-- mnemos package installed at `/opt/mnemos` with virtualenv at `/opt/mnemos/venv`
+- MNEMOS REST reachable at `http://<mnemos-host>:5002` from the machine
+  running Claude Code
+- `mnemos` installed and on `PATH` where Claude Code runs (`pip install
+  mnemos-core` or equivalent)
 
 ## Configuration
 
-Merge into `~/.claude.json`. The MCP process runs on the remote host; `MNEMOS_BASE` defaults to `localhost:5002` which is correct from there.
+Merge into `~/.claude.json`:
 
 ```json
 {
@@ -28,12 +30,20 @@ Merge into `~/.claude.json`. The MCP process runs on the remote host; `MNEMOS_BA
 }
 ```
 
+`MNEMOS_BASE` can point at `localhost:5002` (same machine) or any reachable
+host — the `env` block here is passed to the locally-spawned process, so it
+applies with no SSH-specific handling needed.
+
+For a persistent, remotely-reachable connection instead of a
+locally-spawned process, use the HTTP/SSE transport
+(`mnemos serve mcp-http`) — see the [ChatGPT Pro Developer Mode
+guide](./chatgpt-pro-developer-mode.md)'s OAuth 2.1 and bearer-token setup,
+which applies to any MCP client that speaks SSE, including Claude Code.
+
 ## Notes
 
 - Port 5002 is the unified API port for both MNEMOS and GRAEAE.
-- `PYTHONPATH=/opt/mnemos` is required — the package is editable, not installed in venv site-packages.
-- `MNEMOS_API_KEY` must be in the SSH args via `/usr/bin/env`; Claude Code's `env` block is local-only and does not cross the SSH boundary.
-- GRAEAE reasoning is available as the `graeae_consult` MCP tool, or over REST at `POST http://<mnemos-host>:5002/v1/consultations` with a Bearer token. Both require the `mnemos-graeae` add-on to be installed.
+- GRAEAE reasoning is available as the `graeae_consult` MCP tool, or over REST at `POST http://<mnemos-host>:5002/v1/consultations` with a Bearer token. Both require the `graeae` extra to be installed.
 
 ## Idempotent fix script (for pre-v5.x configs)
 

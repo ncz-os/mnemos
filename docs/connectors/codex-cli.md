@@ -84,10 +84,10 @@ Bring up the OAuth-enabled MCP edge and expose it publicly:
 export MNEMOS_OAUTH_ISSUER="https://mnemos.example.com"
 export MNEMOS_OAUTH_ADMIN_PASSPHRASE="$(openssl rand -hex 32)"
 export MNEMOS_DATABASE_DSN="sqlite:////data/mnemos.db"
-mnemos serve mcp-http --host 0.0.0.0 --port 5004
+mnemos serve mcp-http --host 0.0.0.0 --port 5003
 ```
 
-Then expose port 5004 over HTTPS. Two tunnel options, operator-verified
+Then expose port 5003 over HTTPS. Two tunnel options, operator-verified
 against real ChatGPT and Codex clients:
 
 - **Cloudflare Tunnel** (recommended — stable URL, no rotating link to
@@ -96,12 +96,12 @@ against real ChatGPT and Codex clients:
   cloudflared tunnel login
   cloudflared tunnel create mnemos
   cloudflared tunnel route dns mnemos mnemos.yourdomain.com
-  cloudflared tunnel run --url http://<mnemos-host>:5004 mnemos
+  cloudflared tunnel run --url http://<mnemos-host>:5003 mnemos
   ```
 - **ngrok** (faster to try, URL rotates on the free tier):
   ```bash
   ngrok config add-authtoken <your-ngrok-authtoken-from-dashboard>
-  ngrok http http://<mnemos-host>:5004
+  ngrok http http://<mnemos-host>:5003
   ```
 
 Register the connector: ChatGPT → Settings → Connectors → Add custom (URL =

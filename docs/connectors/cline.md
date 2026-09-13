@@ -21,7 +21,9 @@ Cline can use MNEMOS from VS Code by adding a `mnemos` MCP server to the extensi
 
 Open Cline settings, then merge this into the `mcpServers` object.
 The `autoApprove` list includes read-only tools only; write tools should
-still prompt for approval.
+still prompt for approval. `graeae_consult` and the `pantheon_*` tools are
+deliberately excluded even though they're read-only — they spend LLM
+budget and are rate-limited, so leave them on manual approval.
 
 ```json
 {
@@ -44,7 +46,10 @@ still prompt for approval.
         "log_memory",
         "diff_memory_commits",
         "checkout_memory",
-        "recommend_model"
+        "recommend_model",
+        "list_deletions",
+        "kronos_anomalies",
+        "kronos_forecast"
       ]
     }
   }

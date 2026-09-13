@@ -88,20 +88,14 @@ watch it and then pull on each host.
       ```
       Expect both `{'architecture':'arm64','os':'linux'}` and
       `{'architecture':'amd64','os':'linux'}`.
-- [ ] **Test against a real instance of every backend this release touched
-      BEFORE broad fleet rollout, not just the SQLite/mocked local suite.**
-      This fleet runs one federated node per backend family precisely for
-      this (as of 2026-09-13): `pythia`=Oracle (production), `minos`=MariaDB,
-      `pegasus`=Db2, `achilles`/`proteus`=SQLite. Roll the new version to
-      ONE of the affected backend's nodes first, restart it **twice** in a
-      row (not once — a migration can succeed on the first-ever boot and
-      then crash on replay, since migrations here carry no applied-state
-      table and re-run in full every start), and confirm `/health` stays
+- [ ] **Validate against a real instance of every backend this release
+      touched before broad rollout.** Maintain one staging node per
+      supported backend family (Oracle, Db2, MariaDB, SQLite) for this
+      purpose. Roll the new version to the affected node first, restart it
+      **twice** (migrations replay in full on every start, so idempotency
+      only shows up on the second boot), and confirm `/health` stays
       `healthy` with the new `version` both times before rolling further.
-      Real, previously-undetectable defects found exactly this way in
-      `v6.3.4`–`v6.3.7` (see `docs/PERSISTENCE_ABC_STANDARDIZATION.md` Item 5
-      and `CHANGELOG.md`) — none of them were, or could have been, caught
-      by the local test suite.
+      See `docs/PERSISTENCE_ABC_STANDARDIZATION.md` Item 5.
 - [ ] Roll the rest of the fleet's federated nodes, then production last:
       pull the new tag, recreate/restart the container in place (same
       volume, same env), confirm `/health` reports the new `version` and

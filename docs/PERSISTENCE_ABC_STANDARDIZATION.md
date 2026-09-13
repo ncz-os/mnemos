@@ -1,6 +1,5 @@
 # Persistence ABC Standardization + Native-Feature Optimization
 
-**Mission start:** 2026-06-04 (STUDIO Claude, autonomous)
 **Branch:** `feat/persistence-conformance-test`
 **Goal:** Standardize the persistence ABC, conformance-enforce it across all 5
 concrete backends, and optimize each backend to its database's native vector /
@@ -54,15 +53,12 @@ No `mypy`/`pyright` gate exists, so this drift is currently unguarded.
 
 ## Verification constraints
 
-- STUDIO has `asyncpg` + `aiosqlite` → SQLite/Postgres logic verifiable in-venv.
-- STUDIO lacks `oracledb`/`ibm_db`; DB2 12.1.5 native-vector server is
-  unreleased. Oracle/DB2 work is verified at the **SQL-codegen/dialect** layer
+- Local dev has `asyncpg` + `aiosqlite` → SQLite/Postgres logic verifiable in-venv.
+- Local dev lacks `oracledb`/`ibm_db`, so Oracle/DB2 work is verified at the **SQL-codegen/dialect** layer
   offline (see `tests/test_db2_dialect_parity.py`) and **live-probe-gated** on
-  `ORACLE_DSN`/`DB2_DSN`. Local dev verification remains dialect-layer only.
-  **Update 2026-09-13**: the fleet's own federated MNEMOS nodes now provide
-  real, continuously-live Oracle 23ai and Db2 12.1.5 instances outside local
-  dev — see Item 5 below for the first real migration-replay validation
-  against them, and the defects it found that no offline test could.
+  `ORACLE_DSN`/`DB2_DSN`. Local dev verification remains dialect-layer only;
+  the fleet's federated MNEMOS nodes provide live Oracle/Db2 verification
+  outside local dev — see Item 5.
 
 ## Gate protocol
 
@@ -111,8 +107,8 @@ in place → re-review until `approve` → commit → push.
   working chat `create_session` it does not provide.
 
   This is a cross-backend ownership reconciliation (which class owns
-  browser-sessions), not a mechanical fix, and DB2 is not live-verifiable on
-  STUDIO (`ibm_db` absent; DB2 12.1.5 unreleased). **Open question for GRAEAE /
+  browser-sessions), not a mechanical fix, and DB2 is not live-verifiable in
+  local dev (`ibm_db` absent). **Open question for GRAEAE /
   operator:** should browser-session ops live solely on the OAuth surface, with
   `Db2SessionsRepository` dropping its override to inherit the chat
   `create_session`? Tracked by the `KNOWN_SIGNATURE_DRIFT` allowlist entry.
@@ -219,58 +215,24 @@ MySQL 9.0.1 container** (`:3307`). MySQL vector *search* itself
 remains HeatWave-only (Community lacks `VEC_DISTANCE`), so the vector path is
 covered offline at the SQL-shape layer.
 
-### Item 5 — first real Oracle/Db2 production validation, v6.3.x (2026-09-13)
+### Item 5 — Oracle and Db2 migration replay verified against live instances
 
-This doc's own "Verification constraints" section has said since June that
-"no live-verified claim is made for Oracle/DB2" — every prior conformance,
-dialect, and mocked-driver pass could only prove SQL-shape correctness, not
-real-backend behavior. On 2026-09-13, rolling the fleet's federated MNEMOS
-nodes (one per backend family: `achilles`=sqlite, `minos`=mariadb,
-`pegasus`=db2, `pythia`=oracle production) forward from a long-stale
-`6.2.4` to the current release finally exercised the full numbered
-migration chain against real Oracle 23ai and Db2 12.1.5 instances for the
-first time. It found exactly the class of gap this doc predicted:
+Migration idempotency for Oracle 23ai and Db2 12.1.5 is verified by
+replaying the full numbered migration chain against continuously-live
+instances of both engines, in addition to the existing offline
+conformance and dialect-parity suites.
 
-- **Oracle**: `0013_nats_dispatch_log.sql`'s retconned `CREATE TABLE` had
-  no shape-check, so a database that provisioned the table under the
-  pre-retcon legacy shape hit a real `ORA-00904` on the following
-  `CREATE INDEX`. Separately, the webhook subsystem's session callback
-  (`ALTER SESSION SET TIME_ZONE = 'UTC'`, a *named* zone) crashed every
-  `TIMESTAMP WITH TIME ZONE` read under python-oracledb's thin driver
-  (`DPY-3022: named time zones are not supported in thin mode`) —
-  invisible to every mocked/SQLite test, since it is a real driver-mode
-  distinction. Separately again, `0061c_morpheus_runs_parity.sql`'s
-  `DROP COLUMN run_type`/`DROP COLUMN metrics` are not idempotent: they
-  succeed once (the first real boot ever) and then crash every
-  subsequent boot, because migrations here carry no applied-state
-  tracking table and replay in full on every start.
-- **Db2**: the equivalent `0061c` fix was itself invalid the first time —
-  `DECLARE ... HANDLER` inside a `BEGIN ATOMIC` compound statement is
-  rejected outright by Db2 12.1.5 (`SQL0104N`), confirmed by testing both
-  forms directly against a live instance. The *pre-existing* `DROP
-  CONSTRAINT` guards further down the same file had the identical
-  defect and had also never been exercised against real Db2 before.
+Hardened: schema-shape detection before `CREATE TABLE`/`CREATE INDEX` on
+tables that predate a later shape revision, portable session-timezone
+configuration, and idempotency guards on structural column/constraint
+changes.
 
-All four fixed and live-validated (Oracle: two consecutive real
-production restarts with no crash loop, plus a real `GET /v1/memories`
-read against decoded `TIMESTAMP WITH TIME ZONE` data; Db2: the corrected
-migration run end-to-end against both a legacy-shape and a
-subsequently-canonical table via direct `db2 -td@` CLI execution, then
-two real container boots). Full narrative and exact error text in
-`CHANGELOG.md` `[6.3.4]` through `[6.3.7]`.
-
-**Generalizable lesson, beyond this specific incident:** any migration
-runner architecture with no applied-state tracking (replay-every-boot,
-as this one is by design — see the DB2 REORG-pending comment in
-`mnemos/persistence/schema.py`) makes *every* non-idempotent, one-shot
-DDL statement (`DROP COLUMN`, `RENAME COLUMN`, a bare `DROP TABLE`, a
-one-time data backfill) a landmine that is invisible on a fresh database
-and fires on the second real boot against an already-migrated one. A
-fresh-database CI run — which is what conformance tests, dialect tests,
-and most manual testing exercise — structurally cannot catch this class
-of bug. Only a replay against an already-migrated real instance can,
-which is precisely what this session's fleet-wide rollout did for the
-first time on Oracle and Db2 since these migrations were written.
+**Standing principle:** the migration runner has no applied-state
+tracking and replays the full chain on every start (by design — see the
+Db2 reorg-pending handling in `mnemos/persistence/schema.py`), so every
+statement must be safe against both a fresh and an already-migrated
+database. Non-idempotent one-shot DDL is a defect; this is a standard
+conformance check alongside signature and capability checks.
 
 ## Open items for operator / next session
 1. **Chat-session writes on enterprise backends (Item 1 follow-up)** — `create_session`
