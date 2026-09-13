@@ -11,12 +11,11 @@ These tests cover:
   - phase_cluster via the MorpheusRepository ABC — ordering,
     threshold, min_size filter, config persistence (verified
     through the captured ``merge_run_config`` patch).
-  - phase_synthesise against a mocked pool — INSERT shape,
+  - phase_synthesise against a mocked repository — INSERT shape,
     source_memories tagging, rollback safety contract.
 
-Item 11a (ABC migration): ``phase_cluster`` and ``phase_synthesise``
-dispatch their final ``update_counters`` call through
-``_get_backend()`` → ``backend.morpheus.update_counters``.
+Items 11a/11c route phase counters and SYNTHESISE persistence through
+``_get_backend()`` → ``backend.morpheus``.
 
 Item 11b (ABC migration): ``phase_cluster`` now routes the
 candidate fetch + cluster-payload write through
@@ -25,11 +24,12 @@ candidate fetch + cluster-payload write through
 mock those ABC methods directly (with a ``_MockMorpheus`` stub) so
 the runner's plumbing is exercised end-to-end without standing up
 a real Postgres / SQLite / Oracle. A separate
-``tests/test_morpheus_cluster_abc.py`` test file ships a real-SQLite
+``tests/test_morpheus_cluster_abc_sqlite.py`` test file ships a real-SQLite
 coverage run that pins the ABC contract against the actual
 ``SqliteMorpheusRepository.fetch_cluster_candidates`` / merge_run_config
 impls.
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -48,6 +48,7 @@ from mnemos.domain.morpheus.runner import (
 )
 
 # ── pure helper tests ────────────────────────────────────────────────────────
+
 
 def test_cosine_similarity_identical_vectors():
     a = np.array([1.0, 0.0, 0.0], dtype=np.float32)
@@ -151,8 +152,10 @@ async def test_synthesise_extractive_handles_empty():
 
 # ── phase_cluster tests against mocked pool ─────────────────────────────────
 
+
 class _MockConn:
     """Minimal asyncpg connection mock that records executed statements."""
+
     def __init__(self, fetchrow_result, fetch_result):
         self._fetchrow_result = fetchrow_result
         self._fetch_result = fetch_result
@@ -175,8 +178,14 @@ class _MockConn:
 
 class _MockPool:
     """Minimal asyncpg.Pool mock returning a single _MockConn via acquire()."""
+
     def __init__(self, conn: _MockConn):
         self._conn = conn
+        from mnemos.core import lifecycle as _lifecycle
+
+        backend = _lifecycle._persistence_backend
+        if hasattr(backend, "morpheus"):
+            backend.morpheus._conn = conn
 
     def acquire(self):
         pool = self
@@ -211,9 +220,7 @@ class _MorpheusNoOp:
     async def update_counters(self, tx, run_id, **_kwargs):
         return None
 
-    async def increment_extract_counters(
-        self, tx, run_id, *, triples_extracted, memories_processed
-    ):
+    async def increment_extract_counters(self, tx, run_id, *, triples_extracted, memories_processed):
         return None
 
     async def finish_run(self, tx, run_id):
@@ -233,6 +240,49 @@ class _MorpheusNoOp:
 
     async def merge_run_config(self, tx, run_id, *, patch):
         return None
+
+    async def phase_synthesise_load(self, tx, *, run_id):
+        from mnemos.persistence.base import MorpheusSynthesisCluster, MorpheusSynthesisMember
+
+        conn = self._conn
+        config = await conn.fetchval("SELECT config FROM morpheus_runs", run_id)
+        if config is None:
+            return None
+        out = []
+        for cluster in config.get("clusters", []):
+            rows = await conn.fetch(
+                "SELECT id, content, category, owner_id, namespace FROM memories",
+                cluster.get("member_memory_ids") or [],
+            )
+            members = tuple(
+                MorpheusSynthesisMember(
+                    row["id"],
+                    row["content"],
+                    row.get("category"),
+                    row.get("owner_id"),
+                    row.get("namespace"),
+                )
+                for row in rows
+            )
+            if members:
+                out.append(MorpheusSynthesisCluster(cluster.get("cluster_id", 0), members))
+        return out
+
+    async def phase_synthesise_store(self, tx, **kwargs):
+        import json
+
+        await self._conn.execute(
+            "INSERT INTO memories (morpheus_run_id, source_memories, provenance) VALUES (..., 'morpheus_local')",
+            kwargs["memory_id"],
+            kwargs["content"],
+            kwargs["category"],
+            "morpheus_summary",
+            json.dumps(kwargs["metadata"]),
+            kwargs["owner_id"],
+            kwargs["namespace"],
+            kwargs["run_id"],
+            kwargs["source_memory_ids"],
+        )
 
 
 class _MockMorpheus(_MorpheusNoOp):
@@ -339,8 +389,8 @@ async def test_phase_cluster_groups_similar_vectors(_install_mock_morpheus_backe
         _candidate_ctx(
             candidates=[
                 _row("mem_a", [1.0, 0.0, 0.0]),
-                _row("mem_b", [0.99, 0.01, 0.0]),       # very close to mem_a
-                _row("mem_c", [0.0, 1.0, 0.0]),         # orthogonal — its own cluster
+                _row("mem_b", [0.99, 0.01, 0.0]),  # very close to mem_a
+                _row("mem_c", [0.0, 1.0, 0.0]),  # orthogonal — its own cluster
             ],
             cluster_min_size=2,
         )
@@ -361,9 +411,7 @@ async def test_phase_cluster_groups_similar_vectors(_install_mock_morpheus_backe
 
 
 @pytest.mark.asyncio
-async def test_phase_cluster_threshold_separation(
-    monkeypatch, _install_mock_morpheus_backend
-):
+async def test_phase_cluster_threshold_separation(monkeypatch, _install_mock_morpheus_backend):
     """A threshold raised above the actual similarity should split a
     cluster that would otherwise merge."""
     from mnemos.core import config
@@ -392,9 +440,7 @@ async def test_phase_cluster_threshold_separation(
 @pytest.mark.asyncio
 async def test_phase_cluster_no_rows_zero_clusters(_install_mock_morpheus_backend):
     backend = _install_mock_morpheus_backend
-    backend.morpheus.set_candidates(
-        _candidate_ctx(candidates=[], cluster_min_size=3)
-    )
+    backend.morpheus.set_candidates(_candidate_ctx(candidates=[], cluster_min_size=3))
     pool = _MockConn(None, None)
     n = await phase_cluster(pool, "00000000-0000-0000-0000-000000000003")
     assert n == 0
@@ -418,9 +464,7 @@ async def test_phase_cluster_passes_namespace_to_query(_install_mock_morpheus_ba
         return ctx
 
     backend.morpheus.fetch_cluster_candidates = spy_fetch  # type: ignore[method-assign]
-    backend.morpheus.set_candidates(
-        _candidate_ctx(candidates=[], cluster_min_size=1, namespace="tenant-a")
-    )
+    backend.morpheus.set_candidates(_candidate_ctx(candidates=[], cluster_min_size=1, namespace="tenant-a"))
     pool = _MockConn(None, None)
     n = await phase_cluster(pool, "00000000-0000-0000-0000-000000000005")
     assert n == 0
@@ -461,9 +505,7 @@ async def test_phase_cluster_skips_garbage_embeddings(_install_mock_morpheus_bac
 
 
 @pytest.mark.asyncio
-async def test_phase_cluster_respects_max_input_count(
-    monkeypatch, _install_mock_morpheus_backend
-):
+async def test_phase_cluster_respects_max_input_count(monkeypatch, _install_mock_morpheus_backend):
     """Item 11b: ``phase_cluster`` forwards ``max_input_count`` to
     ``fetch_cluster_candidates`` so each backend can apply its own
     LIMIT/FETCH-FIRST clause. This test pins the runner-side
@@ -495,6 +537,7 @@ async def test_phase_cluster_respects_max_input_count(
 
 # ── phase_synthesise tests ─────────────────────────────────────────────────
 
+
 @pytest.mark.asyncio
 async def test_phase_synthesise_inserts_one_per_cluster():
     """Two clusters in the run config → two INSERTs into memories,
@@ -509,12 +552,36 @@ async def test_phase_synthesise_inserts_one_per_cluster():
 
     member_rows_by_call = [
         [
-            {"id": "mem_1", "content": "First fact about the deploy.", "category": "facts", "owner_id": "default", "namespace": "default"},
-            {"id": "mem_2", "content": "Second fact, related to the first.", "category": "facts", "owner_id": "default", "namespace": "default"},
+            {
+                "id": "mem_1",
+                "content": "First fact about the deploy.",
+                "category": "facts",
+                "owner_id": "default",
+                "namespace": "default",
+            },
+            {
+                "id": "mem_2",
+                "content": "Second fact, related to the first.",
+                "category": "facts",
+                "owner_id": "default",
+                "namespace": "default",
+            },
         ],
         [
-            {"id": "mem_3", "content": "Decision was made on Tuesday.", "category": "decisions", "owner_id": "default", "namespace": "default"},
-            {"id": "mem_4", "content": "Decision rationale captured.", "category": "decisions", "owner_id": "default", "namespace": "default"},
+            {
+                "id": "mem_3",
+                "content": "Decision was made on Tuesday.",
+                "category": "decisions",
+                "owner_id": "default",
+                "namespace": "default",
+            },
+            {
+                "id": "mem_4",
+                "content": "Decision rationale captured.",
+                "category": "decisions",
+                "owner_id": "default",
+                "namespace": "default",
+            },
         ],
     ]
 

@@ -49,7 +49,13 @@ from mnemos.persistence.base import (
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
+    MorpheusConsolidationResult,
+    MorpheusExtractBatch,
+    MorpheusExtractCandidate,
+    MorpheusExtractFailure,
     MorpheusRepository,
+    MorpheusSynthesisCluster,
+    MorpheusSynthesisMember,
     NatsDispatchLogRepository,
     OAuthRepository,
     SessionsRepository,
@@ -140,10 +146,12 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v6_3_api_keys_last_used_sqlite.sql",
     "migrations_v6_3_mcp_oauth_sqlite.sql",
     "migrations_v6_3_morpheus_runs_parity_sqlite.sql",  # item 11/11a: morpheus_runs canonical shape
+    "migrations_v6_3_morpheus_phase_parity_sqlite.sql",  # item 11c: source_memories parity
     "0038_oauth_sessions_consultations.sql",
     "0039_subscription_plan_current_limits.sql",
     "0043_memory_acl.sql",
     "0048_memory_versions_visibility.sql",
+    "0054_memory_tags.sql",
 ]
 
 
@@ -935,6 +943,40 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             raise DuplicateMemoryError(f"memory id already exists: {memory_id}")
         return "INSERT 0 1"
 
+    async def replace_memory_tags(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        tags: Sequence[str],
+    ) -> None:
+        conn = self._conn(tx)
+        await _execute(conn, "DELETE FROM memory_tags WHERE memory_id = ?", (memory_id,))
+        if tags:
+            await _call(
+                conn.executemany,
+                "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
+                [(memory_id, tag) for tag in tags],
+            )
+
+    async def fetch_memory_tags(
+        self,
+        tx: Transaction,
+        memory_ids: Sequence[str],
+    ) -> dict[str, list[str]]:
+        if not memory_ids:
+            return {}
+        params: list[Any] = []
+        condition = _in_clause("memory_id", list(memory_ids), params)
+        rows = await _fetch_all(
+            self._conn(tx),
+            f"SELECT memory_id, tag FROM memory_tags WHERE {condition} ORDER BY memory_id, tag",
+            params,
+        )
+        result = {memory_id: [] for memory_id in memory_ids}
+        for row in rows:
+            result.setdefault(row["memory_id"], []).append(row["tag"])
+        return result
+
     async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None:
         return await _fetch_one(
             self._conn(tx),
@@ -1042,6 +1084,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
@@ -1089,6 +1132,12 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             if val is not None:
                 conditions.append(f"m.{col} = ?")
                 params.append(val)
+        if tags:
+            tag_condition = _in_clause("mt.tag", list(tags), params)
+            conditions.append(
+                "EXISTS (SELECT 1 FROM memory_tags mt "
+                f"WHERE mt.memory_id = m.id AND {tag_condition})"
+            )
         vis_clause = _render_sqlite_visibility(visibility, params, table_alias="m")
         if vis_clause:
             conditions.append(vis_clause)
@@ -1149,6 +1198,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
@@ -1176,6 +1226,12 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             if val is not None:
                 conditions.append(f"m.{col} = ?")
                 params.append(val)
+        if tags:
+            tag_condition = _in_clause("mt.tag", list(tags), params)
+            conditions.append(
+                "EXISTS (SELECT 1 FROM memory_tags mt "
+                f"WHERE mt.memory_id = m.id AND {tag_condition})"
+            )
         vis_clause = _render_sqlite_visibility(visibility, params, table_alias="m")
         if vis_clause:
             conditions.append(vis_clause)
@@ -1200,6 +1256,12 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 if val is not None:
                     like_conditions.append(f"m.{col} = ?")
                     like_params.append(val)
+            if tags:
+                tag_condition = _in_clause("mt.tag", list(tags), like_params)
+                like_conditions.append(
+                    "EXISTS (SELECT 1 FROM memory_tags mt "
+                    f"WHERE mt.memory_id = m.id AND {tag_condition})"
+                )
             like_vis_clause = _render_sqlite_visibility(
                 visibility,
                 like_params,
@@ -1245,6 +1307,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         limit: int = 20,
         offset: int = 0,
         include_archived: bool = False,
@@ -1263,6 +1326,12 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         if subcategory is not None:
             where_parts.append("subcategory = ?")
             params.append(subcategory)
+        if tags:
+            tag_condition = _in_clause("mt.tag", list(tags), params)
+            where_parts.append(
+                "EXISTS (SELECT 1 FROM memory_tags mt "
+                f"WHERE mt.memory_id = memories.id AND {tag_condition})"
+            )
         vis_clause = _render_sqlite_visibility(visibility, params)
         if vis_clause:
             where_parts.append(vis_clause)
@@ -2233,6 +2302,11 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
     extension (``json_extract``, ``json_remove``, ``json_type``) —
     SQLite ≥3.35 ships ``json_remove`` and is the minimum the
     backend already enforces (``_check_sqlite_version``).
+
+    Item 11c uses ``json_set`` for the CONSOLIDATE audit value and
+    expanded ``IN (?, ...)`` binds in place of Postgres arrays.  The
+    existing ``BEGIN IMMEDIATE`` transaction also serialises EXTRACT's
+    source claim, retry upsert, triples, and counters.
     """
 
     _ORPHAN_TIMEOUT_ERROR = "orphan_timeout_sweep"
@@ -2347,16 +2421,14 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
     async def finish_run(self, tx: Transaction, run_id: str) -> None:
         await _execute(
             self._conn(tx),
-            "UPDATE morpheus_runs SET status = 'success', "
-            "finished_at = CURRENT_TIMESTAMP WHERE id = ?",
+            "UPDATE morpheus_runs SET status = 'success', finished_at = CURRENT_TIMESTAMP WHERE id = ?",
             (run_id,),
         )
 
     async def fail_run(self, tx: Transaction, run_id: str, error: str) -> None:
         await _execute(
             self._conn(tx),
-            "UPDATE morpheus_runs SET status = 'failed', "
-            "finished_at = CURRENT_TIMESTAMP, error = ? WHERE id = ?",
+            "UPDATE morpheus_runs SET status = 'failed', finished_at = CURRENT_TIMESTAMP, error = ? WHERE id = ?",
             (str(error)[:4000], run_id),
         )
 
@@ -2421,15 +2493,13 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
         # before the DELETE so we can clear triples_extracted_at next.
         deleted_triples = await _fetch_all(
             conn,
-            "DELETE FROM kg_triples WHERE extracted_by_run_id = ? "
-            "RETURNING memory_id",
+            "DELETE FROM kg_triples WHERE extracted_by_run_id = ? RETURNING memory_id",
             (run_id,),
         )
         # Step 2: drop the run_memories join table rows.
         run_memories = await _fetch_all(
             conn,
-            "DELETE FROM morpheus_extract_run_memories WHERE run_id = ? "
-            "RETURNING memory_id",
+            "DELETE FROM morpheus_extract_run_memories WHERE run_id = ? RETURNING memory_id",
             (run_id,),
         )
         affected_ids: set[str] = set()
@@ -2443,8 +2513,7 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
             placeholders = ",".join("?" for _ in affected_ids)
             await _execute(
                 conn,
-                f"UPDATE memories SET triples_extracted_at = NULL "
-                f"WHERE id IN ({placeholders})",
+                f"UPDATE memories SET triples_extracted_at = NULL WHERE id IN ({placeholders})",
                 tuple(affected_ids),
             )
         # Step 4: restore consolidated originals from the metadata audit
@@ -2535,9 +2604,7 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
         # Step 6: delete the run-created memories.
         n_deleted = await _execute_count(
             conn,
-            "DELETE FROM memories WHERE morpheus_run_id = ? "
-            "AND provenance = 'morpheus_local' "
-            "AND deleted_at IS NULL",
+            "DELETE FROM memories WHERE morpheus_run_id = ? AND provenance = 'morpheus_local' AND deleted_at IS NULL",
             (run_id,),
         )
         # Step 7: flip the run row.
@@ -2549,8 +2616,7 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
             (run_id,),
         )
         logger.warning(
-            "[MORPHEUS] run %s rolled back: %d memories deleted, "
-            "%d extract markers reset",
+            "[MORPHEUS] run %s rolled back: %d memories deleted, %d extract markers reset",
             run_id,
             n_deleted,
             n_extract_reset,
@@ -2631,6 +2697,36 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
             candidates=candidates,
         )
 
+    async def replay_scan_count(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> int:
+        """SQLite implementation of the MORPHEUS REPLAY count — item 11d.
+
+        SQLite 3.35+ supports ``IS DISTINCT FROM`` (the minimum version
+        enforced by this backend), so the canonical provenance predicate
+        carries over unchanged.  ``BETWEEN`` is inclusive on both ends,
+        matching the original Postgres query.
+        """
+        conn = self._conn(tx)
+        count = await _fetch_val(
+            conn,
+            f"""
+            SELECT COUNT(*)
+              FROM memories m
+              JOIN morpheus_runs r ON r.id = ?
+             WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
+               AND m.provenance IS DISTINCT FROM 'morpheus_local'
+               AND m.morpheus_run_id IS NULL
+               AND {_eligibility.eligible_for_morpheus('m')}
+               AND (r.namespace IS NULL OR m.namespace = r.namespace)
+            """,
+            (run_id,),
+        )
+        return int(count or 0)
+
     async def merge_run_config(
         self,
         tx: Transaction,
@@ -2684,6 +2780,356 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
             "UPDATE morpheus_runs SET config = ? WHERE id = ?",
             (json.dumps(merged), run_id),
         )
+
+    async def phase_consolidate(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        consolidated_permission_mode: int,
+    ) -> MorpheusConsolidationResult | None:
+        """SQLite JSON1/expanded-``IN`` CONSOLIDATE implementation."""
+        conn = self._conn(tx)
+        run_row = await _fetch_one(
+            conn,
+            "SELECT config, cluster_min_size, namespace FROM morpheus_runs WHERE id = ?",
+            (run_id,),
+        )
+        if run_row is None:
+            return None
+        try:
+            config = json.loads(run_row["config"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        min_size = int(run_row["cluster_min_size"])
+        namespace = run_row["namespace"]
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        audit_path = '$."pre_consolidate_permission_mode"'
+        memories_consolidated = 0
+        clusters_consolidated = 0
+        for cluster in clusters:
+            member_ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
+            if len(member_ids) < min_size:
+                continue
+            placeholders = ",".join("?" for _ in member_ids)
+            rows = await _fetch_all(
+                conn,
+                f"""
+                SELECT id, recall_count, created, permission_mode,
+                       consolidated_into, morpheus_run_id, metadata
+                  FROM memories
+                 WHERE id IN ({placeholders})
+                   AND {eligibility_clause}
+                   AND (? IS NULL OR namespace = ?)
+                """,
+                (*member_ids, namespace, namespace),
+            )
+            if not rows:
+                continue
+            canonical = sorted(
+                rows,
+                key=lambda row: (
+                    -int(row["recall_count"] or 0),
+                    row["created"],
+                    str(row["id"]),
+                ),
+            )[0]
+            canonical_id = str(canonical["id"])
+            cluster_count = int(
+                await _fetch_val(
+                    conn,
+                    f"""
+                    SELECT COUNT(*) FROM memories
+                     WHERE id IN ({placeholders})
+                       AND deleted_at IS NULL AND archived_at IS NULL
+                       AND consolidated_into = ? AND morpheus_run_id = ?
+                       AND json_type(COALESCE(metadata, '{{}}'), ?) IS NOT NULL
+                       AND (? IS NULL OR namespace = ?)
+                    """,
+                    (*member_ids, canonical_id, run_id, audit_path, namespace, namespace),
+                )
+                or 0
+            )
+            if len(rows) + cluster_count < min_size:
+                continue
+            for row in rows:
+                member_id = str(row["id"])
+                if member_id == canonical_id:
+                    continue
+                cluster_count += await _execute_count(
+                    conn,
+                    """
+                    UPDATE memories
+                       SET consolidated_into = ?, consolidated_at = CURRENT_TIMESTAMP,
+                           permission_mode = ?, morpheus_run_id = ?,
+                           metadata = CASE
+                               WHEN json_type(COALESCE(metadata, '{}'), ?) IS NOT NULL
+                               THEN COALESCE(metadata, '{}')
+                               ELSE json_set(COALESCE(metadata, '{}'), ?, permission_mode)
+                           END
+                     WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL
+                       AND consolidated_into IS NULL AND morpheus_run_id IS NULL
+                       AND (? IS NULL OR namespace = ?)
+                    """,
+                    (
+                        canonical_id,
+                        int(consolidated_permission_mode),
+                        run_id,
+                        audit_path,
+                        audit_path,
+                        member_id,
+                        namespace,
+                        namespace,
+                    ),
+                )
+            if cluster_count:
+                memories_consolidated += cluster_count
+                clusters_consolidated += 1
+        await self.update_counters(
+            tx,
+            run_id,
+            memories_consolidated=memories_consolidated,
+            clusters_consolidated=clusters_consolidated,
+        )
+        return MorpheusConsolidationResult(memories_consolidated, clusters_consolidated)
+
+    async def phase_synthesise_load(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> list[MorpheusSynthesisCluster] | None:
+        conn = self._conn(tx)
+        row = await _fetch_one(conn, "SELECT config FROM morpheus_runs WHERE id = ?", (run_id,))
+        if row is None:
+            return None
+        try:
+            config = json.loads(row["config"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        loaded: list[MorpheusSynthesisCluster] = []
+        for cluster in clusters:
+            member_ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
+            if not member_ids:
+                continue
+            placeholders = ",".join("?" for _ in member_ids)
+            rows = await _fetch_all(
+                conn,
+                f"SELECT id, content, category, owner_id, namespace FROM memories "
+                f"WHERE id IN ({placeholders}) AND {eligibility_clause}",
+                tuple(member_ids),
+            )
+            members = tuple(
+                MorpheusSynthesisMember(
+                    id=str(item["id"]),
+                    content=str(item["content"] or ""),
+                    category=item["category"],
+                    owner_id=item["owner_id"],
+                    namespace=item["namespace"],
+                )
+                for item in rows
+            )
+            if members:
+                loaded.append(MorpheusSynthesisCluster(cluster.get("cluster_id"), members))
+        return loaded
+
+    async def phase_synthesise_store(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        content: str,
+        category: str | None,
+        owner_id: str,
+        namespace: str,
+        run_id: str,
+        source_memory_ids: Sequence[str],
+        metadata: Mapping[str, Any],
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            INSERT INTO memories
+                (id, content, category, subcategory, metadata, quality_rating,
+                 verbatim_content, owner_id, namespace, permission_mode,
+                 morpheus_run_id, source_memories, provenance)
+            VALUES (?, ?, ?, 'morpheus-synthesis', ?, 75, ?, ?, ?, 600, ?, ?,
+                    'morpheus_local')
+            """,
+            (
+                memory_id,
+                content,
+                category,
+                json.dumps(dict(metadata)),
+                content,
+                owner_id,
+                namespace,
+                run_id,
+                json.dumps(list(source_memory_ids)),
+            ),
+        )
+
+    async def phase_extract_load(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        min_chars: int,
+        max_input_count: int,
+    ) -> MorpheusExtractBatch | None:
+        conn = self._conn(tx)
+        run_row = await _fetch_one(
+            conn,
+            "SELECT config, namespace, window_ended_at FROM morpheus_runs WHERE id = ?",
+            (run_id,),
+        )
+        if run_row is None:
+            return None
+        try:
+            config = json.loads(run_row["config"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        eligibility_clause = _eligibility.eligible_for_morpheus("m")
+        rows = await _fetch_all(
+            conn,
+            f"""
+            SELECT m.id, m.verbatim_content, m.owner_id, m.namespace
+              FROM memories m
+              LEFT JOIN morpheus_extract_failures failure ON failure.memory_id = m.id
+             WHERE {eligibility_clause}
+               AND m.created <= ? AND m.triples_extracted_at IS NULL
+               AND m.verbatim_content IS NOT NULL AND length(m.verbatim_content) >= ?
+               AND (? IS NULL OR m.namespace = ?)
+               AND (failure.status IS NULL OR failure.status <> 'dead_letter')
+             ORDER BY m.created, m.id LIMIT ?
+            """,
+            (
+                run_row["window_ended_at"],
+                int(min_chars),
+                run_row["namespace"],
+                run_row["namespace"],
+                int(max_input_count),
+            ),
+        )
+        return MorpheusExtractBatch(
+            config,
+            run_row["namespace"],
+            tuple(
+                MorpheusExtractCandidate(
+                    id=str(item["id"]),
+                    verbatim_content=str(item["verbatim_content"] or ""),
+                    owner_id=str(item["owner_id"]),
+                    namespace=str(item["namespace"]),
+                )
+                for item in rows
+            ),
+        )
+
+    async def phase_extract_failure(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        max_failures: int,
+        error: str,
+    ) -> MorpheusExtractFailure | None:
+        conn = self._conn(tx)
+        pending = await _fetch_val(
+            conn,
+            "SELECT id FROM memories WHERE id = ? AND triples_extracted_at IS NULL",
+            (memory_id,),
+        )
+        if pending is None:
+            return None
+        row = await _fetch_one(
+            conn,
+            """
+            INSERT INTO morpheus_extract_failures
+                (memory_id, attempts, status, last_error, last_failed_at)
+            VALUES (?, 1, CASE WHEN ? <= 1 THEN 'dead_letter' ELSE 'retryable' END,
+                    ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(memory_id) DO UPDATE SET
+                attempts = morpheus_extract_failures.attempts + 1,
+                status = CASE
+                    WHEN morpheus_extract_failures.attempts + 1 >= ?
+                    THEN 'dead_letter' ELSE 'retryable' END,
+                last_error = excluded.last_error,
+                last_failed_at = excluded.last_failed_at
+            RETURNING attempts, status
+            """,
+            (memory_id, int(max_failures), str(error)[:2000], int(max_failures)),
+        )
+        return MorpheusExtractFailure(int(row["attempts"]), str(row["status"]))
+
+    async def phase_extract_store(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        candidate: MorpheusExtractCandidate,
+        triples: Sequence[tuple[str, str, str, str, float]],
+    ) -> bool:
+        conn = self._conn(tx)
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        marked = await _execute_count(
+            conn,
+            f"""
+            UPDATE memories SET triples_extracted_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND triples_extracted_at IS NULL
+               AND {eligibility_clause}
+               AND (? IS NULL OR namespace = ?)
+            """,
+            (candidate.id, candidate.namespace, candidate.namespace),
+        )
+        if not marked:
+            return False
+        await _execute(
+            conn,
+            "DELETE FROM morpheus_extract_failures WHERE memory_id = ?",
+            (candidate.id,),
+        )
+        await _execute(
+            conn,
+            """
+            INSERT INTO morpheus_extract_run_memories (run_id, memory_id)
+            VALUES (?, ?)
+            ON CONFLICT(run_id, memory_id) DO UPDATE SET processed_at = CURRENT_TIMESTAMP
+            """,
+            (run_id, candidate.id),
+        )
+        for triple_id, subject, predicate, object_, confidence in triples:
+            await _execute(
+                conn,
+                """
+                INSERT INTO kg_triples
+                    (id, subject, predicate, object, memory_id, confidence,
+                     extracted_by_run_id, owner_id, namespace)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    triple_id,
+                    subject,
+                    predicate,
+                    object_,
+                    candidate.id,
+                    float(confidence),
+                    run_id,
+                    candidate.owner_id,
+                    candidate.namespace,
+                ),
+            )
+        await self.increment_extract_counters(
+            tx,
+            run_id,
+            triples_extracted=len(triples),
+            memories_processed=1,
+        )
+        return True
 
 
 class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueRepository):
@@ -2901,9 +3347,10 @@ class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueReposi
         promises; ``log_stats()`` consumes every key.
         """
         conn = self._conn(tx)
-        row = await _fetch_one(
-            conn,
-            """
+        row = (
+            await _fetch_one(
+                conn,
+                """
             SELECT
                 COUNT(*) AS total,
                 COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
@@ -2912,7 +3359,9 @@ class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueReposi
                 COUNT(CASE WHEN status = 'failed' THEN 1 END) AS failed
             FROM memory_compression_queue
             """,
-        ) or {}
+            )
+            or {}
+        )
         variants = await _fetch_val(conn, "SELECT COUNT(*) FROM memory_compressed_variants")
         return {
             "total": int(row.get("total") or 0),
@@ -3002,8 +3451,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
             self._conn(tx),
             "SELECT id, url, events, description, owner_id, namespace, "
             "created_at AS created, revoked, revoked_at "
-            "FROM webhook_subscriptions WHERE "
-            + " AND ".join(conditions),
+            "FROM webhook_subscriptions WHERE " + " AND ".join(conditions),
             params,
         )
         return _sqlite_webhook_subscription(row) if row is not None else None
@@ -3026,8 +3474,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
         return (
             await _execute_count(
                 self._conn(tx),
-                "UPDATE webhook_subscriptions SET revoked = 1, revoked_at = ? WHERE "
-                + " AND ".join(conditions),
+                "UPDATE webhook_subscriptions SET revoked = 1, revoked_at = ? WHERE " + " AND ".join(conditions),
                 (params[-1], *params[:-1]),
             )
             > 0
@@ -3158,8 +3605,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
                 "response_status = ?, response_body = ?, error = ?, status_updated_at = ?, "
                 + ("delivered_at = ?, " if delivered_at is not None else "")
                 + "lease_token = NULL, lease_expires_at = NULL WHERE id = ? "
-                "AND lease_token = ? AND status IN ('pending', 'retrying') AND superseded = 0"
-                + expiry_clause,
+                "AND lease_token = ? AND status IN ('pending', 'retrying') AND superseded = 0" + expiry_clause,
                 tuple(params),
             )
             > 0
@@ -3275,9 +3721,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
                 ),
             )
             if updated:
-                detail = await _fetch_one(
-                    conn, _SQLITE_WEBHOOK_CLAIM_SELECT + " WHERE d.id = ?", (delivery_id,)
-                )
+                detail = await _fetch_one(conn, _SQLITE_WEBHOOK_CLAIM_SELECT + " WHERE d.id = ?", (delivery_id,))
                 if detail is not None:
                     claimed.append(_sqlite_webhook_claim(detail, lease_token, claim_now))
         return claimed
@@ -3292,8 +3736,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
         conn = self._conn(tx)
         delivery = await _fetch_one(
             conn,
-            "SELECT id, subscription_id, event_type, payload_hash, attempt_num "
-            "FROM webhook_deliveries WHERE id = ?",
+            "SELECT id, subscription_id, event_type, payload_hash, attempt_num FROM webhook_deliveries WHERE id = ?",
             (delivery_id,),
         )
         if delivery is None:
@@ -3407,8 +3850,14 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
             )
             if peer_succeeded:
                 applied = await self._abandon_owned(
-                    conn, delivery_id, lease_token, now, outcome.error, True,
-                    outcome.response_status, outcome.response_body,
+                    conn,
+                    delivery_id,
+                    lease_token,
+                    now,
+                    outcome.error,
+                    True,
+                    outcome.response_status,
+                    outcome.response_body,
                 )
                 return WebhookFinalizationResult(applied=applied, status="abandoned")
             updated = await _execute_count(
@@ -3429,8 +3878,14 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
             )
             if not updated:
                 abandoned = await self._abandon_owned(
-                    conn, delivery_id, lease_token, now, outcome.error, True,
-                    outcome.response_status, outcome.response_body,
+                    conn,
+                    delivery_id,
+                    lease_token,
+                    now,
+                    outcome.error,
+                    True,
+                    outcome.response_status,
+                    outcome.response_body,
                 )
                 if abandoned:
                     return WebhookFinalizationResult(applied=True, status="abandoned")
@@ -3461,8 +3916,15 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
 
         if delivery["revoked"]:
             applied = await self._abandon_owned(
-                conn, delivery_id, lease_token, now, "subscription revoked", False,
-                outcome.response_status, outcome.response_body, require_unexpired=True,
+                conn,
+                delivery_id,
+                lease_token,
+                now,
+                "subscription revoked",
+                False,
+                outcome.response_status,
+                outcome.response_body,
+                require_unexpired=True,
                 delivered_at=now,
             )
             return WebhookFinalizationResult(applied=applied, status="abandoned" if applied else None)
@@ -3476,16 +3938,30 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
         )
         if peer_succeeded:
             applied = await self._abandon_owned(
-                conn, delivery_id, lease_token, now, outcome.error, True,
-                outcome.response_status, outcome.response_body, require_unexpired=True,
+                conn,
+                delivery_id,
+                lease_token,
+                now,
+                outcome.error,
+                True,
+                outcome.response_status,
+                outcome.response_body,
+                require_unexpired=True,
             )
             return WebhookFinalizationResult(applied=applied, status="abandoned")
 
         next_attempt = int(delivery["attempt_num"]) + 1
         if next_attempt > max_attempts:
             applied = await self._abandon_owned(
-                conn, delivery_id, lease_token, now, outcome.error, False,
-                outcome.response_status, outcome.response_body, require_unexpired=True,
+                conn,
+                delivery_id,
+                lease_token,
+                now,
+                outcome.error,
+                False,
+                outcome.response_status,
+                outcome.response_body,
+                require_unexpired=True,
                 delivered_at=now,
             )
             return WebhookFinalizationResult(applied=applied, status="abandoned" if applied else None)
@@ -3498,8 +3974,15 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
             (*chain, delivery["attempt_num"]),
         )
         applied = await self._abandon_owned(
-            conn, delivery_id, lease_token, now, outcome.error, True,
-            outcome.response_status, outcome.response_body, require_unexpired=True,
+            conn,
+            delivery_id,
+            lease_token,
+            now,
+            outcome.error,
+            True,
+            outcome.response_status,
+            outcome.response_body,
+            require_unexpired=True,
         )
         if not applied:
             return WebhookFinalizationResult(applied=False)
@@ -3533,9 +4016,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
                 (*chain, next_attempt),
             )
             successor_id = str(inserted) if inserted is not None else None
-        return WebhookFinalizationResult(
-            applied=True, status="abandoned", successor_delivery_id=successor_id
-        )
+        return WebhookFinalizationResult(applied=True, status="abandoned", successor_delivery_id=successor_id)
 
     async def store_delivery_response_body(
         self,
@@ -3617,8 +4098,7 @@ _SQLITE_WEBHOOK_CLAIM_SELECT = (
 def _validate_webhook_scope(owner_id: str | None, namespace: str | None, method: str) -> None:
     if (owner_id is None) != (namespace is None):
         raise ValueError(
-            f"{method} requires both owner_id and namespace to be set, "
-            "or both to be None for a root/operator view"
+            f"{method} requires both owner_id and namespace to be set, or both to be None for a root/operator view"
         )
 
 
@@ -3649,11 +4129,7 @@ def _sqlite_webhook_subscription(row: Any) -> WebhookSubscriptionRecord:
         namespace=row["namespace"],
         created=_sqlite_webhook_datetime(row["created"]),
         revoked=bool(row["revoked"]),
-        revoked_at=(
-            _sqlite_webhook_datetime(row["revoked_at"])
-            if row["revoked_at"] is not None
-            else None
-        ),
+        revoked_at=(_sqlite_webhook_datetime(row["revoked_at"]) if row["revoked_at"] is not None else None),
     )
 
 
@@ -3673,19 +4149,13 @@ def _sqlite_webhook_delivery(row: Any) -> WebhookDeliveryRecord:
         response_body=row["response_body"],
         error=row["error"],
         scheduled_at=_sqlite_webhook_datetime(row["scheduled_at"]),
-        delivered_at=(
-            _sqlite_webhook_datetime(row["delivered_at"])
-            if row["delivered_at"] is not None
-            else None
-        ),
+        delivered_at=(_sqlite_webhook_datetime(row["delivered_at"]) if row["delivered_at"] is not None else None),
         created=_sqlite_webhook_datetime(row["created"]),
         status_updated_at=_sqlite_webhook_datetime(row["status_updated_at"]),
         superseded=bool(row["superseded"]),
         lease_token=str(row["lease_token"]) if row["lease_token"] is not None else None,
         lease_expires_at=(
-            _sqlite_webhook_datetime(row["lease_expires_at"])
-            if row["lease_expires_at"] is not None
-            else None
+            _sqlite_webhook_datetime(row["lease_expires_at"]) if row["lease_expires_at"] is not None else None
         ),
         writer_revision=int(row["writer_revision"] or 0),
     )
@@ -3916,9 +4386,7 @@ class SqliteOAuthRepository(_SqliteRepository, MCPOAuthRepositoryMixin, OAuthRep
             (session_id,),
         )
 
-    async def lookup_api_key(
-        self, tx: Transaction, key_hash: str
-    ) -> Row | None:
+    async def lookup_api_key(self, tx: Transaction, key_hash: str) -> Row | None:
         # SQLite has no array_agg, so resolve groups in a second round-trip
         # rather than trying to emulate LATERAL.
         conn = self._conn(tx)
@@ -3949,14 +4417,11 @@ class SqliteOAuthRepository(_SqliteRepository, MCPOAuthRepositoryMixin, OAuthRep
             (key_id,),
         )
 
-    async def resolve_active_session(
-        self, tx: Transaction, session_id: str, *, now: Any
-    ) -> Row | None:
+    async def resolve_active_session(self, tx: Transaction, session_id: str, *, now: Any) -> Row | None:
         conn = self._conn(tx)
         row = await _fetch_one(
             conn,
-            "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions "
-            "WHERE session_id=?",
+            "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions WHERE session_id=?",
             (session_id,),
         )
         if row is None:
@@ -3966,11 +4431,7 @@ class SqliteOAuthRepository(_SqliteRepository, MCPOAuthRepositoryMixin, OAuthRep
         expires_at = row["expires_at"]
         # Compare as ISO-8601 strings so the same caller code works on every
         # backend regardless of whether the driver returns datetime or text.
-        if (
-            expires_at is not None
-            and now is not None
-            and str(expires_at) <= _isoformat_for_compare(now)
-        ):
+        if expires_at is not None and now is not None and str(expires_at) <= _isoformat_for_compare(now):
             return None
         await _execute_count(
             conn,
@@ -4356,8 +4817,13 @@ class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
         return consultation, refs
 
     async def fetch_consultation_full(
-        self, tx: Transaction, consultation_id: str,
-        *, root: bool = False, user_id: str | None = None, namespace: str | None = None,
+        self,
+        tx: Transaction,
+        consultation_id: str,
+        *,
+        root: bool = False,
+        user_id: str | None = None,
+        namespace: str | None = None,
     ) -> dict[str, Any] | None:
         """SQLite implementation of fetch_consultation_full.
 

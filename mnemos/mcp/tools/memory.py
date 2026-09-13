@@ -7,6 +7,7 @@ from typing import Any
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import connector_default_namespace
 from mnemos.core.injection_defense import defend as _defend_untrusted
+from mnemos.domain.models import MAX_TAG_LENGTH, MAX_TAGS_PER_REQUEST
 
 from ._runtime import (
     MCP_BULK_CREATE_MAX_ITEMS,
@@ -65,6 +66,26 @@ def _validate_optional_filter(value: str | None, *, label: str) -> str | None:
     return value
 
 
+def _validate_tags(tags: list[str] | None) -> list[str] | None:
+    if tags is None:
+        return None
+    values = _bounded_list(tags, label="tags", max_items=MAX_TAGS_PER_REQUEST)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for i, raw_tag in enumerate(values):
+        if not isinstance(raw_tag, str):
+            raise ValueError(f"tags[{i}] must be a string")
+        tag = raw_tag.strip()
+        if not tag:
+            raise ValueError(f"tags[{i}] must not be blank")
+        if len(tag) > MAX_TAG_LENGTH:
+            raise ValueError(f"tags[{i}] must be at most {MAX_TAG_LENGTH} characters")
+        if tag not in seen:
+            normalized.append(tag)
+            seen.add(tag)
+    return normalized
+
+
 _SEARCH_MODES = ("semantic", "lexical")
 
 
@@ -97,6 +118,7 @@ async def tool_search_memories(
     limit: int = 10,
     category: str | None = None,
     subcategory: str | None = None,
+    tags: list[str] | None = None,
     mode: str = "semantic",
     semantic: bool | None = None,
     user: UserContext | None = None,
@@ -111,6 +133,9 @@ async def tool_search_memories(
         body["category"] = category
     if subcategory:
         body["subcategory"] = subcategory
+    tags = _validate_tags(tags)
+    if tags is not None:
+        body["tags"] = tags
     # Always send the resolved flag explicitly so the MCP default is
     # semantic (with in-request FTS fallback), not the REST FTS default.
     body["semantic"] = _resolve_search_semantic(mode, semantic)
@@ -125,6 +150,7 @@ async def tool_update_memory(
     content: str | None = None,
     category: str | None = None,
     subcategory: str | None = None,
+    tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     permission_mode: int | None = None,
     user: UserContext | None = None,
@@ -132,10 +158,12 @@ async def tool_update_memory(
     body: dict[str, Any] = {}
     category = _validate_optional_filter(category, label="category")
     subcategory = _validate_optional_filter(subcategory, label="subcategory")
+    tags = _validate_tags(tags)
     for key, value in {
         "content": content,
         "category": category,
         "subcategory": subcategory,
+        "tags": tags,
         "metadata": metadata,
         "permission_mode": permission_mode,
     }.items():
@@ -196,6 +224,7 @@ async def tool_create_memory(
     content: str,
     category: str = "facts",
     subcategory: str | None = None,
+    tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     permission_mode: int | None = None,
     user: UserContext | None = None,
@@ -205,6 +234,9 @@ async def tool_create_memory(
     body: dict[str, Any] = {"content": content, "category": category}
     if subcategory:
         body["subcategory"] = subcategory
+    tags = _validate_tags(tags)
+    if tags is not None:
+        body["tags"] = tags
     if metadata:
         body["metadata"] = metadata
     if permission_mode is not None:
@@ -227,6 +259,7 @@ async def tool_delete_memory(
 async def tool_list_memories(
     category: str | None = None,
     subcategory: str | None = None,
+    tags: list[str] | None = None,
     limit: int = 20,
     offset: int = 0,
     user: UserContext | None = None,
@@ -239,10 +272,12 @@ async def tool_list_memories(
     )
     category = _validate_optional_filter(category, label="category")
     subcategory = _validate_optional_filter(subcategory, label="subcategory")
+    tags = _validate_tags(tags)
     params: dict[str, Any] = {}
     for key, value in {
         "category": category,
         "subcategory": subcategory,
+        "tags": tags,
         "limit": limit,
         "offset": offset,
     }.items():
@@ -276,6 +311,8 @@ async def tool_bulk_create_memories(
                 label=f"memories[{i}].subcategory",
                 max_length=128,
             )
+        if "tags" in row and row["tags"] is not None:
+            _validate_tags(row["tags"])
         if "namespace" in row and row["namespace"] is not None:
             _safe_path_value(row["namespace"], label=f"memories[{i}].namespace", max_length=128)
     ns = _connector_namespace()
@@ -302,6 +339,12 @@ TOOLS: dict[str, dict[str, Any]] = {
             "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": MCP_DEFAULT_LIMIT_MAX},
             "category": {"type": "string", "description": "Optional category filter"},
             "subcategory": {"type": "string", "description": "Optional subcategory filter"},
+            "tags": {
+                "type": "array",
+                "maxItems": MAX_TAGS_PER_REQUEST,
+                "items": {"type": "string", "maxLength": MAX_TAG_LENGTH},
+                "description": "Optional tag filter; matches memories carrying any supplied tag",
+            },
             "mode": {
                 "type": "string",
                 "enum": list(_SEARCH_MODES),
@@ -332,6 +375,12 @@ TOOLS: dict[str, dict[str, Any]] = {
             "content": {"type": "string", "description": "New content (replaces existing)"},
             "category": {"type": "string", "description": "New category"},
             "subcategory": {"type": "string", "description": "New subcategory"},
+            "tags": {
+                "type": "array",
+                "maxItems": MAX_TAGS_PER_REQUEST,
+                "items": {"type": "string", "maxLength": MAX_TAG_LENGTH},
+                "description": "Replacement tag set; [] clears all tags",
+            },
             "metadata": {"type": "object", "description": "New metadata (replaces existing)"},
             "permission_mode": {"type": "integer", "description": "Unix-style octal permission digits, e.g. 600 or 644"},
         },
@@ -369,6 +418,11 @@ TOOLS: dict[str, dict[str, Any]] = {
             "content": {"type": "string"},
             "category": {"type": "string", "default": "facts"},
             "subcategory": {"type": "string"},
+            "tags": {
+                "type": "array",
+                "maxItems": MAX_TAGS_PER_REQUEST,
+                "items": {"type": "string", "maxLength": MAX_TAG_LENGTH},
+            },
             "metadata": {"type": "object"},
             "permission_mode": {"type": "integer", "description": "Unix-style octal permission digits, e.g. 600 or 644"},
         },
@@ -386,6 +440,12 @@ TOOLS: dict[str, dict[str, Any]] = {
         {
             "category": {"type": "string"},
             "subcategory": {"type": "string"},
+            "tags": {
+                "type": "array",
+                "maxItems": MAX_TAGS_PER_REQUEST,
+                "items": {"type": "string", "maxLength": MAX_TAG_LENGTH},
+                "description": "Match memories carrying any supplied tag",
+            },
             "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": MCP_DEFAULT_LIMIT_MAX},
             "offset": {"type": "integer", "default": 0, "minimum": 0, "maximum": MCP_OFFSET_MAX},
         },
@@ -410,6 +470,11 @@ TOOLS: dict[str, dict[str, Any]] = {
                         "content": {"type": "string"},
                         "category": {"type": "string", "default": "facts"},
                         "subcategory": {"type": "string"},
+                        "tags": {
+                            "type": "array",
+                            "maxItems": MAX_TAGS_PER_REQUEST,
+                            "items": {"type": "string", "maxLength": MAX_TAG_LENGTH},
+                        },
                         "metadata": {"type": "object"},
                         "verbatim_content": {"type": "string"},
                     },

@@ -5,7 +5,7 @@ from mnemos.core import lifecycle
 from mnemos.workers import deletion_request_worker, persephone_archival_worker
 
 
-def test_postgres_lifecycle_workers_receive_pool_not_backend(monkeypatch):
+def test_deletion_lifecycle_workers_receive_backend(monkeypatch):
     pool = object()
     backend = object()
     deletion_calls = []
@@ -34,8 +34,8 @@ def test_postgres_lifecycle_workers_receive_pool_not_backend(monkeypatch):
     lifecycle_hooks._hard_deletion_request_worker(pool)
     lifecycle_hooks._persephone_archival_worker(pool)
 
-    assert deletion_calls[0][0] is pool
-    assert hard_deletion_calls[0][0] is pool
+    assert deletion_calls[0][0] is backend
+    assert hard_deletion_calls[0][0] is backend
     assert hard_deletion_calls[0][1]["phase"] == "hard_delete"
     assert archival_calls[0][0] is pool
 

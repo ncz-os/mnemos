@@ -122,6 +122,7 @@ services:
       - ./mnemos/db_migrations/migrations/0039_subscription_plan_current_limits.sql:/docker-entrypoint-initdb.d/70-subscription-plan-current-limits.sql
       - ./mnemos/db_migrations/migrations/0043_memory_acl.sql:/docker-entrypoint-initdb.d/71-memory-acl.sql
       - ./mnemos/db_migrations/migrations/0048_memory_versions_visibility.sql:/docker-entrypoint-initdb.d/72-memory-versions-visibility.sql
+      - ./mnemos/db_migrations/migrations/0054_memory_tags.sql:/docker-entrypoint-initdb.d/73-memory-tags.sql
     ports:
       - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
@@ -190,6 +191,7 @@ services:
       - ./mnemos/db_migrations/migrations/0039_subscription_plan_current_limits.sql:/migrations/70-subscription-plan-current-limits.sql:ro
       - ./mnemos/db_migrations/migrations/0043_memory_acl.sql:/migrations/71-memory-acl.sql:ro
       - ./mnemos/db_migrations/migrations/0048_memory_versions_visibility.sql:/migrations/72-memory-versions-visibility.sql:ro
+      - ./mnemos/db_migrations/migrations/0054_memory_tags.sql:/migrations/73-memory-tags.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -243,7 +245,8 @@ services:
       -f /migrations/69-knemon-dispatch-rule-refresh.sql
       -f /migrations/70-subscription-plan-current-limits.sql
       -f /migrations/71-memory-acl.sql
-      -f /migrations/72-memory-versions-visibility.sql"
+      -f /migrations/72-memory-versions-visibility.sql
+      -f /migrations/73-memory-tags.sql"
     restart: "no"
 
   mnemos:
