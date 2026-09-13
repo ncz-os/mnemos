@@ -299,6 +299,34 @@ class MemoryRepository(ABC):
     ) -> str: ...
 
     @abstractmethod
+    async def replace_memory_tags(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        tags: Sequence[str],
+        *,
+        visibility: VisibilityFilter | None = None,
+    ) -> bool:
+        """Replace a memory's complete tag set inside the caller's transaction.
+
+        Tags are mutable retrieval metadata stored in ``memory_tags``; this
+        operation must not update ``memories`` or create a version snapshot.
+        Implementations lock the active parent row before replacing tags so
+        concurrent complete-set writes serialize. When ``visibility`` is
+        supplied, authorization is evaluated by that same locking read.
+        """
+        ...
+
+    @abstractmethod
+    async def fetch_memory_tags(
+        self,
+        tx: Transaction,
+        memory_ids: Sequence[str],
+    ) -> dict[str, list[str]]:
+        """Return sorted tags keyed by memory id for the requested rows."""
+        ...
+
+    @abstractmethod
     async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None: ...
 
     @abstractmethod
@@ -329,6 +357,7 @@ class MemoryRepository(ABC):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         limit: int = 20,
         offset: int = 0,
         include_archived: bool = False,
@@ -502,6 +531,7 @@ class MemoryRepository(ABC):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
@@ -533,6 +563,7 @@ class MemoryRepository(ABC):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
@@ -2140,7 +2171,7 @@ class CompressionQueueRepository(ABC):
 
 
 class MorpheusRepository(ABC):
-    """v3.3 MORPHEUS run-lifecycle CRUD — backend-agnostic.
+    """v3.3 MORPHEUS run lifecycle and phase persistence — backend-agnostic.
 
     Item 11a of the 12-item ABC migration: the run-lifecycle functions
     (``begin_run`` / ``set_phase`` / ``update_counters`` /
@@ -2192,6 +2223,21 @@ class MorpheusRepository(ABC):
     mode). Read-modify-write is acceptable on the read-modify-write
     fallbacks because ``rollback_run`` is an admin path, not a hot
     loop.
+
+    Item 11c moves the CONSOLIDATE, SYNTHESISE, and EXTRACT phase SQL
+    behind this surface.  The orchestration layer deliberately retains
+    summary/triple generation: provider calls MUST happen outside database
+    transactions.  Repository methods therefore expose short transactional
+    load/store operations around those calls.  A successful EXTRACT store
+    atomically claims the source memory, clears its retry row, records the
+    run-memory association, inserts all triples, and increments run counters.
+
+    CONSOLIDATE preserves the rollback audit contract above exactly: before
+    changing ``permission_mode`` it writes the original value under
+    ``pre_consolidate_permission_mode`` only when that key is absent.  Native
+    JSON dialects are backend-owned (Postgres JSONB, SQLite JSON1,
+    MySQL/MariaDB JSON functions); Oracle and Db2 may use the established
+    read-modify-write fallback while holding the supplied transaction.
     """
 
     @abstractmethod
@@ -2369,6 +2415,30 @@ class MorpheusRepository(ABC):
         ...
 
     @abstractmethod
+    async def replay_scan_count(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> int:
+        """Count memories eligible for the run's REPLAY window.
+
+        Item 11d of the 12-item ABC migration: ``phase_replay`` only
+        needs one scalar count; it does not read embeddings or any other
+        vector-specific column.  The implementation joins the run row to
+        obtain its inclusive ``window_started_at`` / ``window_ended_at``
+        bounds and namespace, then applies the canonical MORPHEUS
+        eligibility predicate.
+
+        Returns zero for a missing run, matching ``COUNT(*)`` semantics.
+        Implementations own their placeholder syntax and the portable
+        spelling of the provenance exclusion: Postgres/SQLite support
+        ``IS DISTINCT FROM``; MySQL/MariaDB use ``<=>``; Oracle/Db2 use
+        explicit equality plus ``IS NULL``.
+        """
+        ...
+
+    @abstractmethod
     async def merge_run_config(
         self,
         tx: Transaction,
@@ -2407,6 +2477,159 @@ class MorpheusRepository(ABC):
         on those too).
         """
         ...
+
+    @abstractmethod
+    async def phase_consolidate(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        consolidated_permission_mode: int,
+    ) -> "MorpheusConsolidationResult | None":
+        """Apply the run's persisted cluster payload to live memories.
+
+        Returns ``None`` when the run row does not exist.  Otherwise returns
+        stable counts that include rows this same run consolidated earlier,
+        making a retry idempotent.  Canonical selection is highest
+        ``recall_count``, then earliest ``created``, then lexical memory id.
+
+        The full phase runs in the supplied transaction so concurrent phase
+        attempts cannot split canonical selection from member updates.
+        Implementations must preserve the rollback metadata key contract
+        documented on the class.
+        """
+        ...
+
+    @abstractmethod
+    async def phase_synthesise_load(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+    ) -> "list[MorpheusSynthesisCluster] | None":
+        """Load visible member rows for each cluster persisted on the run.
+
+        Returns ``None`` for a missing run and an empty list for a run with no
+        usable clusters.  Array membership is backend-specific: Postgres uses
+        ``ANY(text[])``; SQLite/MySQL-family/Oracle/Db2 expand bound ``IN``
+        placeholders.  The returned Python values let provider work happen
+        after this read transaction closes.
+        """
+        ...
+
+    @abstractmethod
+    async def phase_synthesise_store(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        content: str,
+        category: str | None,
+        owner_id: str,
+        namespace: str,
+        run_id: str,
+        source_memory_ids: Sequence[str],
+        metadata: Mapping[str, Any],
+    ) -> None:
+        """Insert one append-only ``morpheus_local`` summary memory."""
+        ...
+
+    @abstractmethod
+    async def phase_extract_load(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        min_chars: int,
+        max_input_count: int,
+    ) -> "MorpheusExtractBatch | None":
+        """Load run config and retryable EXTRACT candidates.
+
+        Candidates are ordered by ``created, id`` and bounded by
+        ``max_input_count``.  Dead-letter rows are excluded.  Returns ``None``
+        when the run does not exist; provider calls consume the materialised
+        batch outside the transaction.
+        """
+        ...
+
+    @abstractmethod
+    async def phase_extract_failure(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        max_failures: int,
+        error: str,
+    ) -> "MorpheusExtractFailure | None":
+        """Lock a still-pending source and upsert its retry/dead-letter row.
+
+        Returns ``None`` if another worker already processed the source.
+        Postgres/SQLite use ``ON CONFLICT``; MySQL/MariaDB use
+        ``ON DUPLICATE KEY``; Oracle/Db2 use ``MERGE``.  Lock + upsert must be
+        one transaction so concurrent failures cannot lose an attempt.
+        """
+        ...
+
+    @abstractmethod
+    async def phase_extract_store(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        candidate: "MorpheusExtractCandidate",
+        triples: Sequence[tuple[str, str, str, str, float]],
+    ) -> bool:
+        """Atomically mark one source processed and persist its triples.
+
+        ``triples`` entries are ``(id, subject, predicate, object,
+        confidence)``.  Returns ``False`` if another worker won the
+        ``triples_extracted_at IS NULL`` claim.  On ``True``, failure cleanup,
+        run-memory upsert, triple inserts, and counter increments commit with
+        that claim.
+        """
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class MorpheusConsolidationResult:
+    memories_consolidated: int
+    clusters_consolidated: int
+
+
+@dataclass(frozen=True, slots=True)
+class MorpheusSynthesisMember:
+    id: str
+    content: str
+    category: str | None
+    owner_id: str | None
+    namespace: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MorpheusSynthesisCluster:
+    cluster_id: Any
+    members: tuple[MorpheusSynthesisMember, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MorpheusExtractCandidate:
+    id: str
+    verbatim_content: str
+    owner_id: str
+    namespace: str
+
+
+@dataclass(frozen=True, slots=True)
+class MorpheusExtractBatch:
+    config: dict[str, Any]
+    namespace: str | None
+    candidates: tuple[MorpheusExtractCandidate, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MorpheusExtractFailure:
+    attempts: int
+    status: str
 
 
 @dataclass(frozen=True)

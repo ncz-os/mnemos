@@ -19,6 +19,28 @@ SUPPORTED_CONSULTATION_MODES: tuple[str, ...] = (
     "majority",
 )
 
+# Memory tags are lightweight filter labels. Bound the per-request list so a
+# single search cannot expand into an unbounded backend IN/ANY predicate.
+MAX_TAGS_PER_REQUEST = 32
+MAX_TAG_LENGTH = 255
+
+
+def _normalize_memory_tags(value: Optional[List[str]]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_tag in value:
+        tag = raw_tag.strip()
+        if not tag:
+            raise ValueError("tags must not contain blank values")
+        if len(tag) > MAX_TAG_LENGTH:
+            raise ValueError(f"tags must be at most {MAX_TAG_LENGTH} characters")
+        if tag not in seen:
+            normalized.append(tag)
+            seen.add(tag)
+    return normalized
+
 
 class ConsultationRequest(BaseModel):
     prompt: str
@@ -82,6 +104,7 @@ class MemoryItem(BaseModel):
     content: str
     category: str
     subcategory: Optional[str] = None
+    tags: List[str] = Field(default_factory=list)
     created: str
     updated: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
@@ -527,6 +550,7 @@ def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = 
         content=content,
         category=row["category"],
         subcategory=row.get("subcategory"),
+        tags=list(row.get("tags") or []),
         created=_isoformat_value(row["created"]) or "",
         updated=_isoformat_value(row.get("updated")),
         metadata=raw_meta if raw_meta else None,
@@ -577,6 +601,7 @@ class MemoryListResponse(BaseModel):
 class MemoryListRequest(BaseModel):
     category: Optional[str] = None
     subcategory: Optional[str] = None
+    tags: Optional[List[str]] = Field(None, max_length=MAX_TAGS_PER_REQUEST)
     namespace: Optional[str] = None
     include_archived: Optional[bool] = False
     limit: int = Field(20, ge=1, le=500)
@@ -586,12 +611,18 @@ class MemoryListRequest(BaseModel):
     exclude_superseded: Optional[bool] = False
     current_only: Optional[bool] = False
 
+    @field_validator("tags")
+    @classmethod
+    def _validate_tags(cls, value):
+        return _normalize_memory_tags(value)
+
 
 class MemorySearchRequest(BaseModel):
     query: str
     limit: int = 10
     category: Optional[str] = None
     subcategory: Optional[str] = None
+    tags: Optional[List[str]] = Field(None, max_length=MAX_TAGS_PER_REQUEST)
     include_compressed: Optional[bool] = False
     semantic: Optional[bool] = False  # True = pgvector cosine similarity; False = FTS
     # Provenance filters — all optional, ANDed together when set
@@ -660,11 +691,17 @@ class MemorySearchRequest(BaseModel):
             raise ValueError("must be a finite number")
         return v
 
+    @field_validator("tags")
+    @classmethod
+    def _validate_tags(cls, value):
+        return _normalize_memory_tags(value)
+
 
 class MemoryCreateRequest(BaseModel):
     content: str
     category: str = "facts"
     subcategory: Optional[str] = None
+    tags: Optional[List[str]] = Field(None, max_length=MAX_TAGS_PER_REQUEST)
     metadata: Optional[Dict[str, Any]] = None
     verbatim_content: Optional[str] = None
     permission_mode: Optional[StrictInt] = None
@@ -677,11 +714,19 @@ class MemoryCreateRequest(BaseModel):
     source_session: Optional[str] = None  # session_id if created during session
     source_agent: Optional[str] = None  # agent name if created by autonomous agent
 
+    @field_validator("tags")
+    @classmethod
+    def _validate_tags(cls, value):
+        return _normalize_memory_tags(value)
+
 
 class MemoryUpdateRequest(BaseModel):
     content: Optional[str] = None
     category: Optional[str] = None
     subcategory: Optional[str] = None
+    # When present, replaces the complete tag set. [] clears; omitted/None
+    # leaves tags unchanged, matching the existing optional PATCH convention.
+    tags: Optional[List[str]] = Field(None, max_length=MAX_TAGS_PER_REQUEST)
     metadata: Optional[Dict[str, Any]] = None
     # #178: removed `quality_rating` — was declared but never
     # consumed by the update_memory route handler, so clients
@@ -691,6 +736,11 @@ class MemoryUpdateRequest(BaseModel):
     # appears in the OpenAPI schema as a "supported" update.
     verbatim_content: Optional[str] = None  # original uncompressed content
     permission_mode: Optional[StrictInt] = None
+
+    @field_validator("tags")
+    @classmethod
+    def _validate_tags(cls, value):
+        return _normalize_memory_tags(value)
 
 
 class BulkCreateRequest(BaseModel):

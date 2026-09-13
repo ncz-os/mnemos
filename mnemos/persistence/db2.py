@@ -853,6 +853,70 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
     # the inherited ``OracleMemoryRepository`` constructor signature.
     _settings: Any = None
 
+    async def replace_memory_tags(
+        self,
+        tx: Any,
+        memory_id: str,
+        tags: Sequence[str],
+        *,
+        visibility: VisibilityFilter | None = None,
+    ) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            where = ["m.id = ?", "m.deleted_at IS NULL"]
+            params: list[Any] = [memory_id]
+            if visibility is not None:
+                clause, vis_params = _render_visibility(visibility, table_alias="m")
+                if clause:
+                    where.append(_BIND_RE.sub("?", clause))
+                    params.extend(
+                        vis_params[match.group(1)]
+                        for match in _BIND_RE.finditer(clause)
+                    )
+            await _call(
+                cursor.execute,
+                "SELECT m.id FROM memories m WHERE "
+                + " AND ".join(where)
+                + " FOR UPDATE",
+                tuple(params),
+            )
+            if await _call(cursor.fetchone) is None:
+                return False
+            await _call(cursor.execute, "DELETE FROM memory_tags WHERE memory_id = ?", (memory_id,))
+            if tags:
+                await _call(
+                    cursor.executemany,
+                    "INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)",
+                    [(memory_id, tag) for tag in tags],
+                )
+            return True
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_tags(
+        self,
+        tx: Any,
+        memory_ids: Sequence[str],
+    ) -> dict[str, list[str]]:
+        if not memory_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in memory_ids)
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT memory_id, tag FROM memory_tags "
+                f"WHERE memory_id IN ({placeholders}) ORDER BY memory_id, tag WITH UR",
+                tuple(memory_ids),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        result = {memory_id: [] for memory_id in memory_ids}
+        for row in rows:
+            result.setdefault(row["memory_id"], []).append(row["tag"])
+        return result
+
     async def semantic_search(
         self,
         tx: Any,
@@ -862,6 +926,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
@@ -907,6 +972,13 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 if val is not None:
                     where.append(f"m.{col} = ?")
                     where_params.append(val)
+            if tags:
+                placeholders = ", ".join("?" for _ in tags)
+                where.append(
+                    "EXISTS (SELECT 1 FROM memory_tags mt "
+                    f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                )
+                where_params.extend(tags)
 
             # Db2 12.1.5 EAP: the DiskANN vector index supports EUCLIDEAN
             # distance only. For L2-normalized embeddings (MNEMOS default)
@@ -1280,6 +1352,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         limit: int = 20,
         offset: int = 0,
         include_archived: bool = False,
@@ -1306,6 +1379,13 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             if subcategory is not None:
                 where.append("m.subcategory = ?")
                 params_list.append(subcategory)
+            if tags:
+                placeholders = ", ".join("?" for _ in tags)
+                where.append(
+                    "EXISTS (SELECT 1 FROM memory_tags mt "
+                    f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                )
+                params_list.extend(tags)
             where_sql = " AND ".join(where)
 
             await _call(
@@ -1493,6 +1573,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         visibility: VisibilityFilter,
         category: str | None = None,
         subcategory: str | None = None,
+        tags: Sequence[str] | None = None,
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
@@ -1541,6 +1622,13 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 if val is not None:
                     where.append(f"m.{col} = ?")
                     params_list.append(val)
+            if tags:
+                placeholders = ", ".join("?" for _ in tags)
+                where.append(
+                    "EXISTS (SELECT 1 FROM memory_tags mt "
+                    f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                )
+                params_list.extend(tags)
             params_list.append(limit)
             sql = (
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
@@ -2658,7 +2746,7 @@ class Db2CompressionRepository(_Db2OraCompatMixin, OracleCompressionRepository):
 class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
     """Db2 12.1.5 (Oracle Compat) impl of :class:`MorpheusRepository` (item 11a).
 
-    Inherits every method from :class:`OracleMorpheusRepository` because
+    Inherits most methods from :class:`OracleMorpheusRepository` because
     the cursor layer in :class:`_Db2AsyncCursor.execute` rewrites
     Oracle→Db2 dialect tokens (``SYSTIMESTAMP``→``CURRENT TIMESTAMP``,
     ``:name``→``?``, ``TIMESTAMP WITH TIME ZONE``→``TIMESTAMP``)
@@ -2689,7 +2777,18 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
     ``0061c_morpheus_runs_parity.sql`` — the canonical 19-column
     Postgres shape retconned onto Db2 with TIMESTAMP (not TIMESTAMP
     WITH TIME ZONE) and CLOB config/namespace columns.
+
+    Item 11c's Oracle parent already uses locked read-modify-write for
+    CONSOLIDATE and ``MERGE`` for EXTRACT, both accepted by Db2's
+    compatibility cursor.  The only new driver gap is Oracle CLOB bind
+    sizing; ``_set_morpheus_clob_inputs`` is therefore a no-op here
+    because ``ibm_db_dbi`` binds Python strings to CLOB directly.
     """
+
+    @staticmethod
+    def _set_morpheus_clob_inputs(cursor: Any, **names: Any) -> None:
+        """Db2 binds Python strings to CLOB without python-oracledb hints."""
+        _ = cursor, names
 
     async def rollback_run(
         self,

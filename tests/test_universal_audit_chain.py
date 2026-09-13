@@ -8,6 +8,7 @@ import pytest
 import pytest_asyncio
 
 from mnemos.domain.models import BulkCreateRequest, MemoryCreateRequest, MemoryUpdateRequest
+from mnemos.persistence.sqlite import _execute as _sqlite_execute
 
 
 @pytest.fixture(autouse=True)
@@ -159,7 +160,8 @@ async def _update_source_memory(source_backend, *, memory_id: str, content: str,
 
     metadata = {"origin": "source"}
     async with source_backend.transactional() as tx:
-        await tx.conn.execute(
+        await _sqlite_execute(
+            tx.conn,
             "UPDATE memories SET content = ?, verbatim_content = ?, updated = ? WHERE id = ?",
             (content, content, updated, memory_id),
         )
@@ -352,7 +354,8 @@ async def test_federation_real_feed_source_head_seeds_and_extends_replica_chain(
         assert verify_entry(second_entry, second["signature"])
 
         async with sqlite_backend.transactional() as tx:
-            await tx.conn.execute(
+            await _sqlite_execute(
+                tx.conn,
                 "UPDATE memory_audit_chain SET signature = ? WHERE entry_id = ?",
                 (b"\x00" * 64, second["entry_id"]),
             )
