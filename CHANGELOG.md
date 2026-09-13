@@ -57,9 +57,48 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.5] — 2026-09-13
+
+- **Fixed**: deploying `6.3.4` to a production Oracle database made
+  every `GET /v1/memories` (and any other read of a `TIMESTAMP WITH TIME
+  ZONE` column) return `500 Internal Server Error`:
+  `oracledb.exceptions.NotSupportedError: DPY-3022: named time zones are
+  not supported in thin mode`. Also silently hid the `webhooks`
+  persistence capability from `/health` — its startup probe query hit
+  the same error and was caught elsewhere as "capability absent" rather
+  than surfacing loudly. Root cause: the item 6/12 webhook work
+  (`7469ad94`) added a per-session `ALTER SESSION SET TIME_ZONE = 'UTC'`
+  to make `SYSTIMESTAMP`-derived values unambiguously UTC. `'UTC'` is a
+  **named** zone; Oracle records `SESSIONTIMEZONE` exactly as entered,
+  and python-oracledb's thin driver (no Oracle Client libs required) can
+  only decode `TIMESTAMP WITH TIME ZONE` values tagged with a *fixed
+  offset* — a value tagged with the named region `'UTC'` raises
+  DPY-3022 the instant any later query in that session fetches a TSTZ
+  column. Never caught before deployment: the local suite runs against
+  SQLite/mocked Oracle, and this specific driver-level distinction
+  (named zone vs. fixed offset) only shows up against a real Oracle
+  instance in thin mode — the exact gap `tests/test_oracle_live.py`'s
+  live arms exist for, but production had been stuck on `6.2.4` (predating
+  this code) since 2026-09-10, so this was the first time it ran against
+  real traffic.
+- **Fix**: `ALTER SESSION SET TIME_ZONE = '+00:00'` instead of `'UTC'`
+  — functionally identical (UTC has no DST, so the offset never
+  changes) but expressed as a fixed offset, which thin mode decodes
+  without issue.
+- Added `test_oracle_pool_session_callback_pins_fixed_offset_not_named_zone`
+  to `tests/test_oracle_live.py` (skipped without `ORACLE_DSN`, same as
+  every other live arm in that file) asserting `SESSIONTIMEZONE` is a
+  fixed offset and that a `SYSTIMESTAMP` fetch does not raise.
+- **Process note**: this is the second real defect this release line
+  surfaced only by actually deploying to a live Oracle instance (see
+  `6.3.4`'s note on the same migration file) — every backend-specific
+  driver-mode behavior (thin vs. thick Oracle client, named vs. offset
+  timezones, DKMS-style ABI mismatches on other stacks) is a class of
+  bug the mocked/SQLite-only local suite structurally cannot catch.
+
 ## [6.3.4] — 2026-09-13
 
-- **Fixed**: deploying `6.3.3` to PYTHIA's production Oracle database
+- **Fixed**: deploying `6.3.3` to a production Oracle database
   crash-looped `mnemos serve` on every restart:
   `RuntimeError: ORACLE schema migration 0013_nats_dispatch_log.sql failed
   at CREATE INDEX idx_nats_dispatch_log_dispatched_at:
@@ -69,7 +108,7 @@ All notable changes to MNEMOS are documented here.
   canonical `(event_id, subject, dispatched_at)` shape by editing the
   same migration file in place, rather than adding a new migration. A
   database that had already provisioned the table under the pre-retcon
-  shape (PYTHIA's prod Oracle, provisioned months before the retcon)
+  shape (our prod Oracle instance, provisioned months before the retcon)
   hits `ORA-00955`/`table already exists` on the `CREATE TABLE`, which
   the migration runner's benign-error handling correctly treats as an
   idempotent replay and skips — but the table is still in the OLD shape,
@@ -95,7 +134,7 @@ All notable changes to MNEMOS are documented here.
   because migrations in this codebase have no applied-state tracking
   table and are replayed on every start — "table already exists" alone
   cannot distinguish an already-canonical replay from a still-legacy one.
-- PYTHIA's `mnemos-api.service` (root-managed Podman quadlet,
+- The production `mnemos-api.service` (root-managed Podman quadlet,
   `/etc/containers/systemd/mnemos-api.container`) was rolled back to
   `6.2.4` immediately on hitting the crash loop and confirmed healthy
   before this fix was written, to avoid an extended production outage

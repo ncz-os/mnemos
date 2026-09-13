@@ -540,8 +540,22 @@ def _build_oracle_session_callback(settings: Any) -> Any:
             # naive-but-unambiguously-UTC, matching the convention already
             # used by every other backend (Postgres/MySQL/SQLite are all
             # UTC internally).
+            #
+            # MUST be a fixed offset ('+00:00'), never the named zone
+            # string 'UTC': Oracle records SESSIONTIMEZONE exactly as
+            # entered, and python-oracledb's thin driver (no Oracle Client
+            # libs) can only decode TIMESTAMP WITH TIME ZONE values tagged
+            # with a fixed offset -- a value tagged with the named region
+            # 'UTC' raises `DPY-3022: named time zones are not supported
+            # in thin mode` the moment ANY later query fetches a TSTZ
+            # column in this session. Found live in production (2026-09-13):
+            # every GET /v1/memories 500'd the instant this session
+            # callback ran, and any capability-probe query that hit the
+            # same error was silently swallowed elsewhere as "capability
+            # absent" (e.g. `webhooks` vanishing from
+            # persistence_capability_details) rather than surfacing loudly.
             try:
-                await cur.execute("ALTER SESSION SET TIME_ZONE = 'UTC'")
+                await cur.execute("ALTER SESSION SET TIME_ZONE = '+00:00'")
             except Exception as exc:  # pragma: no cover - driver-dependent
                 _LOG.debug("ALTER SESSION SET TIME_ZONE failed: %s", exc)
             if pdb_target:
