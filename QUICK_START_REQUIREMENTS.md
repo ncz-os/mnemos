@@ -1,7 +1,7 @@
 # MNEMOS Quick Start Requirements
 
-**Applies to**: current v6.2.5 release line
-**TL;DR**: Python 3.11+ for package installs, or no host Python at all if you
+**Applies to**: current v6.3.0 release line
+**TL;DR**: Python 3.13+ for package installs, or no host Python at all if you
 run the container image. Use SQLite for `edge`/`dev`, or PostgreSQL 16 for
 `server` — plus Redis only if you run more than one worker.
 **Full Details**: See `SYSTEM_REQUIREMENTS.md`
@@ -27,13 +27,13 @@ to keep a fleet on identical code.
 
 ```bash
 # 1. Python (2 minutes)
-sudo apt update && sudo apt install -y python3.11 python3.11-venv python3.11-dev
+sudo apt update && sudo apt install -y python3.13 python3.13-venv python3.13-dev
 
 # 2. System dependencies (1 minute)
 sudo apt install -y git curl build-essential libpq-dev
 
 # 3. MNEMOS package (2 minutes)
-python3.11 -m venv ~/.venvs/mnemos
+python3.13 -m venv ~/.venvs/mnemos
 source ~/.venvs/mnemos/bin/activate
 pip install 'mnemos-core[edge]'
 
@@ -48,7 +48,7 @@ counters are process-local without it:
 
 ```bash
 sudo apt install -y postgresql-16 postgresql-16-pgvector postgresql-client redis-server
-python3.11 -m venv venv
+python3.13 -m venv venv
 source venv/bin/activate
 pip install 'mnemos-core[server,redis]'
 export MNEMOS_PROFILE=server
@@ -102,7 +102,7 @@ already-initialized volumes.
 | CPU | 2 cores | Asyncio tasks, database threads |
 | RAM | 4 GB | Python (500MB) + PostgreSQL (1GB) + OS (2.5GB) |
 | Disk | 10 GB | Schema (50MB) + data + buffer |
-| OS | Linux/macOS/Windows | Python 3.11+ support |
+| OS | Linux/macOS/Windows | Python 3.13+ support |
 
 **Viable**: Raspberry Pi 4 (4GB), ASUS NUC, old laptop
 **Recommended**: ASUS NUC i5 or better for production
@@ -117,7 +117,7 @@ PostgreSQL 13+
 ├─ Port: 5432 (local or remote)
 └─ Storage: 10GB+ (depends on data)
 
-Python 3.11+
+Python 3.13+
 └─ asyncio, FastAPI, asyncpg, uvicorn
 
 LLM Provider (pick one)
@@ -190,8 +190,8 @@ Database:
 
 ```bash
 # 1. Check Python
-python3.11 --version
-# Expected: Python 3.11.x or higher
+python3.13 --version
+# Expected: Python 3.13.x or higher
 
 # 2. Check PostgreSQL
 psql -U mnemos_user -d mnemos -c "SELECT 1;"
@@ -329,6 +329,6 @@ kill -9 <PID>
 
 ---
 
-**Version**: v6.2.5
+**Version**: v6.3.0
 **Updated**: 2026-07-10
 **Accuracy**: Production-verified

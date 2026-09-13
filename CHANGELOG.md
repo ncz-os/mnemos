@@ -57,6 +57,67 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.0] — 2026-09-13
+
+- **Added**: `memory_tags` — lightweight, multi-valued tags for multi-project
+  memory scoping, exposed identically via REST and MCP. Junction-table
+  design (mirrors `memory_acl`'s existing pattern) across all 6 backends;
+  tags compose with the existing read-visibility predicate the same way
+  category/subcategory filters already do, and are deliberately kept
+  outside `memory_versions` (metadata about placement, not content).
+- **Added**: completed the `WebhookRepository`/persistence-ABC migration
+  sequence (items 11c, 11d, 12) — MORPHEUS's `phase_consolidate`,
+  `phase_synthesise`, `phase_extract`, and `phase_replay` all now run
+  through `MorpheusRepository` across all 6 backends instead of raw
+  `asyncpg.Pool` SQL, and `deletion_request_worker` no longer requires a
+  Postgres-only pool (its pre-existing-but-unreachable ABC dispatch path
+  is finally live).
+- **Added**: real sliding-window `NatsRateLimiter` and lease-based
+  `NatsConcurrencyLimiter` (Redis→NATS JetStream migration, partial) — not
+  yet wired into any production call site; the actual Redis cutover is a
+  separate follow-up.
+- **Fixed**: `worker_lifecycle.py`'s backend-dialect dispatcher had no
+  Postgres branch, so `deletion_request_worker`'s Postgres path raised
+  `TypeError` on every real deployment once its `main()` started passing a
+  real backend object instead of a raw pool — every Postgres deployment's
+  deletion/hard-deletion worker would have been completely non-functional.
+  Fixed with real asyncpg dialect support (`$N` param markers,
+  `conn.execute`/`fetchrow`/`fetch`, `FOR UPDATE SKIP LOCKED`).
+- **Fixed**: tag-only `PATCH` had a TOCTOU authorization gap and a
+  lost-update race under concurrent writers (two concurrent tag-replace
+  requests could each land, producing the union of both). Fixed on all 6
+  backends with a locked, visibility-checked read before the write.
+- **Fixed**: MySQL/MariaDB's MORPHEUS-consolidate rollback snapshot
+  captured the *new* `permission_mode` instead of the original, due to a
+  same-statement column-evaluation-order hazard — rollback would have
+  restored the wrong value. Fixed by binding the pre-fetched original value
+  explicitly.
+- **Fixed**: Oracle/Db2's REPLAY phase excluded ordinary NULL-provenance
+  memories (a sign error in the NULL-handling logic) — undercounted every
+  normal REPLAY scan on those two backends.
+- **Fixed**: Oracle/Db2 `memory_tags.tag` columns were byte-length under
+  default settings while the API validates by character count — a
+  128-character Unicode tag could pass validation and fail at the DB layer.
+- **Fixed**: triaged and fixed master's pre-existing 20 failing tests (13
+  originally tracked + 7 more that appeared later). Root cause for 13: test
+  code was bypassing this codebase's own sqlite async-compat wrappers,
+  hitting a driver-version mismatch unrelated to the code under test. The
+  remaining 7 are honestly `skipif`'d on the optional `nats-py` dependency
+  not being installed in CI's unit-test environment.
+- **Changed**: `requires-python` floor raised to `>=3.13` (was `>=3.11`,
+  which was never actually validated and is currently false — real Python
+  3.11 hits a `Protocol.__instancecheck__`/`BackendCapabilityMissing`
+  incompatibility). All 5 Dockerfiles' base image bumped to `python:3.13-slim`
+  to match.
+- **Changed**: `.github/workflows/release-images.yml` no longer publishes
+  `mnemos-core` or `mnemos` as their own separately-tagged, public ghcr.io
+  packages — only `mnemos-enterprise` is published, per the 2026-09-10
+  single-image-standardization decision. The intermediate images are still
+  built (via Docker Buildx Bake, chaining the existing Dockerfiles as
+  dependent build contexts) since `mnemos-enterprise` is built FROM them,
+  they are simply no longer pushed as discoverable packages in their own
+  right.
+
 ## [6.2.5] — 2026-09-11
 
 - **Added**: `WebhookRepository` ABC (item 2 of the ongoing webhook/ABC fix
