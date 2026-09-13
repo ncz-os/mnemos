@@ -2320,6 +2320,113 @@ class MorpheusRepository(ABC):
         """
         ...
 
+    @abstractmethod
+    async def fetch_cluster_candidates(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        max_input_count: int,
+    ) -> ClusterCandidateRow | None:
+        """Return the run-window config + candidate memories for CLUSTER phase.
+
+        Item 11b of the 12-item ABC migration: ``phase_cluster`` was a
+        raw-asyncpg blob that depended on Postgres-specific pgvector
+        ``embedding::text`` casting, ``IS DISTINCT FROM`` (Oracle/DB2
+        dialect mismatch), and Postgres ``jsonb_build_object`` merge.
+        This method bundles all three backend-specific concerns behind
+        the ABC so the runner only sees plain Python types.
+
+        Returns :class:`ClusterCandidateRow` — the run's
+        ``cluster_min_size``, ``window_started_at``, ``window_ended_at``,
+        ``namespace``, and an ordered list of ``(memory_id, embedding)``
+        tuples ready for online cosine clustering. Embeddings are
+        pre-materialised to ``list[float]`` using each backend's own
+        convention (Postgres: ``embedding::text`` parse; SQLite: the
+        ``_parse_embedding`` helper on the joined ``memory_embeddings``
+        TEXT; MySQL/MariaDB: ``FROM_VECTOR(m.embedding)`` JSON
+        ``json.loads``; Oracle 23ai: the ``array.array('f', ...)``
+        ``oracledb`` returns for ``VECTOR`` columns converted via
+        ``list(...)``; Db2: same shape via ``ibm_db``).
+
+        Returns ``None`` if the run row does not exist — matches the
+        pre-11b runner's ``run_row is None`` early-exit contract.
+
+        Order is by ``memories.created ASC`` so the single-pass online
+        clustering walks the corpus in chronological order, identical
+        to the pre-11b path.
+
+        The candidate eligibility predicate
+        (``provenance IS DISTINCT FROM 'morpheus_local'`` +
+        ``morpheus_run_id IS NULL`` + ``embedding IS NOT NULL`` +
+        :func:`eligible_for_morpheus` + optional namespace filter) is
+        the responsibility of the impl — the runner doesn't repeat it.
+        Each backend translates ``IS DISTINCT FROM`` to its own
+        dialect (Oracle/DB2 fall back to ``NOT (provenance = ... OR
+        provenance IS NULL)`` style; MySQL/MariaDB use ``<=>``;
+        SQLite/Postgres use ``IS DISTINCT FROM`` directly).
+        """
+        ...
+
+    @abstractmethod
+    async def merge_run_config(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        patch: dict[str, Any],
+    ) -> None:
+        """Merge ``patch`` keys into ``morpheus_runs.config``.
+
+        Item 11b of the 12-item ABC migration: ``phase_cluster`` writes
+        the survived cluster payload to
+        ``morpheus_runs.config["clusters"]`` so ``phase_synthesise``
+        can consume it via :func:`_parse_run_config` without a
+        separate table. The original runner used Postgres-specific
+        ``config || jsonb_build_object('clusters', $2::jsonb)``;
+        every other backend either lacks JSONB merge entirely (Oracle
+        23ai / Db2) or has a different dialect (MySQL ``JSON_SET``,
+        SQLite ``json_set``).
+
+        Every backend uses the safer Python-side read-modify-write
+        pattern (item 11a's ``rollback_run`` already established this
+        approach for the metadata JSONB translation): ``SELECT config
+        FROM morpheus_runs``, ``json.loads`` it, merge ``patch`` keys,
+        ``json.dumps``, ``UPDATE morpheus_runs SET config = :new``.
+        The read+write lives inside the supplied ``tx`` so a partial
+        write cannot leak.
+
+        Postgres MAY still use its native ``||`` operator if it is
+        faster on a hot path — every other backend uses RMW because
+        its native merge dialect is either absent or surprising
+        (Oracle ``JSON_MERGEPATCH`` rejects path expressions as bind
+        variables — same ORA-40454 that Oracle's ``rollback_run``
+        step-4 worked around; Db2 has no JSON update function in
+        ORA-compat mode; MySQL/MariaDB's ``JSON_MERGE_PATCH`` is
+        whole-document-level and would clobber sibling keys, hence RMW
+        on those too).
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class ClusterCandidateRow:
+    """Bundle returned by :meth:`MorpheusRepository.fetch_cluster_candidates`.
+
+    Item 11b: keeps ``phase_cluster`` runner-side single-call:
+    the run's cluster config + the candidate ``(memory_id, embedding)``
+    pairs in the same backend-neutral struct. Backends translate their
+    own ``embedding`` column type into a plain ``list[float]`` here so
+    the runner's :func:`_parse_pgvector` and per-row text casts become
+    per-impl-only.
+    """
+
+    cluster_min_size: int
+    window_started_at: Any
+    window_ended_at: Any
+    namespace: str | None
+    candidates: list[tuple[str, list[float]]]
+
 
 CapabilityName: TypeAlias = Literal[
     "core",

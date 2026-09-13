@@ -35,6 +35,7 @@ from urllib.parse import unquote, urlparse
 from mnemos.core.config import oracle_pdb_env, runtime_env_value_stripped, vector_dim_max_env
 from mnemos.core.oauth import _mint_user_id
 from mnemos.core import webhook_constants
+from mnemos.core import eligibility as _eligibility
 from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.base import (
@@ -42,6 +43,7 @@ from mnemos.persistence.base import (
     AuditChainRepository,
     BackendCapabilityMissing,
     BranchRepository,
+    ClusterCandidateRow,
     CompressionQueueRepository,
     CompressionRepository,
     ConsultationAuditRepository,
@@ -2779,6 +2781,196 @@ class OracleMorpheusRepository(MorpheusRepository):
             n_extract_reset,
         )
         return n_deleted, n_run
+
+    async def fetch_cluster_candidates(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        max_input_count: int,
+    ) -> ClusterCandidateRow | None:
+        """Oracle 23ai impl of MORPHEUS fetch_cluster_candidates — item 11b.
+
+        Returns the run's cluster-window config + the candidate rows
+        pre-materialised to ``list[float]`` in a single transaction.
+        Oracle 23ai stores embeddings as ``VECTOR(*, FLOAT32)``;
+        ``oracledb`` returns the column as an
+        ``array.array('f', [...])`` (verified live on a real
+        ``gvenzl/oracle-free:23-slim`` instance on HYDRA — see
+        ``OracleMorpheusRepository.begin_run`` docstring), which
+        trivially becomes a ``list[float]`` via ``list(...)``.
+
+        ``IS DISTINCT FROM`` is not portable to Oracle — we use
+        ``NOT (provenance = 'morpheus_local' OR provenance IS NULL)``
+        which is the canonical Oracle null-safe equality form.
+
+        Db2 inherits this whole method via ``_Db2OraCompatMixin``
+        because Db2 in ORA-compat mode uses the same ``IS [NOT] NULL`` /
+        equality SQL surface.
+        """
+        conn = _conn_from_tx(tx)
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT cluster_min_size, window_started_at, window_ended_at, namespace
+                  FROM morpheus_runs WHERE id = :id
+                """,
+                {"id": run_id},
+            )
+            run_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            if run_row is None:
+                return None
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT id, embedding
+                  FROM memories
+                 WHERE created BETWEEN :window_start AND :window_end
+                   AND NOT (provenance = 'morpheus_local' OR provenance IS NULL)
+                   AND morpheus_run_id IS NULL
+                   AND embedding IS NOT NULL
+                   AND {eligibility_clause}
+                   AND (:ns IS NULL OR namespace = :ns)
+                 ORDER BY created
+                 FETCH FIRST :max_rows ROWS ONLY
+                """,
+                {
+                    "window_start": run_row["window_started_at"],
+                    "window_end": run_row["window_ended_at"],
+                    "ns": run_row["namespace"],
+                    "max_rows": int(max_input_count),
+                },
+            )
+            raw_rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        candidates: list[tuple[str, list[float]]] = []
+        for row in raw_rows:
+            mid = row.get("id")
+            raw_embed = row.get("embedding")
+            if mid is None or raw_embed is None:
+                continue
+            # oracledb returns VECTOR columns as array.array('f', [...])
+            # on the wire. ``list(...)`` materialises the typed array
+            # into a plain ``list[float]`` for the clustering algorithm.
+            # Fall back to an explicit iteration if a future driver
+            # version returns a different shape (string JSON, list, etc.).
+            if isinstance(raw_embed, (list, tuple)):
+                try:
+                    vec = [float(value) for value in raw_embed]
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(raw_embed, (bytes, bytearray)):
+                try:
+                    parsed = json.loads(raw_embed.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(parsed, list):
+                    continue
+                try:
+                    vec = [float(value) for value in parsed]
+                except (TypeError, ValueError):
+                    continue
+            elif isinstance(raw_embed, str):
+                try:
+                    parsed = json.loads(raw_embed)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(parsed, list):
+                    continue
+                try:
+                    vec = [float(value) for value in parsed]
+                except (TypeError, ValueError):
+                    continue
+            else:
+                try:
+                    vec = [float(value) for value in raw_embed]
+                except (TypeError, ValueError):
+                    continue
+            if not vec:
+                continue
+            candidates.append((str(mid), vec))
+        return ClusterCandidateRow(
+            cluster_min_size=int(run_row["cluster_min_size"]),
+            window_started_at=run_row["window_started_at"],
+            window_ended_at=run_row["window_ended_at"],
+            namespace=run_row["namespace"],
+            candidates=candidates,
+        )
+
+    async def merge_run_config(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        patch: dict[str, Any],
+    ) -> None:
+        """Oracle 23ai impl of MORPHEUS merge_run_config — item 11b.
+
+        Read-modify-write on the ``config`` column (Oracle 23ai
+        stores it as ``CLOB`` with a ``CHECK (config IS JSON)``
+        constraint). Oracle's ``JSON_MERGEPATCH`` accepts path
+        expressions only as literals (ORA-40454 rejects bind
+        variables there) — same trap ``OracleMorpheusRepository.rollback_run``
+        step-4 worked around with RMW. ``JSON_TRANSFORM`` is also
+        PL/SQL-only on this Oracle version.
+
+        RMW lives inside the supplied ``tx`` so the SELECT and
+        UPDATE both commit/fail together. The patch is bounded to
+        ``{"clusters": [...]}`` per CLUSTER phase so the read+write
+        is a single round trip per phase call. Db2 inherits this
+        method via ``_Db2OraCompatMixin`` — Db2 in ORA-compat mode
+        has no JSON update function so RMW is the only option there
+        too.
+        """
+        if not patch:
+            return
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT config FROM morpheus_runs WHERE id = :id",
+                {"id": run_id},
+            )
+            row = await _call(cursor.fetchone)
+        finally:
+            await _call(cursor.close)
+        if row is None:
+            return
+        raw_config = await _materialize_value(row[0])
+        if raw_config is None or raw_config == "":
+            merged: dict[str, Any] = {}
+        elif isinstance(raw_config, dict):
+            merged = dict(raw_config)
+        elif isinstance(raw_config, str):
+            try:
+                parsed = json.loads(raw_config)
+            except json.JSONDecodeError:
+                parsed = {}
+            merged = parsed if isinstance(parsed, dict) else {}
+        else:
+            merged = {}
+        merged.update(patch)
+        cursor = await _call(conn.cursor)
+        try:
+            import oracledb
+
+            # ``config`` is a CLOB on Oracle 23ai — oracledb's default
+            # bind-type inference for a Python str picks CHAR/VARCHAR2,
+            # which ORA-00932 mismatches the CLOB column. Force it
+            # explicitly, same pattern as the metadata rollback step.
+            cursor.setinputsizes(new_config=oracledb.DB_TYPE_CLOB)
+            await _call(
+                cursor.execute,
+                "UPDATE morpheus_runs SET config = :new_config WHERE id = :id",
+                {"new_config": json.dumps(merged), "id": run_id},
+            )
+        finally:
+            await _call(cursor.close)
 
 
 class OracleCompressionQueueRepository(CompressionQueueRepository):

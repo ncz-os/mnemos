@@ -38,6 +38,7 @@ from mnemos.persistence.base import (
     AclRepository,
     AuditChainRepository,
     BranchRepository,
+    ClusterCandidateRow,
     CompressionQueueRepository,
     CompressionRepository,
     CompressionStatsRow,
@@ -5785,6 +5786,112 @@ class PostgresMorpheusRepository(MorpheusRepository):
             n_extract_reset,
         )
         return n_deleted, n_run
+
+    async def fetch_cluster_candidates(
+        self,
+        tx: Transaction,
+        *,
+        run_id: str,
+        max_input_count: int,
+    ) -> ClusterCandidateRow | None:
+        """Postgres impl of MORPHEUS fetch_cluster_candidates — item 11b.
+
+        Returns the run's cluster-window config + the candidate rows
+        pre-materialised to ``list[float]`` in a single transaction.
+        Uses the canonical ``embedding::text`` pgvector cast the
+        pre-11b runner depended on, parsed by ``_parse_pgvector_text``
+        — same path the rest of the Postgres persistence surface uses
+        for vector serialisation. ``IS DISTINCT FROM`` and
+        ``morpheus_runs.config`` JSONB are native Postgres syntax —
+        no dialect translation needed.
+        """
+        conn = _postgres_tx(tx).conn
+        run_row = await conn.fetchrow(
+            """
+            SELECT cluster_min_size, window_started_at, window_ended_at, namespace
+            FROM morpheus_runs WHERE id = $1::uuid
+            """,
+            run_id,
+        )
+        if run_row is None:
+            return None
+        eligibility_clause = _eligibility.eligible_for_morpheus("")
+        rows = await conn.fetch(
+            f"""
+            SELECT id, embedding::text AS embedding_text
+              FROM memories
+             WHERE created BETWEEN $1 AND $2
+               AND provenance IS DISTINCT FROM 'morpheus_local'
+               AND morpheus_run_id IS NULL
+               AND embedding IS NOT NULL
+               AND {eligibility_clause}
+               AND ($3::text IS NULL OR namespace = $3)
+             ORDER BY created
+             LIMIT $4
+            """,
+            run_row["window_started_at"],
+            run_row["window_ended_at"],
+            run_row["namespace"],
+            int(max_input_count),
+        )
+        candidates: list[tuple[str, list[float]]] = []
+        for row in rows:
+            mid = row["id"]
+            vec = _parse_pgvector_text(row["embedding_text"])
+            if not vec:
+                continue
+            candidates.append((str(mid), vec))
+        return ClusterCandidateRow(
+            cluster_min_size=int(run_row["cluster_min_size"]),
+            window_started_at=run_row["window_started_at"],
+            window_ended_at=run_row["window_ended_at"],
+            namespace=run_row["namespace"],
+            candidates=candidates,
+        )
+
+    async def merge_run_config(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        patch: dict[str, Any],
+    ) -> None:
+        """Postgres impl of MORPHEUS merge_run_config — item 11b.
+
+        Uses the native ``config || jsonb_build_object(...)`` operator
+        so the write stays a single SQL statement (matches the
+        pre-11b runner's ``UPDATE morpheus_runs SET config = config ||
+        jsonb_build_object('clusters', $2::jsonb) WHERE id=$1::uuid``
+        shape). Postgres can short-circuit this path because the
+        ``jsonb_build_object`` literal is built from the ``patch``
+        dict on the Python side — the dialect cost is one
+        ``jsonb_build_object(k, v, k, v, ...)`` call, not the JSONB
+        merge search path, so the native operator stays fast.
+        """
+        if not patch:
+            return
+        # Bind both the key AND the value as parameters -- jsonb_build_object
+        # accepts a text bind in the key position just as well as a literal,
+        # so there is no need to splice caller-supplied keys into the SQL
+        # text (this method's signature is a general dict[str, Any] patch,
+        # not just the one hardcoded "clusters" key the current runner.py
+        # caller happens to pass).
+        args: list[Any] = []
+        pairs: list[str] = []
+        i = 2
+        for key, value in patch.items():
+            pairs.append(f"${i}::text, ${i + 1}::jsonb")
+            args.append(str(key))
+            args.append(json.dumps(value))
+            i += 2
+        assignments = ", ".join(pairs)
+        await _postgres_tx(tx).conn.execute(
+            f"UPDATE morpheus_runs "
+            f"SET config = config || jsonb_build_object({assignments}) "
+            f"WHERE id = $1::uuid",
+            run_id,
+            *args,
+        )
 
 
 class PostgresNatsDispatchLogRepository(NatsDispatchLogRepository):

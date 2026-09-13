@@ -2669,6 +2669,15 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
     read-modify-write fallback does. This is an admin rollback path
     so the extra round trip is acceptable.
 
+    Item 11b: ``merge_run_config`` is also overridden because the
+    Oracle impl's ``cursor.setinputsizes(new_config=oracledb.DB_TYPE_CLOB)``
+    would crash on Db2 — ``oracledb`` is not an installed dependency on
+    a Db2 fleet. ``ibm_db_dbi`` handles CLOB parameter binding
+    automatically when given a Python ``str``, so the Db2 override
+    drops the ``setinputsizes`` call entirely. ``fetch_cluster_candidates``
+    inherits unchanged because the only ``import oracledb`` in the
+    Oracle impl lives inside ``merge_run_config``.
+
     The Oracle parent's ``rollback_run`` body is otherwise portable:
     every JSON call (``JSON_EXISTS``, ``JSON_VALUE``) and the
     ``STANDARD_HASH(..., 'SHA256')`` audit hash translate through
@@ -2880,6 +2889,71 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
             n_extract_reset,
         )
         return n_deleted, n_run
+
+    async def merge_run_config(
+        self,
+        tx: Transaction,
+        run_id: str,
+        *,
+        patch: dict[str, Any],
+    ) -> None:
+        """Db2 override of MORPHEUS merge_run_config — item 11b.
+
+        Same read-modify-write as :class:`OracleMorpheusRepository.merge_run_config`
+        but without ``cursor.setinputsizes(oracledb.DB_TYPE_CLOB)``
+        — ``oracledb`` is not installed on a Db2 fleet, so the
+        Oracle parent's import-oracledb branch would crash on call.
+        ``ibm_db_dbi`` binds Python ``str`` values to CLOB columns
+        automatically, so the Db2 form is the simpler ``UPDATE ...
+        SET config = ?`` without a bind-type hint.
+
+        ``fetch_cluster_candidates`` is inherited unchanged from
+        Oracle — its only ``import oracledb`` reference is gated to
+        ``merge_run_config`` (which the Db2 override shadows).
+        """
+        import json
+
+        if not patch:
+            return
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT config FROM morpheus_runs WHERE id = ?",
+                (run_id,),
+            )
+            row = await _call(cursor.fetchone)
+        finally:
+            await _call(cursor.close)
+        if row is None:
+            return
+        # ibm_db_dbi returns CLOB columns as Python str directly when
+        # bound parameter autocommit is off — no async LOB .read()
+        # dance like oracledb. row[0] is the JSON text (or None).
+        raw_config = row[0]
+        if raw_config is None or raw_config == "":
+            merged: dict[str, Any] = {}
+        elif isinstance(raw_config, dict):
+            merged = dict(raw_config)
+        elif isinstance(raw_config, str):
+            try:
+                parsed = json.loads(raw_config)
+            except json.JSONDecodeError:
+                parsed = {}
+            merged = parsed if isinstance(parsed, dict) else {}
+        else:
+            merged = {}
+        merged.update(patch)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE morpheus_runs SET config = ? WHERE id = ?",
+                (json.dumps(merged), run_id),
+            )
+        finally:
+            await _call(cursor.close)
 
 
 class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
