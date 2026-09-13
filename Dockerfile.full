@@ -1,7 +1,7 @@
 # MNEMOS-OS Dockerfile — `full` build (all extras incl. mnemos_hot)
 # Multi-stage build with uv for fast dependency resolution
 
-FROM python:3.11-slim as builder
+FROM python:3.13-slim as builder
 
 WORKDIR /app
 
@@ -35,7 +35,7 @@ COPY mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl /tmp/
 RUN uv pip install --system /tmp/mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl && \
     rm /tmp/mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl
 
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 WORKDIR /app
 
@@ -43,7 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 && \
     rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 
 COPY . .
 

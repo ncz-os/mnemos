@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "mnemos-native-search"
 version = "0.1.0"
 description = "PyO3 accelerators for MNEMOS search and federation hot paths"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "MNEMOS Contributors" }]
 classifiers = [

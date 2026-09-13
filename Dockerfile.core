@@ -30,7 +30,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 ARG MNEMOS_CORE_REF=unknown
 
-FROM python:3.11-slim AS builder
+FROM python:3.13-slim AS builder
 
 WORKDIR /app
 
@@ -100,7 +100,7 @@ RUN target_arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
 RUN python -m pip wheel --no-deps --no-build-isolation --wheel-dir /wheelhouse .
 
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 ARG MNEMOS_CORE_REF
 
@@ -123,7 +123,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (the proven Dockerfile.oracle / Dockerfile.split handoff). Re-running the
 # third-party install here would rebuild source-only deps (llama-cpp-python)
 # and fail with no gcc present.
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /wheelhouse /wheelhouse
 
