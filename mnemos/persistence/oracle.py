@@ -7343,6 +7343,24 @@ class OracleFederationRepository(FederationRepository):
                 "m.consolidated_into IS NULL",
                 "(m.namespace IS NULL OR m.namespace <> :vault_ns)",
             ]
+            # F07: explicit withdrawal branch — rows that USED TO BE
+            # federated but have left the live feed (soft-delete /
+            # archive / permission narrowed offsite / moved into the
+            # secret vault namespace). Mirrors the SQLite/Postgres/MySQL
+            # branches; Oracle's existing feed_query did not surface a
+            # consolidation tombstone branch, so this is a clean
+            # add-on.
+            withdrawal_where = [
+                "m.federation_source IS NULL",
+                "m.consolidated_into IS NULL",
+                "(m.deleted_at IS NOT NULL OR m.archived_at IS NOT NULL OR m.namespace = :vault_ns",
+                *(
+                    []
+                    if federation_feed_include_private()
+                    else ["OR MOD(m.permission_mode, 10) < 4"]
+                ),
+                ")",
+            ]
             params: dict[str, Any] = {"limit": limit, "vault_ns": VAULT_NAMESPACE}
             if since_updated is not None and since_id is not None:
                 where.append("(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))")
@@ -7354,14 +7372,23 @@ class OracleFederationRepository(FederationRepository):
                 upd_var.setvalue(0, since_updated)
                 params["upd"] = upd_var
                 params["since_id"] = since_id
+                withdrawal_where.append(
+                    "(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))"
+                )
             if namespaces:
                 ns_ph, ns_params = _in_placeholders(namespaces, "ns")
                 where.append(f"m.namespace IN ({ns_ph})")
                 params.update(ns_params)
+                ns_ph_w, ns_params_w = _in_placeholders(namespaces, "nsw")
+                withdrawal_where.append(f"m.namespace IN ({ns_ph_w})")
+                params.update(ns_params_w)
             if categories:
                 cat_ph, cat_params = _in_placeholders(categories, "cat")
                 where.append(f"m.category IN ({cat_ph})")
                 params.update(cat_params)
+                cat_ph_w, cat_params_w = _in_placeholders(categories, "catw")
+                withdrawal_where.append(f"m.category IN ({cat_ph_w})")
+                params.update(cat_params_w)
             # v6.1 F-1.2: optional embedding + embedding_model literal columns.
             # See docs/v6.1-federation-embeddings-copy.md.
             embed_cols = ""
@@ -7377,12 +7404,21 @@ class OracleFederationRepository(FederationRepository):
                 _model_escaped = _model.replace("'", "''")
                 embed_cols = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
             sql = (
+                "SELECT * FROM ("
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
                 "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
                 "m.permission_mode, m.source_model, m.source_provider, "
                 "m.source_session, m.source_agent, m.created, m.updated, "
                 "m.archived_at" + embed_cols + " FROM memories m WHERE " + " AND ".join(where) + " "
-                "ORDER BY m.updated ASC, m.id ASC "
+                "UNION ALL "
+                # F07: explicit withdrawal branch.
+                "SELECT m.id, NULL AS content, NULL AS category, NULL AS subcategory, NULL AS metadata, "
+                "NULL AS quality_rating, NULL AS verbatim_content, NULL AS owner_id, m.namespace, "
+                "NULL AS permission_mode, NULL AS source_model, NULL AS source_provider, "
+                "NULL AS source_session, NULL AS source_agent, m.created, m.updated AS updated, "
+                "m.archived_at, NULL AS embedding, NULL AS embedding_model "
+                "FROM memories m WHERE " + " AND ".join(withdrawal_where) + ") feed "
+                "ORDER BY updated ASC, id ASC "
                 "FETCH FIRST :limit ROWS ONLY"
             )
             await _call(cursor.execute, sql, params)

@@ -79,7 +79,10 @@ def _redacted_row(row: Mapping[str, Any]) -> dict[str, Any]:
     # serializer can emit bytes: vault rows never leave the node, and every
     # content-bearing field is span-redacted for credentials.
     out = dict(row)
-    if out.get("type") == "consolidation":
+    if out.get("type") in ("consolidation", "withdrawal"):
+        # Tombstone variants carry no live content — they exist only to
+        # tell the receiver "drop this id" or "redirect to canonical".
+        # No redaction needed; the receiver applies its own deletion.
         return out
     for key in ("content", "compressed_content", "verbatim_content"):
         if key in out:
@@ -135,6 +138,18 @@ def _wire_payload(row: Mapping[str, Any]) -> dict[str, Any]:
             "id": row["id"],
             "consolidated_into": row["consolidated_into"],
             "consolidated_at": _iso_value(row["consolidated_at"]) or "",
+        }
+    if row.get("type") == "withdrawal":
+        # F07: explicit withdrawal/tombstone signal. Receivers drop the
+        # local copy of `id` on receipt. See FederationWithdrawalEvent
+        # for the wire-shape contract.
+        namespace_val = row.get("namespace")
+        return {
+            "type": "withdrawal",
+            "id": row["id"],
+            "namespace": namespace_val if namespace_val else None,
+            "withdrawn_at": _iso_value(row.get("updated") or row.get("created")) or "",
+            "reason": "ineligible",
         }
     return _memory_item_payload(row)
 

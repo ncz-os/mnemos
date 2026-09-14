@@ -4720,6 +4720,13 @@ class PostgresFederationRepository(FederationRepository):
             _eligibility.eligible_for_federation_tombstone("m"),
             "m.consolidated_at IS NOT NULL",
         ]
+        # F07: explicit withdrawal branch — rows that USED TO BE federated
+        # but have left the live feed (soft-delete / archive / permission
+        # narrowed offsite / moved into the secret vault namespace). The
+        # NATS path already handles deletion correctly; this is the HTTP
+        # counterpart so a polling replica gets an actionable tombstone
+        # instead of silently losing the row on the next poll.
+        withdrawal_query_parts = [_eligibility.eligible_for_federation_withdrawal("m")]
         args: list[Any] = []
         if since_updated is not None:
             args.append(since_updated)
@@ -4733,14 +4740,20 @@ class PostgresFederationRepository(FederationRepository):
                 f"(m.consolidated_at > ${since_updated_arg} "
                 f"OR (m.consolidated_at = ${since_updated_arg} AND m.id > ${since_id_arg}))"
             )
+            withdrawal_query_parts.append(
+                f"(m.updated > ${since_updated_arg} "
+                f"OR (m.updated = ${since_updated_arg} AND m.id > ${since_id_arg}))"
+            )
         if namespaces:
             args.append(list(namespaces))
             memory_query_parts.append(f"m.namespace = ANY(${len(args)})")
             tombstone_query_parts.append(f"m.namespace = ANY(${len(args)})")
+            withdrawal_query_parts.append(f"m.namespace = ANY(${len(args)})")
         if categories:
             args.append(list(categories))
             memory_query_parts.append(f"m.category = ANY(${len(args)})")
             tombstone_query_parts.append(f"m.category = ANY(${len(args)})")
+            withdrawal_query_parts.append(f"m.category = ANY(${len(args)})")
         args.append(limit)
 
         if prefer_compressed:
@@ -4787,6 +4800,7 @@ class PostgresFederationRepository(FederationRepository):
 
         memory_where_clause = " AND ".join(memory_query_parts)
         tombstone_where_clause = " AND ".join(tombstone_query_parts)
+        withdrawal_where_clause = " AND ".join(withdrawal_query_parts)
         return list(
             await _postgres_tx(tx).conn.fetch(
                 f"""
@@ -4836,6 +4850,38 @@ class PostgresFederationRepository(FederationRepository):
                        NULL::text AS _trailer
                 FROM memories m
                 WHERE {tombstone_where_clause}
+
+                UNION ALL
+
+                -- F07: explicit withdrawal/tombstone for rows that left
+                -- the live feed (deleted/archived/permission_narrowed/
+                -- moved-to-vault). Receivers must drop their local copy
+                -- on receipt; superseded by a later upsert for the same id.
+                SELECT 'withdrawal'::text AS type,
+                       m.id,
+                       NULL::text AS content,
+                       NULL::text AS category,
+                       NULL::text AS subcategory,
+                       NULL::jsonb AS metadata,
+                       NULL::int AS quality_rating,
+                       NULL::text AS verbatim_content,
+                       NULL::text AS owner_id,
+                       m.namespace,
+                       NULL::smallint AS permission_mode,
+                       NULL::text AS source_model,
+                       NULL::text AS source_provider,
+                       NULL::text AS source_session,
+                       NULL::text AS source_agent,
+                       m.created,
+                       m.updated AS updated,
+                       m.archived_at,
+                       NULL::text AS consolidated_into,
+                       NULL::timestamptz AS consolidated_at,
+                       NULL::text AS compressed_content,
+                       {embedding_select_tombstone}
+                       NULL::text AS _trailer
+                FROM memories m
+                WHERE {withdrawal_where_clause}
             ) feed
             ORDER BY updated ASC, id ASC
             LIMIT ${len(args)}

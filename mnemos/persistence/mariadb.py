@@ -1080,25 +1080,39 @@ class MariadbFederationRepository(MysqlFederationRepository):
             _eligibility.eligible_for_federation_tombstone("m"),
             "m.consolidated_at IS NOT NULL",
         ]
+        # F07: explicit withdrawal branch — rows that USED TO BE federated
+        # but have left the live feed (soft-delete / archive / permission
+        # narrowed offsite / moved into the secret vault namespace). The
+        # NATS path already handles deletion correctly; this is the HTTP
+        # counterpart so a polling replica gets an actionable tombstone
+        # instead of silently losing the row on the next poll.
+        withdrawal_where = [_eligibility.eligible_for_federation_withdrawal("m")]
         memory_params: list[Any] = []
         tombstone_params: list[Any] = []
+        withdrawal_params: list[Any] = []
         if since_updated is not None:
             memory_where.append("(m.updated > %s OR (m.updated = %s AND m.id > %s))")
             memory_params.extend([since_updated, since_updated, since_id])
             tombstone_where.append("(m.consolidated_at > %s OR (m.consolidated_at = %s AND m.id > %s))")
             tombstone_params.extend([since_updated, since_updated, since_id])
+            withdrawal_where.append("(m.updated > %s OR (m.updated = %s AND m.id > %s))")
+            withdrawal_params.extend([since_updated, since_updated, since_id])
         if namespaces:
             placeholders = ", ".join(["%s"] * len(namespaces))
             memory_where.append(f"m.namespace IN ({placeholders})")
             tombstone_where.append(f"m.namespace IN ({placeholders})")
+            withdrawal_where.append(f"m.namespace IN ({placeholders})")
             memory_params.extend(namespaces)
             tombstone_params.extend(namespaces)
+            withdrawal_params.extend(namespaces)
         if categories:
             placeholders = ", ".join(["%s"] * len(categories))
             memory_where.append(f"m.category IN ({placeholders})")
             tombstone_where.append(f"m.category IN ({placeholders})")
+            withdrawal_where.append(f"m.category IN ({placeholders})")
             memory_params.extend(categories)
             tombstone_params.extend(categories)
+            withdrawal_params.extend(categories)
 
         if prefer_compressed:
             use_variant = (
@@ -1199,11 +1213,44 @@ class MariadbFederationRepository(MysqlFederationRepository):
                            NULL AS _trailer
                     FROM memories m
                     WHERE {" AND ".join(tombstone_where)}
+
+                    UNION ALL
+
+                    -- F07: explicit withdrawal/tombstone for rows that
+                    -- left the live feed (deleted/archived/permission
+                    -- narrowed/moved-to-vault). Receivers drop their
+                    -- local copy on receipt; superseded by a later
+                    -- upsert for the same id.
+                    SELECT 'withdrawal' AS type,
+                           m.id,
+                           NULL AS content,
+                           NULL AS category,
+                           NULL AS subcategory,
+                           NULL AS metadata,
+                           NULL AS quality_rating,
+                           NULL AS verbatim_content,
+                           NULL AS owner_id,
+                           m.namespace,
+                           NULL AS permission_mode,
+                           NULL AS source_model,
+                           NULL AS source_provider,
+                           NULL AS source_session,
+                           NULL AS source_agent,
+                           m.created,
+                           m.updated AS updated,
+                           m.archived_at,
+                           NULL AS consolidated_into,
+                           NULL AS consolidated_at,
+                           NULL AS compressed_content,
+                           {embed_select_tombstone}
+                           NULL AS _trailer
+                    FROM memories m
+                    WHERE {" AND ".join(withdrawal_where)}
                 ) feed
                 ORDER BY updated ASC, id ASC
                 LIMIT %s
                 """,
-                [*select_params, *memory_params, *tombstone_params, limit],
+                [*select_params, *memory_params, *tombstone_params, *withdrawal_params, limit],
             )
             return await _fetch_all_dicts(cursor)
 

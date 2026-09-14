@@ -5095,28 +5095,43 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             _eligibility.eligible_for_federation_tombstone("m"),
             "m.consolidated_at IS NOT NULL",
         ]
+        # F07: explicit withdrawal branch — rows that USED TO BE federated
+        # but have left the live feed (soft-delete / archive / permission
+        # narrowed offsite / moved into the secret vault namespace). The
+        # NATS path already handles deletion correctly; this is the HTTP
+        # counterpart so a polling replica gets an actionable tombstone
+        # instead of silently losing the row on the next poll.
+        withdrawal_query_parts = [_eligibility.eligible_for_federation_withdrawal("m")]
         memory_params: list[Any] = []
         tombstone_params: list[Any] = []
+        withdrawal_params: list[Any] = []
         if since_updated is not None:
             memory_query_parts.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
             memory_params.extend([since_updated, since_updated, since_id])
             tombstone_query_parts.append("(m.consolidated_at > ? OR (m.consolidated_at = ? AND m.id > ?))")
             tombstone_params.extend([since_updated, since_updated, since_id])
+            withdrawal_query_parts.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
+            withdrawal_params.extend([since_updated, since_updated, since_id])
         if namespaces:
             placeholders = _placeholders(namespaces)
             memory_query_parts.append(f"m.namespace IN ({placeholders})")
             tombstone_query_parts.append(f"m.namespace IN ({placeholders})")
+            withdrawal_query_parts.append(f"m.namespace IN ({placeholders})")
             memory_params.extend(namespaces)
             tombstone_params.extend(namespaces)
+            withdrawal_params.extend(namespaces)
         if categories:
             placeholders = _placeholders(categories)
             memory_query_parts.append(f"m.category IN ({placeholders})")
             tombstone_query_parts.append(f"m.category IN ({placeholders})")
+            withdrawal_query_parts.append(f"m.category IN ({placeholders})")
             memory_params.extend(categories)
             tombstone_params.extend(categories)
+            withdrawal_params.extend(categories)
 
         memory_where_clause = " AND ".join(memory_query_parts)
         tombstone_where_clause = " AND ".join(tombstone_query_parts)
+        withdrawal_where_clause = " AND ".join(withdrawal_query_parts)
         # v6.1 F-1.2: optional embedding + embedding_model literal columns.
         # See docs/v6.1-federation-embeddings-copy.md. SQLite reads
         # embeddings from memory_embeddings join table (not memories.embedding
@@ -5134,6 +5149,8 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             mem_embed = f", me.embedding AS embedding, '{_model_escaped}' AS embedding_model"
             mem_embed_join = "LEFT JOIN memory_embeddings me ON me.memory_id = m.id"
             tomb_embed = ", NULL AS embedding, NULL AS embedding_model"
+            # Withdrawal rows don't carry embedding bytes; only the tombstone
+            # payload travels. Same NULL shape as consolidation.
         else:
             mem_embed = ""
             mem_embed_join = ""
@@ -5195,11 +5212,42 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                        {tomb_embed}
                 FROM memories m
                 WHERE {tombstone_where_clause}
+
+                UNION ALL
+
+                -- F07: explicit withdrawal/tombstone for rows that left
+                -- the live feed (deleted/archived/permission_narrowed/
+                -- moved-to-vault). Receivers must drop their local copy
+                -- on receipt; superseded by a later upsert for the same id.
+                SELECT 'withdrawal' AS type,
+                       m.id,
+                       NULL AS content,
+                       NULL AS category,
+                       NULL AS subcategory,
+                       NULL AS metadata,
+                       NULL AS quality_rating,
+                       NULL AS verbatim_content,
+                       NULL AS owner_id,
+                       m.namespace,
+                       NULL AS permission_mode,
+                       NULL AS source_model,
+                       NULL AS source_provider,
+                       NULL AS source_session,
+                       NULL AS source_agent,
+                       m.created,
+                       m.updated AS updated,
+                       m.archived_at,
+                       NULL AS consolidated_into,
+                       NULL AS consolidated_at,
+                       NULL AS compressed_content
+                       {tomb_embed}
+                FROM memories m
+                WHERE {withdrawal_where_clause}
             ) feed
             ORDER BY updated ASC, id ASC
             LIMIT ?
             """,
-            [*memory_params, *tombstone_params, limit],
+            [*memory_params, *tombstone_params, *withdrawal_params, limit],
         )
 
     async def get_feed_memory(

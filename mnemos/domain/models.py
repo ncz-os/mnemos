@@ -168,6 +168,41 @@ class FederationConsolidationEvent(BaseModel):
     consolidated_at: str
 
 
+class FederationWithdrawalEvent(BaseModel):
+    """Emitted when a previously-exported memory becomes ineligible for federation.
+
+    F07: deletion/archival/permission-narrowing (private export disabled, or
+    the record itself made private) previously disappeared from the HTTP feed
+    WITHOUT a withdrawal signal, so a polling replica kept the now-invalid
+    copy forever. NATS handled deletion correctly already; this is the HTTP
+    counterpart that brings the two transports to the same change semantics.
+
+    Wire-level shape (mirrors ``FederationConsolidationEvent``):
+        type:     literal "withdrawal" so receivers can branch on it
+        id:       the REMOTE memory id (same shape as MemoryItem.id)
+        namespace: scope filter, copied from the source row so receivers can
+                  pre-filter (e.g. only apply withdrawals for namespaces they
+                  actually replicated). May be None.
+        withdrawn_at: ISO-8601 timestamp of the source mutation that
+                  triggered the withdrawal (typically ``memories.updated``).
+        reason:    coarse category string for diagnostics / operator logs
+                  (one of "deleted", "archived", "permission_narrowed",
+                  "ineligible"). Carries no semantics the receiver must act on.
+
+    Receivers MUST drop their local federated copy of ``id`` on receipt
+    (idempotent w.r.t. missing rows). A subsequent ``MemoryItem`` for the
+    same ``id`` supersedes the withdrawal (records can be un-deleted /
+    re-shared); only the LAST event for a given ``id`` in the ordering
+    defined by ``updated`` (this field) is authoritative.
+    """
+
+    type: Literal["withdrawal"] = "withdrawal"
+    id: str
+    namespace: Optional[str] = None
+    withdrawn_at: str
+    reason: str = "ineligible"
+
+
 def _isoformat_value(value: Any) -> str | None:
     if value is None:
         return None
@@ -1350,7 +1385,7 @@ class FederationStatusResponse(BaseModel):
 class FederationFeedResponse(BaseModel):
     """Returned by /v1/federation/feed to remote peers pulling from us."""
 
-    memories: List[MemoryItem | FederationConsolidationEvent]
+    memories: List[MemoryItem | FederationConsolidationEvent | FederationWithdrawalEvent]
     next_cursor: Optional[str] = None
     has_more: bool = False
 
