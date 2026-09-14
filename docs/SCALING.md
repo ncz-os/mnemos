@@ -9,6 +9,14 @@ state is backed by Redis. Without Redis, each worker keeps its own in-process
 rate-limit, circuit-breaker, and concurrency state; MNEMOS logs a startup
 warning but does not block boot.
 
+**Redis is not the whole multi-worker story.** Webhook delivery triggers and
+federation event propagation run over NATS/JetStream regardless of Redis, so a
+worker that only reads NATS streams on its own process still needs the broker
+reachable — this is not something Redis substitutes for or covers. See
+[`docs/NATS_OPERATIONS.md`](NATS_OPERATIONS.md) for the stream layout
+(`MNEMOS_WEBHOOK`, `MNEMOS_WEBHOOKS_OUTBOX`, `MNEMOS_FEDERATION`) and account
+scoping before scaling out a deployment that uses either feature.
+
 ## Single-worker default
 
 Use the default when one API process can handle the workload:

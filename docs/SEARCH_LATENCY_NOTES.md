@@ -1,5 +1,22 @@
 # Search Latency Notes
 
+> **STALE ARCHITECTURE WARNING.** This document describes `_get_embedding` as
+> an HTTP call to a remote `INFERENCE_EMBED_HOST` server. That is no longer
+> true: per an operator-locked architectural decision (2026-05-21,
+> `mem_1779334716543_f8ebd4`), embedding generation is now ALWAYS IN-PROCESS
+> via `llama-cpp-python` — see `mnemos/runtime/embedder.py` and
+> `mnemos/core/lifecycle.py::_get_embedding`. There is no remote embedding
+> HTTP call, no `httpx.AsyncClient`, no `/v1/embeddings` vs `/api/embeddings`
+> fallback, and `INFERENCE_EMBED_HOST`/`INFERENCE_EMBED_MODEL` do nothing on
+> the search path today. The "embed" phase estimate, the "Likely Hot Path"
+> primary hypothesis, and the `INFERENCE_EMBED_HOST` tuning tip below are all
+> from the PRE-2026-05-21 architecture and do not reflect the current code.
+> The `ann_scan` / index / rerank sections are unaffected by this change and
+> remain accurate. Re-benchmark before trusting the embed-phase numbers for
+> anything operational; F15's embedder concurrency fix (2026-09-14) is also
+> relevant to in-process embedding latency under load and postdates the
+> numbers below.
+
 Context: live pg-host production `POST /v1/memories/search` latency measured on
 2026-05-04 was p50=1527ms, p95=1913ms, p99=1931ms, mean=1579ms,
 stdev=144ms over a corpus of about 7,500 memories. Image v5.0.7 had
