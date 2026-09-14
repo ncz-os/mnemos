@@ -140,6 +140,7 @@ class _MysqlCursor:
 
     def __init__(self, rows: list[tuple], columns: tuple[str, ...]) -> None:
         self._rows = rows
+        self._columns = columns
         self.description = tuple((column,) for column in columns)
 
     async def __aenter__(self) -> "_MysqlCursor":
@@ -148,10 +149,17 @@ class _MysqlCursor:
     async def __aexit__(self, *_exc_info) -> None:
         return None
 
-    async def execute(self, _sql: str, _params) -> None:
-        return None
+    async def execute(self, sql: str, _params) -> None:
+        self._executed_sql = sql
 
     async def fetchall(self) -> list[tuple]:
+        sql = getattr(self, "_executed_sql", "") or ""
+        # Mirror the COUNT(*) probe the production code now runs before
+        # the heavy Python-cosine fallback; the probe exists so a large
+        # eligible corpus emits a loud warning + gets ranked off the
+        # event loop. Return the row count instead of the row payload.
+        if "COUNT(*)" in sql:
+            return [(len(self._rows),)]
         return self._rows
 
 
