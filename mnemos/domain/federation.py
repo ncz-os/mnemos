@@ -727,7 +727,7 @@ async def _store_memories(
     local_ids = [
         f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}"
         for mem in memories
-        if mem.get("type") != "consolidation"
+        if mem.get("type") not in ("consolidation", "withdrawal")
         for remote_id in [mem.get("id")]
         if isinstance(remote_id, str) and remote_id
     ]
@@ -762,6 +762,15 @@ async def _store_memories(
             continue
         if mem.get("type") == "consolidation":
             upd_n += await _apply_consolidation_tombstone(repo, tx, peer_name, mem)
+            continue
+        if mem.get("type") == "withdrawal":
+            # F07: explicit withdrawal/tombstone from the HTTP feed. NATS
+            # already handles the equivalent transition by issuing a
+            # hard-delete (delete_federated_memory) on the
+            # `memory.deleted` subject. Mirror that here so a polling
+            # replica converges regardless of transport. Idempotent —
+            # missing rows count as 0 deleted, not an error.
+            await _apply_withdrawal(repo, tx, peer_name, mem)
             continue
         # Cap inbound strings. A hostile peer otherwise fills the disk.
         content = _cap(mem.get("content", ""), FEDERATION_MAX_CONTENT)
@@ -1062,6 +1071,30 @@ async def _apply_consolidation_tombstone(
         peer_name=peer_name,
     )
     return 1 if updated else 0
+
+
+async def _apply_withdrawal(
+    repo: FederationRepository,
+    tx: Transaction,
+    peer_name: str,
+    event: Dict[str, Any],
+) -> int:
+    """F07: drop a federated row on receipt of an explicit HTTP-feed withdrawal.
+
+    Mirrors the NATS-path hard-delete
+    (``nats_consumer.delete_federated_memory``) so a polling replica
+    converges regardless of transport. Idempotent: missing rows are
+    not an error — the receiver may have never had the row, may have
+    already deleted it, or may have lost it in a prior sync error.
+
+    Returns the number of rows deleted (0 if the local row was already
+    absent).
+    """
+    remote_id = event.get("id")
+    if not isinstance(remote_id, str) or not remote_id:
+        return 0
+    deleted = await repo.delete_federated_memory(tx, peer_name, remote_id)
+    return int(deleted or 0)
 
 
 # ── Background worker ────────────────────────────────────────────────────────

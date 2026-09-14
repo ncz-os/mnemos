@@ -4187,18 +4187,42 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 # even when a caller supplies an explicit namespace filter.
                 "(m.namespace IS NULL OR m.namespace <> ?)",
             ]
+            # F07: explicit withdrawal branch — mirror of the live query.
+            # Db2's existing feed_query did not surface a consolidation
+            # tombstone branch, so this is a clean add-on.
+            withdrawal_where = [
+                "m.federation_source IS NULL",
+                "m.consolidated_into IS NULL",
+                "(m.deleted_at IS NOT NULL OR m.archived_at IS NOT NULL OR m.namespace = ?",
+                *(
+                    []
+                    if federation_feed_include_private()
+                    else ["OR MOD(m.permission_mode, 10) < 4"]
+                ),
+                ")",
+                "(m.namespace IS NULL OR m.namespace <> ? OR m.deleted_at IS NOT NULL OR m.archived_at IS NOT NULL)",
+            ]
             params_list: list[Any] = [VAULT_NAMESPACE]
+            withdrawal_params: list[Any] = [VAULT_NAMESPACE, VAULT_NAMESPACE]
             if since_updated is not None and since_id is not None:
                 where.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
                 params_list.extend([since_updated, since_updated, since_id])
+                withdrawal_where.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
+                withdrawal_params.extend([since_updated, since_updated, since_id])
             if namespaces:
                 ns_ph = ",".join("?" for _ in namespaces)
                 where.append(f"m.namespace IN ({ns_ph})")
                 params_list.extend(namespaces)
+                ns_ph_w = ",".join("?" for _ in namespaces)
+                withdrawal_where.append(f"m.namespace IN ({ns_ph_w})")
+                withdrawal_params.extend(namespaces)
             if categories:
                 cat_ph = ",".join("?" for _ in categories)
                 where.append(f"m.category IN ({cat_ph})")
                 params_list.extend(categories)
+                cat_ph_w = ",".join("?" for _ in categories)
+                withdrawal_where.append(f"m.category IN ({cat_ph_w})")
+                withdrawal_params.extend(categories)
             # v6.1 F-1.2: optional embedding + embedding_model literal columns.
             # See docs/v6.1-federation-embeddings-copy.md.
             embed_cols = ""
@@ -4213,16 +4237,26 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 _model_escaped = _model.replace("'", "''")
                 embed_cols = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
             params_list.append(limit)
+            withdrawal_params.append(limit)
             sql = (
+                "SELECT * FROM ("
                 "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
                 "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
                 "m.permission_mode, m.source_model, m.source_provider, "
                 "m.source_session, m.source_agent, m.created, m.updated, "
                 "m.archived_at" + embed_cols + " FROM memories m WHERE " + " AND ".join(where) + " "
-                "ORDER BY m.updated ASC, m.id ASC "
+                "UNION ALL "
+                # F07: explicit withdrawal branch.
+                "SELECT m.id, NULL AS content, NULL AS category, NULL AS subcategory, NULL AS metadata, "
+                "NULL AS quality_rating, NULL AS verbatim_content, NULL AS owner_id, m.namespace, "
+                "NULL AS permission_mode, NULL AS source_model, NULL AS source_provider, "
+                "NULL AS source_session, NULL AS source_agent, m.created, m.updated AS updated, "
+                "m.archived_at, NULL AS embedding, NULL AS embedding_model "
+                "FROM memories m WHERE " + " AND ".join(withdrawal_where) + ") feed "
+                "ORDER BY updated ASC, id ASC "
                 "FETCH FIRST ? ROWS ONLY"
             )
-            await _call(cursor.execute, sql, tuple(params_list))
+            await _call(cursor.execute, sql, tuple([*params_list, *withdrawal_params]))
             return await _fetch_all_dicts(cursor)
         finally:
             await _call(cursor.close)
