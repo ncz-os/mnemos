@@ -30,6 +30,7 @@ from mnemos.domain.models import (
     FederationSyncLogEntry,
     FederationSyncLogResponse,
     FederationSyncTriggerResponse,
+    FederationWithdrawalEvent,
     MemoryItem,
 )
 
@@ -285,7 +286,7 @@ def _feed_item_from_row(
     *,
     include_compressed: bool = False,
     include_embedding: bool = False,
-) -> MemoryItem | FederationConsolidationEvent:
+) -> MemoryItem | FederationConsolidationEvent | FederationWithdrawalEvent:
     try:
         item_type = row["type"]
     except (KeyError, IndexError):
@@ -296,6 +297,21 @@ def _feed_item_from_row(
             id=row["id"],
             consolidated_into=row["consolidated_into"],
             consolidated_at=_iso_value(consolidated_at) or "",
+        )
+    if item_type == "withdrawal":
+        # F07: explicit withdrawal/tombstone signal for a row that has
+        # left the live federation feed (deleted, archived, permission
+        # narrowed offsite, or moved into the secret vault). The NATS
+        # path already handles the same transition via a hard delete;
+        # this brings the HTTP wire shape into parity so a polling
+        # replica converges regardless of transport.
+        withdrawn_at_raw = row["updated"]
+        namespace_val = row.get("namespace") if hasattr(row, "get") else None
+        return FederationWithdrawalEvent(
+            id=row["id"],
+            namespace=namespace_val if namespace_val else None,
+            withdrawn_at=_iso_value(withdrawn_at_raw) or "",
+            reason="ineligible",
         )
     return _memory_item_from_row(
         row,
@@ -653,14 +669,16 @@ async def federation_feed(
                 from mnemos.audit.crypto import AuditEntry as _AE
 
                 if _ace() and getattr(backend, "audit_chain", None) is not None:
-                    # Build memory_id list (skip consolidation rows + missing ids).
+                    # Build memory_id list (skip consolidation + withdrawal
+                    # rows; only live MemoryItem payloads carry audit-chain
+                    # provenance to piggyback).
                     pairs: list[tuple[str, bytes]] = []
                     for r in rows:
                         try:
                             item_type = r.get("type") if hasattr(r, "get") else None
                         except (AttributeError, TypeError, KeyError):
                             item_type = None
-                        if item_type == "consolidation":
+                        if item_type in ("consolidation", "withdrawal"):
                             continue
                         mid_str = r["id"] if r else None
                         if not mid_str:

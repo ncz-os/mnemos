@@ -82,11 +82,60 @@ def eligible_for_federation_tombstone(alias: str = "m", *, include_private: bool
     )
 
 
+def eligible_for_federation_withdrawal(alias: str = "m", *, include_private: bool | None = None) -> str:
+    """F07: select rows that have LEFT the live federation feed so the HTTP
+    feed can emit an explicit, ordered withdrawal/tombstone event for them.
+
+    The mirror image of ``eligible_for_federation`` minus the consolidation
+    branch (which has its own ``eligible_for_federation_tombstone`` form
+    because it carries a redirect target — a "go look at canonical id X"
+    tombstone, not a "drop id X" withdrawal). The vault exclusion and
+    ``federation_source IS NULL`` loop-guard ALWAYS apply — a row that was
+    never exported never produces a withdrawal, and a row that has been
+    moved INTO the secret-vault namespace by hand (the live write path
+    already refuses to publish to vault) must produce a withdrawal even
+    on the trusted-LAN feed so the credential boundary stays a
+    credential boundary on the receiver side.
+
+    Trigger conditions (any one is sufficient — union, not intersection):
+      - ``deleted_at IS NOT NULL`` (soft-delete)
+      - ``archived_at IS NOT NULL`` (archive)
+      - ``namespace`` has become the secret vault
+      - ``permission_mode`` no longer passes the world-read gate AND the
+        trusted-feed posture is OFF (i.e. ``MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0``
+        only; in the trusted-LAN posture the world-read bit never gates
+        export and so "made private" is meaningless — keep sharing).
+
+    The caller is responsible for naming the timestamp column used for
+    cursor ordering (typically ``m.updated``).
+    """
+    prefix = f"{alias}." if alias else ""
+    vault_literal = VAULT_NAMESPACE.replace("'", "''")
+    trust_posture = _federation_include_private(include_private)
+    # Offsite / multi-tenant: rows that lost their world-read bit must
+    # also produce a withdrawal so a polling replica drops them.
+    if trust_posture:
+        world_read_branch = ""
+    else:
+        world_read_branch = f"OR ({prefix}permission_mode % 10) < 4 "
+    return (
+        f"{prefix}federation_source IS NULL "
+        f"AND {prefix}consolidated_into IS NULL "
+        f"AND ("
+        f"{prefix}deleted_at IS NOT NULL "
+        f"OR {prefix}archived_at IS NOT NULL "
+        f"OR {prefix}namespace = '{vault_literal}' "
+        f"{world_read_branch}"
+        f")"
+    )
+
+
 __all__ = [
     "MEMORY_ELIGIBILITY_PREDICATE",
     "eligible_for_compression",
     "eligible_for_federation",
     "eligible_for_federation_tombstone",
+    "eligible_for_federation_withdrawal",
     "eligible_for_morpheus",
     "eligible_memory_predicate",
     "qualify_memory_predicate",
