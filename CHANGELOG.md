@@ -57,6 +57,28 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.9] — 2026-09-14
+
+- **Fixed**: `6.3.8`'s fix for the GRAEAE consult quota 503 was itself
+  incomplete — `_lock_quota_row_for_update` no longer awaited
+  `conn.cursor()`, but its `finally` block still unconditionally
+  `await`ed `cursor.close()`. Deployed and hit immediately against
+  real production Oracle: `AsyncCursor.close()` is a plain synchronous
+  call there (closing a cursor needs no DB round trip), unlike
+  `execute()`/`fetchone()` on that same cursor, which genuinely are
+  coroutines. `await cursor.close()` raised `TypeError: object
+  NoneType can't be used in 'await' expression`, reproducing the exact
+  "Shared consultation quota storage is unavailable." 503 with the
+  first fix already live.
+- **Process note**: fixed upstream in `mnemos-graeae` (`342f2c1`) with
+  a `_maybe_await()` helper mirroring the defensive normalization
+  `oracle.py`'s own `_call()` already uses for this same
+  inconsistent driver surface, instead of hardcoding another
+  assumption about which cursor methods are coroutines. New regression
+  tests use a fake connection shaped like the real driver (synchronous
+  `close()`) — the earlier fakes happened to make `close()` a coroutine
+  too and didn't catch this. Repinned here via `.github/addons.lock.json`.
+
 ## [6.3.8] — 2026-09-13
 
 - **Fixed**: every GRAEAE consultation (`POST /v1/consultations`,
