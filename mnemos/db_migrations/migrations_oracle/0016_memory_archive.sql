@@ -1,4 +1,4 @@
--- 0016_memory_archive.sql — Oracle 23ai port for MNEMOS parity.
+-- 0016_memory_archive.sql — Oracle 26ai port for MNEMOS parity.
 
 CREATE TABLE memory_archive (
     id VARCHAR2(36) PRIMARY KEY,

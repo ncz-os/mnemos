@@ -10,7 +10,7 @@
 -- Idempotent. CREATE INDEX CONCURRENTLY would be the live-database
 -- choice for long-running tables, but the loader runs migrations inside
 -- a transaction so we use the plain form here. Operators who applied
--- this index live (PYTHIA, CERBERUS, PROTEUS on 2026-05-04) can safely
+-- this index live (the production host, a GPU host, an edge host on 2026-05-04) can safely
 -- re-run because of `IF NOT EXISTS`.
 
 CREATE INDEX IF NOT EXISTS idx_memories_content_fts

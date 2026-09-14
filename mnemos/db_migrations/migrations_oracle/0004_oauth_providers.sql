@@ -1,4 +1,4 @@
--- 0004_oauth_providers.sql — Oracle 23ai port for MNEMOS parity.
+-- 0004_oauth_providers.sql — Oracle 26ai port for MNEMOS parity.
 -- Source: PG db/migrations (oauth_providers table)
 
 CREATE TABLE oauth_providers (

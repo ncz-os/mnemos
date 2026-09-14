@@ -43,10 +43,10 @@ router = APIRouter(prefix="/v1/federation", tags=["federation"])
 # Class names + error strings that indicate the DB backend lost its
 # connection (vs a legitimate query failure / programming error).
 # Matched by name + chained-cause walk so we don't hard-import every
-# DB driver. Triggered by the 2026-05-23 CERBERUS investigation
+# DB driver. Triggered by the 2026-05-23 a GPU host investigation
 # (hive job 019e563f): mnemos-api-cerb's Oracle standby was MOUNTED
 # (not OPEN READ ONLY), oracledb raised DPY-6005 inside feed_query,
-# raw 500 propagated to PYTHIA federation pull worker.
+# raw 500 propagated to the production host federation pull worker.
 _DB_DISCONNECT_EXC_NAMES = frozenset(
     {
         "OperationalError",  # oracledb + sqlalchemy + psycopg
@@ -199,7 +199,7 @@ def _memory_item_from_row(
 
             # Backend-specific embedding shapes:
             #   - postgres pgvector: list[float] / str representation
-            #   - oracle 23ai VECTOR: array.array / list of floats
+            #   - oracle 26ai VECTOR: array.array / list of floats
             #   - sqlite mnemos: JSON text "[0.1, 0.2, ...]"
             #   - any bytes-like blob already in float32 LE
             if isinstance(raw, (bytes, bytearray, memoryview)):

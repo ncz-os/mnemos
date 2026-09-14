@@ -354,7 +354,7 @@ BEGIN
     add_col('recall_count',               'recall_count NUMBER DEFAULT 0 NOT NULL');
     add_col('last_recalled_at',           'last_recalled_at TIMESTAMP WITH TIME ZONE');
     add_col('content_hash',               'content_hash VARCHAR2(64)');
-    -- Oracle 23ai VECTOR for native cosine similarity (semantic_search).
+    -- Oracle 26ai VECTOR for native cosine similarity (semantic_search).
     -- Dimension is substituted by the runtime schema provisioner from
     -- MNEMOS_EMBEDDING_DIM. FLOAT32 matches the python-oracledb wire format.
     add_col('embedding',                  'embedding VECTOR({{embedding_dim}}, FLOAT32)');

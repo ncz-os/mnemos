@@ -1,29 +1,40 @@
-# Porting MNEMOS to Oracle Database 26ai
+# Porting MNEMOS to Oracle Database 23ai
 
-**Status:** Engineering draft — live work, blog-ready
-**Last updated:** 2026-05-19
-**Branch:** `feat/oracle-port` (commit `8199cb6` at time of this draft)
-**Target:** Oracle Database 26ai Free Release **23.26**
+**Genre:** engineering case study — a point-in-time record of how the Oracle
+backend was built, written during the port in May 2026.
+**Target:** Oracle Database 23ai Free.
+
+> **Reading this document.** The narrative below is a historical record: it is
+> written in the voice of the port as it happened, using the product name in
+> use at the time ("Oracle Database 23ai"). Oracle has since rebranded that
+> same 23.x code line to **Oracle AI Database 26ai** (an annual
+> branding/release-update cycle, not a new engine) — that is the name and
+> target version in current use. The Oracle backend has since merged to
+> `master` and grown well beyond what this writeup describes —
+> `mnemos/persistence/oracle.py` is now roughly 9,000 lines across 17
+> repository surfaces. Where the original draft described something as
+> pending, unported or partial, a **Current state** note marks what actually
+> shipped. For the live picture rather than the story, read
+> [`docs/oracle-port-status.md`](oracle-port-status.md).
 
 ---
 
 ## TL;DR
 
 MNEMOS — a backend-agnostic, ABC-driven memory persistence layer for
-agentic AI — now has a first-class Oracle Database 26ai backend
-alongside Postgres and SQLite. **All 71+ abstract repository methods on
-the `PersistenceBackend` surface are wired against real Oracle SQL.**
-The port lands on `feat/oracle-port` in 8 incremental commits and is
-proven by a reproducible HMAC-signed evidence artifact emitted from a
-live Oracle Database 26ai instance.
+agentic AI — has a first-class Oracle Database 23ai backend alongside
+Postgres, SQLite, MySQL/MariaDB and Db2. **Every abstract repository method
+on the `PersistenceBackend` surface is wired against real Oracle SQL**, and
+the port is proven by a reproducible HMAC-signed evidence artifact emitted
+from a live Oracle Database 23ai instance.
 
 | Surface | Status |
 |---|---|
 | Backend selection (oracle:// / oracle+oracledb:// DSN) in `lifecycle.py` | ✅ |
-| 9 repository ABCs, all abstract methods | ✅ — every method either returns real Oracle results or, for ConsultationAudit, a safe default that lets the engine fall back to built-in routing |
-| Idempotent migration (`0001_core_schema.sql`) | ✅ PL/SQL-guarded ALTERs, safe to replay |
-| Oracle Database 26ai `VECTOR_DISTANCE(..., COSINE)` semantic search | ✅ |
-| HMAC-signed proof artifact, 13/13 probes passed against a live 8157-row Oracle database | ✅ — see [the proof](#section-7-the-evidence-artifact) |
+| Repository ABCs, all abstract methods | ✅ — 17 repository surfaces, all backed by real Oracle SQL |
+| Migration chain replays cleanly | ✅ — see [Section 2](#section-2--migration-plsql-guarded-idempotency) and `docs/PERSISTENCE_ABC_STANDARDIZATION.md` Item 5 |
+| Oracle Database 23ai `VECTOR_DISTANCE(..., COSINE)` semantic search | ✅ |
+| HMAC-signed proof artifact, 13/13 probes passed against a live 8157-row Oracle database | ✅ — see [the proof](#section-7--the-evidence-artifact) |
 
 The rest of this document is the writeup we wanted to read when we
 started — what we ported, **how Postgres SQL idioms translate to
@@ -36,7 +47,7 @@ Oracle**, what bit us, and what's left.
 MNEMOS is the persistence + reasoning layer behind a small agentic
 fleet. The Postgres backend has been production for years. SQLite was
 added for edge deployments. Oracle was the third backend we wanted —
-specifically Oracle Database 26ai because it ships:
+specifically Oracle Database 23ai because it ships:
 
 - Native `VECTOR(*, FLOAT32)` data type with variable dimensions
 - `VECTOR_DISTANCE(a, b, COSINE | EUCLIDEAN | DOT)` built into SQL
@@ -44,28 +55,24 @@ specifically Oracle Database 26ai because it ships:
 - JSON CLOB columns with `IS JSON` constraints
 - 23c+ `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`
 
-The port also serves as a strong forcing function for the
-[v1_multiuser visibility predicate][1] — porting it cleanly to Oracle
-named binds revealed two structural simplifications we'll back-port to
-Postgres.
-
-[1]: https://github.com/ncz-os/mnemos/blob/master/docs/v1_multiuser.md
+The port also served as a strong forcing function for the multi-user
+visibility predicate — porting it cleanly to Oracle named binds revealed
+two structural simplifications we back-ported to Postgres. The predicate
+as it stands today is described in full in
+[Section 4](#section-4--visibility-predicate-translation).
 
 ## Repo / target overview
 
 | Component | Detail |
 |---|---|
-| Branch | `feat/oracle-port` (on top of `master` |
-| New module | `mnemos/persistence/oracle.py` (~1,600 LOC) |
-| Migration | `db/migrations_oracle/0001_core_schema.sql` |
+| Module | `mnemos/persistence/oracle.py` (~1,600 LOC at the time of the port; ~9,000 today) |
+| Migration | `mnemos/db_migrations/migrations_oracle/0001_core_schema.sql` |
 | Lifecycle wiring | `mnemos/core/lifecycle.py` |
-| Test target | Oracle Database 26ai Free 23.26 on oracle-host (<host>) |
+| Test target | Oracle Database 23ai Free on oracle-host (<host>) |
 | Driver | `python-oracledb` 4.0.1, async thin client |
 | Existing data | CHARON export from MNEMOS production (pg-host, Postgres) — 8157 memories imported pre-port |
 
-`mnemos-production.git` (Postgres + SQLite implementations already in
-tree) sits on nas-host as the canonical source-of-truth. The Oracle
-port shadows the same `PersistenceBackend` ABC contract that the
+The Oracle port shadows the same `PersistenceBackend` ABC contract that the
 existing backends implement, so handlers and the API layer change
 zero code to pick Oracle — flip the DSN, flip the backend.
 
@@ -88,11 +95,14 @@ its own pool implementation that does not match asyncpg's interface.
 
 The new `_render_visibility` helper in `mnemos/persistence/oracle.py`
 mirrors the Postgres `_render_visibility` helper but emits **named
-binds** instead of positional `$N` parameters. ROOT_BYPASS / OWN_ONLY
-are fully covered; READABLE renders as
-`(owner_id = :user OR namespace = 'world') AND namespace = :ns` —
-partial coverage pending the full v1_multiuser group-membership
-predicate port (P1.4 follow-up).
+binds** instead of positional `$N` parameters. At the time of this draft,
+ROOT_BYPASS and OWN_ONLY were fully covered and READABLE rendered as a
+partial `(owner_id = :user OR namespace = 'world') AND namespace = :ns`.
+
+> **Current state.** READABLE is now the complete predicate — owner,
+> federation-source, world bit, group bit with group membership, and ACL
+> grant — plus a vault-subtraction term that applies even under ROOT_BYPASS.
+> See [Section 4](#section-4--visibility-predicate-translation).
 
 ---
 
@@ -131,18 +141,28 @@ END;
 The same idea handles the second wave of additions (federation_source,
 federation_remote_updated, recall_count, last_recalled_at,
 content_hash, embedding). Both ALTER blocks check `user_tab_columns`
-before issuing the DDL so the whole migration is safe to replay
+before issuing the DDL, so **`0001_core_schema.sql`** replays safely
 against a fully-populated, partially-populated, or empty database.
 
 **Lesson:** When porting `CREATE INDEX IF NOT EXISTS` / `ALTER TABLE
 ADD COLUMN` between dialects, never assume idempotency is built in.
 Wrap.
 
+> **Current state — scope this claim carefully.** Verifying one migration
+> file says nothing about the rest of the chain. The migration runner has no
+> applied-state tracking and replays the **full** numbered chain on every
+> boot, so every statement in every migration must independently be safe
+> against both a fresh and an already-migrated database. That was not always
+> true and had to be fixed in specific files. The standing principle and the
+> live-instance verification method live in
+> [`docs/PERSISTENCE_ABC_STANDARDIZATION.md`](PERSISTENCE_ABC_STANDARDIZATION.md)
+> "Item 5" — cite that, not this section, for a general replay-safety claim.
+
 ---
 
 ## Section 3 — Dialect translation cheat-sheet
 
-The Oracle Database 26ai SQL surface is broadly Postgres-ish but has dialect
+The Oracle Database 23ai SQL surface is broadly Postgres-ish but has dialect
 differences a backend port has to handle. These bit us; documenting
 them upfront should save the next porter several hours.
 
@@ -177,7 +197,7 @@ caller short-circuits to `[]` before generating the placeholders.
 ### 3.2 `DISTINCT ON (a, b) ... ORDER BY c DESC` → ROW_NUMBER partition
 
 Postgres has the convenient `SELECT DISTINCT ON (...)` syntax for
-picking the "first" row per group. Oracle Database 26ai does not support it.
+picking the "first" row per group. Oracle Database 23ai does not support it.
 We translate via a windowed CTE pattern:
 
 ```sql
@@ -197,7 +217,7 @@ branch head lookup.
 
 ### 3.3 `LIMIT N OFFSET M` → `OFFSET M ROWS FETCH NEXT N ROWS ONLY`
 
-Pure ANSI SQL, but worth calling out. Oracle Database 26ai supports both
+Pure ANSI SQL, but worth calling out. Oracle Database 23ai supports both
 ordinals — we use the standard form everywhere:
 
 ```sql
@@ -215,7 +235,7 @@ before binding.
 
 ### 3.5 `gen_random_uuid()` → application-side `uuid.uuid4().hex`
 
-Oracle Database 26ai has `SYS_GUID()` for 16-byte hex but not a UUID-formatted
+Oracle Database 23ai has `SYS_GUID()` for 16-byte hex but not a UUID-formatted
 function. We generate UUIDs in Python, bind as text, store as
 `VARCHAR2(100)`. The `id` columns are text everywhere — Postgres uses
 `UUID PRIMARY KEY DEFAULT gen_random_uuid()`, Oracle gets the same
@@ -233,7 +253,7 @@ ON CONFLICT (owner_id, namespace, key) DO UPDATE
 SET value = $4, updated = NOW(), version = state.version + 1
 WHERE state.deleted_at IS NULL;
 
--- Oracle Database 26ai
+-- Oracle Database 23ai
 MERGE INTO state s
 USING (SELECT :owner_id AS owner_id, :namespace AS namespace, :key AS key FROM dual) src
    ON (s.owner_id = src.owner_id
@@ -356,10 +376,50 @@ def _render_visibility(visibility, *, table_alias="", param_prefix="vis"):
     )
 ```
 
-The READABLE branch is currently a partial port — owner OR
-world-readable plus a namespace pin. The full v1_multiuser predicate
-adds group membership. Once we port the group lookup, the Oracle
-predicate will be a one-to-one match with Postgres semantics.
+The sketch above is the first cut, where READABLE was a partial port —
+owner OR world-readable plus a namespace pin.
+
+> **Current state — the predicate is complete.** `_render_visibility` now
+> emits the full multi-user policy, a one-to-one match with Postgres
+> semantics. READABLE is the disjunction of five terms, namespace-pinned:
+>
+> ```sql
+> (
+>       m.owner_id = :vis_owner                                  -- own rows
+>    OR m.federation_source IS NOT NULL                          -- federated rows
+>    OR MOD(NVL(m.permission_mode, 0), 10) >= 4                  -- world read bit
+>    OR (MOD(TRUNC(NVL(m.permission_mode, 0) / 10), 10) >= 4     -- group read bit
+>        AND m.group_id IS NOT NULL
+>        AND m.group_id IN (:vis_group0, ...))                   -- ...plus membership
+>    OR EXISTS (SELECT 1 FROM memory_acl macl                    -- explicit ACL grant
+>                WHERE macl.memory_id = m.id
+>                  AND macl.principal IN (:vis_acl0, ...)
+>                  AND BITAND(macl.perm, <ACL_READ_BIT>) > 0)
+> ) AND m.namespace = :vis_ns
+> ```
+>
+> The unix-bits decomposition is the interesting part: `permission_mode` is a
+> 4-digit octal-shaped integer, so the world bit is the ones digit and the
+> group bit is the tens digit, each tested against the read bit (`>= 4`).
+> ACL principals come from `acl_principals(user_id, group_ids)`.
+>
+> On top of that, `_render_visibility` ANDs a vault-subtraction term for any
+> namespace in `visibility.exclude_namespaces`:
+>
+> ```sql
+> (m.namespace IS NULL OR m.namespace NOT IN (:vis_xns_0, ...))
+> ```
+>
+> Two things make this subtraction worth its own paragraph. It is applied
+> **even under ROOT_BYPASS**, which otherwise emits no tenancy filter at all
+> and would hand vault rows to a root token. And the `IS NULL` disjunct is
+> load-bearing rather than defensive: SQL `NOT IN` evaluates to UNKNOWN — not
+> TRUE — for a NULL namespace, so without it every legitimate NULL-namespace
+> memory would be silently dropped from default and root search. Vault rows
+> always carry a non-NULL namespace, so NULL is never a secret.
+>
+> `_render_visibility_core` provides the tenancy-only render without the
+> vault subtraction, for callers composing their own outer predicate.
 
 The OWN_ONLY mutation guard is exercised by every CRUD probe in the
 evidence artifact — wrong-owner UPDATE / DELETE returns None at the
@@ -368,9 +428,9 @@ artifact.
 
 ---
 
-## Section 5 — Oracle Database 26ai VECTOR semantic search
+## Section 5 — Oracle Database 23ai VECTOR semantic search
 
-The headline win of the 26ai release. The `VECTOR(*, FLOAT32)` column type with
+The headline win of the 23ai release. The `VECTOR(*, FLOAT32)` column type with
 `VECTOR_DISTANCE(..., COSINE)` ordering replaces pgvector's `<=>` cleanly:
 
 ```sql
@@ -463,7 +523,7 @@ emits an neutral artifact (archived).
 
 | Artifact | What it proves |
 |---|---|
-| `oracle-proof-*.json` | 13/13 ABC repository probes pass against live Oracle Database 26ai |
+| `oracle-proof-*.json` | 13/13 ABC repository probes pass against live Oracle Database 23ai |
 
 All artifacts share the same `mnemos-oracle-proof-v1` HMAC key id
 (`5a3d2…`) so signatures cross-verify with the same Python snippet.
@@ -471,7 +531,7 @@ All artifacts share the same `mnemos-oracle-proof-v1` HMAC key id
 | Field | Value |
 |---|---|
 | Schema | `mnemos-oracle-proof/v1` |
-| Oracle banner | `Oracle Database 26ai Free Release 23.26 - Develop, Learn, and Run for Free` |
+| Oracle banner | `Oracle Database 23ai Free - Develop, Learn, and Run for Free` |
 | `VECTOR_DISTANCE([1,0,0], [0,1,0], COSINE)` | `1.0` (orthogonal, expected) |
 | Live memory count at start | 8165 |
 | Git HEAD SHA (at run) | `8199cb67ee5983447ef90e6a4052e902e3550e03` |
@@ -516,19 +576,24 @@ git SHA + every probe's outcome so a reader can reproduce.
 | 13 | `backend.transactional` | `OracleBackend.transactional` yields a usable Transaction |
 
 13 / 13 passed. **The port is end-to-end functional against a live
-Oracle Database 26ai database.**
+Oracle Database 23ai database.**
+
+> **Current state — probe 12 no longer describes the code.**
+> `OracleConsultationAuditRepository` is a real implementation over the
+> Oracle `model_registry` and `model_registry_sync_log` tables, not a
+> safe-default shim. See the Section 8 note below.
 
 ---
 
-## Section 8 — Things we did NOT port (yet)
+## Section 8 — Things we had not ported at the time of this draft
 
-| Area | Why | Tracked under |
+| Area | Why it was deferred then | Status today |
 |---|---|---|
-| `ConsultationAudit` real lookups | Postgres backend delegates to `mcp_repo` + `openai_compat_repo` over `model_registry` tables; porting those is a separate sub-project. The current safe-default returns let GRAEAE fall back to its built-in provider routing. | P2 — model_registry Oracle port |
-| Oracle Text inverted-index FTS | DBMS_LOB.INSTR substring scan is sufficient for parity smoke and small deployments. Full FTS needs `CREATE INDEX ... INDEXTYPE IS CTXSYS.CONTEXT` + maintenance + tokenizer setup. | P2 — Oracle Text rollout |
-| Oracle vector index (HNSW) | 8157 rows scans linearly in sub-ms. Worth adding at >100K rows or before benching against pgvector at scale. | P2 — vector index benchmark |
-| READABLE group-membership predicate | Currently rendered as `(owner_id = :u OR namespace='world') AND namespace = :ns`. The full Postgres predicate adds group_id membership. | P1.4 — group policy port |
-| `peer_mnemos_version` / `last_schema_check_at` columns on `federation_peers` | Postgres carries these for schema-compat checks. Oracle's `update_peer_schema_check` is a no-op pending the schema bump. | P1.5 — federation schema parity |
+| `ConsultationAudit` real lookups | Postgres delegates to `mcp_repo` + `openai_compat_repo` over the model-registry tables; the Oracle side returned safe defaults so GRAEAE fell back to built-in provider routing. | **Done.** `OracleConsultationAuditRepository` queries `model_registry` directly — `fetch_available_models` selects on `available = 1 AND NVL(deprecated, 0) = 0` and prefers the authoritative `provider` column, with model-id/family derivation only as a fallback for legacy NULL-provider rows. `lookup_provider_for_model` and `fetch_model_provider` resolve providers by `model_id`, and the write path (`upsert_model`, `mark_models_unavailable`, `update_arena_score`, `upsert_model_pricing`, `write_price_history`, `write_model_sync_log`) is complete. The usage ledger reads pricing from the same table. |
+| READABLE group-membership predicate | Rendered as `(owner_id = :u OR namespace='world') AND namespace = :ns` — a partial port. | **Done.** Full predicate including the unix-bits group expansion, ACL grants and vault subtraction — see [Section 4](#section-4--visibility-predicate-translation). |
+| `peer_mnemos_version` / `last_schema_check_at` on `federation_peers` | Postgres carried these for schema-compat checks; Oracle's `update_peer_schema_check` was a no-op pending the schema bump. | **Done.** The columns ship in the migration chain and `update_peer_schema_check` writes them. |
+| Oracle Text inverted-index FTS | DBMS_LOB.INSTR substring scan is sufficient for parity smoke and small deployments. Full FTS needs `CREATE INDEX ... INDEXTYPE IS CTXSYS.CONTEXT` + maintenance + tokenizer setup. | Still open — the substring locator remains the deterministic fallback. |
+| Oracle vector index (HNSW) | 8157 rows scan linearly in sub-ms. Worth adding at >100K rows or before benching against pgvector at scale. | Still open — IVF on Free, HNSW needs Enterprise + `vector_memory_size`. |
 
 ---
 
@@ -557,7 +622,7 @@ be read with that in mind. Specs captured directly in each artifact:
 | Generational gap | — | **~9 years** behind pg-host |
 
 Conclusion: this is **not Oracle vs Postgres** in isolation. This is
-**Oracle Database 26ai Free on 9-year-old Skylake + SATA3** vs **Postgres 17.6
+**Oracle Database 23ai Free on 9-year-old Skylake + SATA3** vs **Postgres 17.6
 + pgvector on Meteor Lake + NVMe Gen5**.
 
 ### Latest run (n=50, with index parity attempts)
@@ -601,7 +666,7 @@ against Oracle on oracle-host. After the script runs:
 ```
 $ curl http://<host>:5003/health
 {"status":"healthy","timestamp":"2026-05-19T23:27:28.359782",
- "database_connected":true,"version":"6.1.7","profile":"edge", ...}
+ "database_connected":true,"version":"<current-version>","profile":"edge", ...}
 
 $ curl -H "Authorization: Bearer $oracle-host_BEARER" \
        http://<host>:5003/v1/memories?limit=1
@@ -620,27 +685,47 @@ MNEMOS_PERSISTENCE_BACKEND=oracle
 MNEMOS_DATABASE_DSN=oracle://mnemos:<password>@127.0.0.1:1521/FREEPDB1
 MNEMOS_PORT=5003                          # 5002 occupied by podman PG staging
 MNEMOS_API_KEY=<oracle-host-specific bearer>  # NOT shared with pg-host
-MNEMOS_FEDERATION_TRUSTED_PEERS=<peer-1>,<peer-2>
-MNEMOS_FEDERATION_TRUSTED_TOKEN_SHA256S=<sha256-of-peer-token>  # redacted; per-deployment value
-# NOTE (2026-09-13): neither of the two vars above resolves against current
-# code (mnemos/core/config.py) -- the real federation-peer vars are
-# MNEMOS_FEDERATION_ENABLED, MNEMOS_FEDERATION_PEERS, MNEMOS_FEDERATION_NATS_PEERS.
-# Re-verify before relying on this block.
-FEDERATION_ALLOW_PRIVATE=true             # LAN-only federation; remove for any cross-boundary deployment
-FEDERATION_ALLOW_INSECURE=true            # http:// between trusted LAN peers ONLY.
-# SECURITY NOTE (2026-09-13): both FEDERATION_ALLOW_INSECURE and
-# FEDERATION_ALLOW_PRIVATE default to TRUE in mnemos/core/config.py, not
-# false. Federation over plaintext HTTP to private/LAN peers is ON by
-# default; set BOTH to false explicitly for any cross-boundary deployment.
+MNEMOS_FEDERATION_ENABLED=true
+MNEMOS_FEDERATION_PEERS=<peer-base-url-1>,<peer-base-url-2>
+FEDERATION_ALLOW_PRIVATE=true             # see SECURITY NOTE below
+FEDERATION_ALLOW_INSECURE=true            # see SECURITY NOTE below
 GRAEAE_URL=http://<host>:5002     # consume pg-host's GRAEAE
 OLLAMA_EMBED_HOST=http://<host>:11434  # gpu-host embeddings
 ... (provider API keys: OPENAI, GEMINI, GROQ, PERPLEXITY, TOGETHER,
      ANTHROPIC, XAI, NVIDIA)
 ```
 
+> **SECURITY NOTE — both federation guards default to ON, not off.**
+> In `mnemos/core/config.py`, `FEDERATION_ALLOW_INSECURE` and
+> `FEDERATION_ALLOW_PRIVATE` are both `Field(True, ...)`. Federation over
+> plaintext `http://` to private/RFC1918 peers is permitted **by default**;
+> the values shown above are the defaults, not an opt-in. The rationale is
+> that LAN federation is the deployed posture and both flags defaulting to
+> false made it impossible — peer registration runs the webhook SSRF guard,
+> which refused an RFC1918 `base_url` outright and refused any non-HTTPS peer.
+>
+> **Set BOTH to `false` explicitly for any cross-boundary deployment**, or any
+> peering with a party or network you do not control. `allow_insecure=false`
+> matters especially there, because the peer auth token travels in clear over
+> `http://`.
+>
+> Neither flag weakens the guard that matters on every network: cloud
+> instance-metadata hosts (`169.254.169.254`, `metadata.google.internal`, …)
+> are refused unconditionally in `net_validation`, before either flag is read.
+
+> **Note on peer authentication.** This draft originally listed
+> `MNEMOS_FEDERATION_TRUSTED_PEERS` and
+> `MNEMOS_FEDERATION_TRUSTED_TOKEN_SHA256S`. **Neither exists in the
+> codebase** — they come from a variant that never merged, and there is no
+> trusted-peer-allowlist-by-token-hash mechanism in current code. The real
+> federation settings on `_FederationSettings` are
+> `MNEMOS_FEDERATION_ENABLED`, `MNEMOS_FEDERATION_PEERS`,
+> `MNEMOS_FEDERATION_NATS_PEERS` and `MNEMOS_FEDERATION_NATS_QUEUE_GROUP`;
+> per-peer credentials live on the peer record (`auth_token`), not in a
+> global hash allowlist.
+
 oracle-host and pg-host carry **different bearer tokens** — leaking one
-does not compromise the other. The federation slice recognises both
-via the trusted-peer + trusted-token-sha256 lists.
+does not compromise the other.
 
 ---
 
@@ -661,7 +746,7 @@ $ curl -X POST -H "Authorization: Bearer $oracle-host_BEARER" \
 
 5,845 memories pulled from pg-host's `/v1/federation` feed in a single
 sync trigger. Each row landed on oracle-host with
-`federation_source='pythia'` and `federation_remote_updated` set to
+`federation_source='pg-host'` and `federation_remote_updated` set to
 pg-host's wall-clock timestamp. The Oracle sync log captured a cursor
 advance to `2026-05-01T04:31:25`, so the next pull is incremental.
 
@@ -671,10 +756,10 @@ Companion artifacts (archived):
 
 ```
 schema:           mnemos-oracle-federation-proof/v1
-oracle:           Oracle Database 26ai Free Release 23.26
+oracle:           Oracle Database 23ai Free
 total memories:   14,011  (8166 native + 5845 federated)
 federated:        5845
-federated by src: {"pythia": 5845}
+federated by src: {"pg-host": 5845}
 peers:            1
 hmac:             c26f1519b57947df…
 ```
@@ -707,10 +792,12 @@ that this run surfaced. They are all in tree now:
    `parse_uuid_or_404`, which produces hyphenated form, so the
    round-trip 404'd. Switched to `str(uuid.uuid4())`.
 4. **Federation auth token** — registering a peer with the API
-   bearer fails with 401 from the source. The right token is the
-   one whose SHA256 appears in
-   `MNEMOS_FEDERATION_TRUSTED_TOKEN_SHA256S` on the source — not the
-   API bearer used for `/v1/memories`.
+   bearer fails with 401 from the source. The token that authenticates a
+   federation pull is the peer record's own `auth_token`, which the source
+   accepts for its `/v1/federation` feed — not the API bearer used for
+   `/v1/memories`. (The original draft attributed this to a
+   `MNEMOS_FEDERATION_TRUSTED_TOKEN_SHA256S` allowlist; no such setting
+   exists — see the note in Section 8.6.)
 5. **compat_mode='strict'** — the strict path expects the peer to
    expose its schema version. pg-host's schema-version probe returns
    401 in this configuration, so a strict peer never gets past the
@@ -718,13 +805,13 @@ that this run surfaced. They are all in tree now:
 6. **`FEDERATION_ALLOW_PRIVATE`** — the SSRF guard rejects RFC1918
    targets unless this env is set. Necessary for LAN federation.
 
-Every one of these is in a commit message on `feat/oracle-port`.
+Every one of these is fixed in tree on `master`.
 
 ---
 
 ## Section 8.8 — Wipe + reimport: migration replays clean
 
-This is the disaster-recovery proof. The Oracle migration must be
+This is the disaster-recovery proof. The Oracle migration chain must be
 safe to replay against a freshly-recreated user. We tested it for
 real.
 
@@ -756,7 +843,7 @@ Companion artifacts (archived):
 
 ```
 total:     5845    (federation re-populated the rows)
-federated: 5845    (federation_source='pythia')
+federated: 5845    (federation_source='pg-host')
 hmac:      173e44b35ff7e189…
 ```
 
@@ -768,16 +855,16 @@ fresh runs).
 
 ---
 
-## Section 8.9 — Equal-hardware bench: Oracle Database 26ai vs Postgres on pg-host
+## Section 8.9 — Equal-hardware bench: Oracle Database 23ai vs Postgres on pg-host
 
 The Section 8.5 numbers were honest but tainted by a ~9-year
 hardware gap (Meteor Lake vs Skylake; NVMe Gen5 vs SATA3). To close
-that gap we stood up **Oracle Database 26ai Free as a podman container on
+that gap we stood up **Oracle Database 23ai Free as a podman container on
 pg-host itself**, alongside the existing Postgres+pgvector container,
 on the same Meteor Lake + NVMe box.
 
 ```
-$ podman run -d --name pythia-oracle -p 1522:1521 \
+$ podman run -d --name oracle-bench -p 1522:1521 \
     -e ORACLE_PASSWORD=<password> \
     -e APP_USER=mnemos -e APP_USER_PASSWORD=<password> \
     docker.io/gvenzl/oracle-free:23-slim-faststart
@@ -785,7 +872,7 @@ $ podman run -d --name pythia-oracle -p 1522:1521 \
 
 pg-host now runs **three databases concurrently** in the perf bench:
 - PostgreSQL 17.6 + pgvector at `:5433`
-- Oracle Database 26ai Free at `:1522` (via the `gvenzl/oracle-free` podman image)
+- Oracle Database 23ai Free at `:1522` (via the `gvenzl/oracle-free` podman image)
 - The original pg-host MNEMOS Postgres at `:5002` (untouched)
 
 Same 6,435 memories from PG copied into Oracle (6,432 inserted, 3
@@ -844,7 +931,7 @@ Companion artifacts (archived):
 ```
 protocol:        2025-11-25 (MCP)
 server:          mnemos v1.27.1
-tools count:     21
+tools count:     25
 get_stats({})                              → 118 ms, total_memories=5845
 list_memories({limit:3})                   →  40 ms, count=5845
 search_memories({query:"oracle",limit:3})  → 157 ms, matched=2
@@ -854,14 +941,19 @@ hmac:            62981bf96cf577bb…
 
 The data flow: MCP client → SSE transport → `mnemos.mcp.http` →
 REST call to `http://127.0.0.1:5003/v1/...` → MNEMOS API handlers
-→ `OracleBackend.memories.list_memories()` → Oracle Database 26ai. No
+→ `OracleBackend.memories.list_memories()` → Oracle Database 23ai. No
 handler code or MCP tool wrappers needed to be touched.
 
-The 21 tools exposed include `search_memories`, `list_memories`,
-`get_memory`, `create_memory`, `update_memory`, `delete_memory`,
-`get_stats`, `kg_create_triple`, `kg_search`, `kg_timeline`, and
-several others. Each one hits the Oracle backend through the same
-ABC contract the REST handlers use.
+The tools exposed are registered in `_TOOL_ORDER`
+(`mnemos/mcp/tools/__init__.py`) — 25 of them: `search_memories`,
+`update_memory`, `get_memory`, `create_memory`, `delete_memory`,
+`list_memories`, `get_stats`, `kg_create_triple`, `kg_search`,
+`kg_timeline`, `update_triple`, `delete_triple`, `bulk_create_memories`,
+`log_memory`, `branch_memory`, `diff_memory_commits`, `checkout_memory`,
+`recommend_model`, `pantheon_list_models`, `pantheon_route_explain`,
+`graeae_consult`, `graeae_get_consultation`, `list_deletions`,
+`kronos_anomalies` and `kronos_forecast`. Each one hits the Oracle backend
+through the same ABC contract the REST handlers use.
 
 ### Why this matters
 
@@ -925,28 +1017,33 @@ A few small follow-ups also remain:
   pass and possibly a hint).
 - Oracle Text (CTXSYS.CONTEXT) inverted-index FTS to replace
   `DBMS_LOB.INSTR`.
-- READABLE visibility expansion to mirror the full v1_multiuser
-  group-membership predicate from Postgres.
+- READABLE visibility expansion to mirror the full multi-user
+  group-membership predicate from Postgres. **(Since closed — see
+  [Section 4](#section-4--visibility-predicate-translation).)**
 - Reverse federation direction (oracle-host-Oracle → pg-host-Postgres)
   to close the bidirectional HA loop.
+
+For the current, live status of the Oracle backend — repository coverage,
+open operational follow-ups and test wiring — see
+[`docs/oracle-port-status.md`](oracle-port-status.md).
 
 ---
 
 ## Section 10 — Reproducing this work
 
 ```bash
-# Clone the branch
+# Clone the repo (the Oracle backend is on master)
 git clone git@gitlab.com:ncz-os/mnemos.git
 cd mnemos
 
 # Python env
 uv venv && uv pip install oracledb asyncpg fastapi pytest pytest-asyncio
 
-# Point at your Oracle Database 26ai instance
+# Point at your Oracle Database 23ai instance
 export ORACLE_PROOF_DSN="oracle://user:pass@host:1521/FREEPDB1"
 
 # Run the migration (one-shot or via sqlplus)
-sqlplus -L user/pass@host:1521/FREEPDB1 @db/migrations_oracle/0001_core_schema.sql
+sqlplus -L user/pass@host:1521/FREEPDB1 @mnemos/db_migrations/migrations_oracle/0001_core_schema.sql
 
 # Emit a fresh signed proof artifact
 .venv/bin/python scripts/oracle_proof_run.py
@@ -958,7 +1055,7 @@ Boot the MNEMOS API server against Oracle:
 ```bash
 export MNEMOS_DATABASE_DSN="oracle://user:pass@host:1521/FREEPDB1"
 export MNEMOS_PERSISTENCE_BACKEND=oracle
-uvicorn mnemos.api:app --port 5002
+uvicorn mnemos.api.main:app --port 5002
 curl http://localhost:5002/health
 ```
 
@@ -971,45 +1068,31 @@ behind it.
 ## Section 11 — Acknowledgements + open invitation
 
 This work is open to anyone at Oracle (or elsewhere) who wants to look
-at the codebase, run the harness against a different 26ai build, or
+at the codebase, run the harness against a different 23ai build, or
 suggest dialect improvements. The branch is on GitLab; pull requests
 welcome.
 
 If you're an Oracle engineer reading this and have feedback — vector
 index advice, an EE trial path that includes Data Guard, suggestions
 on the migration idempotency pattern — drop a note. We'll happily
-re-run the harness against any 26ai/26ai variant and re-publish the
+re-run the harness against any 23ai build and re-publish the
 artifact.
 
 ---
 
-## Appendix A — Commit history of this port
+## Appendix A — Provenance
 
-```
-76e45b3 bench(oracle): equal-hardware Oracle vs PG on pg-host + GPU embed bench
-2c0c6e6 feat(oracle): wipe + reimport proof — migration replays on clean schema
-e94bc58 feat(oracle): federation HA proof — pg-host-PG → oracle-host-Oracle pull
-7d7ade9 fix(oracle): broaden federation peer SELECTs to all columns
-fc8d13e fix(oracle): federation_peers compat_mode + version + schema-check columns
-2ab5dab fix(oracle): federation peer + sync_log ids use hyphenated UUID
-89c93d4 deploy(oracle): scripts to stand up MNEMOS-on-Oracle on oracle-host
-a5fd1b3 bench(oracle): capture hardware asymmetry in perf artifact + blog
-b60252a bench(oracle): embedding sync + IVF vector index + re-bench
-af685a9 bench(oracle): side-by-side perf harness — Oracle Database 26ai vs Postgres+pgvector
-4622c34 feat(oracle): reproducible proof harness + blog draft + KG NVL/CAST fix
-8199cb6 feat(oracle): Oracle Database 26ai VECTOR semantic search + memory context
-6696209 feat(oracle): full federation, recall+dedup, webhook outbox, safe audit
-ed7310e docs(oracle): refresh M7 status with parity-sprint progress
-9fd3be2 feat(oracle): version log + checkout + diff + create_memory_branch
-ae625e1 feat(oracle): portability + branch-head + duplicate-detect impls
-eede8f1 feat(oracle): visibility-filtered memory CRUD + FTS fallback
-73d89ef feat(oracle): ABC-conformant subclasses for full persistence surface
-7096c3e feat(oracle): wire OracleBackend into lifecycle + idempotent migrations
-```
+The Oracle port was developed on a working branch that was **squashed before
+merging to master**, so the individual development commits the original draft
+listed here no longer resolve in this repository's history. Rather than
+preserve SHAs that cannot be verified, this appendix records what is true: the
+implementation described above is on `master` today, in
+`mnemos/persistence/oracle.py` and `mnemos/db_migrations/migrations_oracle/`,
+and has continued to evolve since. Use `git log -- mnemos/persistence/oracle.py`
+for the real, resolvable history.
 
-19 commits, ~5,000 net lines of new code, every commit ruff-formatted +
-pre-commit-clean. Author: `Jason Perlow <jperlow@gmail.com>` per repo
-conventions.
+Author: `Jason Perlow <jperlow@gmail.com>` per repo conventions; every commit
+ruff-formatted and pre-commit-clean.
 
 ### Companion scripts shipped during this work
 
@@ -1026,7 +1109,7 @@ conventions.
 ## Appendix B — License + production posture
 
 The MNEMOS code in this branch is the existing project license
-(see `LICENSE`). The Oracle Database 26ai Free instance on oracle-host
+(see `LICENSE`). The Oracle Database 23ai Free instance on oracle-host
 runs under the Oracle Free terms — dev/learn/run only, no production
 use. When we move beyond research-grade deployment, we'll need either
 a paid Oracle EE license or the OTN Developer License for full

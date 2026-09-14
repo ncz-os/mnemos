@@ -1,4 +1,4 @@
--- 0014_entities.sql — Oracle 23ai port for MNEMOS parity.
+-- 0014_entities.sql — Oracle 26ai port for MNEMOS parity.
 
 CREATE TABLE entities (
     id VARCHAR2(36) PRIMARY KEY,

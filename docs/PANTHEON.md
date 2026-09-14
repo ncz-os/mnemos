@@ -1,29 +1,36 @@
 # PANTHEON — Unified LLM Provider Facade
 
-**v5.0 status:** shipped (v0.2) for the `/pantheon/v1` slice. Routing is direct
-HTTP forward from the gateway to the selected upstream; NATS is used for the
-best-effort routing audit substrate, not the main request path.
-**Position in stack:** Above Triton (gpu-host) + GRAEAE (pg-host); below every OpenAI-compatible client.
+**Packaging:** PANTHEON is a separately-installable add-on. It ships as the
+`mnemos-pantheon` namespace distribution under the `mnemos.domain.pantheon.*`
+import path and is selected from mnemos-core with the `pantheon` extra
+(`mnemos-pantheon>=0.2,<0.3`). mnemos-core carries the integration seams —
+MCP tool wrappers, config settings, routing-audit migrations, deploy units —
+and none of the gateway implementation.
+
+**Serving surface:** the opt-in `/pantheon/v1` slice. Routing is a direct HTTP
+forward from the gateway to the selected upstream; NATS carries the
+best-effort routing-audit substrate, not the main request path.
+
+**Position in stack:** above local GPU inference and GRAEAE; below every
+OpenAI-compatible client.
+
 **Greek-name fit:** *Temple of all gods.* One facade, many providers behind it. Pairs with CHARON (the ferryman who carries memories across systems): same interop posture, different surface.
 
-## v0.2 Implementation Note
+## Shipped behavior
 
-PANTHEON v0.2 closes the v0.1 deferred items while keeping the surface opt-in
-under `/pantheon/v1`. The shipped slice now includes per-(user, session)
-hard caps for `usage_tier=consultation_only` models, best-effort MNEMOS
-`pantheon_routing` memory writes for successful and failed gateway calls,
-rolling-window adaptive selection for `auto:*` aliases, and expanded
-`/pantheon/v1/route/explain` output with candidates, scores, selected backend,
-and the selection reason.
+The `/pantheon/v1` slice provides per-(user, session) hard caps for
+`usage_tier=consultation_only` models, best-effort MNEMOS `pantheon_routing`
+memory writes for successful and failed gateway calls, rolling-window adaptive
+selection for `auto:*` aliases, and `/pantheon/v1/route/explain` output
+carrying candidates, scores, the selected backend, and the selection reason.
 
-The consultation cap bucket is intentionally process-local in v0.2. It is
-correct for a single MNEMOS process and test/dev deployments; horizontally
-scaled deployments need a Redis-backed bucket so every replica shares the same
-per-session count.
+The consultation cap bucket is process-local. That is correct for a single
+MNEMOS process and for test/dev deployments; a horizontally scaled deployment
+needs a Redis-backed bucket so every replica shares the same per-session count.
 
-Deferred to v0.3: Redis-backed cap buckets, full tool-use streaming passthrough
-across provider adapters, real-time provider health via NATS, and KRONOS
-forecasting integration for proactive routing.
+Not yet implemented: Redis-backed cap buckets, full tool-use streaming
+passthrough across every provider adapter, real-time provider health over NATS,
+and KRONOS forecasting integration for proactive routing.
 
 ---
 
@@ -43,34 +50,40 @@ Every existing tool keeps working — PANTHEON is OpenAI-shape. The win is the c
 
 ---
 
-## CHARON v0.2 contract note (related work)
+## CHARON contract note (related work)
 
-The CHARON v0.2 portability subsystem (shipped in the v3.4 line and available
-to later PANTHEON work) restricts the trigger-suppressed `memory_versions` sidecar
-import path to the **root + preserve_owner=true** admin/migration
-path. Non-root callers can ship `kg_triples` and
-`compression_manifest` sidecars without restriction, but
-`memory_versions` requires a root bearer token (`--preserve-metadata`
-on `mnemos/tools/memory_import.py`). This restriction is structural:
-the interaction of caller-scoped deterministic id derivation,
-ON CONFLICT idempotency, and `memory_versions` surviving memory
-deletion makes the non-root path a defect-prone surface where
-adversarial review surfaced a sequence of stale-state edge cases
-that each required extending the equality check on every column.
-The architectural restriction collapses the entire class.
+CHARON is likewise a separate add-on: the portability and ingest routes
+(`/v1/import`, `/v1/export`, universal ingest, document import) mount only when
+the `mnemos-charon` distribution is installed and `MNEMOS_ENABLE_CHARON` is
+left on. Without the extra the routers are never included, so the endpoints are
+**absent (404)** rather than present-and-restricted — unless strict layering is
+configured, in which case startup fails loudly instead of degrading quietly.
+The `mpf`/`mif` import CLI (`mnemos.tools.memory_import`) ships in that same
+distribution.
 
-**Practical impact for PANTHEON clients:** none. PANTHEON callers
-hitting `/v1/import` for non-DAG-history use cases (typical agent
-memory sync) still work as before. Cross-system migrations go
-through the documented root path. If a peer-system adapter wants
-to preserve authoritative version history across systems, it
-needs a root token — the same constraint as any administrative
-data movement.
+The CHARON portability subsystem restricts the trigger-suppressed
+`memory_versions` sidecar import path to the **root + preserve_owner=true**
+admin/migration path. Non-root callers can ship `kg_triples` and
+`compression_manifest` sidecars without restriction, but `memory_versions`
+requires a root bearer token (`--preserve-metadata` on the import CLI). This
+restriction is structural: the interaction of caller-scoped deterministic id
+derivation, ON CONFLICT idempotency, and `memory_versions` surviving memory
+deletion makes the non-root path a defect-prone surface where adversarial
+review surfaced a sequence of stale-state edge cases that each required
+extending the equality check on every column. The architectural restriction
+collapses the entire class.
+
+**Practical impact for PANTHEON clients:** none, where CHARON is installed.
+Callers hitting `/v1/import` for non-DAG-history use cases (typical agent
+memory sync) work normally. Cross-system migrations go through the documented
+root path. A peer-system adapter that wants to preserve authoritative version
+history across systems needs a root token — the same constraint as any
+administrative data movement.
 
 ## What we are NOT building
 
-- **A new message queue.** PANTHEON uses **NATS JetStream** (Apache 2.0, single binary, ~30MB RAM, native Python client). Building bespoke MQ infrastructure is not the project. Same posture as MNEMOS choosing pgvector over a custom vector store: pick the boring proven option, focus engineering on the layer that's actually novel.
-- **A new provider catalog.** PANTHEON auto-populates from GRAEAE's existing provider/muses database. GRAEAE already knows which providers have keys configured, which models each one offers, and recent health stats. PANTHEON's catalog is a *view* over GRAEAE's provider table plus per-worker advertisements. See "Catalog auto-population" below.
+- **A new message queue.** Where PANTHEON needs a bus — routing-audit fan-out, shared cooldown and breaker state across a worker pool — it uses **NATS JetStream** (Apache 2.0, single binary, ~30MB RAM, native Python client). Building bespoke MQ infrastructure is not the project. Same posture as MNEMOS choosing pgvector over a custom vector store: pick the boring proven option, focus engineering on the layer that's actually novel.
+- **A new pricing database.** The catalog is regenerated from machine-readable upstream price feeds by a timer-driven sync job, with a vendored last-good seed for feed outages. See "Catalog sync" below.
 - **A new auth system.** Tokens map to existing MNEMOS owner_id + namespace identity. The same auth that gates `/v1/memories` gates `/v1/chat/completions` here.
 
 ## OpenAI-Compatible Memory Injection Control
@@ -141,9 +154,9 @@ Stock OpenAI returns `{id, object, created, owned_by}`. PANTHEON returns the sam
       "id": "mistral-7b-instruct",
       "object": "model",
       "created": 1714000000,
-      "owned_by": "pantheon:vllm.cerberus",
+      "owned_by": "pantheon:vllm.local",
       "pantheon": {
-        "backend": "vllm.cerberus",
+        "backend": "vllm.local",
         "cost_tier": "free",
         "usage_tier": "agentic_ok",
         "context_window": 32768,
@@ -174,50 +187,69 @@ Stock OpenAI returns `{id, object, created, owned_by}`. PANTHEON returns the sam
 }
 ```
 
-### Catalog auto-population from GRAEAE
+### Catalog sync
 
-GRAEAE already maintains a provider database (the muses registry) — which providers have keys configured, what models each one offers, recent health from consultation runs. PANTHEON does NOT duplicate this. The catalog is computed at startup and refreshed on heartbeat:
+The catalog is regenerated by a timer-driven sync job rather than assembled
+from live worker advertisements. mnemos-core ships the ops units and the
+entrypoints; the fetch/normalize implementation lives in the add-on
+(`mnemos.domain.pantheon.pricing`).
+
+| Artifact | Role |
+|---|---|
+| `systemd/pantheon-catalog-sync.service` | oneshot refresh job |
+| `systemd/pantheon-catalog-sync.timer` | daily schedule, `Persistent=true`, randomized delay |
+| `scripts/refresh_pantheon_catalog.py` | script entrypoint invoked by the unit |
+| `mnemos/tools/refresh_pantheon_catalog.py` | console-script shim; exits 2 with an install hint when the add-on is absent |
 
 ```
-                  ┌─────────────────────────────┐
-                  │ GRAEAE muses_api_keys.json  │
-                  │ + provider/muse registry    │
-                  │ (existing on pg-host)        │
-                  └─────────────┬───────────────┘
-                                │ read on PANTHEON startup
-                                │ + on `catalog reload` event
-                                ▼
-                  ┌─────────────────────────────┐
-                  │ PANTHEON catalog cache      │
-                  │ - provider list             │
-                  │ - models per provider       │
-                  │ - usage_tier per model      │
-                  └─────────────┬───────────────┘
-                                │ + per-worker `catalog.advertise`
-                                │   for live model availability
-                                ▼
-                          /v1/models response
+      machine-readable upstream price feeds
+      + live model/availability APIs
+      + vendored last-good seed
+                 │  pantheon-catalog-sync.timer (daily)
+                 ▼
+      ┌─────────────────────────────┐
+      │ PANTHEON catalog cache      │
+      │ JSON + SQLite on disk       │
+      │ - provider / model list     │
+      │ - cost_per_mtok in/out      │
+      │ - context, capabilities     │
+      │ - usage_tier per model      │
+      │ - per-source fetched_at     │
+      └─────────────┬───────────────┘
+                    │ read by the gateway
+                    ▼
+              /v1/models response
 ```
 
-Adding a new provider becomes a one-step operation: drop the key into GRAEAE's existing key store + register the muse. PANTHEON picks it up next reload (or on a SIGHUP). No PANTHEON-side config changes.
+Cache locations are operator-set (`PANTHEON_CATALOG_CACHE`,
+`PANTHEON_CATALOG_SQLITE`, or `MNEMOS_PANTHEON_CATALOG_CACHE_PATH`). Each
+source carries its own `fetched_at` and staleness; a failed fetch keeps the
+last-good catalog rather than emptying it, so a feed outage degrades freshness
+and never availability.
 
-The `usage_tier` annotation per model is configured once in the GRAEAE registry (e.g. Anthropic models tagged `consultation_only`). PANTHEON reads that tag verbatim — it's not a separate file to keep in sync.
+Health and latency fields are observed at request time from the routing-audit
+rolling window, not advertised by workers.
+
+Adding a provider is therefore a catalog-plus-key operation, not a code change:
+the model appears at the next sync, and the `usage_tier` annotation travels
+with the catalog entry rather than living in a second file to keep in sync.
 
 ### Required fields per entry
 
 | Field | Type | Purpose |
 |---|---|---|
-| `backend` | string | which worker subject serves this. e.g. `vllm.cerberus`, `together`, `groq` |
+| `backend` | string | which upstream serves this. e.g. `vllm.local`, `together`, `groq` |
 | `cost_tier` | enum: `free`, `paid`, `premium` | for `prefer:free` style routing |
 | `usage_tier` | enum: `agentic_ok`, `consultation_only`, `embedding_only` | enforcement boundary |
 | `context_window` | int | max prompt+completion tokens |
 | `capabilities` | list | `chat`, `tool_use`, `vision`, `json_mode`, `embedding`, `reasoning` |
 | `latency_p50_ms` | int | observed median; updated from rolling window |
-| `health` | enum: `ok`, `degraded`, `down` | from worker heartbeats |
+| `health` | enum: `ok`, `degraded`, `down` | from observed outcomes + cooldown state |
 | `rate_limit_rpm` | int or null | provider's stated limit (null = local/unbounded) |
 | `advisory` | string (optional) | human-readable warning surfaced to clients |
 
-The catalog is computed (not configured): each worker advertises its models on startup, the frontend aggregates, refreshes on worker heartbeat events.
+The catalog is computed, not hand-configured: the sync job supplies the static
+metadata and the gateway overlays observed health and latency.
 
 ---
 
@@ -238,7 +270,7 @@ consensus:reasoning       → routes through GRAEAE for multi-LLM consensus
 The alias is resolved server-side at request time, using:
 
 1. The caller's tenant policy (cost cap, allowed_tiers).
-2. Current worker health (skip degraded/down).
+2. Current backend health (skip degraded/down and anything in cooldown).
 3. MNEMOS-stored history for this caller (which backend has been winning recently).
 
 ### Hint headers (alternative to alias)
@@ -255,7 +287,7 @@ Stock OpenAI clients ignore these headers (no harm). Smart clients use them to e
 ### Deterministic policy (no LLM in the loop)
 
 The routing decision is a pure function of:
-- catalog state (worker health + advertised metadata)
+- catalog state (synced metadata + observed backend health)
 - caller policy (tenant config + recent usage)
 - request hints (model name + headers)
 - MNEMOS rolling stats (last N minutes per provider × outcome)
@@ -294,73 +326,24 @@ The user runs Anthropic Max as a personal sub. They're not abusing it; consultat
 
 ---
 
-## Streaming
+## Dispatch: direct HTTP forward
 
-**Shipped v0.2 routing is direct HTTP forward.** Streaming and non-streaming
-chat completions, plus embeddings, are forwarded directly from the gateway to
-the selected provider after alias resolution and adaptive policy selection.
-NATS carries audit events only.
+Routing is a direct HTTP forward. Streaming and non-streaming chat completions,
+and embeddings, all take the same path: alias resolution → adaptive policy
+selection → forward to the selected provider, with the provider key resolved
+server-side and caller identity attached. Streaming responses are proxied
+through as SSE. NATS carries audit events and shared limiter state, never the
+request itself.
 
-The worker-pool shape below remains a v0.3+ design option for batch/async
-requests that would benefit from queue smoothing and redelivery semantics.
+There is no per-provider worker daemon and no `work.<backend>` queue. Scale-out
+is process replication of the same gateway app behind the reverse proxy, which
+is why cooldown, breaker, and rate-limit state must be shared (see "Packaging
+and deployment") before a pool runs more than one worker.
 
-The frontend decides at request time:
-
-```
-streaming = body.get("stream") == True
-
-if streaming:
-    pre_select_backend()  # one-shot pick from healthy workers
-    proxy_directly_with_sse()
-else:
-    publish_to_subject(work.<backend>)
-    return await await_response(request_id)
-```
-
-The split is invisible to clients — same `/v1/chat/completions` URL.
-
----
-
-## Worker contract
-
-A PANTHEON worker is a tiny daemon that:
-
-1. **Connects to NATS** and consumes one subject (e.g. `work.groq`).
-2. **Loads its provider key** from the local key vault on startup.
-3. **Maintains a token bucket** sized to the provider's rate limit.
-4. **Advertises its models** on startup (publishes to `catalog.advertise`).
-5. **Heartbeats** to `catalog.heartbeat` every 30s with current health.
-
-Workers are stateless and horizontally scalable: run two `groq-worker`s and they share the queue.
-
-### Reference shape (Python)
-
-```python
-class PantheonWorker:
-    SUBJECT = "work.groq"
-    PROVIDER = "groq"
-
-    async def run(self):
-        await self.nats.subscribe(
-            self.SUBJECT,
-            cb=self.handle,
-            queue="groq-workers",  # competing consumers
-        )
-        await self.advertise_models()
-        await self.start_heartbeat()
-
-    async def handle(self, msg):
-        req = json.loads(msg.data)
-        async with self.token_bucket.acquire():
-            try:
-                resp = await self.provider_call(req)
-                await self.reply(msg, resp)
-            except RateLimited:
-                await msg.nak(delay=req.get("retry_delay", 5))
-            except ProviderDown:
-                await msg.nak(delay=30)
-                await self.report_health("degraded")
-```
+A queue-mediated path — competing consumers per provider subject, nak-with-delay
+on rate limits, redelivery semantics — remains a plausible future direction for
+batch and async workloads. It is not the current model, and nothing in the
+shipped slice depends on it.
 
 ---
 
@@ -379,7 +362,7 @@ The frontend validates the token, attaches the policy to the request envelope, t
 
 ### Provider keys
 
-Stored centrally in PANTHEON's vault. Default: encrypted at rest under a master key. Production: HashiCorp Vault / AWS KMS / sealed secrets. Workers unseal on startup.
+Stored centrally in PANTHEON's keyvault, encrypted at rest under a master key; production deployments can back it with HashiCorp Vault, AWS KMS, or sealed secrets. The gateway unseals on startup and resolves the provider key server-side per request — a key is never handed to a client.
 
 ```
 ~/.pantheon/keys/
@@ -392,7 +375,7 @@ Stored centrally in PANTHEON's vault. Default: encrypted at rest under a master 
 └── master.key         ← root key (mode 600, owner only)
 ```
 
-A new tool integrating with PANTHEON gets ONE token. Adding a new backend = dropping a key file in the vault + starting a new worker. No client config changes anywhere.
+A new tool integrating with PANTHEON gets ONE token. Adding a backend is a key in the vault plus a catalog entry. No client config changes anywhere.
 
 ---
 
@@ -419,7 +402,9 @@ PANTHEON ships with PR-ready patches for the agents we own/influence:
 
 4. **OpenAI-shape ecosystem (langchain, openai-python)** — these aren't ours to patch. PANTHEON's solution is the alias convention: clients pass `model="auto:reasoning"` and the resolution happens server-side. No client changes required.
 
-The PRs land before PANTHEON's v4 cut, ideally upstream-merged. If upstream is slow, ship the patch as a doc + sidecar branch that operators can apply manually.
+Where upstream is slow to take a discovery patch, the fallback is a documented
+sidecar branch operators can apply themselves; the server side needs nothing
+from the client either way.
 
 ### Why client-side changes matter
 
@@ -427,16 +412,27 @@ Without them, PANTHEON degrades to "single endpoint with one default model." Tha
 
 ## MCP front-door
 
-Alongside the HTTP/v1 surface, PANTHEON exposes an MCP server. Tools:
+Alongside the HTTP `/v1` surface, MNEMOS's MCP server exposes two PANTHEON
+tools:
 
 ```
-pantheon_chat(messages, model_or_alias, capability_hint?, max_cost?)
-pantheon_embed(texts, model_or_alias?)
-pantheon_list_models(filter_capabilities?, filter_tier?)
-pantheon_route_explain(messages, model_or_alias)  # diagnostic
+pantheon_list_models(filter_capabilities?, filter_tier?, max_cost?)
+pantheon_route_explain(messages, model_or_alias)   # diagnostic
 ```
 
-MCP-aware agents (Claude Code with custom MCP, Cursor, Continue) discover capabilities through the standard MCP advertising mechanism. The HTTP path remains for everything else.
+Both are **capability-filtered out of the advertised tool list when the
+`pantheon` extra is not installed**, so an agent connected to a core-only
+MNEMOS never sees them. If one is invoked anyway, the handler returns
+`{"success": false, "error": "PANTHEON not installed"}` rather than raising an
+import error.
+
+Inference itself is not an MCP tool. There is no `pantheon_chat` or
+`pantheon_embed` — completions and embeddings go through the OpenAI-compatible
+HTTP surface, which every client already speaks. The MCP tools exist for what
+HTTP cannot express: browsing the catalog with structured metadata, and asking
+the router to explain a decision without making the call.
+
+MCP-aware agents discover both through the standard MCP advertising mechanism.
 
 ---
 
@@ -490,69 +486,113 @@ GROUP BY backend
 
 Result: **the routing improves with use, automatically.** Backends that have been winning get more traffic; ones that are degraded shed load before the catalog's `health` field flips. This is the key differentiator from LiteLLM / Portkey, which use static config.
 
----
-
-## Migration story
-
-For the user's current fleet:
-
-1. **Day 0:** PANTHEON deployed on pg-host next to GRAEAE. Empty catalog, no workers.
-2. **Day 1:** First worker = vLLM-gpu-host. PANTHEON advertises Mistral-7B as `pantheon:vllm.cerberus`. One client (zterm? Cursor?) points at PANTHEON; rest of fleet still uses old configs.
-3. **Day 2–5:** Together / Groq / Gemini workers come online. Catalog grows.
-4. **Day 6:** Anthropic worker added with `usage_tier: consultation_only`. GRAEAE consultation flow now goes through PANTHEON instead of GRAEAE's direct provider calls (or alongside).
-5. **Day 7+:** Other clients migrate (`~/.zeroclaw/config.toml`, `~/.openclaw/config.toml`, etc. — replace per-provider sections with single PANTHEON URL).
-
-Old configs keep working throughout — PANTHEON adds a path, doesn't remove one.
+The durable audit destination is the `pantheon_routing_audit` table rather than
+the memory store. mnemos-core ships that migration for every supported backend
+(PostgreSQL, SQLite, Oracle, Db2), so the audit trail survives on an install
+whose memory writes are disabled or failing. The memory write is best-effort and
+feeds the rolling-window policy above; the NATS publish and its optional
+consumer are what move a routing event into the audit table.
 
 ---
 
-## Out of scope for v4 launch
+## Adoption path
 
-The following are interesting follow-ons but explicitly NOT in the v4 cut:
+PANTHEON is additive. It adds an endpoint; it removes none, and existing
+per-provider client configs keep working the whole way through.
 
-- **Cross-fleet PANTHEON** (a peer instance you can route to as a backend). Future story for federation, beyond v4.
-- **Streaming-via-MQ** (NATS-token-by-token). Bypass-direct is sufficient.
-- **Caching layer** (content-hash lookups). Real wins for reasoning workloads but needs careful invalidation rules; defer to v4.1.
-- **Cost-cap enforcement at the request level** (mid-stream kill switch). Token-bucket level is enough for v4.
-
----
-
-## Open design questions
-
-1. **MQ choice: NATS JetStream vs Redis Streams vs Postgres LISTEN/NOTIFY.** Recommendation: NATS JetStream (~30MB binary, native Python client, request/reply semantics built-in, persistent subjects for replay). Redis adds a dependency we can avoid; Postgres LISTEN/NOTIFY isn't durable for crash recovery.
-2. **Streaming bypass: pre-select vs pre-flight.** Pre-select (pick worker before forwarding) is simpler; pre-flight (call catalog first, then select) is cleaner but adds 10–20ms. Recommend pre-select for v4 launch.
-3. **Catalog refresh interval.** Worker heartbeat every 30s, frontend cache TTL 60s. Health flips visible within 60–90s.
-4. **Tenant model: single (operator-only) or multi (per-user tokens with caps)?** Recommend multi from day one — even for personal use, having a separate token per tool gives audit + revocation.
-
----
-
-## Naming + repo layout
-
-- **Project name:** PANTHEON
-- **Repo:** `github.com/ncz-os/pantheon` (new repo, not under MNEMOS)
-- **Top-level dirs:**
-  ```
-  pantheon/
-  ├── frontend/        FastAPI + MCP surface
-  ├── workers/         per-provider workers (one subdir each)
-  ├── catalog/         model advertising + heartbeat aggregation
-  ├── auth/            token verification, tenant policy
-  ├── docs/            this doc + per-worker config recipes
-  └── pyproject.toml
-  ```
-- **Ships with MNEMOS v4.** Co-released. MNEMOS gets a `pantheon_routing` category convention; PANTHEON depends on MNEMOS for the feedback loop. They're loosely coupled — MNEMOS has no PANTHEON imports.
+1. Install the add-on (`mnemos-core[pantheon]`) and enable the service, then run
+   the gateway with an empty or seed catalog.
+2. Run the catalog sync once so `/v1/models` reflects real pricing and
+   capability metadata.
+3. Point one low-stakes client at PANTHEON. Everything else stays on its old
+   config.
+4. Add providers as catalog entries plus keys. Each becomes routable at the next
+   sync with no client change.
+5. Tag restricted providers `usage_tier: consultation_only` so the cap and the
+   agentic-mode filter apply from the moment they appear.
+6. Migrate remaining clients by replacing their per-provider sections with one
+   PANTHEON base URL and token.
 
 ---
 
-## Concrete next steps
+## Packaging and deployment
 
-1. **This doc → review.** Operator + outside-eyes pass. Codex adversarial review at design-doc level (catch policy / interop holes before code).
-2. **Skeleton repo.** New `perlowja/pantheon` with frontend stub + one vLLM worker. End-to-end happy path: client → /v1/chat/completions → vLLM.
-3. **Catalog + heartbeat.** Workers advertise, frontend aggregates.
-4. **Second worker (Groq).** Validates the multi-backend story. Alias resolution + cost-tier policy.
-5. **Anthropic worker with usage_tier enforcement.** Validates the consultation-only boundary.
-6. **MNEMOS routing-log integration.** Adaptive policy goes live.
-7. **MCP front-door.** Optional surface, lights up agentic discovery.
-8. **MNEMOS v4 release** with PANTHEON co-launch.
+### Distribution
 
-Estimated calendar: design + repo skeleton in week 1; multi-backend + adaptive policy in weeks 2–3; v4 cut after CHARON cross-system rig + MemPalace announcement push (parallelizable).
+PANTHEON is a namespace distribution, `mnemos-pantheon`, occupying
+`mnemos.domain.pantheon.*`. mnemos-core declares it as the `pantheon` extra and
+holds only the seams:
+
+| Seam in mnemos-core | What it does |
+|---|---|
+| `mnemos/api/main.py` | mounts `mnemos.api.routes.pantheon` when the `pantheon` service is enabled and the distribution is importable |
+| `mnemos/mcp/tools/models.py` | the two MCP tool wrappers, each guarded by an extra check and a lazy import |
+| `mnemos/core/config.py` | the `MNEMOS_PANTHEON_*` settings surface — caps, policy weights, timeouts, rate limit, catalog cache paths, passthrough, audit queue |
+| `mnemos/core/services.py` | `pantheon` and `pantheon_routing_audit_consumer` service entries |
+| `mnemos/db_migrations/` | `pantheon_routing_audit` schema for PostgreSQL, SQLite, Oracle, and Db2 |
+| `mnemos/tools/refresh_pantheon_catalog.py` | console-script shim with an actionable message when the add-on is missing |
+
+Absent the extra, every seam degrades to nothing: routes are not mounted, MCP
+tools are filtered out of the advertised list, the refresh shim exits 2 with an
+install hint. Strict layering turns those silent skips into a loud startup
+failure for operators who would rather not discover a missing add-on at request
+time.
+
+### Service enablement
+
+PANTHEON is **off in every default profile**, including `server`. It is a niche
+model-proxy surface rather than required substrate, so operators opt in with the
+`pantheon` component selection (which also enables the routing-audit consumer)
+or the `full` bundle, or by setting `MNEMOS_PANTHEON_ENABLED` directly.
+
+### Gateway process
+
+The gateway app is `mnemos.api.pantheon_shadow:app`, run single-process for dev
+
+```sh
+uvicorn mnemos.api.pantheon_shadow:app --port 4101
+```
+
+and as a worker pool in production, behind a reverse proxy that owns the stable
+public VIP and forwards to loopback:
+
+```sh
+gunicorn mnemos.api.pantheon_shadow:app \
+  -k uvicorn.workers.UvicornWorker -w "${WEB_CONCURRENCY}" -b 127.0.0.1:4110
+```
+
+`deploy/pantheon/` carries the ops artifacts for that topology:
+`pantheon-gunicorn.sh` (validated launcher), `pantheon-gunicorn.env.example`
+(environment template), `pantheon-gateway.service` (systemd unit), a
+review-only reverse-proxy site snippet, and a README with the VIP-stable
+cutover and one-line rollback.
+
+**Shared state is a precondition for a multi-worker pool.** Cooldown, breaker,
+and request-limit state are process-local by default, which is wrong the moment
+the proxy fans out across workers. Before running more than one worker: point
+every worker at the same NATS bus, keep
+`MNEMOS_PANTHEON_GATEWAY_RATE_LIMIT` identical across the pool, and move HTTP
+rate-limit counters off `memory://` to a shared `limits` backend. A
+single-worker capacity ceiling is a capacity finding, not the target topology.
+
+### Smoke test
+
+`scripts/pantheon_shadow_smoke.py` exercises a running gateway over the
+OpenAI-compatible surface: health, chat completion, tool-call passthrough
+(asserting the tool call survives with its id, name, and parseable JSON
+arguments intact), and `/responses`-style routing for models that require it.
+Run it against the shadow port before any cutover, and against the pool after.
+
+---
+
+## Deliberately not in scope
+
+- **Cross-fleet PANTHEON** — routing to a peer instance as a backend. A
+  federation story, not a gateway one.
+- **Token-by-token streaming over the bus.** Direct SSE forwarding is
+  sufficient and simpler.
+- **Response caching** (content-hash lookups). Real wins for reasoning
+  workloads, but the invalidation rules have to be right first.
+- **Mid-stream cost kill switch.** Enforcement happens pre-dispatch and at the
+  limiter; killing a response in flight buys little and complicates every
+  adapter.

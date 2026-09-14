@@ -1,4 +1,4 @@
--- 0043_memory_acl.sql — Oracle 23ai port for MNEMOS parity.
+-- 0043_memory_acl.sql — Oracle 26ai port for MNEMOS parity.
 --
 -- Per-principal ACL escape hatch + delegated group-admin. RLS is not used on
 -- Oracle; the application visibility predicate in mnemos.persistence.oracle

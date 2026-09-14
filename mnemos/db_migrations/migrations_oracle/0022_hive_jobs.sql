@@ -1,12 +1,12 @@
 -- migration: 0002_hive_jobs
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- schema:    HIVE_MIND
 -- purpose:   Hive Mind job queue. Phase 2 SQLite -> Oracle port.
 --
 -- Critical correctness:
 --   - dequeue uses SELECT ... FOR UPDATE SKIP LOCKED for atomic claim
 --     under contention. Matches mnemos-prod-working/db/migrations_oracle/
---     pattern + Oracle 23ai's queue-friendly locking model.
+--     pattern + Oracle 26ai's queue-friendly locking model.
 --   - jobs.status CHECK constraint enforces FSM.
 --   - ix_hive_jobs_queue is the dequeue path: (status, priority DESC,
 --     started_at ASC) — Polars dequeue snapshots filter on this.

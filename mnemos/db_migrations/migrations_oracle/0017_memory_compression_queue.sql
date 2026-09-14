@@ -1,4 +1,4 @@
--- 0017_memory_compression_queue.sql — Oracle 23ai port for MNEMOS parity.
+-- 0017_memory_compression_queue.sql — Oracle 26ai port for MNEMOS parity.
 
 CREATE TABLE memory_compression_queue (
     id VARCHAR2(36) PRIMARY KEY,

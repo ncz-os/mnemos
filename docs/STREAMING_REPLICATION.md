@@ -166,9 +166,9 @@ After promotion, the old primary must not keep accepting writes. Stop it,
 fence it, or rebuild it as a standby from the new primary before returning it
 to service.
 
-For automatic failover deployments, v5.3.0 prescribes Patroni with an etcd3
-quorum witness cluster. See `docs/HA_AUTOMATION.md`. The manual promotion
-steps below are retained as the fallback path when automation is unavailable.
+Automatic failover deployments should use Patroni with an etcd3 quorum witness
+cluster; see [`docs/HA_AUTOMATION.md`](HA_AUTOMATION.md). The manual promotion
+steps above are retained as the fallback path when automation is unavailable.
 
 ## Reconnecting MNEMOS
 
@@ -320,15 +320,20 @@ Use this when pg-host needs maintenance and you can drain writes cleanly.
 
    ```bash
    ssh <user>@<host> "
-   cat > /tmp/cerberus_runtime.env << EOF
+   cat > /tmp/mnemos_runtime.env << EOF
    $(podman inspect mnemos-standby | python3 -c 'import sys,json; d=json.load(sys.stdin)[0]; [print(e) for e in d[\"Config\"][\"Env\"] if not e.startswith((\"PATH\",\"PYTHON_\",\"GPG_\",\"LANG\",\"container\",\"HOME\",\"PWD\",\"HOSTNAME\"))]' | sed 's/PG_PORT=.*/PG_PORT=5434/;s|DATABASE_URL=.*|DATABASE_URL=postgresql://mnemos_user:$PGPASSWORD@127.0.0.1:5434/mnemos|')
    EOF
    podman stop mnemos-standby && podman rm mnemos-standby
    podman run -d --name mnemos-standby --network host --restart unless-stopped \
-       --env-file /tmp/cerberus_runtime.env localhost/mnemos-os:5.0.1-full-hot \
+       --env-file /tmp/mnemos_runtime.env \
+       ghcr.io/ncz-os/mnemos-enterprise:<current-version> \
        mnemos serve
    "
    ```
+
+   Substitute the tag the node is actually running for `<current-version>`;
+   re-launch on the same image the container was originally started from so the
+   failover does not silently become an upgrade.
 
    pg-host's mnemos can then be repointed at gpu-host:5434 once the network path
    is open (port-forward, WireGuard, or simply leave pg-host's mnemos stopped if

@@ -2,10 +2,10 @@
 
 The fleet runs MNEMOS on hosts with vastly different accelerators:
 
-  * NVIDIA CUDA discrete GPUs (TYPHON, CERBERUS) — torch CUDA wheel
-  * NVIDIA Tegra (cixmini) — TensorRT, NOT the desktop CUDA wheel
-  * Intel iGPU (PYTHIA, PROTEUS, ARGOS) — OpenVINO
-  * Apple Silicon (jperlow-mlt, ULTRA, STUDIO) — MPS / Metal
+  * NVIDIA CUDA discrete GPUs — torch CUDA wheel
+  * NVIDIA Tegra (ARM edge hosts) — TensorRT, NOT the desktop CUDA wheel
+  * Intel iGPU (production/edge/build hosts) — OpenVINO
+  * Apple Silicon (dev hosts) — MPS / Metal
   * VideoCore + ARM CPU (bigpi, clawpi, zeropi) — CPU only
 
 A single "is there a GPU" check is the wrong shape because each

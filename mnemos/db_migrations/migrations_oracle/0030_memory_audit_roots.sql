@@ -1,5 +1,5 @@
 -- migration: 0030_memory_audit_roots
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- purpose:   v6.2 M-2.2.1 — sealed-window Merkle root ledger. Each row =
 --            one 60-second window. Sealer worker writes one row per seal.
 --            Federation peers fetch via /v1/federation/audit_roots.

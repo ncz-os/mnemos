@@ -1,8 +1,8 @@
-# MNEMOS v6.0 — Db2 12.1 + Oracle Database 26ai Enterprise Feature Test Plan
+# Db2 12.1 + Oracle Database 26ai Enterprise Feature Test Plan
 
 **Goal:** Prove + sign HMAC artifacts for every enterprise feature MNEMOS uses or depends on, across both backends.
 
-**Audience:** Larry Ellison / IBM CEO inbox · v6.0 blog ammunition · operational deployment confidence.
+**Audience:** enterprise-backend evaluation, published benchmark material, and operational deployment confidence.
 
 **Status reference:** [PROVEN] = capability verified [PENDING] = test plan written below.
 
@@ -41,8 +41,8 @@ For each pair, MNEMOS use case + priority.
 | **Workload management** | Resource Manager | WLM (Workload Manager) | foreground vs background priority | P3 |
 | **Replication / CDC** | GoldenGate | Q Replication / InfoSphere CDC | cross-backend sync | P3 |
 | **JSON columns** | native (since 21c) | JSON datatype + JSON_TABLE | sidecar metadata | covered by Duality on Oracle |
-| **Native sharding** | Globally Distributed Database | DPF (Database Partitioning Feature) | multi-region — N/A for v6.0 | skip |
-| **Multi-node cluster** | RAC | pureScale | N/A for v6.0 — single-node container | skip |
+| **Native sharding** | Globally Distributed Database | DPF (Database Partitioning Feature) | multi-region — not applicable to this deployment | skip |
+| **Multi-node cluster** | RAC | pureScale | not applicable — single-node container | skip |
 | **Graph (RDF)** | RDF Knowledge Graph | RDF Triple Store + SPARQL | KG layer alternative | skip (P6/PGQ covers) |
 | **OLAP cubes** | Analytic Workspace | OLAP Server (deprecated) | N/A — MNEMOS not OLAP-shaped | skip |
 
@@ -235,7 +235,7 @@ For each pair, MNEMOS use case + priority.
 
 ---
 
-### 2.10 EE Globally Distributed Database / Sharding — SKIP for v6.0
+### 2.10 EE Globally Distributed Database / Sharding — SKIP
 
 Too heavy for single-tenant memory backend. Revisit at scale.
 
@@ -587,7 +587,7 @@ CREATE TABLE vec_bit (id NUMBER, embedding VECTOR(384, BINARY));
 
 ### 4.3 GPU-accelerated embed throughput on gpu-host [PENDING] — P2
 
-**Goal:** Run `scripts/embed_throughput_bench.py` on RTX 4500 ADA. Quote embeddings/sec for v6.0 blog.
+**Goal:** Run `scripts/embed_throughput_bench.py` on RTX 4500 ADA. Quote embeddings/sec for published benchmark material.
 
 **Effort:** 20 min, already scripted.
 
@@ -673,7 +673,7 @@ CREATE THRESHOLD bg_runaway FOR SERVICE CLASS bg_distill ACTIVITIES
 
 **Goal:** Same mcp server lifecycle.py serves MNEMOS over Db2.
 
-**Setup:** Set `MNEMOS_DSN=db2://...` env, restart server, run 21 MCP tools.
+**Setup:** Set `MNEMOS_DATABASE_DSN=db2://...` env, restart server, run all 25 MCP tools.
 
 **Artifact:** `<future-bench-output>` — identical tool surface as Oracle.
 
@@ -742,7 +742,10 @@ Every proof emits HMAC-signed JSON with:
 
 HMAC key: `b"mnemos-oracle-proof-v1"` (already in use; same for Db2).
 
-Validator script `scripts/verify_proof.py` reads any artifact + re-computes HMAC + checks integrity.
+The `scripts/*_proof_run.py` runners sign the artifacts they emit. No standalone
+validator ships in this repo: verifying an artifact means re-computing the HMAC
+over its canonical body with the key above and comparing with
+`hmac.compare_digest`.
 
 ---
 
@@ -750,11 +753,11 @@ Validator script `scripts/verify_proof.py` reads any artifact + re-computes HMAC
 
 | Skipped | Why |
 |---|---|
-| Oracle Globally Distributed Database / Sharding | Single-tenant memory backend — N/A at v6.0 |
+| Oracle Globally Distributed Database / Sharding | Single-tenant memory backend — not applicable |
 | Oracle RAC | Single-node container architecture |
-| Db2 pureScale | Same — clustering not part of v6.0 deployment |
+| Db2 pureScale | Same — clustering is not part of the supported deployment |
 | Db2 DPF | Same |
-| Oracle Database Vault | Stronger than RLS but operational overhead too high for v6.0 |
+| Oracle Database Vault | Stronger than RLS but operational overhead too high for this deployment |
 | Db2 Q Replication | Federation HA via mnemos pull covers this need |
 | Oracle GoldenGate | Same |
 | OLAP / Analytic Workspace | MNEMOS workload not OLAP-shaped |
@@ -766,10 +769,10 @@ Validator script `scripts/verify_proof.py` reads any artifact + re-computes HMAC
 
 ## 8. Cross-references
 
-- DB2 EAP recipe: `docs/db2-eap-recipe-2026-05-20.md`
-- OpenCode SQL-override handoff: `docs/handoff-opencode-db2-sql-overrides-2026-05-20.md`
-- nas-host backups: `/mnt/argonas/datapool/projects/container-backups/`
+- Db2 container build recipe: [`docs/db2-eap-recipe-2026-05-20.md`](db2-eap-recipe-2026-05-20.md)
+- Container backups: the NAS `container-backups/` share
 - Test scripts: `scripts/oracle_ee_*.py` (HNSW, Duality, PGQ, TDE templates to copy)
+- Proof runners: `scripts/{oracle,db2,postgres,sqlite}_proof_run.py`
 
 ---
 

@@ -1,4 +1,4 @@
--- 0008_user_groups.sql — Oracle 23ai port for MNEMOS parity.
+-- 0008_user_groups.sql — Oracle 26ai port for MNEMOS parity.
 
 CREATE TABLE user_groups (
     user_id VARCHAR2(36) NOT NULL,

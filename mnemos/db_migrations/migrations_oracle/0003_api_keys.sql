@@ -1,6 +1,6 @@
--- 0003_api_keys.sql — Oracle 23ai port of api_keys table for MNEMOS parity.
+-- 0003_api_keys.sql — Oracle 26ai port of api_keys table for MNEMOS parity.
 -- Source: PG db/migrations (base schema or early migration)
--- Target: PYTHIA Oracle 23ai (ORCLPDB1)
+-- Target: the production host Oracle 26ai (ORCLPDB1)
 
 CREATE TABLE api_keys (
     id VARCHAR2(36) PRIMARY KEY,

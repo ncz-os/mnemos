@@ -6872,7 +6872,7 @@ class SqliteBackend:
         silently scored 0.0 in cosine similarity.
 
         This scans every row. The query uses sqlite's json_array_length
-        which is O(1) per row given the stored format. For the PYTHIA fleet
+        which is O(1) per row given the stored format. For the the production host fleet
         (~9k memories) this is millisecond-scale at boot. Returns empty
         dict if the table is absent or has no rows.
         """

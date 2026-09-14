@@ -1,5 +1,5 @@
 -- migration: 0041_knemon_tier_assignments
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- purpose:   KNEMON Phase 3 — tier-split table (B1/B2/C1/C2) from
 --            knemon_phase1_baseline_2026_05_28 throughput + latency data.
 -- design:    Tier = throughput_class (B=high >1K/day, C=low <=1K/day)

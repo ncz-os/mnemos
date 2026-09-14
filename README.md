@@ -21,7 +21,7 @@ What is in the box:
 
 - a packaged **FastAPI runtime** with a CLI-first deployment surface
 - **EPIMONE**, the six-backend persistence layer — SQLite + sqlite-vec by
-  default, PostgreSQL + pgvector, Oracle Database 23ai, IBM Db2 12.1, MySQL 9.0
+  default, PostgreSQL + pgvector, Oracle AI Database 26ai, IBM Db2 12.1, MySQL 9.0
   Enterprise/HeatWave, and MariaDB 11.7+. Every backend self-provisions its
   schema on first connect. See [Persistence](#persistence).
 - the **GRAEAE** reasoning bus and **PANTHEON** unified LLM facade
@@ -49,7 +49,7 @@ What is in the box:
 > Two commands to durable, MCP-accessible agent memory on a **free** database.
 > It's built around **IBM Db2 12.1** — the reference deployment for the
 > *"mnemos on Db2"* IBM TechXchange write-up — but the exact same image and
-> steps run unchanged on **Oracle Database 23ai Free**, **PostgreSQL + pgvector**,
+> steps run unchanged on **Oracle AI Database 26ai Free**, **PostgreSQL + pgvector**,
 > or **MariaDB 11.7+**. Pick a backend in
 > [`quickstart/docs/BACKENDS.md`](quickstart/docs/BACKENDS.md); we lead with Db2,
 > it works with all of them.
@@ -94,7 +94,7 @@ Single subsystem, e.g. reasoning: pip install 'mnemos-core[graeae]'
 Hive (STIPHOS) is a SEPARATE service: pip install 'mnemos-stiphos[mcp]' (port 8080)
 ```
 
-**Enterprise backends (Oracle Database 23ai, IBM Db2 12.1).**
+**Enterprise backends (Oracle AI Database 26ai, IBM Db2 12.1).**
 `mnemos-enterprise` is a single multi-arch (amd64 + arm64) image with every
 backend driver baked in. The one asymmetry: Db2's driver has no arm64 wheel,
 so the Db2 backend is amd64-only — Oracle (thin driver), MySQL, and MariaDB
@@ -186,7 +186,7 @@ implemented, in `mnemos/persistence/`:
 |---|---|---|
 | **SQLite + sqlite-vec** | `vec0` virtual table | Default. Edge and development installs; no server to run. |
 | **PostgreSQL + pgvector** | HNSW | **Recommended for vector and semantic workloads** — the most mature and predictable option, with broad managed-service support. |
-| **Oracle Database 23ai** | HNSW `INMEMORY NEIGHBOR GRAPH` | Also JSON Duality and TDE. Thin driver, so it runs on the standard `mnemos` image and on arm64. |
+| **Oracle AI Database 26ai** | HNSW `INMEMORY NEIGHBOR GRAPH` | Also JSON Duality and TDE. Thin driver, so it runs on the standard `mnemos` image and on arm64. |
 | **IBM Db2** | DiskANN | Hot paths emit native Db2 SQL — `VECTOR_DISTANCE(..., EUCLIDEAN)` with `FETCH APPROX FIRST`, engaging the DiskANN index on the user-facing query path. The default dialect (`MNEMOS_DB2_DIALECT=compat`) still translates inherited Oracle-shaped SQL at the cursor layer; set `MNEMOS_DB2_DIALECT=native` for the pass-through backend. amd64 only. |
 | **MySQL 9.0+** | `VECTOR_DISTANCE` | For the managed-cloud MySQL audience (RDS and Aurora MySQL, HeatWave). Note that the vector functions ship only in MySQL **Enterprise/HeatWave**, not Community. |
 | **MariaDB 11.7+** | `VEC_DISTANCE_COSINE` + HNSW `VECTOR INDEX` | The strongest *MySQL-family* option, and available in the **free Community** edition. Embeddings live in a `memory_embeddings` join table. Its vector engine is newer than pgvector's and correspondingly less battle-tested. |

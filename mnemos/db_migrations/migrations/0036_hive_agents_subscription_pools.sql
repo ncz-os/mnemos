@@ -1,5 +1,5 @@
 -- migration: 0036_hive_agents_subscription_pools
--- target:    PostgreSQL 16 + pgvector (development + cixmini edge)
+-- target:    PostgreSQL 16 + pgvector (development + an ARM edge host edge)
 -- purpose:   Advertise workspace-local subscription pools per hive agent.
 
 ALTER TABLE hive_agents

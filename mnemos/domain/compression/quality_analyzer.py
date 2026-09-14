@@ -129,7 +129,7 @@ class QualityAnalyzer:
 
         Embedding backend: ``fastembed`` (ONNX runtime). ~10-20 MB
         package, no torch dependency. We pick the MiniLM ONNX shape
-        which matches the prod mnemos blueprint (PYTHIA :5002 /
+        which matches the prod mnemos blueprint (the production host :5002 /
         phi_server.py uses fastembed + openvino_genai across the
         embedding hot path with zero torch in the venv).
 

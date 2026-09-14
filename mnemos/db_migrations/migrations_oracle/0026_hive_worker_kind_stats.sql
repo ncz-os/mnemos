@@ -1,5 +1,5 @@
 -- migration: 0026_hive_worker_kind_stats
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- schema:    HIVE_MIND
 -- purpose:   Per-worker per-kind aggregate counters. Used by dispatcher to
 --            steer work toward agents with the best track record on a given

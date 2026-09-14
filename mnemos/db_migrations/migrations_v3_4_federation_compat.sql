@@ -1,7 +1,7 @@
 -- migrations_v3_4_federation_compat.sql
 --
 -- v3.4 federation schema-compatibility check. After standing up
--- cross-version federation (PROTEUS at v3.4 pulling from PYTHIA at
+-- cross-version federation (an edge host at v3.4 pulling from the production host at
 -- v3.3 succeeded by accident on 2026-04-26), we want explicit
 -- safety: federation should fail-loud when peers have
 -- significantly-different schemas, not silently drop or mangle

@@ -4989,7 +4989,7 @@ class Db2Backend(OracleBackend):
     supports_row_level_security = False
     supports_pgvector = False
     # Db2 12.1.2+ ships native VECTOR data type with VECTOR_DISTANCE
-    # functions identical to Oracle 23ai. DiskANN-style ANN index
+    # functions identical to Oracle 26ai. DiskANN-style ANN index
     # lands in 12.1.5 (GA Jun 9 2026).
     supports_db2_vector = True
 
@@ -5053,7 +5053,7 @@ class Db2Backend(OracleBackend):
         self._federation_repo = Db2FederationRepository()
         self._morpheus_repo = Db2MorpheusRepository()
         self._state_kv_repo = Db2StateRepository()
-        # RA-0/5/6: OAuth/Sessions/Consultations repos (PYTHIA Oracle-only
+        # RA-0/5/6: OAuth/Sessions/Consultations repos (the production host Oracle-only
         # uses these in production; Db2 needs them for cross-backend parity
         # so the same code paths exercise both backends in tests).
         self._oauth_repo = Db2OAuthRepository()

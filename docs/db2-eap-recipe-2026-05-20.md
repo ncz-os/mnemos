@@ -1,4 +1,4 @@
-# Db2 12.1.5 (Early Access Program) container — local build recipe + June 6 GA repackage guide
+# Db2 12.1.5 container — local build recipe + GA repackage guide
 
 > **⚠️ Important — IBM Db2 Early Access Program (EAP) terms apply.**
 >
@@ -28,21 +28,23 @@
 
 ## Why this exists
 
-IBM publishes the official `icr.io/db2_community/db2` container only for
-12.1.x GA releases. EAP participants who want a 12.1.5-vNext container
-for local development must build their own image from the IBM-supplied
-AESE media. This document captures one working build pattern; **the IBM
-binaries themselves are not included** — bring your own under your EAP
-entitlement.
+Db2 12.1.5 is GA and is the version MNEMOS's Db2 backend targets in production.
+The recipe originated during the Early Access Program, before any 12.1.5
+container existed, and remains useful because IBM publishes the official
+`icr.io/db2_community/db2` container on its own schedule and because a local
+build lets you pin the exact media.
 
-When the GA equivalent of 12.1.5 ships on June 6, two paths:
+Two paths to a 12.1.5 image:
 
-| Path | What you do | When |
+| Path | What you do | Trade-off |
 |---|---|---|
-| **A — wait for icr.io** | Switch to `icr.io/db2_community/db2:12.1.5` once IBM publishes it (typically 2-4 weeks post-GA) | Easy, no rebuild |
-| **B — repackage now** | Drop the GA tarball in, rerun the same Dockerfile, retag as `mnemos/db2:12.1.5-ga` | Same-day on June 6 |
+| **A — use icr.io** | Pull `icr.io/db2_community/db2:12.1.5` | Easiest; no build, no media to obtain |
+| **B — build from media** | Drop the GA tarball in, run the Dockerfile below, tag as `mnemos/db2:12.1.5-ga` | Exact control over media and install options |
 
-Path B is the reason this doc exists. The Dockerfile + entrypoint + response.rsp here are **GA-agnostic** — they don't bake in anything EAP-specific.
+Path B is what this document covers. The Dockerfile, entrypoint, and
+response.rsp are **GA-agnostic** — nothing EAP-specific is baked in, so the same
+recipe builds from GA media unchanged. **The IBM binaries are not included**;
+supply them under your own entitlement.
 
 ---
 
@@ -77,7 +79,7 @@ docker build \
   .
 ```
 
-For GA repackage on June 6:
+For a GA repackage:
 
 ```bash
 docker build \
@@ -94,16 +96,22 @@ docker build \
 ## Run command
 
 ```bash
-docker run -d --name pythia-db2 \
+docker run -d --name mnemos-db2 \
   --privileged=true \
   --ulimit memlock=-1:-1 \
   --shm-size=2g \
   -p 50000:50000 \
   -e DBNAME=MNEMOS \
   mnemos/db2-eap:vnext
-# ENABLE_ORACLE_COMPATIBILITY defaults to false as of PR #12 (2026-05-22).
-# Set ENABLE_ORACLE_COMPATIBILITY=true to fall back to ORA-compat mode.
+# ENABLE_ORACLE_COMPATIBILITY defaults to false: MNEMOS ships a fully native
+# Db2 backend and does not need ORA-compat mode. Pass
+# -e ENABLE_ORACLE_COMPATIBILITY=true to fall back to it.
 ```
+
+The image `ENV` sets `ENABLE_ORACLE_COMPATIBILITY` explicitly, so the
+entrypoint's shell fallback only applies when the variable has been unset.
+Check the value baked into the image you are running rather than assuming the
+fallback governs, and pass `-e` at `docker run` to change it.
 
 Container reaches "ready" in ~90-120s on first start (creates instance + database). Subsequent restarts ~10s.
 
@@ -213,7 +221,7 @@ DB2INSTANCE="${DB2INSTANCE:-db2inst1}"
 DB2FENCED_USER="${DB2FENCED_USER:-db2fenc1}"
 DB2INST1_PASSWORD="${DB2INST1_PASSWORD:?DB2INST1_PASSWORD env var required — set at docker run, not in source}"
 DBNAME="${DBNAME:-MNEMOS}"
-ENABLE_ORACLE_COMPATIBILITY="${ENABLE_ORACLE_COMPATIBILITY:-true}"
+ENABLE_ORACLE_COMPATIBILITY="${ENABLE_ORACLE_COMPATIBILITY:-false}"
 
 DB2INST_HOME="/database/config/${DB2INSTANCE}"
 DB2FENCED_HOME="/database/config/${DB2FENCED_USER}"
@@ -337,9 +345,10 @@ Expected outputs:
 
 ---
 
-## June 6 2026 GA repackage steps
+## GA repackage steps
 
-Assume IBM ships `v12.1.5_linuxx64_server_dec.tar.gz` (or similar name) on June 6.
+IBM ships the GA server media as `v12.1.5_linuxx64_server_dec.tar.gz` or a
+similarly-named tarball; the steps below assume that shape.
 
 ```bash
 # 1. Drop the GA tarball where the EAP one used to be
@@ -371,17 +380,17 @@ docker run -d --name db2-ga-test \
   -p 50002:50000 \
   -e DBNAME=MNEMOS \
   mnemos/db2:12.1.5-ga
-# Note: ENABLE_ORACLE_COMPATIBILITY default is false as of PR #12 (2026-05-22)
+# Note: ENABLE_ORACLE_COMPATIBILITY default is false — MNEMOS is native on Db2.
 
 # 6. Run the validation probes above. If they pass, retire EAP image:
 docker tag mnemos/db2-eap:vnext mnemos/db2:12.1.5-eap-archive
 docker rmi mnemos/db2-eap:vnext
 ```
 
-Expected GA-specific differences:
-- License filenames may revert to `db2aese.lic` etc — adjust 2 lines in Dockerfile COPY + entrypoint.sh
-- `db2icrt -nosharedgroup` flag may or may not be required (vNext made it mandatory; GA may relax)
-- Other than that, the same Dockerfile + response.rsp + entrypoint.sh should work unchanged
+Points to check against GA media:
+- License filenames may differ (`db2aese.lic` rather than `db2adv.lic`/`db2ese.lic`) — adjust 2 lines in Dockerfile COPY + entrypoint.sh
+- `db2icrt` still requires an explicit `-sharedgroup` / `-nosharedgroup`; keep `-nosharedgroup` unless a build says otherwise
+- Other than that, the same Dockerfile + response.rsp + entrypoint.sh work unchanged
 
 ---
 
@@ -393,17 +402,14 @@ entitlement. **Do not** archive the built image to a shared or
 publicly-accessible location, do not push to a public registry, and do
 not redistribute either the image or the AESE media used to build it.
 
-When the GA equivalent ships (June 6, 2026), repackage using the
-GA-equivalent AESE tarball; the recipe in this file is GA-agnostic, so
-the build steps are identical.
+Repackaging from GA AESE media uses the identical build steps; the recipe in
+this file is GA-agnostic.
 
 ---
 
 ## Cross-references
 
-- `docs/handoff-opencode-db2-sql-overrides-2026-05-20.md` — SQL override work needed to push proof from 2/6 → 6/6
-- `docs/db2-port-handoff.md` — older handoff (R1-R6 attempts)
-- <archived bench artifact> — signed 2/6 proof artifact on EAP
+- [`docs/db2-oracle-ee-test-plan.md`](db2-oracle-ee-test-plan.md) — parity test plan for the Db2 and Oracle backends
 - IBM Db2 12.1 docs (response file keywords): https://www.ibm.com/docs/en/db2/12.1
 - jbonhag/db2-docker #9 (Global Profile Registry trap): https://github.com/jbonhag/db2-docker/issues/9
 - aeronje/ibm_db2_community_edition_linux_ubuntu (Ubuntu prereq research): https://github.com/aeronje/ibm_db2_community_edition_linux_ubuntu

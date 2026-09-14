@@ -24,8 +24,8 @@ replication, or production HA.
 
 ## Storage Mapping
 
-The SQLite migration chain lives in `db/migrations_sqlite/` and mirrors the
-canonical Postgres migration list.
+The SQLite migration chain lives in `mnemos/db_migrations/migrations_sqlite/`
+and mirrors the canonical Postgres migration list.
 
 - `UUID` -> `TEXT`
 - `JSONB` -> JSON text, queried through SQLite JSON1 where needed
@@ -42,14 +42,29 @@ SQLite has no row-level security. The profile is single-user or
 single-namespace by deployment convention; tenancy is enforced at the
 application layer through the same visibility predicate used by non-RLS reads.
 
-SQLite has no LISTEN/NOTIFY. Federation and webhook workers use polling.
+SQLite has no LISTEN/NOTIFY. Federation workers use polling.
 
 SQLite has no advisory locks. The backend serializes transactions through one
 connection mutex, matching SQLite's serialized-write model.
 
-Postgres enforces webhook `status='succeeded'` as terminal through a trigger.
-The SQLite profile enforces that path in `mnemos.webhooks.finalize` because the
-profile does not rely on trigger functions for retry-chain safety.
+### Webhook delivery is not available on this profile
+
+`SqliteBackend.supports_webhooks` is `False`, and the API lifecycle hooks refuse
+to start the webhook delivery and NATS-trigger workers against any backend that
+does not advertise the capability. The claim/send/finalize worker is
+asyncpg-specific.
+
+The write side is complete: the SQLite schema provisions the full canonical
+`webhook_deliveries` shape described in
+[`WEBHOOK_PERSISTENCE_CONTRACT.md`](WEBHOOK_PERSISTENCE_CONTRACT.md), and
+`SqliteWebhookRepository` implements the repository surface, so subscriptions
+can be created and outbox rows are appended durably and transactionally. Nothing
+drains them. **Rows are written but never delivered on this profile.** Use
+Postgres for any deployment that depends on webhooks firing.
+
+Where the terminal-success invariant is enforced also differs: Postgres uses a
+trigger, while the SQLite profile enforces it in `mnemos.webhooks.finalize`
+because the profile does not rely on trigger functions for retry-chain safety.
 
 ## Configuration
 

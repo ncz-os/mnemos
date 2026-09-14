@@ -1,4 +1,4 @@
--- 0009_morpheus_runs.sql — Oracle 23ai port for MNEMOS parity.
+-- 0009_morpheus_runs.sql — Oracle 26ai port for MNEMOS parity.
 
 CREATE TABLE morpheus_runs (
     id VARCHAR2(36) PRIMARY KEY,

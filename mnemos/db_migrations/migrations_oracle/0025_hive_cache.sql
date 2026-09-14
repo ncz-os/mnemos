@@ -1,5 +1,5 @@
 -- migration: 0025_hive_cache
--- target:    Oracle 23ai PDB ORCLPDB1 (PYTHIA + CERBERUS standby)
+-- target:    Oracle 26ai PDB ORCLPDB1 (the production host + a GPU host standby)
 -- schema:    HIVE_MIND
 -- purpose:   Result cache keyed by canonical-prompt hash. Lets the dispatcher
 --            skip identical work that another agent already paid for.
@@ -9,7 +9,7 @@
 --   - cache_key is caller-canonical hash (SHA-256 hex over normalized prompt
 --     + model + provider + cost_tier). Up to 128 chars accommodates either
 --     hex SHA-256 (64) or longer composite keys.
---   - result_json native Oracle 23ai JSON for fast SQL/JSON path queries.
+--   - result_json native Oracle 26ai JSON for fast SQL/JSON path queries.
 --   - cost_saved_usd tallies cumulative savings across hits (informational).
 --   - source_job_id + result_mnemos_id back-references for audit.
 --   - hit_count + last_hit_at drive cache eviction policy (LRU + age).

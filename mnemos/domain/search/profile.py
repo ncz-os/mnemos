@@ -13,7 +13,7 @@ class SearchProfile(str, Enum):
     - ``balanced``: current behavior — semantic + FTS union,
       recency-weighted. Default for interactive callers.
     - ``deep``: semantic + cross-encoder rerank top-100 → top-30 via
-      MEDUSA :8091 bge-reranker-v2-m3. p99 ≤ 5s for `synthesize` /
+      a fallback host :8091 bge-reranker-v2-m3. p99 ≤ 5s for `synthesize` /
       `narrate` consumers.
     """
 

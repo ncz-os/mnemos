@@ -1,5 +1,5 @@
 -- 0010_hive_mind.sql
--- GRAEAE Hive Mind schema for Oracle 23ai (PYTHIA production backend).
+-- GRAEAE Hive Mind schema for Oracle 26ai (the production host production backend).
 -- Uses Oracle native JSON columns + sequences. SKIP LOCKED-friendly via FOR UPDATE.
 
 CREATE TABLE hive_agents (

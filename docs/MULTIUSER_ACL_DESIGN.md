@@ -1,6 +1,7 @@
 # Multiuser ACL + delegated group-admin
 
-Status: implemented (PostgreSQL, Oracle, Db2); SQLite read-honors-only.
+Status: implemented (PostgreSQL, Oracle, Db2); SQLite read-honors-only;
+**not implemented on MySQL or MariaDB**.
 Slice: per-principal `memory_acl` escape hatch + `user_groups.is_admin` tier.
 
 ## Problem
@@ -27,9 +28,10 @@ never grants write/admin and never narrows.
   silently does nothing or misleads operators. `ACL_WRITE_BIT` is retained as a
   constant for a future write-delegation slice.
 - Read predicates honor a grant via an `EXISTS` disjunct, added to the
-  visibility OR-group on every multi-user backend. The disjunct is **pinned to
-  the caller's namespace**: a grant widens read only *within* the caller's
-  namespace, never across tenants.
+  visibility OR-group on PostgreSQL, Oracle, Db2, and SQLite. The disjunct is
+  **pinned to the caller's namespace**: a grant widens read only *within* the
+  caller's namespace, never across tenants. MySQL and MariaDB build no such
+  disjunct — see the backend-support note below.
 
 ### Capability-gated management surface
 
@@ -39,6 +41,16 @@ the single-user SQLite laptop tier does **not** — its management routes degrad
 to 503 rather than pretend to manage rows it cannot enforce. SQLite's read
 predicate still honors pre-existing `memory_acl` rows (so a workgroup DB
 migrated down to SQLite keeps its grants readable).
+
+**MySQL and MariaDB have no ACL support at all.** They advertise only `core`,
+`state`, `federation`, and `oauth`; there is no `memory_acl` table, no
+`AclRepository`, and no ACL disjunct in their read predicates. Management routes
+degrade to 503 as they do on SQLite, but unlike SQLite the read path does not
+honor existing grants either. A workgroup migrated to MySQL or MariaDB loses
+every ACL grant: memories shared through `memory_acl` become invisible to their
+grantees, falling back to `group_id` plus mode bits alone. Plan that migration
+by re-expressing each grant as group membership before the cutover, or stay on a
+backend that advertises the `acl` capability.
 
 ### Delegated group-admin authorization
 

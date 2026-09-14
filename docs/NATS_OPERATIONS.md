@@ -8,28 +8,47 @@ separate path behind the `MNEMOS_GRAEAE_NATS_FANOUT` flag, and ships with the
 
 ## Streams
 
-`ensure_streams()` (in `mnemos/nats/client.py`) declares three streams
+`ensure_streams()` (in `mnemos/nats/client.py`) declares six streams
 at startup. Declarations are idempotent — re-running against a broker
-with a matching config is a no-op.
+with a matching config is a no-op. Every stream uses the same shape:
+`LIMITS` retention, `FILE` storage, 30-day `max_age`, 10 GB
+`max_bytes`, 2-minute `duplicate_window`.
 
-| Stream                | Subjects             | Retention      | Max bytes | Dedup window |
-|-----------------------|----------------------|----------------|-----------|--------------|
-| `MNEMOS_MEMORY`       | `mnemos.memory.>`    | 30 days, file  | 10 GB     | 2 minutes    |
-| `MNEMOS_CONSULTATION` | `mnemos.consultation.>` | 30 days, file | 10 GB   | 2 minutes    |
-| `MNEMOS_WEBHOOK`      | `mnemos.webhook.>`   | 30 days, file  | 10 GB     | 2 minutes    |
+| Stream                  | Stream subject filter      | Subjects actually published                                                                     | Producer                          | Consumer                                            |
+|-------------------------|----------------------------|-------------------------------------------------------------------------------------------------|-----------------------------------|-----------------------------------------------------|
+| `MNEMOS_MEMORY`         | `mnemos.memory.>`          | `mnemos.memory.created.<ns>`, `.updated.<ns>`, `.deleted.<ns>`                                    | memory routes                     | `mnemos/federation/nats_consumer.py`                |
+| `MNEMOS_CONSULTATION`   | `mnemos.consultation.>`    | consultation fan-out events                                                                       | `mnemos-graeae` add-on            | GRAEAE backends                                     |
+| `MNEMOS_WEBHOOK`        | `mnemos.webhook.>`         | `mnemos.webhook.delivery.queued.<ns>`, `mnemos.webhook.subscription.created.<ns>`                  | webhook routes / dispatcher       | `mnemos/webhooks/nats_trigger.py`                   |
+| `MNEMOS_PANTHEON`       | `mnemos.pantheon.>`        | `mnemos.pantheon.routing`                                                                         | `mnemos-pantheon` add-on          | `mnemos.workers.pantheon_routing_audit_consumer` (ships in the `pantheon` extra) |
+| `MNEMOS_WEBHOOKS_OUTBOX`| `mnemos.webhooks.outbox.>` | `mnemos.webhooks.outbox.<tenant>.<event_type>`                                                    | `mnemos/persistence/nats_events.py` | `mnemos/workers/webhooks_dispatch_nats_consumer.py` |
+| `MNEMOS_FEDERATION`     | `mnemos.federation.>`      | `mnemos.federation.memory.<ns>`                                                                   | `mnemos/persistence/nats_events.py` | `mnemos/workers/federation_memory_nats_consumer.py` |
+
+> **Operational trap — `mnemos.webhook.` (singular) and
+> `mnemos.webhooks.` (plural) are two different subject families on two
+> different streams.** Singular `mnemos.webhook.>` carries the delivery
+> trigger and subscription events on `MNEMOS_WEBHOOK`; plural
+> `mnemos.webhooks.outbox.>` carries outbox dispatch events on
+> `MNEMOS_WEBHOOKS_OUTBOX`. An ACL, subject filter, monitoring rule or
+> `nats sub` that uses one where the other was meant silently matches
+> nothing — no error, no traffic. Grant both explicitly; never assume a
+> `mnemos.webhook.>` wildcard covers the outbox.
+>
+> Likewise `mnemos.federation.>` (the `MNEMOS_FEDERATION` direct-upsert
+> contract) is distinct from `mnemos.memory.>` (the nudge contract the
+> HTTP-backfill federation consumer reads). Both carry federation traffic;
+> they are not interchangeable.
 
 Storage is `FILE` (durable across broker restart). Retention is
 `LIMITS` policy — messages drop when EITHER the 30-day age limit OR
 the 10 GB byte limit is hit, whichever fires first.
 
 The 2-minute `duplicate_window` matters for the publish-with-`msg_id`
-pattern used by federation push and webhook nudges:
+pattern used by every producer:
 `nats_bus.publish_event(subject, payload, msg_id=<stable-id>)` will
 not double-publish if the same `msg_id` arrives within 2 minutes.
 Outside that window, a re-publish becomes a new message — consumers
-must idempotency-check on the receive side (federation does this via
-the memory `id` primary key + `ON CONFLICT`; webhook delivery does it
-via the outbox `delivery_id` UUID).
+must idempotency-check on the receive side (see
+[Symptom: duplicate messages](#symptom-duplicate-messages)).
 
 ### Storage exhaustion fallback
 
@@ -60,10 +79,25 @@ What lands on each subject:
 | `mnemos.memory.deleted.*`    | `memory_id` + tombstone metadata.                                                                              | low         |
 | `mnemos.consultation.*`      | Consultation `id`, `task_type`, model selection. Prompt/response excerpts NOT published — backends fetch via `/v1/consultations/{id}` for the body. | low-medium |
 | `mnemos.webhook.*`           | Delivery `id`, `subscription_id`, `event_type`, target URL, payload hash. NOT the payload body.                | medium      |
+| `mnemos.webhooks.outbox.*`   | Outbox insert nudge: `event_id`, `delivery_id`, `subscription_id`, `event_type`, target URL, payload hash, namespace, tenant. NOT the payload body. | medium |
+| `mnemos.federation.memory.*` | **Full memory upsert, body included** — `content`, `verbatim_content`, `metadata`, category, namespace, `permission_mode`, provenance, `schema_version`. | high |
+| `mnemos.pantheon.routing`    | Routing decision: alias/model requested, resolved target, outcome, latency, token counts, request/tenant id. No prompt or completion text. | medium |
 | MCP SSE summaries (`/sse`)   | Filtered subset by default: `subject`, `memory_id`, `namespace`, `category`, `source_node`. Full content only when `MNEMOS_MCP_NATS_RAW=true`. | medium |
 
-**Architectural note — why no full content on the bus.** The
-shipped subjects are NUDGES, not content carriers. Federation push
+**`mnemos.federation.memory.>` is the one content-carrying family.**
+Everything else on the bus is a nudge. The direct-upsert contract exists
+so a trusted peer can apply a memory without a second HTTP round trip,
+which necessarily puts the body on the wire. Its export predicate is the
+only authorization boundary: federated-in, deleted, archived and
+consolidated rows never publish; the secret vault namespace never
+publishes under any setting; and unless `federation_feed_include_private`
+marks the deployment a trusted fleet, only world-readable rows publish.
+Treat a subscriber on this family as equivalent to a read-authorized
+federation peer, and scope broker permissions accordingly.
+
+**Architectural note — why the nudge families carry no content.**
+Apart from the direct-upsert family above, the shipped subjects are
+NUDGES, not content carriers. Federation push
 receivers receive the nudge, then fetch the content via the
 authorized HTTP federation feed (``GET
 /v1/federation/feed?since=...&memory_id=...``) which enforces
@@ -71,10 +105,13 @@ per-peer ``namespace_filter`` / ``category_filter`` /
 ``auth_token`` — the same authorization predicate as the HTTP-pull
 path. This means:
 
-  * The broker does NOT hold a 30-day copy of every memory body.
-    The streams retain 30 days of nudges (small JSON blobs); the
-    body itself only lives in Postgres and travels over the
+  * On the nudge families the broker does NOT hold a 30-day copy
+    of every memory body. Those streams retain 30 days of small
+    JSON blobs; the body lives in Postgres and travels over the
     authenticated HTTP feed when peers actually need it.
+    `MNEMOS_FEDERATION` is the exception — where it is enabled,
+    budget its 30-day retention against real memory bodies and
+    protect that stream's files like the database itself.
   * Per-peer authorization runs server-side at content fetch
     time, NOT at NATS subscribe time. A peer subscribed to
     ``mnemos.memory.created.*`` sees that an event happened (id +
@@ -86,26 +123,35 @@ path. This means:
     written. Rate-limit + ACL the bus accordingly (see next
     section), but don't treat broker storage as a content vault.
 
-**Operator implication:** the broker's stream files are still
+**Operator implication:** the broker's stream files are
 operationally important — they hold the activity audit trail and
 nudge backlog. Encrypt at rest, restrict the filesystem, and
-back up alongside Postgres. They're NOT, however, a parallel
-content tier you have to encrypt with the same care as the
-database itself, because no body is on them.
+back up alongside Postgres.
 
 ## NATS ACL recommendations
 
 The MNEMOS publish/subscribe topology is asymmetric:
 
-  * MNEMOS server processes PUBLISH on
+  * MNEMOS server processes PUBLISH on every shipped subject family:
     ``mnemos.memory.>``, ``mnemos.consultation.>``, ``mnemos.webhook.>``,
-    ``mnemos.federation.>``.
+    ``mnemos.webhooks.outbox.>``, ``mnemos.federation.>``,
+    ``mnemos.pantheon.>``.
   * MNEMOS server processes SUBSCRIBE to the same subjects (federation
-    push receivers, webhook NATS triggers).
+    push receivers, webhook NATS triggers, webhook outbox dispatch,
+    federation direct-upsert, PANTHEON routing audit).
   * MCP HTTP/SSE clients SUBSCRIBE only to the principal-namespaced
     summary subset (subjects derived server-side from the
     authenticated principal — a non-operator client cannot pick its
     own subject filter; see ``mnemos/mcp/http.py::_parse_nats_sse_subjects``).
+
+**Write the allow-list from the full six-family inventory**, not from
+the three families an older deployment happened to use. Each family in
+the [Streams](#streams) table is published by a live code path; omitting
+one produces a broker that accepts the connection, rejects the publish
+or subscribe, and shows up only as a consumer that never receives
+anything. The plural/singular pair (``mnemos.webhook.>`` vs
+``mnemos.webhooks.outbox.>``) is the one operators most often collapse
+into a single rule — they must both appear.
 
 Recommended ``authorization`` block (NATS server config snippet):
 
@@ -135,12 +181,14 @@ authorization {
     # External federation peers (if you trust a peer to publish into
     # YOUR memory namespace, which is unusual — most operators
     # prefer the HTTP federation feed for inbound). Scope tightly:
-    # one user per peer with publish-only on a peer-prefixed
-    # subject the local consumer subscribes to.
+    # one user per peer, publish-only, narrowed to the namespaces
+    # that peer is allowed to write. The direct-upsert family
+    # carries memory BODIES, so a publish grant here is a write
+    # grant on the local store.
     # {
     #   user: "peer-alpha"
     #   permissions: {
-    #     publish:   { allow: ["mnemos.federation.alpha.>"] }
+    #     publish:   { allow: ["mnemos.federation.memory.alpha"] }
     #     subscribe: { deny: [">"] }
     #   }
     # }
@@ -190,7 +238,9 @@ For multi-tenant deployments, the recommended hardening:
        permissions: {
          publish:   { allow: ["mnemos.memory.created.alice",
                               "mnemos.memory.updated.alice",
-                              "mnemos.memory.deleted.alice"] }
+                              "mnemos.memory.deleted.alice",
+                              "mnemos.webhooks.outbox.alice.>",
+                              "mnemos.federation.memory.alice"] }
          subscribe: { allow: ["mnemos.>.alice", "_INBOX.>"] }
        }
      }
@@ -236,11 +286,11 @@ Operators who need historical / audit-style reads:
     etc.) which goes through the visibility-gated repository
     path with the proper ``VisibilityFilter.for_read`` checks
     + RLS context.
-  * The NATS streams (``MNEMOS_MEMORY``, ``MNEMOS_CONSULTATION``,
-    ``MNEMOS_WEBHOOK``) DO retain 30 days of events for
-    backend consumers — federation push receivers and webhook
-    NATS triggers ARE durable. The MCP SSE bridge is the
-    OUTLIER that gives up durability deliberately.
+  * All six NATS streams DO retain 30 days of events for backend
+    consumers — federation push receivers, webhook NATS triggers,
+    webhook outbox dispatch, federation direct-upsert and the
+    PANTHEON routing audit are all durable. The MCP SSE bridge is
+    the OUTLIER that gives up durability deliberately.
 
 ## Federation peer config
 
@@ -249,7 +299,7 @@ Set `MNEMOS_FEDERATION_NATS_PEERS` to a JSON array per peer:
 ```json
 [
   {
-    "name": "pythia",
+    "name": "peer-alpha",
     "nats_url": "nats://<host>:4222",
     "nats_token": "<NATS broker token>",
     "subjects": ["mnemos.memory.>"],
@@ -293,12 +343,22 @@ explicitly to a stable, deployment-unique value.
 ## Reconnect backoff
 
 `mnemos/nats/backoff.py:ReconnectBackoff` — exponential growth with
-full jitter on broker outage. Both consumer loops use it:
+full jitter on broker outage. It is the single shared helper; all four
+consumer loops construct it identically
+(`ReconnectBackoff(base_seconds=1.0, cap_seconds=retry_seconds)`):
 
-* **Federation NATS consumer** —
-  `mnemos/federation/nats_consumer.py:consumer_loop`
-* **Webhook NATS trigger** —
-  `mnemos/webhooks/nats_trigger.py:consumer_loop`
+| Consumer loop | Module | Stream | Durable prefix |
+|---|---|---|---|
+| Federation nudge receiver (per peer) | `mnemos/federation/nats_consumer.py:consumer_loop` | `MNEMOS_MEMORY` | `mnemos_federation_` |
+| Webhook delivery trigger | `mnemos/webhooks/nats_trigger.py:consumer_loop` | `MNEMOS_WEBHOOK` | `mnemos_webhook_delivery_trigger` |
+| Webhook outbox dispatch | `mnemos/workers/webhooks_dispatch_nats_consumer.py:consumer_loop` | `MNEMOS_WEBHOOKS_OUTBOX` | `mnemos_webhooks_outbox_dispatch` |
+| Federation memory upsert (per peer) | `mnemos/workers/federation_memory_nats_consumer.py:consumer_loop` | `MNEMOS_FEDERATION` | `mnemos_federation_memory_upsert` |
+
+The PANTHEON routing audit consumer
+(`mnemos.workers.pantheon_routing_audit_consumer`, `MNEMOS_PANTHEON`) is a
+fifth loop, but it lives in the `mnemos-pantheon` add-on rather than in
+mnemos-core; it is only started when the `pantheon` extra is installed and
+`MNEMOS_NATS_AUDIT_CONSUMER_ENABLED` is set.
 
 The window starts at 1s, doubles up to a 30s cap (overridable via
 `retry_seconds` kwarg), and the actual sleep on each attempt is
@@ -318,7 +378,8 @@ exponential window so collisions are rare.
 
 ## Resource cleanup on subscribe failure
 
-`_drain_partial(nc, subscriptions)` runs in BOTH consumer loops on:
+Each of the four loops carries its own `_drain_partial(nc, subscriptions)`
+with identical semantics. It runs on:
 
 1. Cancellation (`asyncio.CancelledError`)
 2. Connect-level exceptions before `_consume_subscription` starts
@@ -363,17 +424,15 @@ same peer behind reconnect backoff. JetStream redelivers unacked
 messages after the ack-wait window, so transient handler failures get
 retried without code-side intervention.
 
-Pre-round-2 (v4.2.0a6), a subscribe failure leaked one TCP connection
-per retry. v4.2.0a7 round-2 added the receive/ack escape path for
-genuine NATS issues. v4.2.0a7 round-3 (codex audit 2026-05-01) split
-the handle scope from the receive/ack scopes so handler errors stay
-local regardless of exception type — earlier code only kept
-`asyncpg.PostgresError` local, which would have torn down NATS on a
-plain `RuntimeError` or `asyncpg.InterfaceError`.
+The split is deliberate and load-bearing: classifying handler errors by
+exception type instead of by scope tears the NATS subscription down on a
+plain `RuntimeError` or a closed pool connection, neither of which the
+broker can do anything about. Scope, not exception type, decides whether
+a failure escapes.
 
 With backoff bounding the rate, drain bounding the total, the
 receive/ack escape paths handling NATS issues, and the handle scope
-keeping handler errors local, a sustained failure now stays in a
+keeping handler errors local, a sustained failure stays in a
 bounded steady state instead of accumulating sockets, wedging, or
 amplifying handler hiccups into peer-wide reconnect storms.
 
@@ -396,31 +455,58 @@ Check in this order:
 3. Stream presence on the peer:
    `nats stream info MNEMOS_MEMORY --server $PEER_NATS_URL`.
 4. Durable consumer name collision:
-   `nats consumer ls MNEMOS_MEMORY` — the federation consumer
-   name pattern is `federation_<peer_name>_<sanitized_subject>`.
-5. As a fallback, restart the local mnemos process — the HTTP
+   `nats consumer ls MNEMOS_MEMORY` — the nudge-receiver durable is
+   `mnemos_federation_<peer_name>_<sanitized_subject>`.
+5. If the peer uses the direct-upsert contract, check the other
+   stream too: `nats consumer ls MNEMOS_FEDERATION`, durable
+   `mnemos_federation_memory_upsert_<peer>_<sanitized_subject>`.
+   The two paths fail independently — memory nudges can be flowing
+   while `mnemos.federation.memory.>` is not, and vice versa.
+6. As a fallback, restart the local mnemos process — the HTTP
    federation pull path will still backfill any rows missed
    while NATS push was unavailable.
 
 ### Symptom: webhook deliveries delayed (broker outage)
 
-* Pre-NATS: webhook delivery still happens via the polling
-  recovery worker (`webhooks.repair_worker_loop` +
-  `webhook_delivery_loop`) in `mnemos/api/lifecycle_hooks.py`. Latency
-  goes from ~real-time (NATS push trigger) to the polling cadence
-  (`RECOVERY_POLL_INTERVAL`, default 30s).
+* Delivery still happens via the polling workers — `repair_worker_loop`
+  and `delivery_worker_loop` (exported from `mnemos/webhooks/`, started
+  in `mnemos/api/lifecycle_hooks.py`; `recovery_worker_loop` is a
+  compatibility alias for `delivery_worker_loop`). Latency goes from
+  ~real-time (NATS push trigger) to the polling cadence
+  (`RECOVERY_POLL_INTERVAL` in `mnemos/webhooks/types.py`, default 30s).
 * No deliveries are lost. The Postgres `webhook_deliveries`
-  outbox is authoritative; NATS is a nudge fast-path only.
+  outbox is authoritative; both NATS webhook paths are nudge
+  fast-paths only.
 
 ### Symptom: duplicate messages
 
 Within a 2-minute window, the `duplicate_window` config blocks
 re-publishes that supply the same `msg_id`. Outside that window
 (network split lasting >2 min, broker restart spans the window),
-duplicates can land. Consumers handle this via:
+duplicates can land. JetStream is at-least-once regardless, so every
+consumer has a receive-side guard:
 
-* Federation: memory `id` primary key + `ON CONFLICT (id) DO NOTHING`.
-* Webhook: `webhook_deliveries.id` UUID primary key.
+* **`nats_dispatch_log`, keyed `(event_id, subject)`** — the dedupe
+  primitive for the webhook outbox dispatch and federation memory
+  upsert consumers. Reached through
+  `NatsDispatchLogRepository.record_if_new`
+  (`mnemos/persistence/base.py`), which does check-and-insert inside
+  the caller's transaction: the federation consumer writes the dedupe
+  row and the memory upsert in one transaction, so a failed upsert
+  rolls the dedupe row back rather than swallowing the event. A
+  redelivery finds the row present and is acked without a second side
+  effect. Implemented on every backend (Postgres / SQLite / MySQL /
+  MariaDB / Oracle / Db2) against the same primary key.
+* **Federation nudge receiver:** memory `id` primary key +
+  `ON CONFLICT (id) DO NOTHING`.
+* **Webhook delivery trigger:** `webhook_deliveries.id` UUID primary
+  key, plus the `SKIP LOCKED` claim that serialises the actual send.
+
+To inspect: `SELECT * FROM nats_dispatch_log WHERE event_id = '<id>'`
+tells you whether a given event was already applied. Rows accumulate —
+prune on whatever cadence your retention policy calls for, but never
+below the JetStream 30-day window, or a redelivered message from the
+backlog loses its dedupe record.
 
 If you see duplicate side-effects despite the receive-side
 idempotency, check whether a consumer is processing AT LEAST ONCE
@@ -438,13 +524,21 @@ or delete + recreate the stream (latter loses retained messages).
 
 ## Multi-replica deployment (queue groups)
 
-`v4.2.0a8` added JetStream queue-group support to both consumer
-loops. By default the substrate is single-replica safe:
+Every consumer loop supports JetStream queue groups, each behind its own
+env var. By default the substrate is single-replica safe — leave the var
+empty and each loop keeps its legacy durable:
 
-| Env var                              | Empty (default)                                                          | Non-empty                                                                                                                                                              |
-|--------------------------------------|--------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `MNEMOS_FEDERATION_NATS_QUEUE_GROUP` | Durable: `mnemos_federation_<peer>_<subject>`. Single subscriber.        | Durable: `mnemos_federation_q_<group>_<peer>_<subject>` (queue == durable per nats-py). JetStream load-balances within the group.                                        |
-| `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP`    | Durable: `mnemos_webhook_delivery_trigger_<node>`. Per-replica fan-out.  | Durable: `mnemos_webhook_delivery_trigger_q_<group>` (queue == durable per nats-py). JetStream delivers each nudge to exactly ONE replica.                               |
+| Env var                              | Consumer loop                   | Empty (default)                                                          | Non-empty                                                                                                                        |
+|--------------------------------------|---------------------------------|--------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| `MNEMOS_FEDERATION_NATS_QUEUE_GROUP` | Federation nudge receiver       | Durable: `mnemos_federation_<peer>_<subject>`. Single subscriber.        | Durable: `mnemos_federation_q_<group>_<peer>_<subject>_<hash>`. JetStream load-balances within the group.                            |
+| `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP`    | Webhook delivery trigger        | Durable: `mnemos_webhook_delivery_trigger_<node>`. Per-replica fan-out.  | Durable: `mnemos_webhook_delivery_trigger_q_<group>_<hash>`. JetStream delivers each nudge to exactly ONE replica.                   |
+| `MNEMOS_NATS_WEBHOOKS_QUEUE_GROUP`   | Webhook outbox dispatch         | Durable: `mnemos_webhooks_outbox_dispatch_<node>`. Per-replica fan-out.  | Durable: `mnemos_webhooks_outbox_dispatch_q_<group>_<hash>`. One replica per event. Falls back to `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP` when unset. |
+| `MNEMOS_NATS_FEDERATION_QUEUE_GROUP` | Federation memory upsert        | Durable: `mnemos_federation_memory_upsert_<peer>_<subject>`.            | Durable: `mnemos_federation_memory_upsert_q_<group>_<peer>_<subject>_<hash>`. Falls back to `MNEMOS_FEDERATION_NATS_QUEUE_GROUP` when unset.  |
+
+Queue-mode durable names append a 12-char SHA-256 digest of the full
+untruncated group/peer/subject triple after capping the readable part, so
+two distinct triples can never collide inside JetStream's 128-character
+durable-name limit.
 
 ### Why durable == queue
 
@@ -468,7 +562,7 @@ coexist on the same broker, because:
 * Switching an existing consumer's `deliver_group` requires
   delete-and-recreate; mnemos does not do this on your behalf.
 
-So an a8 replica with queue-group set and an a7 replica running
+So a replica with the queue group set and a replica still running
 default behavior land on **two separate JetStream consumers** for
 the same stream. Both consumers receive every event published to
 the stream. Both replica groups process those events. **Expect
@@ -486,22 +580,26 @@ only one wins. Less to worry about there.
 ### Steps
 
 1. Pick a stable group name (e.g. `fed_pool`, `webhook_pool`).
-2. Ensure every replica scheduled to join the group is on
-   `v4.2.0a8` or later.
-3. Set `MNEMOS_FEDERATION_NATS_QUEUE_GROUP` and/or
-   `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP` on those replicas.
-4. Set `MNEMOS_NODE_NAME` per replica to a stable, unique value so
+2. Set the queue-group env vars for the loops you are pooling
+   (`MNEMOS_FEDERATION_NATS_QUEUE_GROUP`,
+   `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP`,
+   `MNEMOS_NATS_WEBHOOKS_QUEUE_GROUP`,
+   `MNEMOS_NATS_FEDERATION_QUEUE_GROUP`) identically on every replica
+   that is joining.
+3. Set `MNEMOS_NODE_NAME` per replica to a stable, unique value so
    `source_node` filtering still works (federation echo suppression
    does not depend on the queue group).
-5. Roll the fleet. The queue-mode durable will be auto-created the
+4. Roll the fleet. The queue-mode durable is auto-created the
    first time a replica subscribes; subsequent replicas bind to it.
-6. Once the fleet is fully on a8 + queue-group, you can delete the
+5. Once every replica is in the group, delete the
    stale legacy durables to stop their event flow (and the
    duplicate work):
 
    ```
    nats consumer rm MNEMOS_MEMORY mnemos_federation_<peer>_<subject>
    nats consumer rm MNEMOS_WEBHOOK mnemos_webhook_delivery_trigger_<old_node_name>
+   nats consumer rm MNEMOS_WEBHOOKS_OUTBOX mnemos_webhooks_outbox_dispatch_<old_node_name>
+   nats consumer rm MNEMOS_FEDERATION mnemos_federation_memory_upsert_<peer>_<subject>
    ```
 
    per legacy durable. JetStream auto-prunes inactive consumers
@@ -509,7 +607,7 @@ only one wins. Less to worry about there.
 
 ### Verifying queue-group rollout
 
-After step 5, confirm the queue-mode consumer exists and has the
+After the roll, confirm the queue-mode consumer exists and has the
 expected `deliver_group`:
 
 ```
@@ -544,9 +642,9 @@ not concentrate on a single replica when traffic is high enough.
 If the burst lands entirely on one replica, check:
 
 * All replicas actually have the env var set (`systemctl show
-  mnemos -p Environment | grep QUEUE_GROUP`).
-* All replicas are on `v4.2.0a8` or later
-  (`mnemos --version`).
+  mnemos -p Environment | grep QUEUE_GROUP`), spelled identically —
+  a group name that differs by one character creates a second,
+  separate queue-mode durable rather than joining the first.
 * The consumer's `Delivery Group` is set (queue-mode); if it's
   empty the consumer is in legacy single-subscriber mode and
   the env var didn't take effect.
@@ -556,41 +654,71 @@ If the burst lands entirely on one replica, check:
 
 ## Live-broker integration tests
 
-`v4.2.0a9` added `tests/integration_nats/` — a pytest suite that
-runs against a real NATS broker. It is SKIPPED by default; set
-`MNEMOS_NATS_TEST_URL=nats://host:4222` (and optionally
-`MNEMOS_NATS_TEST_TOKEN`) to enable. The runtime contracts the
-suite proves:
+`tests/integration_nats/` is a pytest suite that runs against a real
+NATS broker. It auto-skips when no broker source is available, so a
+default `pytest` run on a machine without NATS stays green. There are
+two independent broker sources, and each test routes to the one it
+needs:
 
-* `add_stream` is idempotent on a matching config.
-* `add_stream` raises (does not silently mutate) on a drifted
-  config; the existing stream keeps its old config.
-* `ensure_streams()` is safe to re-run — second-call no-op.
-* Queue-group subscriptions actually load-balance: two replicas
-  joined to the same group both receive some traffic and JetStream
-  does not duplicate messages across them.
+| Source | How to enable | Tests it serves |
+|---|---|---|
+| Operator-managed broker | `MNEMOS_NATS_TEST_URL=nats://host:4222` (plus `MNEMOS_NATS_TEST_TOKEN` if the broker requires auth) | Stream declaration, drift, queue-group balance, outbox + federation publish/consume round trips |
+| Test-managed broker | a `nats-server` binary on `PATH`, or `MNEMOS_NATS_SERVER_BIN=<abs path>` | Partial-outage tests, which need to stop and restart the broker |
 
-Operators rolling out queue-group support can use this as a
-pre-prod smoke check against their cluster:
+The runtime contracts the suite proves:
+
+* `add_stream` is idempotent on a matching config, across repeated
+  redeclarations (`test_stream_drift.py`).
+* `add_stream` raises (does not silently mutate) on a drifted config;
+  the existing stream keeps its old config.
+* `ensure_streams()` is safe to re-run — second-call no-op — and
+  survives a broker restart (`test_partial_outage.py`).
+* Queue-group subscriptions actually load-balance: two replicas joined
+  to the same group both receive traffic and JetStream does not
+  duplicate messages across them (`test_queue_group_balance.py`).
+* The webhook outbox dispatch and federation memory upsert contracts
+  publish and consume end to end on a live broker
+  (`test_v5_2_nats_substrate.py`).
+
+### Partial-outage coverage
+
+`test_partial_outage.py` drives the **production** consumer loop —
+`mnemos.federation.nats_consumer.consumer_loop`, not a fake — against a
+pytest-owned `nats-server` subprocess. The `managed_broker` fixture
+(`tests/integration_nats/conftest.py`) gives each test its own broker
+process and JetStream store dir, and exposes `pause()` (SIGSTOP),
+`resume()` (SIGCONT), `kill()` (SIGKILL) and `restart()` — the restart
+reuses the same port and store dir so durables and streams persist
+across the cycle, which is what makes the reconnect path testable
+rather than merely reconnectable-in-principle. The store and handler
+are faked only at the repository boundary, so the NATS subscribe /
+receive / ack / drain / backoff path under test is the shipped one.
+
+What that covers: the loop recovers after a hard broker restart and
+receives messages published afterwards; it survives a paused handler
+without tearing down the subscription; and `ensure_streams()` stays
+correct across a managed-broker restart. `test_managed_broker_identity.py`
+guards the fixture itself — the readiness probe must accept only its
+own child process, so a stray broker already listening on the chosen
+port cannot be mistaken for the one under test.
+
+Unit-level fakes in `tests/test_federation_nats_consumer.py` and
+`tests/test_webhook_nats_trigger.py` remain as the fast, always-on
+tier; the live-broker suite is the one that proves the same behavior
+against a real JetStream.
+
+### Running it
 
 ```
-MNEMOS_NATS_TEST_URL=nats://staging-broker:4222 \
-  pytest tests/integration_nats/ -v
+# Against your own cluster:
+MNEMOS_NATS_TEST_URL=nats://<broker-host>:4222 pytest tests/integration_nats/ -v
+
+# Outage tests, using a locally installed nats-server:
+pytest tests/integration_nats/test_partial_outage.py -v
 ```
 
 The suite creates per-test isolated streams (random suffix) and
 deletes them in finalizers, so it is safe to point at a shared
 broker — though running against a quiet staging cluster is
-preferable.
-
-## Known limitations
-
-* Partial-broker-outage paths (broker shutdown mid-consume,
-  durable consumer deletion mid-consume) are still only proved
-  via the unit-level fakes in `tests/test_federation_nats_consumer.py`
-  and `tests/test_webhook_nats_trigger.py`. A live-broker
-  outage test would need a fixture that can stop+restart the
-  broker subprocess; deferred candidate for v4.2.0a9+ once a
-  test-managed broker fixture lands. The shipped
-  ``MNEMOS_NATS_TEST_URL`` path expects the broker is operator-
-  managed and stays up across the test session.
+preferable. Operators rolling out queue groups can use it as a
+pre-prod smoke check.
