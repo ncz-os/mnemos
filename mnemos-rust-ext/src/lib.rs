@@ -372,13 +372,13 @@ fn batch_cosine_similarity(
 
     let query = query.extract::<Vec<f32>>()?;
     if query.is_empty() {
-        let corpus_seq = corpus.downcast::<PySequence>()?;
+        let corpus_seq = corpus.cast::<PySequence>()?;
         return Ok(vec![0.0; corpus_seq.len()?]);
     }
 
     let norm_query = norm_simd(&query);
     let corpus_seq = corpus
-        .downcast::<PySequence>()
+        .cast::<PySequence>()
         .map_err(|_| PyTypeError::new_err("corpus must be a sequence of float sequences"))?;
     let corpus_len = corpus_seq.len()?;
     if norm_query == 0.0 {
@@ -428,7 +428,7 @@ fn similarity_dot_normalized<'py>(
             .as_slice()
             .map_err(|_| PyValueError::new_err("query must be a contiguous 1-D NumPy array"))?;
         let scores = similarity_dot_normalized_f64_impl(query_slice, candidates_array);
-        return Ok(PyArray1::from_vec_bound(py, scores));
+        return Ok(PyArray1::from_vec(py, scores));
     }
 
     if let (Ok(query_array), Ok(candidates_array)) = (
@@ -439,7 +439,7 @@ fn similarity_dot_normalized<'py>(
             .as_slice()
             .map_err(|_| PyValueError::new_err("query must be a contiguous 1-D NumPy array"))?;
         let scores = similarity_dot_normalized_f32_impl(query_slice, candidates_array);
-        return Ok(PyArray1::from_vec_bound(py, scores));
+        return Ok(PyArray1::from_vec(py, scores));
     }
 
     Err(PyTypeError::new_err(concat!(
