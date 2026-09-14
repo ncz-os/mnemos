@@ -633,6 +633,13 @@ async def persephone_archive_memory(
                             if isinstance(raw_meta, str)
                             else (dict(raw_meta) if raw_meta else None)
                         )
+                        # F16: pass the actual embedding bytes from the
+                        # archive snapshot so payload_hash covers it.
+                        # Pre-fix this was hardcoded None, silently
+                        # shifting the audit signature from the real
+                        # archive payload.
+                        raw_emb = archive_row_snapshot.get("embedding")
+                        embedding_bytes = raw_emb if isinstance(raw_emb, (bytes, bytearray, memoryview)) else None
                         await write_audit_entry(
                             backend,
                             tx,
@@ -642,7 +649,7 @@ async def persephone_archive_memory(
                             category=archive_row_snapshot["category"],
                             subcategory=archive_row_snapshot["subcategory"],
                             metadata=parsed_meta,
-                            embedding=None,
+                            embedding=embedding_bytes,
                             writer_id=user.user_id,
                             session_secret=_session_secret,
                         )

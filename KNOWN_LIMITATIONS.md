@@ -96,6 +96,49 @@ logger-only surface and have no queryable audit table.
 **Recovery:** ship the process logs to your log store, or run the `server`
 profile on PostgreSQL if you need queryable MCP audit history.
 
+## Memory audit chain is not implemented for MySQL/MariaDB
+
+**Where:** `mnemos/persistence/mysql.py::MysqlBackend.audit_chain` (and the
+inherited `MariadbBackend` of the same file) returns `None`. No
+`memory_audit_chain` or `memory_audit_roots` migration exists under
+`mnemos/db_migrations/migrations_mysql/` or `migrations_mariadb/`.
+
+**Symptom:** deployments running on MySQL or MariaDB do not get the v6.2
+M-2.2.1 Ed25519-signed per-memory audit chain at all. Routes that
+require the chain (federation replica pulls, `/v1/audit/health`,
+`/v1/audit/inclusion_proof`, `/v1/audit/proof`) return HTTP 503 with
+the documented "no audit_chain on this backend" message. Routes that
+emit best-effort audit writes log a `[AUDIT] write_audit_entry
+failed` line and proceed (the memory row still commits). F16 added
+`required=True` to `mnemos.audit.route_helper.write_audit_entry`
+precisely so callers can opt into a fail-fast mode; once a caller
+passes `required=True` on MySQL/MariaDB, the call raises
+`AuditChainContinuityError` instead of silently no-opping.
+
+**Recovery:** self-hosted operators who need queryable, signed audit
+history should run the `server` profile on PostgreSQL, Oracle, or Db2
+(the three parity-required backends with full audit-chain coverage).
+Migrating MySQL/MariaDB audit parity requires:
+
+1. Adding `memory_audit_chain` + `memory_audit_roots` tables under
+   `mnemos/db_migrations/migrations_mysql/` and `migrations_mariadb/`
+   (porting `migrations_oracle/0029_memory_audit_chain.sql` and
+   `0030_memory_audit_roots.sql`, with MySQL/Db2 type substitutions —
+   the MySQL family does not have `RAW(16)` / `BLOB(16)` so the
+   `memory_id` column becomes `BINARY(16)`).
+2. Implementing `MysqlAuditChainRepository` in
+   `mnemos/persistence/mysql.py` (or sharing one between MysqlBackend
+   and MariadbBackend), wiring `audit_chain` to return it.
+3. Wiring the sealer and `/v1/audit/*` endpoints against the new
+   repository — most of that is already generic over the
+   `AuditChainRepository` protocol and only needs a tiny MySQL-specific
+   cursor/conversion layer.
+
+**Proper fix:** the recipe above is the proper fix. It is large enough
+that this F16 pass documents the gap and adds the `required=True`
+opt-in for callers that want fail-fast semantics, rather than landing
+the full port in one go.
+
 ---
 
 If you hit one of these in your own deployment, please open an issue at
