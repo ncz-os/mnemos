@@ -2506,14 +2506,23 @@ class MorpheusRepository(ABC):
         tx: Transaction,
         *,
         run_id: str,
-    ) -> "list[MorpheusSynthesisCluster] | None":
-        """Load visible member rows for each cluster persisted on the run.
+    ) -> "tuple[int, list[MorpheusSynthesisCluster]] | None":
+        """Load the run's ``cluster_min_size`` plus visible member rows for
+        each persisted cluster.
 
-        Returns ``None`` for a missing run and an empty list for a run with no
-        usable clusters.  Array membership is backend-specific: Postgres uses
-        ``ANY(text[])``; SQLite/MySQL-family/Oracle/Db2 expand bound ``IN``
-        placeholders.  The returned Python values let provider work happen
-        after this read transaction closes.
+        Returns ``None`` for a missing run and ``(cluster_min_size, [])``
+        for a run with no usable clusters. The ``cluster_min_size`` is
+        read from ``morpheus_runs`` in the same SELECT that pulls
+        ``config`` — it is logged by ``phase_synthesise`` for audit
+        purposes (it is NOT re-applied after the F01 (adbeeb63)
+        per-(owner_id, namespace) partition: the cluster already passed
+        the size check at CLUSTER time, and the partition is purely a
+        privacy scoping).
+
+        Array membership is backend-specific: Postgres uses
+        ``ANY(text[])``; SQLite/MySQL-family/Oracle/Db2 expand bound
+        ``IN`` placeholders. The returned Python values let provider
+        work happen after this read transaction closes.
         """
         ...
 

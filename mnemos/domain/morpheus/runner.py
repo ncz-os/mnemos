@@ -662,6 +662,34 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
     return result.memories_consolidated
 
 
+def _partition_members_by_owner_namespace(
+    members: tuple[Any, ...],
+) -> list[tuple[Any, list[Any]]]:
+    """Split a cluster's members into per-(owner_id, namespace) sub-groups.
+
+    F01 (MORPHEUS cross-owner privacy isolation, adbeeb63): each cluster
+    produced by ``phase_cluster`` is split into per-(owner_id, namespace)
+    sub-clusters before synthesis. The synthesized memory is owned by
+    the unanimous owner_id of its sub-cluster, so the new
+    ``morpheus_local`` summary can never expose another owner’s content
+    under a different owner’s access envelope. The run’s
+    ``cluster_min_size`` was already enforced at CLUSTER time and is
+    not re-applied here: a sub-cluster of size 1 is a legitimate
+    synthesis target (consolidation may have reduced a cluster to one
+    visible member). Members with a missing owner_id fall back to the
+    sentinel ``"default"`` ONLY when every member is owner-less, which
+    is the unreachable defensive path (in practice
+    ``eligible_for_morpheus`` already rejects NULL owner memories
+    upstream, so the pre-F01 ``"default"`` fallback that hid
+    cross-owner leakage cannot reappear).
+    """
+    grouped: dict[tuple[Any, Any], list[Any]] = {}
+    for member in members:
+        key = (getattr(member, "owner_id", None), getattr(member, "namespace", None))
+        grouped.setdefault(key, []).append(member)
+    return [(key, group) for key, group in grouped.items()]
+
+
 async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
     """Generate one summary memory per persisted cluster.
 
@@ -674,49 +702,66 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
     use_llm = get_settings().morpheus.use_llm
     backend = _get_backend()
     async with backend.transactional() as tx:
-        clusters = await backend.morpheus.phase_synthesise_load(tx, run_id=run_id)
+        loaded = await backend.morpheus.phase_synthesise_load(tx, run_id=run_id)
+    if loaded is None:
+        await update_counters(backend, run_id, summaries_created=0)
+        return 0
+    cluster_min_size, clusters = loaded
     if not clusters:
         await update_counters(backend, run_id, summaries_created=0)
         return 0
 
     n_created = 0
     for cluster in clusters:
-        members = cluster.members
-        summary = await _synthesise_cluster_summary(
-            [member.content for member in members],
-            use_llm=use_llm,
-        )
-        category = _majority([member.category for member in members])
-        owner_id = _majority([member.owner_id for member in members]) or "default"
-        namespace = _majority([member.namespace for member in members]) or "default"
-        visible_member_ids = [member.id for member in members]
-        metadata = {
-            "morpheus_run_id": run_id,
-            "cluster_id": cluster.cluster_id,
-            "member_count": len(visible_member_ids),
-            "synthesis_mode": "llm" if use_llm else "extractive",
-        }
-        async with backend.transactional() as tx:
-            await backend.morpheus.phase_synthesise_store(
-                tx,
-                memory_id=new_memory_id(),
-                content=summary,
-                category=category,
-                owner_id=owner_id,
-                namespace=namespace,
-                run_id=run_id,
-                source_memory_ids=visible_member_ids,
-                metadata=metadata,
+        sub_clusters = _partition_members_by_owner_namespace(cluster.members)
+        for (_owner_key, _ns_key), members in sub_clusters:
+            visible_members = list(members)
+            summary = await _synthesise_cluster_summary(
+                [member.content for member in visible_members],
+                use_llm=use_llm,
             )
-        n_created += 1
+            # After partitioning, every member in ``visible_members``
+            # shares the same (owner_id, namespace). Use those values
+            # directly — no more ``_majority`` on owner/namespace.
+            # Fallback to "default" ONLY if all members have a missing
+            # owner_id AND a missing namespace, which would mean the
+            # source memories were wiped between CLUSTER and SYNTHESISE
+            # (defensive; in practice ``eligible_for_morpheus`` rejects
+            # NULL owner memories upstream so this branch is unreachable).
+            owner_id = visible_members[0].owner_id or "default"
+            namespace = visible_members[0].namespace or "default"
+            category = _majority([member.category for member in visible_members])
+            visible_member_ids = [member.id for member in visible_members]
+            metadata = {
+                "morpheus_run_id": run_id,
+                "cluster_id": str(cluster.cluster_id),
+                "member_count": len(visible_member_ids),
+                "synthesis_mode": "llm" if use_llm else "extractive",
+                "isolation": "per_owner_namespace",  # F01 audit trail
+            }
+            async with backend.transactional() as tx:
+                await backend.morpheus.phase_synthesise_store(
+                    tx,
+                    memory_id=new_memory_id(),
+                    content=summary,
+                    category=category,
+                    owner_id=owner_id,
+                    namespace=namespace,
+                    run_id=run_id,
+                    source_memory_ids=visible_member_ids,
+                    metadata=metadata,
+                )
+            n_created += 1
 
     await update_counters(backend, run_id, summaries_created=n_created)
     logger.info(
-        "[MORPHEUS] run %s synthesised %d summary memor%s (mode=%s)",
+        "[MORPHEUS] run %s synthesised %d summary memor%s (mode=%s, "
+        "isolation=per_owner_namespace, min_size=%d)",
         run_id,
         n_created,
         "y" if n_created == 1 else "ies",
         "llm" if use_llm else "extractive",
+        int(cluster_min_size),
     )
     return n_created
 
