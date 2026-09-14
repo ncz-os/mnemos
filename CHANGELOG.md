@@ -57,6 +57,64 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.4.0] — 2026-09-14
+
+### Added — public tunnel management on the admin API
+
+`scripts/mnemos_tunnel_setup.py` has been checked in since v5.0.1 as an
+executable contract for a daemon-side REST surface that did not exist:
+the script refused to run without `--force` and warned that
+`/admin/tunnels/start` would 404. That surface now ships, and the script
+is a working tool rather than a specification.
+
+**REST.** `POST /admin/tunnels/start`, `GET /admin/tunnels/status`,
+`DELETE /admin/tunnels/stop` (`mnemos/api/routes/tunnels.py`). `start`
+takes `{backend, authtoken, target_port}` and returns the public `url`
+plus a `token` the tunnel's target will actually accept. One tunnel per
+process — `start` returns 409 while one is open — and the tunnel is torn
+down on daemon shutdown rather than left orphaned with a live public URL.
+
+**Two backends** (`mnemos/tunnels/`), both driving the vendor's agent
+binary rather than a vendor SDK, so nothing new enters the runtime
+dependency closure. `cloudflare` (`cloudflare_bridge.py`) runs a
+`cloudflared` quick tunnel: no account, no domain, no credential, which
+is why it is the default. `ngrok` (`ngrok_bridge.py`) runs the ngrok
+agent, reads the public URL back from the agent's local API on a port
+MNEMOS pins, and passes the authtoken through the environment rather
+than argv. A missing agent binary returns 503 naming the binary and how
+to install it.
+
+**Authorization.** The routes take the same `require_root` dependency as
+every other `/admin/*` route, and additionally require
+`MNEMOS_TUNNELS_ENABLED=true` (`[mcp] tunnels_enabled`), default off.
+Opening a tunnel makes the instance reachable from the public internet;
+gating that on root auth alone would make a leaked root API key
+sufficient to expose the node, with no host access needed.
+
+**Token.** No new credential type is minted. `start` returns an OAuth 2.1
+access token from the MCP edge's existing authorization server when one
+is configured (12-hour lifetime, reported as `expires_in`), otherwise the
+configured static `MNEMOS_MCP_TOKEN`. Both are credentials
+`mnemos serve mcp-http` already accepts. When neither is configured the
+route returns 503 rather than handing back a token that would 401 on
+first use. `MNEMOS_MCP_TOKENS` — the per-user map — is deliberately not
+used as a source, since handing out one entry would grant that user's
+identity to whoever holds the connector URL.
+
+**Scope, stated plainly.** Ephemeral tunnels only. Both backends produce
+URLs that change on restart. Cloudflare **Named** tunnels — the stable
+`mnemos.yourdomain.com` option the connector docs recommend for anything
+long-lived — still require the manual `cloudflared tunnel create/route`
+flow and are not created, routed or managed by these endpoints.
+
+`Dockerfile.enterprise` now installs pinned `cloudflared` and `ngrok`
+binaries for both published architectures, so the feature is live in the
+published image rather than inert for want of a CLI.
+
+`docs/connectors/chatgpt-pro-developer-mode.md` and
+`docs/connectors/README.md` describe the shipped flow; the "not
+implemented" and "currently inert" language is gone.
+
 ## [6.3.10] — 2026-09-14
 
 - **Fixed**: with `6.3.9`'s quota-lock fix live, every GRAEAE consultation

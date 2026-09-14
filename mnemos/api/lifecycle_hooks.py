@@ -47,6 +47,17 @@ async def _close_pantheon_http_client() -> None:
     await aclose_http_client()
 
 
+async def _close_public_tunnel() -> None:
+    """Kill any /admin/tunnels/* child agent before the process exits.
+
+    Otherwise the vendor agent survives MNEMOS and keeps a public URL
+    live against a port that no longer answers.
+    """
+    from mnemos.api.routes.tunnels import shutdown_active_tunnel
+
+    await shutdown_active_tunnel()
+
+
 async def _run_distillation_worker(_pool: Any) -> None:
     """Supervise the distillation worker loop with bounded restart backoff."""
     from mnemos.core.config import get_settings
@@ -373,6 +384,7 @@ def register_lifespan_hooks() -> None:
     lifecycle.register_lifespan_cleanup_hook("graeae engine", _close_graeae_engine)
     lifecycle.register_lifespan_cleanup_hook("pantheon http client", _close_pantheon_http_client)
     lifecycle.register_lifespan_cleanup_hook("mcp audit drain", _drain_audit_tasks)
+    lifecycle.register_lifespan_cleanup_hook("public tunnel", _close_public_tunnel)
     lifecycle.register_lifespan_worker(
         "distillation_worker",
         _run_distillation_worker,

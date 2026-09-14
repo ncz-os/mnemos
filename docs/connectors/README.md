@@ -206,8 +206,10 @@ Two distinct paths depending on the user's tier and what they need:
   endpoint via a tunnel, register it as a Custom Connector,
   paste the bearer token. See:
   - [ChatGPT Pro Developer Mode](./chatgpt-pro-developer-mode.md) —
-    full walkthrough including ngrok setup and the experimental
-    `mnemos-tunnel-setup` helper script.
+    full walkthrough including manual tunnel setup and the
+    `mnemos-tunnel-setup` helper script, which drives the
+    `/admin/tunnels/*` routes to open a `cloudflared` or `ngrok` tunnel
+    and print connector config in one step.
 
 - **Custom GPT (Actions) — Plus and above.** Sync REST-over-HTTPS
   consuming an OpenAPI 3.x spec. Use this when the user is on a
@@ -376,11 +378,16 @@ to it, we ship the fix as a PR. That's the contract.
 
 While `experimental`:
 
-- Endpoints under `/admin/tunnels/*` are **not implemented**;
-  the `mnemos-tunnel-setup` script that calls them is aspirational. They
-  may be implemented, renamed, restructured, or withdrawn in any minor
-  release. The manual `mnemos serve mcp-http` + ngrok path documented in
-  each connector page works today regardless.
+- Endpoints under `/admin/tunnels/*` are **implemented** (root auth plus
+  the `MNEMOS_TUNNELS_ENABLED` host opt-in, since they publish a local
+  port to the public internet). They open **ephemeral** tunnels only —
+  `cloudflared` quick tunnels and `ngrok` agent tunnels, both with URLs
+  that change on restart. Cloudflare **Named** tunnels, which give the
+  stable URL this page recommends for anything long-lived, are still a
+  manual `cloudflared` setup and are not managed by these routes. While
+  `experimental`, the request/response shapes may be renamed or
+  restructured in any minor release. The manual `mnemos serve mcp-http` +
+  tunnel path documented in each connector page works today regardless.
 - Default ports (5003 for the MCP HTTP/SSE bridge) may change.
 - Bearer auth remains supported as a legacy path. The MCP edge also now
   exposes a full OAuth 2.1 authorization server — discovery, dynamic client

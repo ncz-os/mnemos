@@ -431,6 +431,13 @@ class _MCPSettings(BaseSettings):
     token: str = Field("", validation_alias="MNEMOS_MCP_TOKEN")
     tokens: str = Field("", validation_alias="MNEMOS_MCP_TOKENS")
     bind: str = Field("127.0.0.1", validation_alias="MNEMOS_MCP_BIND")
+    # /admin/tunnels/* spawns `cloudflared`/`ngrok` and publishes a local
+    # MNEMOS port to the public internet. Root auth alone is not a
+    # sufficient gate for that: it turns any leaked root API key into
+    # remote exposure of the whole instance, with no console access
+    # needed. Default OFF so exposure is always a deliberate host-level
+    # decision by whoever runs the daemon, not an API call.
+    tunnels_enabled: bool = Field(False, validation_alias="MNEMOS_TUNNELS_ENABLED")
 
 
 class _RateLimitSettings(BaseSettings):
