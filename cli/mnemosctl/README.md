@@ -32,8 +32,11 @@ cargo build --release
 | `doctor` | stub |
 | `raw <method> <path>` | stub |
 
-All stubs print `[mnemosctl] TODO: <cmd> not implemented yet` and exit
-0 so help/parse paths can be validated against the design.
+All stubs print `[mnemosctl] <cmd> not implemented yet` and exit
+**non-zero** (an `anyhow::bail!`, not `Ok(())`) so a CI job or shell wrapper
+checking `$?` can tell "not implemented" apart from "ran successfully" —
+`--help`/`--version` still exit 0. Regression-guarded by
+`todo_returns_error_not_ok` in `src/main.rs`.
 
 ## Design
 
