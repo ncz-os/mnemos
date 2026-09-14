@@ -78,21 +78,46 @@ docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:la
 
 **pip (compose your own):**
 
-```
-Install MNEMOS on this machine.
+> **None of `mnemos-core`, `mnemos-graeae`, `mnemos-pantheon`, `mnemos-knemon`,
+> `mnemos-charon`, or `mnemos-stiphos` are currently published to PyPI.**
+> `pip install 'mnemos-core[...]'` will 404 — the `[server]`/`[full]` extras
+> recurse into these names on the public index. Until they're published, install
+> from source. This exact sequence is tested in a clean venv:
 
-Steps:
-1. pip install 'mnemos-core[full]'     # everything; arch-neutral (no openvino)
-2. mnemos init                         # scaffold config + token
-3. mnemos serve                        # start API on :5002
-4. mnemos doctor                       # verify subsystems
-5. Set MNEMOS_BASE=http://localhost:5002 and MNEMOS_API_KEY=<token from step 2>
-   in shell env and any agent config that needs to reach it.
-
-Edge device (SQLite kernel only): pip install 'mnemos-core[edge]'
-Single subsystem, e.g. reasoning: pip install 'mnemos-core[graeae]'
-Hive (STIPHOS) is a SEPARATE service: pip install 'mnemos-stiphos[mcp]' (port 8080)
 ```
+# Core (arch-neutral, no openvino):
+git clone https://gitlab.com/ncz-os/mnemos && cd mnemos
+python -m pip install -e .
+
+# Add-ons, --no-deps because each one's own `mnemos-core>=6.2` floor doesn't
+# match this repo's actual current version (6.1.7) and would otherwise send
+# pip back to PyPI for a package that isn't there. The one real (non-core)
+# runtime dependency each add-on needs beyond what core's base install
+# already pulls in is called out — install those explicitly:
+pip install --no-deps 'git+https://gitlab.com/ncz-os/graeae.git'
+pip install --no-deps 'git+https://gitlab.com/ncz-os/knemon.git'
+pip install --no-deps 'git+https://gitlab.com/ncz-os/pantheon.git'   # needs graeae + knemon installed first
+pip install --no-deps 'git+https://gitlab.com/ncz-os/charon.git'
+
+mnemos init                         # scaffold config + token
+mnemos serve                        # start API on :5002
+mnemos doctor                       # verify subsystems
+# Set MNEMOS_BASE=http://localhost:5002 and MNEMOS_API_KEY=<token from mnemos init>
+# in shell env and any agent config that needs to reach it.
+
+# Hive (STIPHOS) is a SEPARATE service, same pattern:
+git clone https://gitlab.com/ncz-os/mnemos-stiphos && cd mnemos-stiphos
+pip install -e '.[mcp]'   # port 8080
+```
+
+Run `pip check` afterward — `pip install --no-deps` intentionally skips each
+add-on's `mnemos-core>=6.2` floor (see above), so `pip check` will report that
+mismatch for every add-on; that specific line is expected and safe to ignore.
+Anything else `pip check` reports is a real gap — install it.
+
+Edge device (SQLite kernel only): after the core install above, `pip install
+aiosqlite sqlite-vec` (the `[edge]` extra's own two deps — both real, published
+packages, unaffected by the above).
 
 **Enterprise backends (Oracle AI Database 26ai, IBM Db2 12.1).**
 `mnemos-enterprise` is a single multi-arch (amd64 + arm64) image with every
@@ -107,9 +132,15 @@ docker run --platform linux/amd64 -p 5002:5002 \
   -e MNEMOS_DATABASE_DSN='db2://user:pass@host:50000/dbname' \
   ghcr.io/ncz-os/mnemos-enterprise:latest
 
-# Or from source:
+# Or from source (see the "pip (compose your own)" section above for why
+# --no-deps and the add-on install order — enterprise adds the same set plus
+# the driver extra on core itself):
 git clone https://gitlab.com/ncz-os/mnemos && cd mnemos
-python -m pip install -e '.[server,enterprise]'   # or '.[server,oracle]' / '.[server,db2]'
+python -m pip install -e '.[enterprise]'   # or '.[oracle]' / '.[db2]' — core's own extras, real PyPI deps
+pip install --no-deps 'git+https://gitlab.com/ncz-os/graeae.git'
+pip install --no-deps 'git+https://gitlab.com/ncz-os/knemon.git'
+pip install --no-deps 'git+https://gitlab.com/ncz-os/pantheon.git'
+pip install --no-deps 'git+https://gitlab.com/ncz-os/charon.git'
 export MNEMOS_DATABASE_DSN='oracle://user:pass@host:1521/service_name'
 # or:  MNEMOS_DATABASE_DSN='db2://user:pass@host:50000/dbname'
 mnemos install --profile server
