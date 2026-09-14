@@ -245,9 +245,19 @@ class _MorpheusNoOp:
         from mnemos.persistence.base import MorpheusSynthesisCluster, MorpheusSynthesisMember
 
         conn = self._conn
-        config = await conn.fetchval("SELECT config FROM morpheus_runs", run_id)
-        if config is None:
+        row = await conn.fetchrow(
+            "SELECT cluster_min_size, config FROM morpheus_runs",
+            run_id,
+        )
+        if row is None:
             return None
+        cluster_min_size = int(row["cluster_min_size"])
+        config = row["config"]
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except json.JSONDecodeError:
+                config = {}
         out = []
         for cluster in config.get("clusters", []):
             rows = await conn.fetch(
@@ -266,7 +276,7 @@ class _MorpheusNoOp:
             )
             if members:
                 out.append(MorpheusSynthesisCluster(cluster.get("cluster_id", 0), members))
-        return out
+        return cluster_min_size, out
 
     async def phase_synthesise_store(self, tx, **kwargs):
         import json
@@ -591,6 +601,12 @@ async def test_phase_synthesise_inserts_one_per_cluster():
         def __init__(self):
             self.executed: list[tuple[str, tuple]] = []
 
+        async def fetchrow(self, *_args, **_kwargs):
+            # F01 (adbeeb63): phase_synthesise_load now returns
+            # (cluster_min_size, clusters); the mock returns
+            # (3, config) so partitioning + min_size both work.
+            return {"cluster_min_size": 3, "config": config}
+
         async def fetchval(self, *_args, **_kwargs):
             return config
 
@@ -664,6 +680,11 @@ async def test_phase_synthesise_inherits_majority_category():
     class _Conn:
         def __init__(self):
             self.executed: list[tuple[str, tuple]] = []
+
+        async def fetchrow(self, *_args, **_kwargs):
+            # F01 (adbeeb63): phase_synthesise_load returns
+            # (cluster_min_size, clusters); mock mirrors it.
+            return {"cluster_min_size": 3, "config": config}
 
         async def fetchval(self, *_args, **_kwargs):
             return config

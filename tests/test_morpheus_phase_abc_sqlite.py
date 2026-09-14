@@ -178,8 +178,10 @@ async def test_sqlite_synthesise_load_and_store_use_canonical_source_memories(tm
                     ]
                 },
             )
-            clusters = await backend.morpheus.phase_synthesise_load(tx, run_id=run_id)
-        assert clusters is not None
+            loaded = await backend.morpheus.phase_synthesise_load(tx, run_id=run_id)
+        assert loaded is not None
+        cluster_min_size, clusters = loaded
+        assert int(cluster_min_size) >= 1
         assert len(clusters) == 1
         assert {member.id for member in clusters[0].members} == set(ids)
 

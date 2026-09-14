@@ -4071,15 +4071,28 @@ class MysqlMorpheusRepository(MorpheusRepository):
         tx: Transaction,
         *,
         run_id: str,
-    ) -> list[MorpheusSynthesisCluster] | None:
+    ) -> tuple[int, list[MorpheusSynthesisCluster]] | None:
+        """MySQL impl of MORPHEUS phase_synthesise_load (item 11c + F01).
+
+        Returns ``(cluster_min_size, clusters)`` so the runner can apply
+        the per-(owner_id, namespace) partition while still honoring the
+        run's ``cluster_min_size`` (F01 cross-owner privacy isolation,
+        adbeeb63). The ``cluster_min_size`` lives on ``morpheus_runs``
+        and is read in the same SELECT as ``config`` to avoid an extra
+        round-trip.
+        """
         conn = tx.conn
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT config FROM morpheus_runs WHERE id = %s", (run_id,))
+            await cursor.execute(
+                "SELECT cluster_min_size, config FROM morpheus_runs WHERE id = %s",
+                (run_id,),
+            )
             row = await cursor.fetchone()
         if row is None:
             return None
+        cluster_min_size = int(row[0])
         try:
-            config = row[0] if isinstance(row[0], dict) else json.loads(row[0] or "{}")
+            config = row[1] if isinstance(row[1], dict) else json.loads(row[1] or "{}")
         except (json.JSONDecodeError, TypeError):
             config = {}
         clusters = config.get("clusters", []) if isinstance(config, dict) else []
@@ -4109,7 +4122,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
             )
             if members:
                 loaded.append(MorpheusSynthesisCluster(cluster.get("cluster_id"), members))
-        return loaded
+        return cluster_min_size, loaded
 
     async def phase_synthesise_store(
         self,
