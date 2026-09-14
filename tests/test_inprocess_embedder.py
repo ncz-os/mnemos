@@ -17,6 +17,7 @@ skipped. CI without the model file still exercises the surface.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 
@@ -402,3 +403,120 @@ def test_ov_device_env_explicit_cpu_overrides_auto():
         assert str(resolved).upper() == "CPU", f"expected CPU pin to win, got {resolved!r}"
     finally:
         del os.environ["MNEMOS_EMBED_OV_DEVICE"]
+
+
+# ─── F15: non-reentrant backend must never be entered concurrently ───────────
+#
+# The in-process backends (llama_cpp.Llama.create_embedding / OpenVINO
+# OVModelForFeatureExtraction forward / libnoe NPU) are documented as
+# NOT reentrant. The pre-fix embedder used a bare ``asyncio.Lock`` around
+# a ``run_in_executor(None, ...)`` call. Cancelling the awaiting asyncio
+# task released the lock in the ``async with`` finally before the
+# underlying thread-pool work actually finished, so a second concurrent
+# caller could pass the lock and start its own backend call before the
+# first one returned -- two simultaneous backend entries into a backend
+# that is only safe with one at a time.
+#
+# The fix dispatches non-reentrant backend calls through a dedicated
+# single-worker ThreadPoolExecutor: ``max_workers=1`` means two submitted
+# tasks are GUARANTEED not to overlap on the executor, regardless of
+# whether the awaiting asyncio side cancels mid-call.
+#
+# This test installs a fake non-reentrant backend that:
+#   * sleeps a moment inside ``_embed_sync`` so a second call could in
+#     principle overlap if the executor serialized it incorrectly;
+#   * asserts an instance-level flag that the backend is "in use" right
+#     now, raising ``AssertionError`` if a second invocation lands while
+#     the first is still running.
+#
+# It then cancels an in-flight call and immediately issues a new one;
+# the assertion never fires (otherwise the test would raise). This is
+# the canonical reproduction shape the reviewer used.
+
+
+class _NonReentrantFakeBackend:
+    """Drop-in for _LlamaCppBackend that asserts single-entry invariant."""
+
+    def __init__(self) -> None:
+        self._in_use = False
+        self._max_overlap = 0
+        self._current_overlap = 0
+        self.loaded = True
+        self.embed_dim = 4
+
+    def _embed_sync(self, text: str) -> list[float]:
+        # The bare assertion: an instance-level flag must NEVER be
+        # already-True when we enter. If the executor serializes
+        # correctly (one worker, one task at a time), this holds even
+        # under cancellation pressure from the asyncio side.
+        assert not self._in_use, (
+            "non-reentrant backend entered twice concurrently -- "
+            "F15 regression: single-worker executor did not serialize"
+        )
+        self._in_use = True
+        self._current_overlap += 1
+        try:
+            # Hold long enough that any overlap would be visible.
+            import time as _t
+            _t.sleep(0.1)
+            return [0.1, 0.2, 0.3, 0.4]
+        finally:
+            self._in_use = False
+            if self._current_overlap > self._max_overlap:
+                self._max_overlap = self._current_overlap
+            self._current_overlap -= 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_then_reembed_never_enters_backend_concurrently():
+    """F15 regression: cancelling an in-flight embed() and immediately
+    issuing a new one must NEVER result in two concurrent entries into
+    the (non-reentrant) backend.
+
+    Before the fix, the cancellation released ``_lock`` while the
+    executor was still running the prior ``_embed_sync``; a new embed()
+    call would acquire ``_lock`` and start its own ``run_in_executor``
+    on the default thread pool. Both backend invocations could run in
+    parallel, breaking the single-entry contract.
+    """
+    e = InProcessEmbedder(backend="llamacpp", model_path="/nonexistent/path.gguf")
+    # Bypass _build_backend: pin a fake backend that does not need a model.
+    fake = _NonReentrantFakeBackend()
+    e._backend = fake  # type: ignore[assignment]
+    e._backend_name = "fake"
+
+    # Issue an embed that will block in _embed_sync for ~100ms.
+    long_task = asyncio.create_task(e.embed("cancel-me-please"))
+    # Let it enter the executor.
+    await asyncio.sleep(0.02)
+    # Cancel mid-flight.
+    long_task.cancel()
+    # Immediately fire a second embed. Pre-fix this races the executor
+    # and the fake backend's assertion would raise.
+    second = await e.embed("right-after-cancel")
+    # Now wait for the cancelled task to fully unwind.
+    with pytest.raises(asyncio.CancelledError):
+        await long_task
+
+    # The fake backend asserts on every entry; reaching this line means
+    # no concurrent entry was ever observed.
+    assert second == [0.1, 0.2, 0.3, 0.4]
+    # And the maximum concurrent-entries recorded by the fake is 1.
+    assert fake._max_overlap == 1, (
+        f"expected max concurrent backend entries = 1, got {fake._max_overlap}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_serial_executor_only_one_worker():
+    """The serial executor used for non-reentrant backends must be
+    configured with max_workers=1 -- otherwise F15's guarantee of
+    serial execution falls apart."""
+    e = InProcessEmbedder(backend="llamacpp", model_path="/nonexistent/path.gguf")
+    # Trigger lazy construction.
+    executor = e._ensure_serial_executor()
+    assert executor._max_workers == 1, (
+        f"F15 regression: serial executor must be max_workers=1, got {executor._max_workers}"
+    )
+    # Idempotent: a second call returns the same instance.
+    assert e._ensure_serial_executor() is executor
