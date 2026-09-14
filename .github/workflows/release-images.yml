@@ -1,16 +1,17 @@
-name: Publish mnemos-enterprise (ghcr.io)
+name: Publish image matrix (ghcr.io)
 
-# Publishes the one supported MNEMOS container package to ghcr.io:
+# Publishes the layered MNEMOS image matrix to ghcr.io:
 #
-#   ghcr.io/<owner>/mnemos-enterprise   amd64 + arm64
+#   ghcr.io/<owner>/mnemos-core         base kernel            amd64 + arm64
+#   ghcr.io/<owner>/mnemos              everything API image   amd64 + arm64
+#   ghcr.io/<owner>/mnemos-enterprise   + Oracle/Db2/MySQL     amd64 ONLY
 #
-# The core and everything layers remain separate Dockerfiles and BuildKit Bake
-# targets, but are passed between targets as in-memory named contexts. They are
-# never pushed or tagged. Only the final per-arch enterprise images are pushed
-# by digest, then merged into the tagged multi-arch release manifest.
+# (mnemos-stiphos is published from its own repo's workflow — it is a separate
+# service, not part of this umbrella.)
 #
-# The native per-architecture matrix is load-bearing: Dockerfile.core compiles
-# architecture-specific extensions and deliberately refuses emulation.
+# Composition is OCI-layered: mnemos is built FROM mnemos-core, and
+# mnemos-enterprise FROM mnemos, each by immutable digest. The heavy base
+# (llama-cpp-python compile + baked GGUF embedder) is built once and shared.
 
 on:
   push:
@@ -23,7 +24,7 @@ on:
         required: false
         default: 'main'
       build_enterprise:
-        description: 'Build and publish the mnemos-enterprise image'
+        description: 'Also build the amd64-only enterprise image'
         type: boolean
         required: false
         default: true
@@ -32,18 +33,32 @@ concurrency:
   group: release-images-${{ github.ref }}
   cancel-in-progress: false
 
+# Repo default is read-only; every job that pushes to ghcr.io already
+# declares its own `packages: write` override below. This top-level block
+# just makes the default explicit for Scorecard's static Token-Permissions
+# check, which reads the workflow YAML rather than repo settings.
+permissions:
+  contents: read
+
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/mnemos-enterprise
   ADDON_REMOTE_BASE: https://gitlab.com/ncz-os
   ADDON_REF: ${{ github.event.inputs.addon_ref || 'main' }}
 
 jobs:
-  # Build the full core -> everything -> enterprise chain once per architecture
-  # on a native runner. Bake's target contexts preserve the Dockerfile layering
-  # without registry round-trips for core or everything.
-  build:
-    if: ${{ github.event_name == 'push' || github.event.inputs.build_enterprise == 'true' }}
+  # ── 1. base kernel ─────────────────────────────────────────────────────────
+  #
+  # Built on NATIVE runners, one per architecture, then merged into a manifest
+  # list. This job compiles llama-cpp-python; under QEMU the arm64 leg took
+  # tens of minutes and — because both platforms were a single buildx call —
+  # it gated the amd64 output too, so the amd64-only enterprise image waited on
+  # an emulated build it never uses. ubuntu-24.04-arm is a native arm64 runner
+  # and is free for public repositories.
+  #
+  # Each leg pushes by digest (no tag), and core-manifest assembles the tags.
+  # The merged manifest digest is what the layers below build FROM, so the
+  # `core.digest` output contract is unchanged.
+  core-build:
     strategy:
       fail-fast: false
       matrix:
@@ -60,30 +75,121 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
 
-      # wheelhouse/ and src-* are created below for Dockerfile.everything, but
-      # Dockerfile.core copies its entire context into /app. Archive the exact
-      # checked-out commit so those staging files cannot leak into the core
-      # layer when all three Dockerfiles share one Bake solve.
-      - name: Prepare clean core context
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core
+
+      - id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.core
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            MNEMOS_CORE_REF=${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=mnemos-core-${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=mnemos-core-${{ matrix.slug }}
+          provenance: true
+          sbom: true
+
+      # The filename is the digest with the "sha256:" prefix stripped: artifact
+      # paths may not contain a colon. core re-adds the prefix when it builds
+      # the @-references for the manifest.
+      - name: Export digest
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/mnemos-core-context"
-          git archive "${GITHUB_SHA}" | tar -x -C "${RUNNER_TEMP}/mnemos-core-context"
+          mkdir -p /tmp/digests
+          digest='${{ steps.build.outputs.digest }}'
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-digest-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assemble the per-arch digests into one tagged manifest list.
+  core:
+    needs: core-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: core-digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          ls -1 | sed 's/^/  leg: /'
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core@sha256:%s ' *)
+
+      - id: manifest
+        name: Resolve merged digest
+        run: |
+          set -euo pipefail
+          tag="$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
+          digest="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "merged manifest: $tag -> $digest"
+          docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' \
+            | jq -r '.manifests[]? | "  platform: \(.platform.os)/\(.platform.architecture)"'
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  # ── 2. everything API image (FROM mnemos-core) ─────────────────────────────
+  everything:
+    needs: core
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
-
-      # setup-python's 3.13 environment does not ambiently include
-      # setuptools the way 3.11's did (CPython 3.12+ dropped bundled
-      # distutils and pip stopped assuming setuptools is present). The
-      # add-on wheel builds below use --no-build-isolation, which relies
-      # on setuptools already being importable in this environment --
-      # without this step, `pip wheel` fails with
-      # `BackendUnavailable: Cannot import 'setuptools.build_meta'`.
-      - name: Ensure setuptools is present for --no-build-isolation wheel builds
-        run: python -m pip install --upgrade pip setuptools wheel
+          python-version: '3.11'
 
       # Pre-build the four add-on wheels from their GitLab repos and stage them
       # into ./wheelhouse for Dockerfile.everything. They are pure-Python
@@ -185,6 +291,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
       # Translate ``addon-provenance.txt`` (one ``overlay SHA`` line per
       # add-on) into per-overlay OCI image labels so the published image
       # records the exact commit each overlay was built from. Without
@@ -203,174 +320,35 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - id: core-meta
-        uses: docker/metadata-action@v5
-        with:
-          bake-target: core-metadata
-          images: ${{ env.IMAGE_NAME }}
-
-      - id: everything-meta
-        uses: docker/metadata-action@v5
-        with:
-          bake-target: everything-metadata
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
-          labels: ${{ steps.addon-labels.outputs.labels }}
-
-      - id: enterprise-meta
-        uses: docker/metadata-action@v5
-        with:
-          bake-target: enterprise-metadata
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=sha,format=short
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      # BuildKit target contexts let each existing Dockerfile consume the
-      # previous target directly. Only enterprise has an image exporter.
-      - name: Define layered build
-        run: |
-          set -euo pipefail
-          cat > "${RUNNER_TEMP}/mnemos-bake.hcl" <<'EOF'
-          variable "PLATFORM" { default = "" }
-          variable "SLUG" { default = "" }
-          variable "CORE_CONTEXT" { default = "" }
-          variable "MNEMOS_CORE_REF" { default = "unknown" }
-          variable "IMAGE_NAME" { default = "" }
-
-          target "core-metadata" {}
-          target "everything-metadata" {}
-          target "enterprise-metadata" {}
-
-          target "core" {
-            inherits = ["core-metadata"]
-            context = CORE_CONTEXT
-            dockerfile = "Dockerfile.core"
-            platforms = [PLATFORM]
-            args = {
-              MNEMOS_CORE_REF = MNEMOS_CORE_REF
-            }
-            cache-from = ["type=gha,scope=mnemos-core-${SLUG}"]
-            cache-to = ["type=gha,mode=max,scope=mnemos-core-${SLUG}"]
-            attest = ["type=provenance", "type=sbom"]
-          }
-
-          target "everything" {
-            inherits = ["everything-metadata"]
-            context = "."
-            dockerfile = "Dockerfile.everything"
-            contexts = {
-              "mnemos-core-build" = "target:core"
-            }
-            platforms = [PLATFORM]
-            args = {
-              MNEMOS_CORE_IMAGE = "mnemos-core-build"
-              MNEMOS_CORE_REF = MNEMOS_CORE_REF
-            }
-            cache-from = ["type=gha,scope=mnemos-everything-${SLUG}"]
-            cache-to = ["type=gha,mode=max,scope=mnemos-everything-${SLUG}"]
-            attest = ["type=provenance", "type=sbom"]
-          }
-
-          target "enterprise" {
-            inherits = ["enterprise-metadata"]
-            context = "."
-            dockerfile = "Dockerfile.enterprise"
-            contexts = {
-              "mnemos-everything-build" = "target:everything"
-            }
-            platforms = [PLATFORM]
-            args = {
-              MNEMOS_EVERYTHING_IMAGE = "mnemos-everything-build"
-              MNEMOS_CORE_REF = MNEMOS_CORE_REF
-            }
-            cache-from = ["type=gha,scope=mnemos-enterprise-${SLUG}"]
-            cache-to = ["type=gha,mode=max,scope=mnemos-enterprise-${SLUG}"]
-            attest = ["type=provenance", "type=sbom"]
-            output = ["type=image,name=${IMAGE_NAME},push-by-digest=true,name-canonical=true,push=true"]
-          }
-          EOF
-
-      - id: bake
-        name: Build layered enterprise image by digest
-        uses: docker/bake-action@v6
-        env:
-          PLATFORM: ${{ matrix.platform }}
-          SLUG: ${{ matrix.slug }}
-          CORE_CONTEXT: ${{ runner.temp }}/mnemos-core-context
-          MNEMOS_CORE_REF: ${{ github.sha }}
-        with:
-          source: .
-          files: |
-            ${{ runner.temp }}/mnemos-bake.hcl
-            ${{ steps.core-meta.outputs.bake-file-labels }}
-            ${{ steps.everything-meta.outputs.bake-file-labels }}
-            ${{ steps.enterprise-meta.outputs.bake-file-labels }}
-          targets: enterprise
-          allow: fs.read=${{ runner.temp }}/mnemos-core-context
-
       - id: build
-        name: Resolve enterprise digest
-        run: |
-          set -euo pipefail
-          # steps.bake.outputs.metadata carries full provenance+sbom
-          # attestations for 3 bake targets and can exceed 128KB (Linux
-          # MAX_ARG_STRLEN). Passing it through `env:` execs it as a
-          # single process argument and fails with "Argument list too
-          # long" -- write it to a file via heredoc instead, which goes
-          # through a normal shell redirect rather than execve.
-          cat > /tmp/bake-metadata.json <<'BAKE_METADATA_EOF'
-          ${{ steps.bake.outputs.metadata }}
-          BAKE_METADATA_EOF
-          digest="$(jq -er '.enterprise["containerimage.digest"]' /tmp/bake-metadata.json)"
-          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
-
-      # Artifact filenames omit the sha256: prefix because colons are invalid.
-      - name: Export digest
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/digests
-          digest='${{ steps.build.outputs.digest }}'
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - uses: actions/upload-artifact@v4
+        uses: docker/build-push-action@v5
         with:
-          name: enterprise-digest-${{ matrix.slug }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
+          context: .
+          file: ./Dockerfile.everything
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            MNEMOS_CORE_IMAGE=${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-core@${{ needs.core.outputs.digest }}
+            MNEMOS_CORE_REF=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            ${{ steps.addon-labels.outputs.labels }}
+          cache-from: type=gha,scope=mnemos-everything
+          cache-to: type=gha,mode=max,scope=mnemos-everything
+          provenance: true
+          sbom: true
 
-  # Merge the two final enterprise digests into the tagged public manifest.
-  #
-  # Multi-arch as of 2026-09-10. Previously amd64-only on the (incorrect)
-  # assumption that Oracle needed gating for the same reason Db2 does; real
-  # arm64 hardware verification that day (O6N, including a live query
-  # against PYTHIA's production Oracle DB) showed oracledb and aiomysql both
-  # work fine on arm64. Only ibm_db (Db2) is genuinely amd64-only — see the
-  # policy note in Dockerfile.enterprise, which installs it conditionally on
-  # TARGETARCH so the two platform builds merge into one manifest list where
-  # the arm64 leg simply lacks the Db2 backend.
+  # ── 3. enterprise image (FROM mnemos) — amd64 ONLY ─────────────────────────
   enterprise:
-    needs: build
+    needs: everything
+    if: ${{ github.event_name == 'push' || github.event.inputs.build_enterprise == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: enterprise-digest-*
-          merge-multiple: true
-
+      - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -382,7 +360,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos-enterprise
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -390,36 +368,36 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
-      - name: Create tagged manifest list
-        working-directory: /tmp/digests
-        run: |
-          set -euo pipefail
-          ls -1 | sed 's/^/  leg: /'
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.IMAGE_NAME }}@sha256:%s ' *)
-
-      - name: Verify published manifest
-        run: |
-          set -euo pipefail
-          tag="$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
-          digest="$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)"
-          echo "published manifest: $tag -> $digest"
-          docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' \
-            | jq -r '.manifests[]? | "  platform: \(.platform.os)/\(.platform.architecture)"'
+      - id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.enterprise
+          # amd64-only by policy (ibm_db has no reliable arm64 wheel).
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            MNEMOS_EVERYTHING_IMAGE=${{ env.REGISTRY }}/${{ github.repository_owner }}/mnemos@${{ needs.everything.outputs.digest }}
+            MNEMOS_CORE_REF=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=mnemos-enterprise
+          cache-to: type=gha,mode=max,scope=mnemos-enterprise
+          provenance: true
+          sbom: true
 
   summary:
-    needs: [build, enterprise]
+    needs: [core, everything, enterprise]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - run: |
           {
-            echo "### MNEMOS enterprise image"
+            echo "### MNEMOS image matrix"
             echo ""
-            echo "Core and everything were internal BuildKit targets; neither was pushed or tagged."
-            echo ""
-            echo "| Published image | Arch | Build | Manifest |"
-            echo "|---|---|---|---|"
-            echo "| mnemos-enterprise | amd64+arm64 (db2 on amd64 only) | ${{ needs.build.result }} | ${{ needs.enterprise.result }} |"
+            echo "| Image | Arch | Status |"
+            echo "|---|---|---|"
+            echo "| mnemos-core | amd64+arm64 | ${{ needs.core.result }} |"
+            echo "| mnemos (everything) | amd64+arm64 | ${{ needs.everything.result }} |"
+            echo "| mnemos-enterprise | amd64 | ${{ needs.enterprise.result }} |"
           } >> "$GITHUB_STEP_SUMMARY"

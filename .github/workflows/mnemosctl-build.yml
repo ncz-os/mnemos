@@ -10,6 +10,9 @@ on:
     paths:
       - "cli/mnemosctl/**"
 
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: cli/mnemosctl

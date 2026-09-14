@@ -10,6 +10,9 @@ on:
   pull_request:
     branches: [master, main, v3.5-dev]
 
+permissions:
+  contents: read
+
 jobs:
   lint-and-unit:
     name: ruff + pytest unit
