@@ -1828,6 +1828,31 @@ def mcp_nats_raw_enabled() -> bool:
     return os.getenv("MNEMOS_MCP_NATS_RAW", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def raw_env(name: str, default: str = "") -> str:
+    """Direct, single-variable ``os.environ`` read.
+
+    This is the chokepoint `lint:env-discipline` (``.gitlab-ci.yml``)
+    expects: callers that need one external environment variable's literal
+    value — not a typed MNEMOS setting — go through here instead of
+    reaching for ``os.environ``/``os.getenv`` themselves. Used by
+    ``mnemos/tunnels`` to look up vendor-specific variables (e.g.
+    ``XDG_CONFIG_HOME``, ``NGROK_AUTHTOKEN``) that describe the host/vendor
+    environment rather than MNEMOS's own configuration.
+    """
+    return os.environ.get(name, default)
+
+
+def raw_env_subset(names: tuple[str, ...]) -> dict[str, str]:
+    """Return the subset of the real process environment matching ``names``.
+
+    Same chokepoint rationale as :func:`raw_env`, for the allow-list case:
+    building a minimal, filtered environment to hand to a spawned
+    subprocess (see ``mnemos/tunnels/base.py:child_env``) without touching
+    ``os.environ`` outside this module.
+    """
+    return {name: os.environ[name] for name in names if name in os.environ}
+
+
 def _reset_settings_for_tests() -> None:
     """Clear the singleton and refresh compatibility dicts.
 

@@ -71,7 +71,7 @@ class CloudflareBridge(TunnelBridge):
         # command shape, and silently treating one as the other would open
         # the wrong tunnel. See the module docstring.
         #
-        # child_env() rather than os.environ: MNEMOS's environment carries
+        # child_env() rather than the raw process environment: MNEMOS's environment carries
         # the database DSN, the MCP bearer token and the OAuth signing key,
         # none of which a tunnel agent needs, and all of which would become
         # readable via /proc/<pid>/environ and visible to a third-party

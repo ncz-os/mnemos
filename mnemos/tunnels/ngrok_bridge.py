@@ -22,12 +22,12 @@ never in argv: argv is readable by every user on the host via ``ps``.
 from __future__ import annotations
 
 import asyncio
-import os
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 
+from mnemos.core.config import raw_env
 from mnemos.tunnels.base import (
     TunnelAuthError,
     TunnelBridge,
@@ -47,7 +47,7 @@ def _ngrok_config_paths() -> tuple[Path, ...]:
     module-level ``Path.home()`` would freeze whatever was true then.
     """
     paths = []
-    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    xdg = raw_env("XDG_CONFIG_HOME").strip()
     if xdg:
         paths.append(Path(xdg) / "ngrok" / "ngrok.yml")
     home = Path.home()
@@ -91,7 +91,7 @@ class NgrokBridge(TunnelBridge):
     def _validate_credentials(self, authtoken: Optional[str]) -> None:
         if authtoken:
             return
-        if os.environ.get("NGROK_AUTHTOKEN", "").strip():
+        if raw_env("NGROK_AUTHTOKEN").strip():
             return
         if self.stored_authtoken_path() is not None:
             return

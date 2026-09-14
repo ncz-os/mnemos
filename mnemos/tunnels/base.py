@@ -21,7 +21,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import shutil
 import socket
 from abc import ABC, abstractmethod
@@ -29,6 +28,8 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import ClassVar, Deque, Optional
+
+from mnemos.core.config import raw_env_subset
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ def child_env(extra: Optional[dict[str, str]] = None) -> dict[str, str]:
     the daemon's environment from silently reconfiguring the agent behind
     the API's back — only what a bridge passes in ``extra`` gets through.
     """
-    env = {name: os.environ[name] for name in _INHERITED_ENV_VARS if name in os.environ}
+    env = raw_env_subset(_INHERITED_ENV_VARS)
     if extra:
         env.update(extra)
     return env
