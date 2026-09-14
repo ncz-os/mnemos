@@ -57,6 +57,30 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.8] — 2026-09-13
+
+- **Fixed**: every GRAEAE consultation (`POST /v1/consultations`,
+  `graeae_consult`) against an Oracle or Db2-backed instance returned
+  `503 Shared consultation quota storage is unavailable.` — reported
+  live against production. Root cause: `mnemos-graeae`'s
+  `_lock_quota_row_for_update` called `await conn.cursor()` for the
+  Oracle/Db2/Db2BackendNative branch, but `cursor()` is a synchronous
+  method on both python-oracledb's async connection and this repo's own
+  `Db2BackendNative` wrapper (`_Db2NativeAsyncConnection.cursor`) — only
+  `execute`/`fetchone`/`fetchall`/`close` are coroutines. Awaiting the
+  plain cursor raised `TypeError: object AsyncCursor can't be used in
+  'await' expression`, caught by `_enforce_consult_quota`'s broad
+  except-Exception and re-raised as the 503 above.
+- **Process note**: every existing test in
+  `mnemos-graeae/tests/test_graeae_consult_quota.py` passed
+  `tx.conn=None`, which trips `_lock_quota_row_for_update`'s
+  `if conn is None: return` early-exit — so the Oracle/Db2 branch had
+  zero test coverage despite the file appearing well-tested. Fixed
+  upstream in `mnemos-graeae` (`58f56ae`) with new regression tests
+  using an Oracle-shaped fake connection (synchronous `cursor()`, async
+  execute/fetchone/close), and repinned here via
+  `.github/addons.lock.json`.
+
 ## [6.3.7] — 2026-09-13
 
 - **Fixed**: `6.3.6`'s Db2 fix for `0061c_morpheus_runs_parity.sql` was
