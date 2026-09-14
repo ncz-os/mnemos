@@ -352,6 +352,7 @@ class _Morpheus:
         run = self._conn.run_row
         if run is None:
             return None
+        cluster_min_size = int(run.get("cluster_min_size", 3))
         namespace = run.get("namespace")
         out = []
         for cluster in (run.get("config") or {}).get("clusters", []):
@@ -375,7 +376,7 @@ class _Morpheus:
                 )
             if members:
                 out.append(MorpheusSynthesisCluster(cluster.get("cluster_id", 0), members))
-        return out
+        return cluster_min_size, out
 
     async def phase_synthesise_store(self, tx, **kwargs):
         memory_id = kwargs["memory_id"]

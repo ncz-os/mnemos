@@ -6127,11 +6127,25 @@ class PostgresMorpheusRepository(MorpheusRepository):
         tx: Transaction,
         *,
         run_id: str,
-    ) -> list[MorpheusSynthesisCluster] | None:
+    ) -> tuple[int, list[MorpheusSynthesisCluster]] | None:
+        """Postgres impl of MORPHEUS phase_synthesise_load (item 11c + F01).
+
+        Returns ``(cluster_min_size, clusters)`` so the runner can apply
+        the per-(owner_id, namespace) partition while still honoring the
+        run's ``cluster_min_size`` (F01 cross-owner privacy isolation,
+        adbeeb63). The ``cluster_min_size`` lives on ``morpheus_runs``
+        and is read in the same SELECT as ``config`` to avoid an extra
+        round-trip.
+        """
         conn = _postgres_tx(tx).conn
-        config = await conn.fetchval("SELECT config FROM morpheus_runs WHERE id = $1::uuid", run_id)
-        if config is None:
+        run_row = await conn.fetchrow(
+            "SELECT cluster_min_size, config FROM morpheus_runs WHERE id = $1::uuid",
+            run_id,
+        )
+        if run_row is None:
             return None
+        cluster_min_size = int(run_row["cluster_min_size"])
+        config = run_row["config"]
         if isinstance(config, str):
             try:
                 config = json.loads(config)
@@ -6164,7 +6178,7 @@ class PostgresMorpheusRepository(MorpheusRepository):
             )
             if members:
                 loaded.append(MorpheusSynthesisCluster(cluster.get("cluster_id"), members))
-        return loaded
+        return cluster_min_size, loaded
 
     async def phase_synthesise_store(
         self,

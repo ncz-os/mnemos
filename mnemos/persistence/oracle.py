@@ -3271,16 +3271,30 @@ class OracleMorpheusRepository(MorpheusRepository):
         tx: Transaction,
         *,
         run_id: str,
-    ) -> list[MorpheusSynthesisCluster] | None:
+    ) -> tuple[int, list[MorpheusSynthesisCluster]] | None:
+        """Oracle/Db2-compat impl of MORPHEUS phase_synthesise_load (item 11c + F01).
+
+        Returns ``(cluster_min_size, clusters)`` so the runner can apply
+        the per-(owner_id, namespace) partition while still honoring the
+        run's ``cluster_min_size`` (F01 cross-owner privacy isolation,
+        adbeeb63). The ``cluster_min_size`` lives on ``morpheus_runs``
+        and is read in the same SELECT as ``config`` to avoid an extra
+        round-trip. Db2 inherits this implementation.
+        """
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
-            await _call(cursor.execute, "SELECT config FROM morpheus_runs WHERE id = :id", {"id": run_id})
+            await _call(
+                cursor.execute,
+                "SELECT cluster_min_size, config FROM morpheus_runs WHERE id = :id",
+                {"id": run_id},
+            )
             row = await _row_to_dict(cursor, await _call(cursor.fetchone))
         finally:
             await _call(cursor.close)
         if row is None:
             return None
+        cluster_min_size = int(row["cluster_min_size"])
         try:
             config = json.loads(row["config"] or "{}")
         except (json.JSONDecodeError, TypeError):
@@ -3316,7 +3330,7 @@ class OracleMorpheusRepository(MorpheusRepository):
             )
             if members:
                 loaded.append(MorpheusSynthesisCluster(cluster.get("cluster_id"), members))
-        return loaded
+        return cluster_min_size, loaded
 
     async def phase_synthesise_store(
         self,

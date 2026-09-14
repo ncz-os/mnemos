@@ -2917,13 +2917,32 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
         tx: Transaction,
         *,
         run_id: str,
-    ) -> list[MorpheusSynthesisCluster] | None:
+    ) -> tuple[int, list[MorpheusSynthesisCluster]] | None:
+        """SQLite impl of MORPHEUS phase_synthesise_load (item 11c + F01).
+
+        Returns ``(cluster_min_size, clusters)`` so the runner can
+        partition clusters per-(owner_id, namespace) for the F01
+        cross-owner privacy isolation fix (adbeeb63) while still
+        surfacing the run's ``cluster_min_size`` for audit logging.
+        The ``cluster_min_size`` lives on ``morpheus_runs`` and is read
+        in the same SELECT as ``config`` to avoid an extra round-trip.
+        """
         conn = self._conn(tx)
-        row = await _fetch_one(conn, "SELECT config FROM morpheus_runs WHERE id = ?", (run_id,))
-        if row is None:
+        run_row = await _fetch_one(
+            conn,
+            "SELECT cluster_min_size, config FROM morpheus_runs WHERE id = ?",
+            (run_id,),
+        )
+        if run_row is None:
             return None
+        if isinstance(run_row, dict):
+            cluster_min_size = int(run_row["cluster_min_size"])
+            raw_config = run_row["config"]
+        else:
+            cluster_min_size = int(run_row[0])
+            raw_config = run_row[1]
         try:
-            config = json.loads(row["config"] or "{}")
+            config = json.loads(raw_config or "{}")
         except (json.JSONDecodeError, TypeError):
             config = {}
         clusters = config.get("clusters", []) if isinstance(config, dict) else []
@@ -2952,7 +2971,7 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
             )
             if members:
                 loaded.append(MorpheusSynthesisCluster(cluster.get("cluster_id"), members))
-        return loaded
+        return cluster_min_size, loaded
 
     async def phase_synthesise_store(
         self,
