@@ -29,7 +29,7 @@ fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     if let Ok(value) = value.extract::<String>() {
         return Ok(Value::String(value));
     }
-    if let Ok(dict) = value.downcast::<PyDict>() {
+    if let Ok(dict) = value.cast::<PyDict>() {
         let mut object = Map::with_capacity(dict.len());
         for (key, item) in dict.iter() {
             let key = key.extract::<String>()?;
@@ -37,14 +37,14 @@ fn py_to_json(value: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
         return Ok(Value::Object(object));
     }
-    if let Ok(list) = value.downcast::<PyList>() {
+    if let Ok(list) = value.cast::<PyList>() {
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
             out.push(py_to_json(&item)?);
         }
         return Ok(Value::Array(out));
     }
-    if let Ok(tuple) = value.downcast::<PyTuple>() {
+    if let Ok(tuple) = value.cast::<PyTuple>() {
         let mut out = Vec::with_capacity(tuple.len());
         for item in tuple.iter() {
             out.push(py_to_json(&item)?);
@@ -259,14 +259,14 @@ pub fn serialize_memory_row_for_feed(row: &Bound<'_, PyDict>) -> PyResult<String
 #[pyo3(text_signature = "(rows, /)")]
 pub fn serialize_memory_for_feed(rows: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
     let rows = rows
-        .downcast::<PySequence>()
+        .cast::<PySequence>()
         .map_err(|_| PyTypeError::new_err("rows must be a sequence of mappings"))?;
     let row_count = rows.len()?;
     let mut out = Vec::with_capacity(row_count);
     for idx in 0..row_count {
         let row = rows.get_item(idx)?;
         let row = row
-            .downcast::<PyDict>()
+            .cast::<PyDict>()
             .map_err(|_| PyTypeError::new_err("rows must contain dict mappings"))?;
         out.push(serialize_memory_row_for_feed(row)?);
     }
@@ -280,7 +280,7 @@ pub fn serialize_memory_rows<'py>(
     rows: &Bound<'py, PyAny>,
 ) -> PyResult<Py<PyBytes>> {
     let rows = rows
-        .downcast::<PySequence>()
+        .cast::<PySequence>()
         .map_err(|_| PyTypeError::new_err("rows must be a sequence of mappings"))?;
     let row_count = rows.len()?;
     let mut out = Vec::with_capacity(row_count.saturating_mul(512));
@@ -291,7 +291,7 @@ pub fn serialize_memory_rows<'py>(
         }
         let row = rows.get_item(idx)?;
         let row = row
-            .downcast::<PyDict>()
+            .cast::<PyDict>()
             .map_err(|_| PyTypeError::new_err("rows must contain dict mappings"))?;
         let value = serialize_feed_row_value(row)?;
         serde_json::to_writer(&mut out, &value).map_err(|err| {
@@ -299,19 +299,19 @@ pub fn serialize_memory_rows<'py>(
         })?;
     }
     out.push(b']');
-    Ok(PyBytes::new_bound(py, &out).unbind())
+    Ok(PyBytes::new(py, &out).unbind())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyo3::types::PyDict;
+    use pyo3::types::{PyDict, PyDictMethods};
 
     #[test]
     fn serializes_required_feed_fields_in_order() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let row = PyDict::new_bound(py);
+        Python::initialize();
+        Python::attach(|py| {
+            let row = PyDict::new(py);
             row.set_item("id", "mem_1").unwrap();
             row.set_item("content", "hello").unwrap();
             row.set_item("category", "projects").unwrap();
@@ -332,9 +332,9 @@ mod tests {
 
     #[test]
     fn omits_missing_embedding_and_defaults_arrays() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            let row = PyDict::new_bound(py);
+        Python::initialize();
+        Python::attach(|py| {
+            let row = PyDict::new(py);
             row.set_item("id", "mem_2").unwrap();
             row.set_item("content", "hello").unwrap();
             row.set_item("category", "projects").unwrap();
