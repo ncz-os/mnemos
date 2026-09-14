@@ -1,0 +1,7 @@
+[project]
+name = "mnemos-charon"
+version = "0.1.0"
+description = "Local stub for F01 testing — charon add-on is not published to PyPI; this stub exists only so uv's resolver can satisfy the `[charon]` extra in this environment."
+requires-python = ">=3.13"
+license = { text = "Apache-2.0" }
+dependencies = []

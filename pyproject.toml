@@ -238,6 +238,27 @@ namespaces = true
 # Note: uv does not support python-version in [tool.uv] (use pyproject.toml requires-python instead)
 # For Docker: use `uv pip install --system -r requirements.txt` (--system is required when no venv exists)
 
+[tool.uv.sources]
+# F01: local-path fallbacks for the external add-on distributions that are
+# not on PyPI. The real wheels for these names are published to an internal
+# index in production; in this repository (which is a standalone checkout
+# without access to that index) uv would otherwise fail to resolve
+# `mnemos-charon`, `mnemos-graeae`, `mnemos-pantheon`, `mnemos-knemon`,
+# and `mnemos-hot` and the validation command would error out before any
+# test ran. The stubs in mnemos-stubs/<name>/ are name-only pyproject
+# files with no Python code — they exist purely so the resolver succeeds
+# and the lockfile can be regenerated. The runtime `is_extra_installed`
+# probe (mnemos/core/extras.py) checks for an importable module path,
+# which the stubs do NOT provide, so CHARON/PANTHEON/KNEMON/GRAEAE/HOT
+# remain correctly reported as "not installed" and the routes return 503
+# — i.e. behaviour is identical to a production node that doesn't have
+# those add-ons deployed.
+mnemos-charon   = { path = "mnemos-stubs/charon" }
+mnemos-graeae   = { path = "mnemos-stubs/graeae" }
+mnemos-pantheon = { path = "mnemos-stubs/pantheon" }
+mnemos-knemon   = { path = "mnemos-stubs/knemon" }
+mnemos-hot      = { path = "mnemos-stubs/hot" }
+
 [tool.ruff]
 line-length = 120
 target-version = "py311"
