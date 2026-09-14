@@ -68,21 +68,59 @@ FEATURE_BUNDLES: dict[str, tuple[str, ...]] = {
 def is_extra_installed(name: str) -> bool:
     """Check if optional extra ``name`` is available by probing deps.
 
-    External add-ons are checked metadata-first because their install contract is
-    the distribution; editable or partial installs may lack metadata, so fall
-    back to importing a stable add-on module before reporting the extra missing.
+    External add-ons are checked by BOTH the distribution metadata AND a
+    stable add-on module import — metadata alone is insufficient because
+    ``[tool.uv.sources]`` may resolve a name-only stub (see the
+    ``mnemos-stubs/<name>`` entries in pyproject.toml) that satisfies the
+    resolver without providing any actual add-on code. Without the import
+    probe, ``mnemos-charon`` etc. would falsely report "installed" after
+    `uv pip install .[charon]` in this repository and the CHARON/PANTHEON/
+    KNEMON/GRAEAE/HOT routes would mount at 503-or-broken instead of
+    cleanly returning 503 with the install hint. In production with the
+    real wheels (which DO contain ``mnemos.domain.portability.schemas``,
+    ``mnemos.domain.pantheon``, ``mnemos.domain.knemon.router``,
+    ``mnemos.domain.graeae.engine``, ``mnemos_hot``) both probes succeed
+    and the extra is reported as installed.
+
+    The fallback order matters: editable or partial installs may lack
+    metadata for a real wheel, so if ``version()`` fails we still try
+    the import probe before reporting the extra missing (preserves the
+    pre-F01 contract). Conversely, when metadata IS present we now ALSO
+    require the import probe to succeed — this catches the stub-resolves-
+    to-metadata-only case introduced by the F01 ``[tool.uv.sources]``
+    fallbacks.
     """
     dist_name = EXTERNAL_EXTRA_DISTS.get(name)
     if dist_name is not None:
         try:
             version(dist_name)
+            metadata_ok = True
         except PackageNotFoundError:
-            probe = EXTERNAL_EXTRA_IMPORT_PROBES[name]
+            metadata_ok = False
+        probe = EXTERNAL_EXTRA_IMPORT_PROBES.get(name)
+        # When metadata IS present (the typical ``uv pip install .[charon]``
+        # case), BOTH probes must succeed — this rejects the name-only
+        # stubs from ``[tool.uv.sources]`` so CHARON/PANTHEON/etc. routes
+        # return 503 instead of mounting with no real code behind them.
+        # When metadata is MISSING (editable / partial installs without
+        # metadata), the import probe is sufficient — that's the pre-F01
+        # contract preserved here.
+        if metadata_ok:
+            if probe is None:
+                return True
             try:
                 import_module(probe)
             except ImportError:
                 return False
-        return True
+            return True
+        # metadata missing — fall back to import probe (pre-F01 behaviour)
+        if probe is not None:
+            try:
+                import_module(probe)
+            except ImportError:
+                return False
+            return True
+        return False
 
     probes = EXTRA_PROBES.get(name)
     if probes is None:
