@@ -57,6 +57,14 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.4.1] — 2026-09-14
+
+### Fixed — docs
+
+`SECURITY.md`'s supported-versions table and `KNOWN_LIMITATIONS.md`'s
+header both still named 6.3.x as the current release line after 6.4.0
+shipped. Bumped both to 6.4.
+
 ## [6.4.0] — 2026-09-14
 
 ### Added — public tunnel management on the admin API
