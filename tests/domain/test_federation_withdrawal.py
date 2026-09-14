@@ -215,10 +215,16 @@ async def test_feed_emits_withdrawal_when_row_is_soft_deleted_offsite(tmp_path, 
         assert withdrawal.namespace == "default"
         assert withdrawal.withdrawn_at  # ISO timestamp populated
         assert withdrawal.reason == "ineligible"
-        # MemoryItem variant must NOT have leaked through for the deleted row.
-        assert None not in event_types or len([t for t in event_types if t is None]) == 0, (
-            "the deleted row must NOT be emitted as a live MemoryItem "
-            f"(got event_types={event_types})"
+        # Crucial: the deleted row must NOT be emitted as a live MemoryItem.
+        # Plain MemoryItem rows have no `.type` attribute → `getattr` is None.
+        live_leak_for_deleted_id = [
+            m for m in response.memories
+            if m.id == "f07-pub-1" and getattr(m, "type", None) is None
+        ]
+        assert live_leak_for_deleted_id == [], (
+            "the deleted row must NOT be emitted as a live MemoryItem — "
+            f"the withdrawal branch must be the sole signal for this id "
+            f"(got {[type(m).__name__ for m in live_leak_for_deleted_id]})"
         )
 
 
@@ -285,6 +291,79 @@ async def test_feed_emits_withdrawal_when_permission_mode_narrows_offsite(tmp_pa
             m.id == "f07-narrow-1" and getattr(m, "type", None) is None
             for m in response.memories
         ), "narrowed row must not appear as a live MemoryItem"
+
+
+@pytest.mark.asyncio
+async def test_feed_emits_withdrawal_when_row_is_archived(tmp_path, monkeypatch):
+    """The third withdrawal trigger: archiving a row (``archived_at IS NOT NULL``).
+
+    Soft-delete and permission-narrowing are covered by sibling tests; this one
+    pins down the archive path. The row was federated (world-readable 644 in
+    the offsite posture); archiving it removes it from the exportable set.
+    The HTTP feed must surface an explicit withdrawal event for it, not
+    silently drop the id.
+    """
+    from mnemos.api.routes import federation as handler
+
+    async with _sqlite_backend(tmp_path) as backend:
+        await _install_in_lifecycle(backend, monkeypatch)
+        now = datetime.now(timezone.utc)
+        async with backend.transactional() as tx:
+            await _insert_memory(
+                backend,
+                tx,
+                memory_id="f07-archive-1",
+                content="public row that will be archived",
+                updated=now,
+                permission_mode=644,
+            )
+
+        # Sanity: the row is in the live feed.
+        async with backend.transactional() as tx:
+            rows = await backend.federation.feed_query(
+                tx,
+                since_updated=None,
+                since_id=None,
+                namespaces=[],
+                categories=[],
+                limit=10,
+                prefer_compressed=False,
+            )
+        assert [r["id"] for r in rows] == ["f07-archive-1"]
+        assert rows[0]["type"] is None  # plain MemoryItem
+
+        # Archive the row directly via UPDATE — same end-state as the public
+        # archive path: archived_at IS NOT NULL, updated bumped.
+        async with backend.transactional() as tx:
+            from mnemos.persistence.sqlite import _execute
+            await _execute(
+                tx.conn,
+                "UPDATE memories SET archived_at = CURRENT_TIMESTAMP, "
+                "updated = CURRENT_TIMESTAMP WHERE id = ?",
+                ("f07-archive-1",),
+            )
+
+        response = await handler.federation_feed(
+            None, None,
+            since=None, namespace=None, category=None, limit=10,
+            prefer_compressed=False, copy_embeddings=False,
+        )
+        ids = [m.id for m in response.memories]
+        assert "f07-archive-1" in ids, (
+            "the archived row's id must still appear, but as a "
+            "FederationWithdrawalEvent — not be silently absent"
+        )
+        withdrawal = next(
+            m for m in response.memories
+            if m.id == "f07-archive-1"
+            and getattr(m, "type", None) == "withdrawal"
+        )
+        assert withdrawal.type == "withdrawal"
+        # Crucial: not delivered as a live MemoryItem.
+        assert not any(
+            m.id == "f07-archive-1" and getattr(m, "type", None) is None
+            for m in response.memories
+        ), "archived row must not appear as a live MemoryItem"
 
 
 @pytest.mark.asyncio

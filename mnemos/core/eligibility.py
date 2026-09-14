@@ -91,16 +91,18 @@ def eligible_for_federation_withdrawal(alias: str = "m", *, include_private: boo
     because it carries a redirect target — a "go look at canonical id X"
     tombstone, not a "drop id X" withdrawal). The vault exclusion and
     ``federation_source IS NULL`` loop-guard ALWAYS apply — a row that was
-    never exported never produces a withdrawal, and a row that has been
-    moved INTO the secret-vault namespace by hand (the live write path
-    already refuses to publish to vault) must produce a withdrawal even
-    on the trusted-LAN feed so the credential boundary stays a
-    credential boundary on the receiver side.
+    never exported never produces a withdrawal (so a vault row that was
+    never federated stays absent from the wire entirely, mirroring the
+    live branch's credential-boundary behavior). And a row that has been
+    moved INTO the secret-vault namespace by hand cannot produce a
+    withdrawal either: the credential boundary is one-way. Once a row
+    enters the vault it stays in the vault and never appears on the wire
+    (live OR withdrawal); a receiver never had the row to begin with,
+    so there is no row to drop.
 
     Trigger conditions (any one is sufficient — union, not intersection):
       - ``deleted_at IS NOT NULL`` (soft-delete)
       - ``archived_at IS NOT NULL`` (archive)
-      - ``namespace`` has become the secret vault
       - ``permission_mode`` no longer passes the world-read gate AND the
         trusted-feed posture is OFF (i.e. ``MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0``
         only; in the trusted-LAN posture the world-read bit never gates
@@ -113,7 +115,9 @@ def eligible_for_federation_withdrawal(alias: str = "m", *, include_private: boo
     vault_literal = VAULT_NAMESPACE.replace("'", "''")
     trust_posture = _federation_include_private(include_private)
     # Offsite / multi-tenant: rows that lost their world-read bit must
-    # also produce a withdrawal so a polling replica drops them.
+    # also produce a withdrawal so a polling replica drops them. In the
+    # trusted-LAN posture the world-read bit never gates export and so
+    # "made private" is meaningless — keep sharing, no withdrawal.
     if trust_posture:
         world_read_branch = ""
     else:
@@ -121,10 +125,10 @@ def eligible_for_federation_withdrawal(alias: str = "m", *, include_private: boo
     return (
         f"{prefix}federation_source IS NULL "
         f"AND {prefix}consolidated_into IS NULL "
+        f"AND ({prefix}namespace IS NULL OR {prefix}namespace <> '{vault_literal}') "
         f"AND ("
         f"{prefix}deleted_at IS NOT NULL "
         f"OR {prefix}archived_at IS NOT NULL "
-        f"OR {prefix}namespace = '{vault_literal}' "
         f"{world_read_branch}"
         f")"
     )

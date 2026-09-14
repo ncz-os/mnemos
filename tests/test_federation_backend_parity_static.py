@@ -139,13 +139,16 @@ async def test_db2_feed_queries_require_public_readable_and_exclude_vault(monkey
         assert "M.CONSOLIDATED_INTO IS NULL" in sql
         assert "M.NAMESPACE IS NULL OR M.NAMESPACE <> ?" in sql
 
-    # F07: the withdrawal branch reuses the vault literal as a trigger
-    # (`namespace = ?`) plus an outer-loop credential-boundary guard.
-    # The first two params are the live branch's [VAULT_NAMESPACE,
-    # limit]; the next four are the withdrawal branch's
-    # [VAULT_NAMESPACE_trigger, VAULT_NAMESPACE_boundary, ...]. We don't
-    # pin the precise shape here — only that VAULT_NAMESPACE appears
-    # at least once and the live limit (25) is the trailing param.
+    # F07: the withdrawal branch reuses the vault literal as both a
+    # trigger (the credential boundary is OUTER, never a withdrawal
+    # trigger — see eligible_for_federation_withdrawal) AND the
+    # loop-guard exclusion. The trailing params are the live-branch
+    # limit (25) immediately followed by the withdrawal-branch limit
+    # (25); they share the same value here. We don't pin the precise
+    # shape beyond asserting that VAULT_NAMESPACE appears at least
+    # once (the credential boundary holds) and the LAST param is 25
+    # (the withdrawal-branch limit, which is also the SQL `LIMIT`
+    # applied to the final result set).
     assert VAULT_NAMESPACE in feed_params
     assert feed_params[-1] == 25
     assert get_params == ("mem-1", VAULT_NAMESPACE)
@@ -366,33 +369,41 @@ def _assert_tombstone_federation_gates(sql: str, public_token: str, vault_token:
 
 def _assert_withdrawal_federation_gates(sql: str, vault_token: str) -> None:
     """F07: withdrawal branch must carry the loop-guard, the
-    dead/archived/vault-or-private trigger, and the vault credential
-    boundary. World-read gate is opt-in (offsite posture): the test
-    harness sets it via the offsite posture when it wants it asserted
-    (see the parameterised callers).
-
-    Note: the withdrawal predicate uses ``namespace = 'vault'`` AS A
-    TRIGGER (a row that has been moved into the secret-vault namespace
-    is a withdrawal signal even on a trusted feed), so the literal
-    vault reference is present in the SQL — just as a positive match,
-    not as the live branch's exclusion form. We accept either form.
+    dead/archived (and offsite-posture: world-read) trigger, the vault
+    credential boundary as an OUTER exclusion (NOT a withdrawal
+    trigger — vault rows stay excluded entirely so a never-federated
+    vault row can't leak as a withdrawal signal), and the literal
+    'withdrawal' `type` column so the receiver classifies it correctly.
+    World-read gate is opt-in (offsite posture): the test harness
+    sets it via the offsite posture when it wants it asserted (see
+    the parameterised callers).
     """
     assert "M.FEDERATION_SOURCE IS NULL" in sql, "loop-guard must always hold"
     assert "M.CONSOLIDATED_INTO IS NULL" in sql, "withdrawal excludes consolidated rows"
     assert "M.DELETED_AT IS NOT NULL" in sql, "withdrawal trigger condition must be present"
     assert "M.ARCHIVED_AT IS NOT NULL" in sql, "withdrawal trigger condition must be present"
-    # The vault literal appears in the SQL in one of these shapes:
-    # - oracle/db2: `namespace = :vault_ns` (positive trigger)
-    # - sqlite/postgres/mysql/mariadb: `namespace = 'vault'` (positive trigger)
-    # - live branch exclusion (every backend): `namespace <> ...`
-    # We accept any of these forms as evidence the vault credential
-    # boundary is honored.
-    vault_present = (
-        vault_token in sql
-        or "M.NAMESPACE = :VAULT_NS" in sql
-        or "M.NAMESPACE = 'VAULT'" in sql
+    # The withdrawal branch must carry the literal 'withdrawal' as the
+    # `type` column so `_feed_item_from_row` recognises it as a
+    # FederationWithdrawalEvent (NOT a plain MemoryItem with content=NULL).
+    # sqlite uses a bare 'withdrawal' AS TYPE literal; postgres uses
+    # 'withdrawal'::text AS TYPE (a typed cast); oracle / db2 / mysql /
+    # mariadb use a bare 'withdrawal' AS TYPE literal. After _normalized_sql
+    # (upper-cases everything), both forms collapse to "SELECT ... 'WITHDRAWAL' AS TYPE"
+    # OR "'WITHDRAWAL'::TEXT AS TYPE" — accept either.
+    assert (
+        "'WITHDRAWAL' AS TYPE" in sql
+        or "'WITHDRAWAL'::TEXT AS TYPE" in sql
+    ), (
+        "withdrawal branch must emit literal 'withdrawal' as the `type` "
+        "column so the receiver classifies it as a FederationWithdrawalEvent"
     )
-    assert vault_present, "vault credential boundary must always hold"
+    # The vault credential boundary is honored as an OUTER exclusion —
+    # the withdrawal predicate is wrapped in
+    # `AND (namespace IS NULL OR namespace <> '<vault>')`, so the
+    # literal vault reference appears in the live-branch's exclusion
+    # form. We accept that as evidence the credential boundary holds
+    # for the withdrawal branch too.
+    assert vault_token in sql, "vault credential boundary must always hold"
 
 
 @pytest.mark.asyncio

@@ -88,6 +88,12 @@ build/
 __pycache__/
 .split-build/
 
+# Agent task scratch files — per-task briefs dropped at the repo root
+# during zoder task framework runs. Reviews scope to actual code
+# changes only; task briefs are not committed.
+.zoder_task_*.md
+TASK_*.md
+
 # Local scripts not for distribution
 sync_argonas_git.py
 run_monthly_export.sh
