@@ -3226,7 +3226,13 @@ async def test_db2_federation_feed_query_native_tokens() -> None:
     assert ":LIMIT" not in sql
     assert ":NS" not in sql
     assert ":CAT" not in sql
-    assert len(params_tuple) == 8  # vault, updated x2, since_id, ns-a, ns-b, cat, limit
+    # F07: the withdrawal branch mirrors the live branch's vault
+    # credential-boundary exclusion plus the same since/namespaces/
+    # categories filters. With the live branch contributing 8 params
+    # (vault + 3×since + 2×ns + 1×cat + 1×limit) and the withdrawal
+    # branch contributing 8 params (vault + 3×since + 2×ns + 1×cat +
+    # 1×limit), the total is 16.
+    assert len(params_tuple) == 16  # see comment above
 
 
 @pytest.mark.asyncio
@@ -3272,7 +3278,17 @@ async def test_db2_federation_feed_query_no_filters_native_tokens() -> None:
     assert "MOD(M.PERMISSION_MODE, 10) >= 4" in sql
     assert "M.CONSOLIDATED_INTO IS NULL" in sql
     assert "M.NAMESPACE IS NULL OR M.NAMESPACE <> ?" in sql
-    assert len(params_tuple) == 2  # vault, limit
+    # F07: the withdrawal branch mirrors the live branch's vault
+    # credential-boundary exclusion plus a trailing limit. The
+    # resulting param tuple is
+    #   (vault, 10, vault, 10)
+    # i.e. 4 elements: live-vault, live-limit, withdrawal-vault,
+    # withdrawal-limit.
+    assert len(params_tuple) == 4
+    assert params_tuple[0] == "vault"  # live branch vault boundary
+    assert params_tuple[1] == 10  # live branch limit
+    assert params_tuple[2] == "vault"  # withdrawal branch vault boundary
+    assert params_tuple[3] == 10  # withdrawal branch limit
 
 
 @pytest.mark.asyncio

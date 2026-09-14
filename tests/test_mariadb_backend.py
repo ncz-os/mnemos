@@ -219,8 +219,23 @@ async def test_mariadb_federation_feed_reads_join_table_embedding() -> None:
     assert "left join memory_embeddings me on me.memory_id = m.id" in sql
     assert "vec_totext(me.embedding) as embedding" in sql
     assert "from_vector(m.embedding)" not in sql
+    # F07: the withdrawal branch repeats the live-branch filters. The
+    # resulting param tuple shape is:
+    #   embed-model (select_params[0]),
+    #   live branch:       since, since, cursor-id, tenant-a, keep
+    #   tombstone branch:  since, since, cursor-id (consolidated_at > ? OR …)
+    #                      + tenant-a, keep (namespace/category IN)
+    #   withdrawal branch: since, since, cursor-id (updated > ? OR …)
+    #                      + tenant-a, keep (namespace/category IN)
+    #   trailing limit (25)
+    # i.e. 1 + 5 + 5 + 5 + 1 = 17.
     assert captured["params"] == (
         "embed-model",
+        since,
+        since,
+        "cursor-id",
+        "tenant-a",
+        "keep",
         since,
         since,
         "cursor-id",

@@ -7345,21 +7345,20 @@ class OracleFederationRepository(FederationRepository):
             ]
             # F07: explicit withdrawal branch — rows that USED TO BE
             # federated but have left the live feed (soft-delete /
-            # archive / permission narrowed offsite / moved into the
-            # secret vault namespace). Mirrors the SQLite/Postgres/MySQL
-            # branches; Oracle's existing feed_query did not surface a
-            # consolidation tombstone branch, so this is a clean
-            # add-on.
+            # archive / permission narrowed offsite). The vault
+            # credential boundary is honored as an OUTER exclusion (NOT
+            # a withdrawal trigger — vault rows stay excluded entirely
+            # so a never-federated vault row can't leak as a withdrawal
+            # signal). The trigger conditions are dead/archived (always)
+            # plus the offsite-posture world-read flip.
+            trigger = "m.deleted_at IS NOT NULL OR m.archived_at IS NOT NULL"
+            if not federation_feed_include_private():
+                trigger = f"{trigger} OR MOD(m.permission_mode, 10) < 4"
             withdrawal_where = [
                 "m.federation_source IS NULL",
                 "m.consolidated_into IS NULL",
-                "(m.deleted_at IS NOT NULL OR m.archived_at IS NOT NULL OR m.namespace = :vault_ns",
-                *(
-                    []
-                    if federation_feed_include_private()
-                    else ["OR MOD(m.permission_mode, 10) < 4"]
-                ),
-                ")",
+                "(m.namespace IS NULL OR m.namespace <> :vault_ns)",
+                f"({trigger})",
             ]
             params: dict[str, Any] = {"limit": limit, "vault_ns": VAULT_NAMESPACE}
             if since_updated is not None and since_id is not None:
@@ -7405,14 +7404,21 @@ class OracleFederationRepository(FederationRepository):
                 embed_cols = f", m.embedding AS embedding, '{_model_escaped}' AS embedding_model"
             sql = (
                 "SELECT * FROM ("
-                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
+                # Live branch — emits a NULL `type` so receivers that branch on
+                # `row["type"]` (sqlite / postgres / mysql / mariadb parity
+                # consumers) treat it as a plain MemoryItem.
+                "SELECT NULL AS type, m.id, m.content, m.category, m.subcategory, m.metadata, "
                 "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
                 "m.permission_mode, m.source_model, m.source_provider, "
                 "m.source_session, m.source_agent, m.created, m.updated, "
                 "m.archived_at" + embed_cols + " FROM memories m WHERE " + " AND ".join(where) + " "
                 "UNION ALL "
-                # F07: explicit withdrawal branch.
-                "SELECT m.id, NULL AS content, NULL AS category, NULL AS subcategory, NULL AS metadata, "
+                # F07: explicit withdrawal branch. The literal 'withdrawal' as
+                # `type` is what makes `_feed_item_from_row` emit a
+                # FederationWithdrawalEvent instead of falling through to the
+                # live MemoryItem path with content=NULL (which would be a
+                # garbage row on the receiver).
+                "SELECT 'withdrawal' AS type, m.id, NULL AS content, NULL AS category, NULL AS subcategory, NULL AS metadata, "
                 "NULL AS quality_rating, NULL AS verbatim_content, NULL AS owner_id, m.namespace, "
                 "NULL AS permission_mode, NULL AS source_model, NULL AS source_provider, "
                 "NULL AS source_session, NULL AS source_agent, m.created, m.updated AS updated, "

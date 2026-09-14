@@ -4187,23 +4187,24 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 # even when a caller supplies an explicit namespace filter.
                 "(m.namespace IS NULL OR m.namespace <> ?)",
             ]
-            # F07: explicit withdrawal branch — mirror of the live query.
-            # Db2's existing feed_query did not surface a consolidation
-            # tombstone branch, so this is a clean add-on.
+            # F07: explicit withdrawal branch — mirror of the live query,
+            # minus the consolidation tombstone. The vault credential
+            # boundary is honored as an OUTER exclusion (NOT a withdrawal
+            # trigger — vault rows stay excluded entirely so a never-
+            # federated vault row can't leak as a withdrawal signal).
+            # The trigger conditions are dead/archived (always) plus the
+            # offsite-posture world-read flip.
+            trigger = "m.deleted_at IS NOT NULL OR m.archived_at IS NOT NULL"
+            if not federation_feed_include_private():
+                trigger = f"{trigger} OR MOD(m.permission_mode, 10) < 4"
             withdrawal_where = [
                 "m.federation_source IS NULL",
                 "m.consolidated_into IS NULL",
-                "(m.deleted_at IS NOT NULL OR m.archived_at IS NOT NULL OR m.namespace = ?",
-                *(
-                    []
-                    if federation_feed_include_private()
-                    else ["OR MOD(m.permission_mode, 10) < 4"]
-                ),
-                ")",
-                "(m.namespace IS NULL OR m.namespace <> ? OR m.deleted_at IS NOT NULL OR m.archived_at IS NOT NULL)",
+                "(m.namespace IS NULL OR m.namespace <> ?)",
+                f"({trigger})",
             ]
             params_list: list[Any] = [VAULT_NAMESPACE]
-            withdrawal_params: list[Any] = [VAULT_NAMESPACE, VAULT_NAMESPACE]
+            withdrawal_params: list[Any] = [VAULT_NAMESPACE]
             if since_updated is not None and since_id is not None:
                 where.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
                 params_list.extend([since_updated, since_updated, since_id])
@@ -4240,14 +4241,21 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
             withdrawal_params.append(limit)
             sql = (
                 "SELECT * FROM ("
-                "SELECT m.id, m.content, m.category, m.subcategory, m.metadata, "
+                # Live branch — emits a NULL `type` so the receiver branches
+                # on `row["type"]` (sqlite / postgres / mysql / mariadb parity
+                # consumers) treat it as a plain MemoryItem.
+                "SELECT NULL AS type, m.id, m.content, m.category, m.subcategory, m.metadata, "
                 "m.quality_rating, m.verbatim_content, m.owner_id, m.namespace, "
                 "m.permission_mode, m.source_model, m.source_provider, "
                 "m.source_session, m.source_agent, m.created, m.updated, "
                 "m.archived_at" + embed_cols + " FROM memories m WHERE " + " AND ".join(where) + " "
                 "UNION ALL "
-                # F07: explicit withdrawal branch.
-                "SELECT m.id, NULL AS content, NULL AS category, NULL AS subcategory, NULL AS metadata, "
+                # F07: explicit withdrawal branch. The literal 'withdrawal' as
+                # `type` is what makes `_feed_item_from_row` emit a
+                # FederationWithdrawalEvent instead of falling through to the
+                # live MemoryItem path with content=NULL (which would be a
+                # garbage row on the receiver).
+                "SELECT 'withdrawal' AS type, m.id, NULL AS content, NULL AS category, NULL AS subcategory, NULL AS metadata, "
                 "NULL AS quality_rating, NULL AS verbatim_content, NULL AS owner_id, m.namespace, "
                 "NULL AS permission_mode, NULL AS source_model, NULL AS source_provider, "
                 "NULL AS source_session, NULL AS source_agent, m.created, m.updated AS updated, "
