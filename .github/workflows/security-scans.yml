@@ -1,0 +1,62 @@
+name: Security scans (CodeQL + OpenSSF Scorecard)
+
+# Least-privilege by design (OpenSSF Scorecard Token-Permissions,
+# SAST, and Pinned-GitHub-Action checks): every job declares its own
+# minimal permissions rather than relying on the repo default, and
+# every third-party action is pinned to a full commit SHA.
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
+  schedule:
+    - cron: '21 3 * * 4'
+  branch_protection_rule:
+
+permissions: read-all
+
+jobs:
+  codeql:
+    name: CodeQL analyze (python)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@b56ba49b26e50535fa1e7f7db0f4f7b4bf65d80d # v3
+        with:
+          languages: python
+      - uses: github/codeql-action/analyze@b56ba49b26e50535fa1e7f7db0f4f7b4bf65d80d # v3
+        with:
+          category: "/language:python"
+
+  scorecard:
+    name: OpenSSF Scorecard analysis
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - uses: ossf/scorecard-action@62b2cac7ed8198b15735ed49ab1e5cf35480ba46 # v2.4.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa9 # v4
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+      - uses: github/codeql-action/upload-sarif@b56ba49b26e50535fa1e7f7db0f4f7b4bf65d80d # v3
+        with:
+          sarif_file: results.sarif
