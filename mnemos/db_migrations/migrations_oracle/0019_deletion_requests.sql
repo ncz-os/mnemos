@@ -1,4 +1,4 @@
--- 0019_deletion_requests.sql — Oracle 23ai port for MNEMOS parity.
+-- 0019_deletion_requests.sql — Oracle 26ai port for MNEMOS parity.
 
 CREATE TABLE deletion_requests (
     id VARCHAR2(36) PRIMARY KEY,

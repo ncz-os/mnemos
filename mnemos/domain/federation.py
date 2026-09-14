@@ -745,7 +745,7 @@ async def _store_memories(
             # Prefer the HTTP-backend model env knob when active; fall back
             # to settings.providers.inference_embed_model. The settings
             # field is empty on instances that route embedding via HTTP
-            # (MEDUSA edge replica points at MEDUSA :8090 bge-m3 via
+            # (a fallback host edge replica points at a fallback host :8090 bge-m3 via
             # MNEMOS_EMBED_HTTP_MODEL=bge-m3).
             local_embed_model = (
                 embed_http_model_override()

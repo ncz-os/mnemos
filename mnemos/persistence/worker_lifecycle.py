@@ -298,7 +298,7 @@ async def _claim(ops: _Ops, *, hard: bool) -> dict[str, Any] | None:
         # DISTINCT / GROUP BY (ORA-02014). That covers FETCH FIRST, and it
         # also covers the "SELECT * FROM (ordered) WHERE ROWNUM <= 1 FOR
         # UPDATE" form this used to build -- the lock still targets the view.
-        # Measured on the production 23ai primary: the old statement raised
+        # Measured on the production 26ai primary: the old statement raised
         # ORA-02014 every tick, so both deletion workers sat in a permanent
         # error state and /health reported degraded.
         #

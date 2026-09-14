@@ -1,4 +1,4 @@
--- 0012_pantheon_routing_audit.sql — Oracle 23ai parity backfill.
+-- 0012_pantheon_routing_audit.sql — Oracle 26ai parity backfill.
 -- Mirrors db/migrations_v4_2_pantheon_routing_audit.sql. Historical drift
 -- shipped this audit only for SQLite/PostgreSQL, which let Oracle-backed
 -- PANTHEON fall back to memories-table telemetry. Idempotent guards make the

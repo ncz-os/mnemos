@@ -1,6 +1,6 @@
 """Cross-encoder reranker HTTP client (v6.2 M-2.2.3).
 
-Talks to llama.cpp `--rerank` endpoint (default: MEDUSA :8091 running
+Talks to llama.cpp `--rerank` endpoint (default: a fallback host :8091 running
 bge-reranker-v2-m3 on AMD NAVI14 Vulkan; see
 docs/v6.2-nexus-pattern-adoption.md § Reranker service).
 
@@ -9,7 +9,7 @@ Circuit-breaker semantics mirror `mnemos/runtime/embedder.py::_HttpBackend`:
 - breaker-open returns ``[]`` so caller falls through to no-rerank
   (the un-reranked order is still a valid result set, never block
   search on a missing reranker — matches v6.2 acceptance criterion
-  "failover to FTS-only ranking if MEDUSA :8091 down 30s+")
+  "failover to FTS-only ranking if a fallback host :8091 down 30s+")
 """
 
 from __future__ import annotations

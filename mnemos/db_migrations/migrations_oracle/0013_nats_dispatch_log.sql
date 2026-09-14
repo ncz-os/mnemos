@@ -1,4 +1,4 @@
--- 0013_nats_dispatch_log.sql — Oracle 23ai port for MNEMOS parity (item 9).
+-- 0013_nats_dispatch_log.sql — Oracle 26ai port for MNEMOS parity (item 9).
 --
 -- Item 9 retconned the legacy Oracle shape `(id, subject, payload,
 -- published_at, acked_at)` to the canonical Postgres/SQLite

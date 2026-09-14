@@ -1799,7 +1799,7 @@ async def create_memory(
             # in-process embedder (architectural decision
             # mem_1779334716543_f8ebd4, 2026-05-21) loads the GGUF model
             # once per worker and returns a 768-dim vector in ~50-100ms
-            # on PYTHIA CPU. Failures (empty vec) are swallowed and the
+            # on the production host CPU. Failures (empty vec) are swallowed and the
             # row keeps embedding=NULL; the backfill script picks it up
             # on the next pass.
             #

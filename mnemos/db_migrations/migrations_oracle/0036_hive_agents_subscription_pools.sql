@@ -1,5 +1,5 @@
 -- migration: 0036_hive_agents_subscription_pools
--- target:    Oracle 23ai PDB ORCLPDB1 (PYTHIA + CERBERUS standby)
+-- target:    Oracle 26ai PDB ORCLPDB1 (the production host + a GPU host standby)
 -- purpose:   Advertise workspace-local subscription pools per hive agent.
 
 DECLARE

@@ -180,6 +180,7 @@ DSN scheme detection:
 | `oracle://…` / `oracle+oracledb://…` | Oracle Database 26ai |
 | `db2://…` / `ibm_db://…` | IBM Db2 12.1.5 |
 | `mysql://…` | MySQL 9.0+ |
+| `mariadb://…` | MariaDB 11.7+ |
 | `sqlite:///…` | SQLite + sqlite-vec |
 
 ---
@@ -194,7 +195,8 @@ Both implement the same `PersistenceBackend` ABC (EPIMONE,
 The `oracledb` driver is **thin mode by default** — no Oracle Instant Client
 required, so Oracle works on the plain `mnemos` everything image (and on arm64).
 Vector column is `VECTOR(768, FLOAT32)`; index is HNSW INMEMORY NEIGHBOR GRAPH
-(requires Database In-Memory). Migration set: `db/migrations_oracle/`.
+(requires Database In-Memory). Migration set:
+`mnemos/db_migrations/migrations_oracle/`.
 
 Pool tuning env (Oracle eng review, 2026-05-21):
 

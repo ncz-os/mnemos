@@ -1,4 +1,4 @@
--- 0005_oauth_identities.sql — Oracle 23ai/26ai port for MNEMOS parity.
+-- 0005_oauth_identities.sql — Oracle 26ai/26ai port for MNEMOS parity.
 --
 -- Canonical oauth_identities matches PostgreSQL (db/migrations_v3_oauth.sql):
 -- (id, user_id, provider, external_id, email, display_name, raw_claims,

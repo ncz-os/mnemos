@@ -1,4 +1,4 @@
--- 0044_model_registry_pricing.sql — Oracle 23ai
+-- 0044_model_registry_pricing.sql — Oracle 26ai
 -- Mirrors db/migrations/0044_model_registry_pricing.sql (canonical PG).
 -- Oracle ALTER TABLE ADD without IF NOT EXISTS — idempotent via PL/SQL block.
 

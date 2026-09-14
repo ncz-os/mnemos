@@ -1,5 +1,5 @@
 -- migration: 0027_hive_scheduled_jobs
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- schema:    HIVE_MIND
 -- purpose:   Recurring job templates. A scheduler tick scans
 --            next_fire_at <= now() AND enabled = 1, materializes a real

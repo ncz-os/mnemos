@@ -2217,7 +2217,7 @@ class MorpheusRepository(ABC):
     each backend translates these to its own JSON dialect
     (MySQL/MariaDB: ``JSON_EXTRACT`` / ``JSON_CONTAINS_PATH`` /
     ``JSON_REMOVE``; SQLite: ``json_extract`` + ``json_remove``;
-    Oracle 23ai: ``JSON_VALUE`` / ``JSON_EXISTS`` +
+    Oracle 26ai: ``JSON_VALUE`` / ``JSON_EXISTS`` +
     ``JSON_TRANSFORM``/read-modify-write; Db2: read-modify-write
     because Db2 has no native JSON update function in ORA-compat
     mode). Read-modify-write is acceptable on the read-modify-write
@@ -2391,7 +2391,7 @@ class MorpheusRepository(ABC):
         convention (Postgres: ``embedding::text`` parse; SQLite: the
         ``_parse_embedding`` helper on the joined ``memory_embeddings``
         TEXT; MySQL/MariaDB: ``FROM_VECTOR(m.embedding)`` JSON
-        ``json.loads``; Oracle 23ai: the ``array.array('f', ...)``
+        ``json.loads``; Oracle 26ai: the ``array.array('f', ...)``
         ``oracledb`` returns for ``VECTOR`` columns converted via
         ``list(...)``; Db2: same shape via ``ibm_db``).
 
@@ -2455,7 +2455,7 @@ class MorpheusRepository(ABC):
         separate table. The original runner used Postgres-specific
         ``config || jsonb_build_object('clusters', $2::jsonb)``;
         every other backend either lacks JSONB merge entirely (Oracle
-        23ai / Db2) or has a different dialect (MySQL ``JSON_SET``,
+        26ai / Db2) or has a different dialect (MySQL ``JSON_SET``,
         SQLite ``json_set``).
 
         Every backend uses the safer Python-side read-modify-write

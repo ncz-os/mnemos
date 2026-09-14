@@ -1,5 +1,5 @@
 -- migration: 0040_memory_compression_queue_parity
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- purpose:   GAP 1 (job 019e7049, CHILD A) — bring the Oracle
 --            memory_compression_queue to FULL PARITY with the canonical
 --            Postgres schema (db/migrations_v3_1_compression.sql) so the

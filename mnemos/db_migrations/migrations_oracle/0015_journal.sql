@@ -1,4 +1,4 @@
--- 0015_journal.sql — Oracle 23ai/26ai port for MNEMOS parity.
+-- 0015_journal.sql — Oracle 26ai/26ai port for MNEMOS parity.
 --
 -- Canonical journal = the per-owner/per-namespace journal API table
 -- (owner_id, namespace, entry_date, topic, content, metadata, deleted_at),

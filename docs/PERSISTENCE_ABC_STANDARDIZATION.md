@@ -217,7 +217,7 @@ covered offline at the SQL-shape layer.
 
 ### Item 5 — Oracle and Db2 migration replay verified against live instances
 
-Migration idempotency for Oracle 23ai and Db2 12.1.5 is verified by
+Migration idempotency for Oracle AI Database 26ai and Db2 12.1.5 is verified by
 replaying the full numbered migration chain against continuously-live
 instances of both engines, in addition to the existing offline
 conformance and dialect-parity suites.

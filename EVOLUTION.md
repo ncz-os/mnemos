@@ -327,8 +327,12 @@ or whether audit has to survive deletion). Twenty-two FK edges.
 
 **Docs / packaging / install story.**
 
-- Installer CLI (`mnemos-install`) now lands on `PATH` via
-  `[project.scripts]`. You can `pip install mnemos-os` and run it.
+- Installer CLI (`mnemos-install`) landed on `PATH` via
+  `[project.scripts]`, and the v3.0-era docs described the entry point
+  as `pip install mnemos-os`. That name is historical and no longer a
+  valid install command — the pip-installable base is `mnemos-core`,
+  with the platform services as separate add-on distributions. See
+  `INSTALL.md` and `AGENTS.md` for the current install surface.
 - All 11 SQL migrations ship as `db/*.sql` package data.
 - `MANIFEST.in` added so the sdist carries `config.toml.example`,
   `mnemos.service`, `Dockerfile`, `docker-compose.yml`, integrations
@@ -431,11 +435,11 @@ The takeaway for contributors: compression engines are not features
 operators register against; they are architectural choices we
 revisit when benchmark evidence demands. The contest's value is
 exactly that we can evaluate, retire, and replace engines without
-breaking the platform around them. LETHE / ANAMNESIS / ALETHEIA
-remain in the codebase as evolutionary history — see
-`compression/{lethe,anamnesis,aletheia}.py` for what each was —
-but the going-forward names are APOLLO and ARTEMIS. The pantheon
-moved on.
+breaking the platform around them. LETHE, ANAMNESIS and ALETHEIA
+were removed from the tree outright rather than kept around as
+dormant code: retiring an engine means deleting it, not carrying
+it. What each one was is recorded above and in the changelog; the
+going-forward names are APOLLO and ARTEMIS. The pantheon moved on.
 
 When MORPHEUS (v3.3+) and PERSEPHONE (v3.6+) land, the same
 naming convention extends: each subsystem is a Greek name that
@@ -473,9 +477,9 @@ boundaries, not syntax. The important lesson was that a memory's live
 row and its historical snapshots are different authorization objects.
 If a memory was private at version 1 and public at version 2, a reader
 allowed to see version 2 is not automatically allowed to see version 1.
-That became `version_visibility_predicate` in `api/visibility.py:99-137`.
+That became `version_visibility_predicate` in `mnemos/core/visibility.py`.
 The live-memory read contract moved next to it as
-`read_visibility_predicate` in `api/visibility.py:40-96`, with owner,
+`read_visibility_predicate` in the same module, with owner,
 federation, world-readable, and Unix group-readable branches spelled
 out in one place.
 
@@ -487,19 +491,21 @@ different memory's version into the graph. Branch creation now locks
 the parent memory row, resolves the start commit after that lock, and
 uses `INSERT ... ON CONFLICT DO NOTHING RETURNING` for duplicate-race
 handling. Merge and feature-branch revert share the same advisory lock
-key (`api/handlers/dag.py:21-40`) and the same lock order.
+key (`_branch_advisory_lock_key` in `mnemos/api/routes/dag.py`) and the
+same lock order.
 
 The database had to participate. The schema's FK can prove that
 `memory_branches.head_version_id` points at an existing version; it
 cannot prove that the version belongs to the same memory. The v3.5
-trigger replacement (`db/migrations_v3_5_trigger_same_memory_parent.sql`)
+trigger replacement
+(`mnemos/db_migrations/migrations_v3_5_trigger_same_memory_parent.sql`)
 does that check under `FOR UPDATE OF mb`, fails closed on missing or
 NULL branch heads, raises SQLSTATE `MN001` for foreign heads, and lets
 `handle_trigger_pgerror` translate the condition to HTTP 409 with an
 operator reconciliation message.
 
 The final documented mismatch is closed by
-`db/migrations_v3_5_rls_group_select_unix_bits.sql`: the
+`mnemos/db_migrations/migrations_v3_5_rls_group_select_unix_bits.sql`: the
 `mnemos_group_select` RLS policy and application predicate now both
 test the Unix group-read bit directly with
 `((permission_mode / 10) % 10) >= 4`.
@@ -632,9 +638,9 @@ If you're here to contribute and want to understand the history:
 - Read `CHANGELOG.md` for what shipped.
 - Read this file for why, and what almost shipped and didn't.
 - The biggest "don't touch this without understanding why" areas are:
-  - **The audit chain lock** (`mnemos/api/routes/consultations.py::_write_audit_entry_on_conn`) — widening or narrowing the lock window changes both correctness and throughput. Don't adjust casually.
-  - **The FK edge ON-DELETE choices** (`db/migrations_*.sql`) — each one is the result of a real design conversation about whether history survives deletion.
-  - **The SSRF validator** (`mnemos/webhooks/validation.py::validate_webhook_url`) — the block list and the async-resolve path have both been tightened in response to real concerns. Loosen carefully.
+  - **The GRAEAE audit chain lock** (`routes/consultations.py::_write_audit_entry_on_conn`) — widening or narrowing the lock window changes both correctness and throughput. Don't adjust casually. This one no longer lives in `mnemos-core`: consultations went out with GRAEAE, so the code is in the `mnemos-graeae` distribution. The warning travels with it. The equivalent hot spot in core is the memory audit chain (`mnemos/audit/writer.py`, `docs/AUDIT_CHAIN.md`).
+  - **The FK edge ON-DELETE choices** (`mnemos/db_migrations/migrations*/*.sql`) — each one is the result of a real design conversation about whether history survives deletion.
+  - **The SSRF validator** (`mnemos/core/net_validation.py::validate_webhook_url`) — the block list and the async-resolve path have both been tightened in response to real concerns. Loosen carefully. It moved to the core layer so `core.safe_http` could use it without breaking the core→webhooks import contract; `mnemos/webhooks/validation.py` is now a back-compat re-export, not the definition.
   - **The Greek names.** They look like whimsy from outside. From inside they are subsystem labels that appear in logs, tables, migrations, and code paths. Renaming one is a distributed refactor.
 
 ---

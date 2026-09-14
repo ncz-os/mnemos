@@ -8,7 +8,7 @@ index) on first connect — no manual DDL.
 | Profile | Engine | Free tier | Vector | Notes |
 |---|---|---|---|---|
 | `db2` | IBM Db2 Community Edition | free (`LICENSE=accept`) | native `VECTOR` + vector index | **Recommended lead** — fewest CE limits |
-| `oracle` | Oracle Database 23ai **Free** | free | AI Vector Search (HNSW/IVF) | see EE note below |
+| `oracle` | Oracle AI Database 26ai **Free** | free | AI Vector Search (HNSW/IVF) | see EE note below |
 | `postgres` | PostgreSQL + pgvector | open source | pgvector HNSW | most familiar |
 | `mariadb` | MariaDB 11.7+ | open source | community `VECTOR` | pure OSS path |
 
@@ -30,7 +30,7 @@ with no change to mnemos and no change to your data model.**
 | Engine | License / edition | Cores | Memory | Data size | Prod use | Vector |
 |---|---|---|---|---|---|---|
 | **Db2 Community Edition** | free (`db2dec.lic`, permanent) | ≤ 4 cores | ≤ 8 GB instance (Soft Stop) | **unlimited** | allowed (small workloads) | native `VECTOR` + vector index |
-| **Oracle 23ai Free** | free (OTN) | ≤ 2 CPUs (foreground) | ≤ 2 GB (SGA+PGA) | ≤ 12 GB user data | allowed | AI Vector Search |
+| **Oracle AI Database 26ai Free** | free (OTN) | ≤ 2 CPUs (foreground) | ≤ 2 GB (SGA+PGA) | ≤ 12 GB user data | allowed | AI Vector Search |
 | **PostgreSQL + pgvector** | open source (PostgreSQL Lic.) | *no engine cap* — host-bound | host-bound | host-bound | yes | pgvector HNSW (≤ 2000 dims indexed) |
 | **MariaDB** | open source (GPLv2) | *no engine cap* — host-bound | host-bound | host-bound | yes | native `VECTOR` (11.7+) |
 
@@ -61,8 +61,8 @@ Native `VECTOR` type + `VECTOR_DISTANCE` + vector indexing (via `DB2_VECTOR_INDE
 free tiers** (generous size/feature envelope for evaluation), which is why we lead with it.
 DSN: `db2://db2inst1:<pw>@db2:50000/MNEMOS`. DB must be **UTF-8 / 32K pagesize**.
 
-## Oracle Database 23ai Free
-The published free container is **Oracle 23ai Free** (`container-registry.oracle.com/database/free`),
+## Oracle AI Database 26ai Free
+The published free container is **Oracle AI Database 26ai Free** (`container-registry.oracle.com/database/free`),
 which **does** include **AI Vector Search** — enough for mnemos semantic recall. DSN:
 `oracle://system:<pw>@oracle:1521/FREEPDB1`.
 
@@ -75,7 +75,7 @@ which **does** include **AI Vector Search** — enough for mnemos semantic recal
 > **On Oracle Enterprise Edition:** Oracle's **OTN Developer License** permits **non-production
 > evaluation** of EE features for development/testing — but there is **no published EE
 > container image**; you would install EE yourself under that license. For a turnkey free
-> container, **23ai Free is the supported path here** and covers vector search. We do not ship
+> container, **26ai Free is the supported path here** and covers vector search. We do not ship
 > or imply an EE image.
 
 ## PostgreSQL + pgvector

@@ -1,5 +1,5 @@
 -- migration: 0042_knemon_baseline_tables
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- purpose:   KNEMON Phase 1 — baseline snapshot table (event-level 48h window)
 --            plus knemon_baselines registry for snapshot metadata.
 -- design:    knemon_phase1_baseline_2026_05_28 holds raw per-event

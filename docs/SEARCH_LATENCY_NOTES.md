@@ -46,24 +46,29 @@ timing logs should replace them with measured per-request deltas.
 | parse | handler entry and cache key setup | <5ms | FastAPI body parsing occurs before handler entry. Redis cache read is outside this estimate and can short-circuit the path. |
 | embed | `_get_embedding` HTTP call | 600-1200ms hypothesis | Most likely hot path if the embedding server is remote, cold, saturated, or `/v1/embeddings` returns 404 and forces the `/api/embeddings` fallback. |
 | ann_scan | `conn.fetch` in `semantic_search` | 100-700ms hypothesis | One pgvector query fetches full memory rows. Cost depends on index use, filters, visibility predicates, pool wait, and result row size. |
-| rerank | `_rerank_composite` block | 0ms on current route unless recency rerank is enabled; 66ms isolated measurement | The repository supports rerank, but as read here the successful semantic handler call does not pass `request.boost_recency` into `semantic_search`. |
+| rerank | `_rerank_composite` block | 0ms unless recency rerank is enabled; 66ms isolated measurement | The handler passes `boost_recency=bool(request.boost_recency)` into `semantic_search`, so rerank is live whenever the client requests it. |
 | metadata_fetch | after DB transaction | ~0-20ms | No N+1 metadata fetch exists in the Postgres path. Metadata is folded into the ANN/FTS SELECT via `_MEMORY_COLS`. |
 | serialize | response model construction and cache JSON | 5-50ms hypothesis | Scales with `limit`, content size, metadata size, and cache JSON encoding. Final FastAPI response encoding occurs after handler return. |
 
 ## Index And K
 
-`db/migrations.sql` creates:
+`mnemos/db_migrations/migrations.sql` creates:
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_memories_embedding
-ON memories USING ivfflat(embedding vector_cosine_ops);
+ON memories USING hnsw (embedding vector_cosine_ops);
 ```
 
-No code path found setting `ivfflat.probes`, `hnsw.ef_search`, or another
-pgvector scan parameter for this endpoint. No HNSW index definition was found in
-the read path. Query K is the client `request.limit`, capped in the handler at
-500. If recency rerank is active in the repository, candidate K widens up to
-`min(limit * 4, 200)`.
+The embedding index is **HNSW**, not IVFFlat. `mnemos/persistence/schema.py`
+treats that as an invariant: it rewrites any legacy `USING ivfflat (embedding
+vector_cosine_ops)` definition to the HNSW form, and the installer
+(`mnemos/installer/db.py`) recreates the index as HNSW when it finds another
+access method in place. Tune HNSW, and ignore IVFFlat knobs.
+
+No code path sets `hnsw.ef_search` or another pgvector scan parameter for this
+endpoint, so the index runs at the server default. Query K is the client
+`request.limit`, capped in the handler at 500. If recency rerank is active in
+the repository, candidate K widens up to `min(limit * 4, 200)`.
 
 ## Likely Hot Path
 
@@ -91,10 +96,12 @@ Rerank is not the dominant source if the isolated 66ms measurement holds.
 - Keep `boost_recency=false` when rerank is not required. Request controls:
   `boost_recency`, `recency_weight`. Repository rerank widens candidates and can
   add vector parsing plus Rust/Python rerank cost when wired.
-- Tune pgvector probes at the session/database level if ANN scan is high.
-  Current code has no `ivfflat.probes` config. A future config would fit near
-  `PostgresMemoryRepository.semantic_search` before `conn.fetch`. `hnsw.ef_search`
-  is not relevant unless the index is changed to HNSW.
+- Tune `hnsw.ef_search` at the session or database level if ANN scan is high.
+  This is the knob for the index actually in use; raising it trades latency for
+  recall, lowering it does the reverse. Current code sets no value, so the
+  server default applies. A config key would fit near
+  `PostgresMemoryRepository.semantic_search` before `conn.fetch`.
+  `ivfflat.probes` has no effect on this deployment — the index is HNSW.
 - Check database pool pressure if `ann_scan` includes connection wait. Existing
   controls: `PG_POOL_MIN`, `PG_POOL_MAX`, and `MNEMOS_POOL_ACQUIRE_TIMEOUT`.
 - Use the existing 5 minute Redis response cache for repeated identical searches.
@@ -109,8 +116,8 @@ Rerank is not the dominant source if the isolated 66ms measurement holds.
   No existing embedding-cache env var was found.
 - Search max K: add a settings key in `mnemos/core/config.py` and use it instead
   of the hardcoded 500 cap in `search_memories`.
-- pgvector probes: add a settings key in `mnemos/core/config.py`, then apply
-  `SET LOCAL ivfflat.probes = ...` inside the Postgres transaction before the
+- HNSW search breadth: add a settings key in `mnemos/core/config.py`, then apply
+  `SET LOCAL hnsw.ef_search = ...` inside the Postgres transaction before the
   ANN `conn.fetch`.
 - Search cache TTL: replace the hardcoded `300` in `search_memories` with a
   runtime setting if operators need to tune repeat-query behavior.
@@ -120,6 +127,7 @@ Rerank is not the dominant source if the isolated 66ms measurement holds.
 Each search request now gets a short `trace_id` and logs elapsed milliseconds
 since handler start at these boundaries:
 
+- `parse`
 - `embed`
 - `ann_scan`
 - `rerank`
@@ -128,7 +136,13 @@ since handler start at these boundaries:
 
 Example:
 
+`parse`, `embed`, `metadata_fetch`, and `serialize` are emitted by the route
+handler; `ann_scan` and `rerank` are emitted by
+`PostgresMemoryRepository.semantic_search`, which receives the trace id from the
+handler.
+
 ```text
+[search:abc123] parse done in 2ms
 [search:abc123] embed done in 823ms
 [search:abc123] ann_scan done in 1235ms
 [search:abc123] rerank done in 1301ms

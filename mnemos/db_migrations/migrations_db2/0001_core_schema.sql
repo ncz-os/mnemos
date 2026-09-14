@@ -88,7 +88,7 @@ CREATE INDEX idx_memories_feed_cursor
 -- latency characteristics; set MNEMOS_DB2_VECTOR_INDEX=exact to
 -- communicate intent on non-EAP builds.
 --
--- Build-time tuning (Db2 12.1.5 EAP; validated on pegasus db2-mnemos
+-- Build-time tuning (Db2 12.1.5 EAP; validated on an edge host db2-mnemos
 -- 2026-06-22 against ~12.6k x 768-dim rows: ~11% faster execute, build ~1s,
 -- recall intact. Ref: IBM community blog "Vector Indexes in Db2", 2026-06-19):
 --   * PCT_COMP_VECT_SIZE — compressed-vector ratio (percent). Higher trades a

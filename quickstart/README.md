@@ -16,7 +16,7 @@ TechXchange write-up — **we lead with Db2** (see why in [`docs/BACKENDS.md`](d
 | Profile | Engine | Why |
 |---|---|---|
 | **`db2`** | IBM Db2 Community Edition | **Recommended** — native `VECTOR` + vector index, fewest CE limits |
-| `oracle` | Oracle Database 23ai **Free** | AI Vector Search (EE-eval note in BACKENDS.md) |
+| `oracle` | Oracle AI Database 26ai **Free** | AI Vector Search (EE-eval note in BACKENDS.md) |
 | `postgres` | PostgreSQL + pgvector | pure open source, most familiar |
 | `mariadb` | MariaDB 11.7+ | pure open source, no vendor tiers |
 
@@ -82,7 +82,7 @@ Point at an **external** database (drop the DB service from compose): set
   (MIF portable-memory + IBM Docling document ingestion).
 
 ## License / provenance
-mnemos is open source (`gitlab.com/ncz-os/mnemos`). Db2 CE (`LICENSE=accept`), Oracle 23ai Free,
+mnemos is open source (`gitlab.com/ncz-os/mnemos`). Db2 CE (`LICENSE=accept`), Oracle AI Database 26ai Free,
 PostgreSQL, and MariaDB are all free under their respective licenses. This quickstart carries no
 credentials — set your own `DB_PASSWORD`, and enable `MNEMOS_AUTH_ENABLED` + a token before any
 shared/production use.

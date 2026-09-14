@@ -1,4 +1,4 @@
--- 0002_graeae.sql — GRAEAE consultation + audit log tables for Oracle 23ai.
+-- 0002_graeae.sql — GRAEAE consultation + audit log tables for Oracle 26ai.
 -- Ports PG migrations:
 --   db/migrations.sql (graeae_consultations baseline)
 --   db/migrations_v3_graeae_unified.sql (graeae_audit_log + consultation_memory_refs)

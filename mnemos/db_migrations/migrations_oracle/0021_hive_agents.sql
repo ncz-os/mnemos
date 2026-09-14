@@ -1,13 +1,13 @@
 -- migration: 0001_hive_agents
--- target:    Oracle 23ai PDB ORCLPDB1 (PYTHIA + CERBERUS standby)
+-- target:    Oracle 26ai PDB ORCLPDB1 (the production host + a GPU host standby)
 -- schema:    HIVE_MIND
 -- purpose:   GRAEAE Hive Mind agent registry — Phase 2 SQLite -> Oracle port.
 --            Mirrors /srv/agent-bus/agents.db SQLite agents table with
---            Oracle 23ai native JSON, identity column, and CHECK constraints.
+--            Oracle 26ai native JSON, identity column, and CHECK constraints.
 --
 -- Notes:
 --   - urn is opaque string (urn:agent:<kind>:<host>:<uuid>) up to 256 chars.
---   - capabilities + metadata stored as JSON (Oracle 23ai native).
+--   - capabilities + metadata stored as JSON (Oracle 26ai native).
 --   - last_heartbeat is NUMBER (epoch seconds, matches Python time.time()).
 --   - All extension columns (runtime/model/provider/cost_tier/etc) included
 --     so the SQLite snapshot can be bulk-inserted without schema delta.

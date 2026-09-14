@@ -177,7 +177,7 @@ def _isoformat_value(value: Any) -> str | None:
 
 
 # Default semantic-relevance floor (UAT 2026-06-13). EMPIRICALLY tuned
-# against the LIVE production corpus (PYTHIA Oracle 23ai, ~8k rows,
+# against the LIVE production corpus (the production host Oracle 26ai, ~8k rows,
 # bge-m3 1024-d, COSINE) — NOT the 0.55-0.65 guessed a priori.
 #
 # Measured top-score distribution (min_score=0.0 opt-out):
@@ -216,7 +216,7 @@ DEFAULT_SEMANTIC_FLOOR = 0.65
 # gate (genuine queries are SKEWED — top-1 stands out; gibberish is FLAT/
 # high-variance), with a LEXICAL-ANCHOR overlay for the borderline cases.
 #
-# EMPIRICAL (live PYTHIA Oracle corpus, top-10, min_score=0.0):
+# EMPIRICAL (live the production host Oracle corpus, top-10, min_score=0.0):
 #   margin = top1 - mean(top-k):
 #     GOOD  range 0.0099 .. 0.0846   (median ~0.026)
 #     NONS  range 0.0041 .. 0.0173
@@ -651,7 +651,7 @@ class MemorySearchRequest(BaseModel):
     recency_weight: float = Field(0.15, ge=0.0, le=1.0)
     # v6.2 M-2.2.3: retrieval profile dispatcher.
     # fast = semantic-only no rerank; balanced = current behavior (default);
-    # deep = semantic + cross-encoder rerank via MEDUSA :8091.
+    # deep = semantic + cross-encoder rerank via a fallback host :8091.
     # Unknown values → 400 in route handler.
     profile: Optional[str] = None
     # v6.2 M-2.2.4: per-category temporal-decay override map.

@@ -1,6 +1,8 @@
 # mnemosctl — Design
 
-**Status:** design draft 1
+**Status:** scaffold shipped — the crate lives at `cli/mnemosctl/`; the
+command surface below is the design target, and the sections marked open in
+[Implementation breakdown](#implementation-breakdown) are not built yet.
 **Authored:** 2026-05-23
 **Hive job:** `019e55e7-328a` (mnemos:mnemosctl-cli-design)
 **Owner:** Studio Claude (per `project_mnemos_desktop_delegation.md`)
@@ -170,7 +172,7 @@ ID                                   NAME      URL                          COMP
 2f7e2cde-c7f1-4dfb-af3a-3287d7c6f332 node-b    http://node-b.example:5003   strict   1h ago     HTTP 500
 
 $ mnemosctl federation peer sync 2f7e2cde-c7f1-4dfb-af3a-3287d7c6f332
-syncing... cerberus
+syncing... node-b
   HTTP 500: oracledb DPY-6005 (db disconnected — standby MOUNTED)
 sync FAILED (last_error recorded on peer record)
 
@@ -197,26 +199,57 @@ Errors print to stderr. Pretty mode shows the request id from server
 for cross-referencing logs. JSON mode emits `{"error": "...", "code":
 N, "request_id": "..."}` to stdout AND non-zero exit.
 
-## Implementation breakdown (follow-up hive jobs to file)
+## Shipped surface
 
-1. `mnemos:mnemosctl-scaffold` P7 — Rust workspace, Cargo manifest,
-   `clap` parser, dummy subcommands, CI build matrix (Linux x86,
-   Linux arm64, macOS arm64, macOS x86)
-2. `mnemos:mnemosctl-config-loader` P7 — TOML config + env layering,
-   keyring integration via `keyring-rs`
-3. `mnemos:mnemosctl-http-client` P7 — share crate with `mnemos-rs`,
-   request id propagation, retry / timeout policy
-4. `mnemos:mnemosctl-auth-login` P7 — paste-token Phase 1 flow,
-   `auth status / logout / token / server`
-5. `mnemos:mnemosctl-search-get-list-store` P8 — core read/write
-   operations
-6. `mnemos:mnemosctl-federation` P8 — peers + peer add/sync/disable
-   subcommand tree
-7. `mnemos:mnemosctl-export-import` P6 — JSONL + Parquet archives
-8. `mnemos:mnemosctl-doctor` P5 — health checks
-9. `mnemos:mnemosctl-fleet-deploy` P6 — deb/rpm + Homebrew tap +
-   ncz-os bundling
-10. `mnemos:mnemosctl-oauth-device-code` P5 — Phase 2 auth
+The crate is at `cli/mnemosctl/` — `Cargo.toml` (binary `mnemosctl`, edition
+2021, dependencies `clap` + `anyhow` only), `src/main.rs`, `README.md`, and the
+`.github/workflows/mnemosctl-build.yml` build matrix.
+
+`src/main.rs` carries the full `clap` derive tree: global `--server`
+(`MNEMOS_URL`), `--token` (`MNEMOS_TOKEN`, env value hidden), and `--format`,
+plus the `auth`, `search`, `get`, `list`, `store`, `update`, `delete`,
+`export`, `import`, `federation`, `stats`, `doctor`, and `raw` subcommands.
+Every command dispatches to `todo()`, which **returns an error** so the process
+exits non-zero — a script cannot mistake an unimplemented command for a
+successful run. Parser-contract tests cover `--help`/`--version` rendering, a
+representative sample of subcommand parses, unknown-subcommand rejection, and
+the non-zero-exit contract.
+
+Deltas from the command surface above, as built:
+
+- Output mode is one global `--format pretty|json|jsonl`, not separate
+  `--json` / `--jsonl` flags.
+- Version reporting is clap's `--version` (local binary only); there is no
+  `version` subcommand and no server-version probe.
+- The hidden `schema` and `dag` subcommands are not scaffolded.
+- `federation` uses flat `peer-add` / `peer-sync` / `peer-disable` verbs rather
+  than a nested `peer` group.
+
+## Implementation breakdown
+
+1. **Done** — scaffold: Cargo manifest, `clap` parser, stub subcommands, CI
+   build matrix. The matrix covers `x86_64-unknown-linux-gnu` and
+   `aarch64-unknown-linux-gnu` with fmt/clippy/build/smoke plus artifact
+   upload; **the macOS targets are still open.**
+2. **Open** — config loader: TOML config + env layering, keyring integration
+   via `keyring-rs`. The crate takes no TOML or keyring dependency yet; only
+   the `--server` / `--token` env-backed globals exist.
+3. **Open** — HTTP client: share a crate with `mnemos-rs`, request-id
+   propagation, retry / timeout policy. No HTTP dependency is wired.
+4. **Open** — `auth login` paste-token Phase 1 flow, plus
+   `auth status / logout / token / server`. Parsed, not implemented.
+5. **Open** — `search` / `get` / `list` / `store` core read-write operations.
+   Parsed, not implemented.
+6. **Open** — `federation` peers + peer add/sync/disable. Parsed, not
+   implemented.
+7. **Open** — `export` / `import`: JSONL + Parquet archives. The `--format
+   jsonl|parquet` flag parses; no archive writer exists.
+8. **Open** — `doctor` health checks.
+9. **Open** — fleet deploy: deb/rpm packaging, Homebrew tap, ncz-os bundling.
+10. **Open** — OAuth device-code (Phase 2 auth).
+
+Exit codes: the sysexits mapping in [Error handling](#error-handling) is design
+target. The scaffold exits 0 on success and 1 on the `todo()` error path.
 
 ## Distribution + naming
 

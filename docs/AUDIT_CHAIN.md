@@ -112,7 +112,7 @@ curl -H "Authorization: Bearer $TOKEN" http://mnemos:5002/v1/audit/health
 # }
 ```
 
-Returns the snapshot with `chain_enabled=False` when the env var is off but the tables exist (lets operators inspect a disabled chain). 503 when backend has no audit_chain repo (Db2 pre-live test).
+Returns the snapshot with `chain_enabled=False` when the env var is off but the tables exist (lets operators inspect a disabled chain). 503 when the backend has no audit_chain repo (MySQL and MariaDB).
 
 **Recommended alerts:**
 
@@ -209,7 +209,7 @@ Each entry signs over: `entry_id, memory_id (16-byte SHA-256-of-mem-id-str), pre
   tests/test_audit_sealer.py tests/test_audit_route_helper.py \
   tests/test_audit_endpoints.py tests/test_audit_merkle_proof.py \
   tests/test_audit_repo_methods.py -v
-# 73 audit tests, all pass on Python 3.11
+# 73 audit tests, all pass on Python 3.13
 ```
 
 For an end-to-end SQLite, sealer, and inclusion-proof example, see the usage
