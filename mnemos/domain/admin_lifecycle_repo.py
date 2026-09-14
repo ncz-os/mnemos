@@ -191,15 +191,20 @@ class AdminLifecycleRepository:
         )
 
     async def fetch_memory_archive_snapshot(self, tx: Transaction, memory_id: str) -> Any | None:
+        # F16: also fetch `embedding` so the route-side audit write can
+        # include the real embedding in payload_hash. The pre-fix shape
+        # passed embedding=None into write_audit_entry, silently dropping
+        # the embedding field from the archive chain entry and shifting
+        # payload_hash from the audit's signed value.
         ops = self._portable_ops(tx)
         if ops is not None:
             return await ops.fetchone(
-                "SELECT content, category, subcategory, metadata FROM memories "
+                "SELECT content, category, subcategory, metadata, embedding FROM memories "
                 "WHERE id = ? AND archived_at IS NULL AND deleted_at IS NULL",
                 memory_id,
             )
         return await _conn(tx).fetchrow(
-            "SELECT content, category, subcategory, metadata FROM memories "
+            "SELECT content, category, subcategory, metadata, embedding FROM memories "
             "WHERE id = $1 AND archived_at IS NULL AND deleted_at IS NULL",
             memory_id,
         )

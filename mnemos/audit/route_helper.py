@@ -59,6 +59,7 @@ async def write_audit_entry(
     expected_prev_entry_id_hex: str | None = None,
     expected_prev_entry_hash_hex: str | None = None,
     enforce_continuity: bool = False,
+    required: bool = False,
 ) -> None:
     """Build + insert one audit entry inside the caller's tx.
 
@@ -67,13 +68,31 @@ async def write_audit_entry(
     payload_hash, signs the new entry with the writer's HKDF-derived
     Ed25519 key, then INSERTs.
 
-    Errors are LOGGED but not re-raised by default — the audit chain
-    is a consistency-guarantee on top of the write, not a write
-    prerequisite. Callers that pass ``enforce_continuity=True`` opt
-    into hard failure for continuity/insert errors (federation uses
-    this for replica-chain audit writes).
+    Default behavior is BEST-EFFORT: errors are LOGGED but not
+    re-raised. The audit chain is a consistency-guarantee on top of the
+    write, not a write prerequisite; callers running inside their own
+    ``async with backend.transactional()`` get the rollback safety from
+    the outer transaction already.
+
+    Callers that pass ``enforce_continuity=True`` opt into hard failure
+    for continuity/insert errors (federation uses this for replica-chain
+    audit writes).
+
+    F16: callers that document audit coverage as REQUIRED (e.g.,
+    archive + delete paths where the chain MUST capture every mutation)
+    pass ``required=True``. With ``required=True``, a failed
+    ``insert_audit_entry`` propagates out of the call so the surrounding
+    transaction rolls back -- preventing the "memory row committed,
+    audit row missed" silent drift documented at
+    ``docs/AUDIT_CHAIN.md`` failure-mode table.
     """
     if backend.audit_chain is None:
+        if required:
+            raise AuditChainContinuityError(
+                f"required audit write for op={op} memory={memory_id_str!r} "
+                "but backend has no audit_chain repo (MySQL/MariaDB "
+                "deployment, or audit_chain not migrated yet)"
+            )
         return  # backend hasn't shipped audit_chain; silently no-op
 
     try:
@@ -133,14 +152,24 @@ async def write_audit_entry(
             memory_id_str,
             entry.entry_id.hex()[:16],
         )
-    except Exception:  # noqa: BLE001 - audit must not block writes unless requested
+    except Exception as exc:  # noqa: BLE001 - audit must not block writes unless requested
         logger.exception(
-            "[AUDIT] write_audit_entry failed for op=%s memory=%s",
+            "[AUDIT] write_audit_entry failed for op=%s memory=%s required=%s",
             op,
             memory_id_str,
+            required,
         )
         if enforce_continuity:
             raise
+        if required:
+            # F16: REQUIRED audit writes must propagate so the outer
+            # transaction rolls back. Re-raise with the original
+            # exception chained; the caller (route handler / repo)
+            # typically sits inside ``async with backend.transactional()
+            # as tx`` and the rollback handles the rest.
+            raise AuditChainContinuityError(
+                f"required audit write failed for op={op} memory={memory_id_str!r}"
+            ) from exc
 
 
 def _audit_prev_head(prev_row: Any | None) -> tuple[bytes | None, bytes | None]:
