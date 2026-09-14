@@ -2,17 +2,31 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from mnemos.domain.persephone.runner import sweep_for_archival
 from mnemos.domain.admin_lifecycle_repo import AdminLifecycleRepository
-from mnemos.persistence.sqlite import SqliteBackend
+from mnemos.persistence.sqlite import SqliteBackend, _execute, _fetch_one
 from mnemos.persistence.worker_lifecycle import _Ops
 from mnemos.workers.deletion_request_worker import (
     process_one_deletion_request,
     process_one_hard_deletion_request,
 )
+
+
+async def _exec(tx: Any, sql: str, *params: Any) -> None:
+    """Run an INSERT/UPDATE/DELETE against ``tx.conn`` asynchronously.
+
+    ``SqliteBackend.transactional`` yields a wrapper whose ``.conn`` is
+    either a raw ``sqlite3.Connection`` (default, when ``aiosqlite`` is
+    not installed) or an ``aiosqlite.Connection`` (when it is). Both
+    return coroutines from ``.execute`` in the async case and ``Cursor``
+    objects in the sync case, so we route through ``_execute`` which
+    uses ``_maybe_await`` to handle either backend.
+    """
+    await _execute(tx.conn, sql, params)
 
 
 def test_db2_worker_sql_uses_driver_positional_markers():
@@ -43,15 +57,17 @@ async def test_sqlite_deletion_worker_claims_and_soft_deletes_atomically(tmp_pat
     await backend.open()
     try:
         async with backend.transactional() as tx:
-            await tx.conn.execute(
+            await _exec(
+                tx,
                 "INSERT INTO memories (id, content, owner_id, namespace) VALUES (?, ?, ?, ?)",
-                ("m1", "secret", "user-1", "private"),
+                "m1", "secret", "user-1", "private",
             )
-            await tx.conn.execute(
+            await _exec(
+                tx,
                 "INSERT INTO deletion_requests "
                 "(id, target_user_id, target_namespace, requested_by, confirmed_at, status) "
                 "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 'confirmed')",
-                ("request-1", "user-1", "private", "admin"),
+                "request-1", "user-1", "private", "admin",
             )
 
         result = await process_one_deletion_request(backend)
@@ -59,12 +75,12 @@ async def test_sqlite_deletion_worker_claims_and_soft_deletes_atomically(tmp_pat
         assert result is not None
         assert result.status == "soft_deleted"
         async with backend.transactional() as tx:
-            memory = await (await tx.conn.execute("SELECT deleted_at FROM memories WHERE id = 'm1'")).fetchone()
-            request = await (
-                await tx.conn.execute(
-                    "SELECT status, soft_deleted_at, restore_by FROM deletion_requests WHERE id = 'request-1'"
-                )
-            ).fetchone()
+            memory = await _fetch_one(tx.conn, "SELECT deleted_at FROM memories WHERE id = ?", ("m1",))
+            request = await _fetch_one(
+                tx.conn,
+                "SELECT status, soft_deleted_at, restore_by FROM deletion_requests WHERE id = ?",
+                ("request-1",),
+            )
         assert memory["deleted_at"] is not None
         assert request["status"] == "soft_deleted"
         assert request["soft_deleted_at"] is not None
@@ -80,22 +96,25 @@ async def test_sqlite_persephone_worker_archives_through_backend_transaction(tmp
     old = datetime.now(timezone.utc) - timedelta(days=60)
     try:
         async with backend.transactional() as tx:
-            await tx.conn.execute(
+            await _exec(
+                tx,
                 "INSERT INTO memories (id, content, owner_id, namespace, created, updated) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                ("m-cold", "cold payload", "user-1", "default", old, old),
+                "m-cold", "cold payload", "user-1", "default", old, old,
             )
 
         archived = await sweep_for_archival(backend, "default", 30, 10)
 
         assert archived == 1
         async with backend.transactional() as tx:
-            memory = await (
-                await tx.conn.execute("SELECT content, archived_at FROM memories WHERE id = 'm-cold'")
-            ).fetchone()
-            archive = await (
-                await tx.conn.execute("SELECT compression_algo, schema_version FROM memory_archive WHERE id = 'm-cold'")
-            ).fetchone()
+            memory = await _fetch_one(
+                tx.conn, "SELECT content, archived_at FROM memories WHERE id = ?", ("m-cold",)
+            )
+            archive = await _fetch_one(
+                tx.conn,
+                "SELECT compression_algo, schema_version FROM memory_archive WHERE id = ?",
+                ("m-cold",),
+            )
         assert memory["content"] == "ARCHIVED:m-cold"
         assert memory["archived_at"] is not None
         assert archive["compression_algo"] == "zstd"
@@ -111,15 +130,18 @@ async def test_sqlite_hard_delete_preserves_durable_audit_log(tmp_path):
     yesterday = datetime.now(timezone.utc) - timedelta(days=1)
     try:
         async with backend.transactional() as tx:
-            await tx.conn.execute(
-                "INSERT INTO memories (id, content, owner_id, namespace, deleted_at) VALUES (?, ?, ?, ?, ?)",
-                ("m-expired", "erase me", "user-1", "private", yesterday),
+            await _exec(
+                tx,
+                "INSERT INTO memories (id, content, owner_id, namespace, deleted_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                "m-expired", "erase me", "user-1", "private", yesterday,
             )
-            await tx.conn.execute(
+            await _exec(
+                tx,
                 "INSERT INTO deletion_requests "
                 "(id, target_user_id, target_namespace, requested_by, status, soft_deleted_at, restore_by) "
                 "VALUES (?, ?, ?, ?, 'soft_deleted', ?, ?)",
-                ("request-hard", "user-1", "private", "admin", yesterday, yesterday),
+                "request-hard", "user-1", "private", "admin", yesterday, yesterday,
             )
 
         result = await process_one_hard_deletion_request(backend)
@@ -127,14 +149,14 @@ async def test_sqlite_hard_delete_preserves_durable_audit_log(tmp_path):
         assert result is not None
         assert result.status == "hard_deleted"
         async with backend.transactional() as tx:
-            memory_count = await (
-                await tx.conn.execute("SELECT COUNT(*) AS n FROM memories WHERE id = 'm-expired'")
-            ).fetchone()
-            audit = await (
-                await tx.conn.execute(
-                    "SELECT memory_id, content_hash, request_kind FROM deletion_log WHERE memory_id = 'm-expired'"
-                )
-            ).fetchone()
+            memory_count = await _fetch_one(
+                tx.conn, "SELECT COUNT(*) AS n FROM memories WHERE id = ?", ("m-expired",)
+            )
+            audit = await _fetch_one(
+                tx.conn,
+                "SELECT memory_id, content_hash, request_kind FROM deletion_log WHERE memory_id = ?",
+                ("m-expired",),
+            )
         assert memory_count["n"] == 0
         assert audit["memory_id"] == "m-expired"
         assert len(audit["content_hash"]) == 64
@@ -151,10 +173,11 @@ async def test_sqlite_admin_lifecycle_repository_covers_crud_archive_restore_and
     old = datetime.now(timezone.utc) - timedelta(days=60)
     try:
         async with backend.transactional() as tx:
-            await tx.conn.execute(
+            await _exec(
+                tx,
                 "INSERT INTO memories (id, content, owner_id, namespace, created, updated) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                ("m-admin", "payload", "user-1", "private", old, old),
+                "m-admin", "payload", "user-1", "private", old, old,
             )
             request = await repo.create_deletion_request(
                 tx,
@@ -180,24 +203,26 @@ async def test_sqlite_admin_lifecycle_repository_covers_crud_archive_restore_and
 
         deleted_at = datetime.now(timezone.utc).replace(microsecond=0)
         async with backend.transactional() as tx:
-            await tx.conn.execute("UPDATE memories SET deleted_at = ? WHERE id = ?", (deleted_at, "m-admin"))
-            await tx.conn.execute(
+            await _exec(tx, "UPDATE memories SET deleted_at = ? WHERE id = ?", deleted_at, "m-admin")
+            await _exec(
+                tx,
                 "INSERT INTO deletion_requests "
                 "(id, target_user_id, target_namespace, requested_by, status, soft_deleted_at, restore_by) "
                 "VALUES (?, ?, ?, ?, 'soft_deleted', ?, ?)",
-                ("restore-request", "user-1", "private", "root", deleted_at, deleted_at + timedelta(days=1)),
+                "restore-request", "user-1", "private", "root", deleted_at, deleted_at + timedelta(days=1),
             )
             existing = await repo.lock_deletion_request(tx, "restore-request")
             restored = await repo.restore_soft_deleted_request(tx, request_id="restore-request", existing=existing)
             assert restored["status"] == "restored"
 
         async with backend.transactional() as tx:
-            await tx.conn.execute("UPDATE memories SET deleted_at = ? WHERE id = ?", (deleted_at, "m-admin"))
-            await tx.conn.execute(
+            await _exec(tx, "UPDATE memories SET deleted_at = ? WHERE id = ?", deleted_at, "m-admin")
+            await _exec(
+                tx,
                 "INSERT INTO deletion_requests "
                 "(id, target_user_id, target_namespace, requested_by, status, soft_deleted_at, restore_by) "
                 "VALUES (?, ?, ?, ?, 'soft_deleted', ?, ?)",
-                ("purge-request", "user-1", "private", "root", deleted_at, deleted_at + timedelta(days=1)),
+                "purge-request", "user-1", "private", "root", deleted_at, deleted_at + timedelta(days=1),
             )
             existing = await repo.lock_deletion_request(tx, "purge-request")
             purged = await repo.force_purge_soft_deleted_request(
@@ -210,10 +235,13 @@ async def test_sqlite_admin_lifecycle_repository_covers_crud_archive_restore_and
             assert purged["status"] == "hard_deleted"
 
         async with backend.transactional() as tx:
-            assert await (await tx.conn.execute("SELECT 1 FROM memories WHERE id = 'm-admin'")).fetchone() is None
-            audit = await (
-                await tx.conn.execute("SELECT request_kind FROM deletion_log WHERE memory_id = 'm-admin'")
-            ).fetchone()
+            row = await _fetch_one(tx.conn, "SELECT 1 AS one FROM memories WHERE id = ?", ("m-admin",))
+            assert row is None
+            audit = await _fetch_one(
+                tx.conn,
+                "SELECT request_kind FROM deletion_log WHERE memory_id = ?",
+                ("m-admin",),
+            )
             assert audit["request_kind"] == "admin_purge"
     finally:
         await backend.close()
