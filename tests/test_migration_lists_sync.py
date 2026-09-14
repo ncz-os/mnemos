@@ -673,3 +673,158 @@ def test_v3_5_trigger_delete_branch_advances_head_to_delete_snapshot():
     assert (
         "UPDATE memory_branches SET head_version_id = _new_version_id WHERE memory_id = OLD.id AND name = _branch"
     ) in compact
+
+
+# ─── F18: GitLab CI migration path references must resolve on disk ──────────
+#
+# The pre-fix GitLab CI referenced a top-level ``db/`` directory for
+# migration paths. That directory has not existed in this repo for
+# several versions — the canonical paths are under
+# ``mnemos/db_migrations/``. The fix swaps both ``test:integration``
+# and ``test:persistence-parity`` to call
+# ``scripts/ci_apply_postgres_migrations.py`` which resolves the
+# installer's canonical list (the same one this test file pins) and
+# applies via psql, FAILING on any missing path.
+#
+# This regression guard parses ``.gitlab-ci.yml`` to confirm the
+# conditional-database CI jobs no longer reference the stale ``db/``
+# prefix, and that the new helper script is invoked.
+
+
+def _read_gitlab_ci_yaml() -> str:
+    repo_root = Path(__file__).resolve().parents[1]
+    return (repo_root / ".gitlab-ci.yml").read_text()
+
+
+def test_gitlab_ci_no_longer_references_stale_db_top_level_dir():
+    """F18 regression guard: the conditional-database CI jobs
+    (test:integration, test:persistence-parity) must NOT reference the
+    stale ``db/`` migration prefix. The previous inline lists hit
+    non-existent paths and either silently skipped (integration) or
+    hard-failed (parity) — inconsistent failure modes for the same
+    stale-path bug.
+
+    Specifically, scan ``.gitlab-ci.yml`` for any EXECUTABLE line (not
+    a comment) of the form ``db/<migration_basename>`` (where
+    ``<migration_basename>`` is one of the names in
+    ``EXPECTED_MIGRATIONS``). Such a reference is the regression: it
+    points at a path that doesn't exist in the repo and would either
+    silently skip (if guarded by ``[ -f "$f" ]``) or hard-fail.
+    """
+    text = _read_gitlab_ci_yaml()
+    repo_root = Path(__file__).resolve().parents[1]
+    # Sanity check the test premise: the stale directory is indeed
+    # absent from the working tree.
+    stale = repo_root / "db"
+    assert not stale.exists(), (
+        "Test premise broken: this repo somehow has a top-level db/ "
+        "directory; the F18 fix may not apply"
+    )
+
+    stale_references: list[tuple[int, str]] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        # Skip pure comments and the documentation that explains the
+        # F18 fix (which deliberately mentions the old `db/<name>`
+        # form to describe the bug being fixed).
+        if stripped.startswith("#"):
+            continue
+        # Match any executable reference that prefixes a known
+        # migration basename with ``db/`` (the old layout).
+        for name in EXPECTED_MIGRATIONS:
+            if f"db/{name}" in stripped:
+                stale_references.append((lineno, stripped))
+
+    assert not stale_references, (
+        "F18 regression: .gitlab-ci.yml still references stale "
+        "``db/<name>`` paths that do not exist on disk. Switch to "
+        "scripts/ci_apply_postgres_migrations.py (or update the inline "
+        "list) and remove every such reference. Offending lines:\n"
+        + "\n".join(f"  L{ln}: {s}" for ln, s in stale_references)
+    )
+
+
+def test_gitlab_ci_uses_canonical_migration_helper_for_db_jobs():
+    """F18 regression guard: the conditional-database CI jobs must
+    invoke the canonical helper
+    (``scripts/ci_apply_postgres_migrations.py``) instead of inline
+    path globs. The helper is the single source of truth for what
+    migrations to apply and hard-fails on any missing path."""
+    text = _read_gitlab_ci_yaml()
+
+    # The canonical migration helper must be referenced at least once
+    # from the conditional-database CI jobs (test:integration and
+    # test:persistence-parity are both behind ``RUN_DB_TESTS=true``).
+    assert "ci_apply_postgres_migrations.py" in text, (
+        "F18 fix not wired: .gitlab-ci.yml does not invoke "
+        "scripts/ci_apply_postgres_migrations.py. The conditional-database "
+        "CI jobs must route through this helper instead of inline "
+        "``db/migrations*.sql`` globs."
+    )
+
+    # The helper must exist on disk.
+    repo_root = Path(__file__).resolve().parents[1]
+    helper = repo_root / "scripts" / "ci_apply_postgres_migrations.py"
+    assert helper.exists(), f"missing helper at {helper}"
+
+
+def test_canonical_migration_helper_fails_on_missing_paths():
+    """F18 regression guard: the canonical CI helper must FAIL — not
+    silently skip — when a referenced migration path does not exist on
+    disk. Silently skipping a real check is strictly worse than a hard
+    error, which is the failure mode this helper exists to prevent.
+
+    Pin via a synthetic installer that lists one real path and one
+    missing path; the helper must exit non-zero with both missing
+    paths reported.
+    """
+    import subprocess
+    import sys
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, prefix="fake_installer_"
+    ) as f:
+        # Reference one definitely-missing path.
+        f.write(
+            "def run_migrations(config):\n"
+            "    migration_files = [\n"
+            "        '/repo/mnemos/db_migrations/DEFINITELY_MISSING_PATH.sql',\n"
+            "        '/repo/mnemos/db_migrations/migrations/9999_nope.sql',\n"
+            "    ]\n"
+            "    return migration_files\n"
+        )
+        fake = f.name
+
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "scripts/ci_apply_postgres_migrations.py",
+                "--dsn",
+                "postgresql://nobody:nobody@127.0.0.1:1/nobody",
+                "--installer",
+                fake,
+            ],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parents[1],
+        )
+        assert result.returncode != 0, (
+            "F18 regression: ci_apply_postgres_migrations.py must FAIL "
+            "non-zero on missing paths. Got exit 0 with stdout:\n"
+            + result.stdout
+        )
+        combined = result.stdout + result.stderr
+        assert "DEFINITELY_MISSING_PATH.sql" in combined, (
+            "F18 regression: helper must NAME the missing path so the CI "
+            "log makes the regression obvious. Got:\n" + combined
+        )
+        assert "9999_nope.sql" in combined, (
+            "F18 regression: helper must also catch numbered-series "
+            "migrations under mnemos/db_migrations/migrations/. Got:\n"
+            + combined
+        )
+    finally:
+        Path(fake).unlink()
+
