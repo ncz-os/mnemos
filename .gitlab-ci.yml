@@ -197,55 +197,23 @@ test:integration:
         END IF;
       END $$;
       SQL
-    # Apply migrations in the canonical order (mirrors mnemos/installer/db.py).
-    # Keep this list in sync with the Python loader.
-    - |
-      for f in \
-        db/migrations.sql \
-        db/migrations_v1_multiuser.sql \
-        db/migrations_v2_versioning.sql \
-        db/migrations_v2_sessions.sql \
-        db/migrations_model_registry.sql \
-        db/migrations_v3_dag.sql \
-        db/migrations_v3_graeae_unified.sql \
-        db/migrations_v3_webhooks.sql \
-        db/migrations_v3_oauth.sql \
-        db/migrations_v3_federation.sql \
-        db/migrations_v3_ownership.sql \
-        db/migrations_v3_1_compression.sql \
-        db/migrations_v3_1_versioning_fix.sql \
-        db/migrations_v3_1_2_kg_tenancy.sql \
-        db/migrations_v3_1_2_audit_log_columns.sql \
-        db/migrations_v3_2_user_namespace.sql \
-        db/migrations_v3_2_entities_namespace.sql \
-        db/migrations_v3_2_2_version_snapshot_new_values.sql \
-        db/migrations_v3_3_morpheus.sql \
-        db/migrations_v3_3_morpheus_namespace.sql \
-        db/migrations_v3_3_recall_tracking.sql \
-        db/migrations_charon_trigger_guard.sql \
-        db/migrations_v3_4_federation_compat.sql \
-        db/migrations_v3_5_trigger_same_memory_parent.sql \
-        db/migrations_v3_5_rls_group_select_unix_bits.sql \
-        db/migrations_v3_5_webhook_retry_terminal_state.sql \
-        db/migrations_v3_5_webhook_attempt_lease.sql \
-        db/migrations_v3_5_webhook_writer_revision.sql \
-        db/migrations_v3_5_webhook_status_updated_at.sql \
-        db/migrations_v3_5_webhook_superseded_marker.sql \
-        db/migrations_v3_5_webhook_attempt_unique.sql \
-        db/migrations_v3_5_webhook_succeeded_unique.sql \
-        db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql \
-        db/migrations_v3_5_entities_namespace_unique.sql \
-        db/migrations_v3_5_state_journal_namespace.sql \
-        db/migrations_v3_5_session_compression_ratio_drop.sql \
-        db/migrations_v3_5_session_compression_legacy_drop.sql \
-        db/migrations_v3_5_sessions_consultations_namespace.sql; do
-        if [ -f "$f" ]; then
-          echo "applying $f"
-          psql -h postgres -U postgres -d mnemos_test -v ON_ERROR_STOP=1 -f "$f"
-        else
-          echo "skip $f (not present)"
-        fi
-      done
+    # Apply migrations in the canonical order.
+    # F18 fix: the previous inline list referenced ``db/migrations.sql``
+    # and friends at a top-level ``db/`` directory that does not exist
+    # in this repo. The on-disk path is ``mnemos/db_migrations/`` (the
+    # flat v1..v5 files) and ``mnemos/db_migrations/migrations/`` (the
+    # numbered-series files). The old loop silently skipped every file
+    # (``if [ -f "$f" ]; then ... else echo "skip $f"; fi``), so the
+    # test passed against an empty database — a worse failure mode
+    # than a hard error.
+    #
+    # The canonical migration list lives in ``mnemos/installer/db.py``
+    # and is pinned by ``tests/test_migration_lists_sync.py``. The
+    # helper below resolves that list, verifies every path exists on
+    # disk (FAIL on any missing — silently skipping a real check is
+    # worse than a strict job), and applies via psql with
+    # ``ON_ERROR_STOP=1``.
+    - python3 scripts/ci_apply_postgres_migrations.py --dsn "$DATABASE_URL"
   script:
     - pytest tests/ -m integration --tb=short -q --junitxml=junit-integration.xml || EXIT=$?
     - |
@@ -307,15 +275,14 @@ test:persistence-parity:
         END IF;
       END $$;
       SQL
-    - |
-      for f in $(python - <<'PY'
-      from tests.test_migration_lists_sync import EXPECTED_MIGRATIONS
-      print(" ".join(f"db/{name}" for name in EXPECTED_MIGRATIONS))
-      PY
-      ); do
-        echo "applying $f"
-        psql -h postgres -U postgres -d mnemos_test -v ON_ERROR_STOP=1 -f "$f"
-      done
+    # F18 fix: the previous inline reference prepended ``db/`` to each
+    # basename. That directory has not existed in this repo for several
+    # versions — the canonical paths are under ``mnemos/db_migrations/``.
+    # The parity arm now resolves the installer's migration list and
+    # applies each path with the correct prefix, FAILING on any missing
+    # path (consistent with the integration arm above; silently skipping
+    # was strictly worse than a hard failure).
+    - python3 scripts/ci_apply_postgres_migrations.py --dsn "$DATABASE_URL"
   script:
     - pytest tests/test_persistence_parity.py --tb=short -q --junitxml=junit-persistence-parity.xml
   artifacts:
