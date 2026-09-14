@@ -244,21 +244,80 @@ Ask things like:
 ChatGPT calls MNEMOS's MCP tools and folds the results into the
 conversation. Same memory is visible from your other agents.
 
-## Setup — assisted path (experimental helper, currently inert)
+## Setup — assisted path (`mnemos-tunnel-setup`)
 
-The `mnemos-tunnel-setup` helper (`scripts/mnemos_tunnel_setup.py`) is
-checked in as an aspirational contract. It expects a daemon-side
-`/admin/tunnels/*` REST surface plus a `mnemos.tunnels.ngrok_bridge`
-module; **neither has shipped**.
-Use the manual path above. The snippet below describes the eventual
-flow:
+The `scripts/mnemos_tunnel_setup.py` helper does the tunnel + connector
+config in one step, against the daemon's `/admin/tunnels/*` routes.
+
+**Enable it first.** Opening a tunnel publishes a local MNEMOS port to
+the public internet, so the routes require a host-level opt-in on top of
+root auth. On the MNEMOS host:
 
 ```bash
-mnemos-tunnel-setup chatgpt
+export MNEMOS_TUNNELS_ENABLED=true   # or [mcp] tunnels_enabled = true in config.toml
+# restart MNEMOS
 ```
 
-The script walks you through ngrok signup, opens the tunnel, generates the
-token, prints the connector config, and copies URL+token to your clipboard.
+Install the agent for whichever backend you want — `brew install
+cloudflared` / `brew install ngrok`, or the Linux equivalents — then:
+
+```bash
+export MNEMOS_API_KEY=<a root API key>
+python3 scripts/mnemos_tunnel_setup.py chatgpt
+```
+
+It confirms MNEMOS is reachable, opens the tunnel, obtains the bearer
+token, prints the connector config, and copies URL+token to your
+clipboard.
+
+Backends:
+
+| `--backend` | Credential needed | URL |
+|---|---|---|
+| `cloudflare` (default) | none | random `*.trycloudflare.com`, **changes every restart** |
+| `ngrok` | free-tier authtoken (the script walks signup + paste) | `*.ngrok-free.app`, rotates on free tier |
+
+Cloudflare is the default because a `cloudflared` quick tunnel needs no
+account, no domain and no credential, so it works on a host where nothing
+has been configured. Pass `--backend ngrok` if you already have an ngrok
+account or want its paid stable subdomain.
+
+**What this helper does not do:** it only opens **ephemeral** tunnels.
+Cloudflare **Named** tunnels — the stable `mnemos.yourdomain.com` option
+recommended above — still require the manual `cloudflared tunnel
+create/route` flow documented earlier on this page; the helper will not
+create, route or manage one. Tailscale Funnel is likewise manual.
+
+Other flags: `--backend {cloudflare,ngrok}`, `--target-port` (default
+5004), `--mnemos <base-url>`, `--api-key`, `--no-clipboard`, and a
+positional surface (`chatgpt`, `claude`, `cursor`, `codex`, `all`).
+
+Manage the tunnel directly if you prefer:
+
+```bash
+curl -H "Authorization: Bearer $MNEMOS_API_KEY" http://localhost:5002/admin/tunnels/status
+curl -X DELETE -H "Authorization: Bearer $MNEMOS_API_KEY" http://localhost:5002/admin/tunnels/stop
+```
+
+One tunnel per MNEMOS process; `start` returns 409 if one is already
+open. MNEMOS closes the tunnel on shutdown.
+
+### Where the connector token comes from
+
+`/admin/tunnels/start` does not mint a new kind of credential. It returns,
+in preference order:
+
+1. an **OAuth 2.1 access token** from the MCP edge's existing
+   authorization server (12-hour lifetime, reported as `expires_in`), when
+   `MNEMOS_OAUTH_ISSUER` + a signing key are configured; or
+2. the configured static **`MNEMOS_MCP_TOKEN`**, surfaced as-is.
+
+Both are credentials `mnemos serve mcp-http` already accepts, so the
+token you paste into ChatGPT is one the endpoint will honour. If neither
+is configured the route returns 503 rather than handing you a token that
+would 401 on first use. `MNEMOS_MCP_TOKENS` (the per-user map) is
+deliberately not used — handing out one entry would grant that user's
+identity to whoever holds the connector.
 
 ## Operational notes
 

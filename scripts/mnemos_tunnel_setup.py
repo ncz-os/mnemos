@@ -2,21 +2,11 @@
 """mnemos-tunnel-setup — interactive helper for connecting MNEMOS to
 ChatGPT Pro Developer Mode, Claude Desktop, Cursor, or Codex CLI.
 
-⚠️ ASPIRATIONAL HELPER — currently inert as of v5.0.1. The
-daemon-side ``/admin/tunnels/*`` REST surface and the
-``mnemos.tunnels.ngrok_bridge`` module that this script depends on
-have not shipped yet. Running the script today will fail at the
-``/admin/tunnels/start`` HTTP call. Use the manual `mnemos serve
-mcp-http` + ngrok path documented per-agent under
-``docs/connectors/`` until the daemon-side endpoints land. The
-docstring + script body are preserved as the contract these
-endpoints should implement when they do ship.
-
-Designed flow (when the contract ships):
+Flow:
 
   1. Confirm MNEMOS is reachable.
-  2. If no ngrok authtoken on file: open the signup page in their
-     browser and prompt for paste.
+  2. For the ngrok backend only: if no authtoken is on file, open the
+     signup page in the user's browser and prompt for paste.
   3. Open the tunnel via the MNEMOS admin API.
   4. Pretty-print connector-ready snippets for each agent surface.
      Copy the relevant one to the system clipboard if available.
@@ -24,16 +14,36 @@ Designed flow (when the contract ships):
 The "easy button" for end users who don't want to know what ngrok
 or SSE or bearer auth means.
 
-Designed to be runnable as:
+Two backends:
+
+  cloudflare (default)
+      A ``cloudflared`` quick tunnel. No account, no signup, no
+      credential — which is why it is the default: it works on a host
+      where nothing has been configured. The URL is EPHEMERAL: random,
+      and different after every restart. For a stable
+      ``mnemos.yourdomain.com`` you want a Cloudflare NAMED tunnel,
+      which needs an account and a zone and is still set up by hand —
+      see ``docs/connectors/chatgpt-pro-developer-mode.md``.
+
+  ngrok
+      The ngrok agent. Needs a free-tier signup + authtoken paste the
+      first time; this script walks that. The free tier also rotates the
+      URL on restart; the paid tier gives a stable subdomain.
+
+Runnable as:
     python3 scripts/mnemos_tunnel_setup.py
 or installed via pyproject as a console script:
     mnemos-tunnel-setup [chatgpt | claude | cursor | codex | all]
 
 Depends only on stdlib + httpx (already a MNEMOS runtime dep). No
-ngrok-python SDK needed in this script — the SDK lives inside the
-(planned) MNEMOS daemon's `mnemos.tunnels.ngrok_bridge` module;
-this script calls the admin API once that module + the
-``/admin/tunnels/*`` routes are wired in.
+vendor SDK here or in the daemon: ``mnemos.tunnels.ngrok_bridge`` and
+``mnemos.tunnels.cloudflare_bridge`` drive the vendors' agent binaries,
+and this script just calls ``/admin/tunnels/*``.
+
+Note the daemon-side gate: ``/admin/tunnels/*`` requires a root bearer
+token AND ``MNEMOS_TUNNELS_ENABLED=true`` on the MNEMOS host, because
+opening a tunnel makes that instance reachable from the public
+internet. A 403 from the API means the flag, not the token.
 """
 from __future__ import annotations
 
@@ -55,6 +65,14 @@ NGROK_SIGNUP_URL = "https://dashboard.ngrok.com/signup"
 NGROK_AUTHTOKEN_URL = "https://dashboard.ngrok.com/get-started/your-authtoken"
 
 DEFAULT_MNEMOS_BASE = os.getenv("MNEMOS_BASE", "http://localhost:5002")
+
+# Cloudflare is the default because a `cloudflared` quick tunnel opens with
+# no account, no signup and no credential, so it works on a host where
+# nothing has been set up. ngrok cannot open its first tunnel until the user
+# has signed up and pasted an authtoken — better as an opt-in.
+DEFAULT_BACKEND = "cloudflare"
+# The MCP HTTP/SSE edge. Matches `mnemos serve mcp-http`'s documented port.
+DEFAULT_TARGET_PORT = 5004
 
 
 def _say(msg: str) -> None:
@@ -175,20 +193,44 @@ def _ensure_authtoken_or_walk_signup() -> str:
     return token
 
 
-def _start_tunnel(base: str, api_key: str, authtoken: str) -> dict:
+def _api_detail(response: httpx.Response) -> str:
+    """Pull FastAPI's `detail` out of an error body, else the raw text.
+
+    The daemon puts genuinely actionable text in `detail` (which flag to
+    set, which binary to install, which env var to configure); printing
+    the raw JSON envelope instead buries it.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return response.text[:400]
+    if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+        return payload["detail"]
+    return response.text[:400]
+
+
+def _start_tunnel(base: str, api_key: str, backend: str,
+                  authtoken: Optional[str], target_port: int) -> dict:
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    body = {"backend": "ngrok", "authtoken": authtoken, "target_port": 5004}
+    body = {"backend": backend, "target_port": target_port}
+    if authtoken:
+        body["authtoken"] = authtoken
     try:
+        # Generous timeout: the daemon spawns the vendor agent and waits
+        # for it to register with the provider's edge before replying.
         r = httpx.post(f"{base}/admin/tunnels/start",
-                       headers=headers, json=body, timeout=30)
+                       headers=headers, json=body, timeout=60)
     except httpx.HTTPError as exc:
         _err(f"tunnel start failed: {exc}")
         sys.exit(1)
     if r.status_code != 200:
-        _err(f"tunnel start failed: HTTP {r.status_code} — {r.text[:200]}")
+        _err(f"tunnel start failed: HTTP {r.status_code} — {_api_detail(r)}")
+        if r.status_code == 409:
+            _err(f"    an existing tunnel is in the way; close it with: "
+                 f"DELETE {base}/admin/tunnels/stop")
         sys.exit(1)
     return r.json()
 
@@ -250,33 +292,24 @@ def _list_surfaces(arg: str) -> list[str]:
 
 
 def main() -> int:
-    _err(
-        "⚠️  mnemos-tunnel-setup is currently inert as of v5.0.1.\n"
-        "    The daemon-side /admin/tunnels/* REST routes and the\n"
-        "    `mnemos.tunnels.ngrok_bridge` module this script depends\n"
-        "    on have not shipped yet. The next /admin/tunnels/start\n"
-        "    HTTP call below will return 404. Use the manual\n"
-        "    `mnemos serve mcp-http` + ngrok path documented in\n"
-        "    docs/connectors/<agent>.md until the daemon endpoints\n"
-        "    land. Continuing with --force; pass nothing to abort."
-    )
-    if "--force" not in sys.argv:
-        _err("    Aborting. Re-run with --force if you want to try anyway.")
-        return 2
-
     p = argparse.ArgumentParser(
         prog="mnemos-tunnel-setup",
         description="Connect MNEMOS to a public URL for ChatGPT, Claude, Cursor, or Codex.",
     )
-    p.add_argument("--force", action="store_true",
-                   help="Acknowledge that the daemon-side tunnel API "
-                        "is not implemented yet and run anyway.")
     p.add_argument("surface", nargs="?", default="all",
                    choices=["chatgpt", "claude", "cursor", "codex", "all"],
                    help="Which agent surface to emit connector config for "
                         "(default: all).")
+    p.add_argument("--backend", default=DEFAULT_BACKEND,
+                   choices=["cloudflare", "ngrok"],
+                   help="Tunnel provider. cloudflare (default) needs no account "
+                        "or signup; ngrok needs a free-tier authtoken, which this "
+                        "script will walk you through obtaining.")
     p.add_argument("--mnemos", default=DEFAULT_MNEMOS_BASE,
                    help=f"MNEMOS base URL (default: {DEFAULT_MNEMOS_BASE}).")
+    p.add_argument("--target-port", type=int, default=DEFAULT_TARGET_PORT,
+                   help=f"Local MNEMOS port to publish — the MCP HTTP/SSE edge "
+                        f"(default: {DEFAULT_TARGET_PORT}).")
     p.add_argument("--api-key", default=os.getenv("MNEMOS_API_KEY", ""),
                    help="MNEMOS bearer token (or set MNEMOS_API_KEY env).")
     p.add_argument("--no-clipboard", action="store_true",
@@ -293,11 +326,17 @@ def main() -> int:
     _say("✓ MNEMOS is reachable")
     _say("")
 
-    authtoken = _ensure_authtoken_or_walk_signup()
-    _say("")
-    _say("Opening ngrok tunnel...")
+    # Only ngrok needs a credential. A cloudflared quick tunnel is
+    # anonymous, so asking for one would be theatre.
+    authtoken: Optional[str] = None
+    if args.backend == "ngrok":
+        authtoken = _ensure_authtoken_or_walk_signup()
+        _say("")
 
-    result = _start_tunnel(args.mnemos, args.api_key, authtoken)
+    _say(f"Opening {args.backend} tunnel to local port {args.target_port}...")
+
+    result = _start_tunnel(args.mnemos, args.api_key, args.backend,
+                           authtoken, args.target_port)
     url = result.get("url")
     token = result.get("token")
     if not url or not token:
@@ -305,6 +344,13 @@ def main() -> int:
         return 1
 
     _say(f"✓ Tunnel open: {url}")
+    if args.backend == "cloudflare":
+        _say("  (quick tunnel — this URL is random and changes every restart.")
+        _say("   For a stable URL, set up a Cloudflare NAMED tunnel by hand:")
+        _say("   docs/connectors/chatgpt-pro-developer-mode.md)")
+    expires_in = result.get("expires_in")
+    if expires_in:
+        _say(f"  (bearer token expires in {int(expires_in) // 3600}h — re-run to reissue)")
     _say("")
 
     for surface in _list_surfaces(args.surface):

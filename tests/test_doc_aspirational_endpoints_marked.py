@@ -10,18 +10,18 @@ Surfaced by the deep documentation-sweep codex audit at HEAD
   ``/admin/dreams/run`` — none of those exist. The shipped
   MORPHEUS subsystem uses ``/v1/morpheus/runs*`` and
   ``/admin/morpheus/runs`` (`mnemos/api/routes/morpheus.py`).
-- ``docs/connectors/chatgpt-pro-developer-mode.md`` and
-  ``docs/connectors/README.md`` reference an experimental
-  ``mnemos-tunnel-setup`` helper that calls daemon-side
-  ``/admin/tunnels/*`` endpoints. As of v5.3.2 the
-  ``mnemos.tunnels.ngrok_bridge`` module + the daemon-side
-  endpoints are NOT implemented; the script is aspirational
-  contract.
+The dream-state test does NOT remove the design content — it pins
+that the historical-note callout stays near the aspirational
+endpoint names so future readers don't grep for non-existent
+routes without finding the explanation immediately.
 
-This test does NOT remove the design content — it pins that the
-historical-note callouts stay near the aspirational endpoint
-names so future readers don't grep for non-existent routes
-without finding the explanation immediately.
+The ``/admin/tunnels/*`` half of this file was INVERTED in v6.4.0.
+Those endpoints, ``mnemos/tunnels/*`` and the helper script all
+shipped, so the assertions below now pin the opposite property:
+that the docs and the script do not regress into claiming the
+feature is unimplemented, that the daemon code they promise is
+really present, and that the remaining honest caveat (ephemeral
+tunnels only; Cloudflare Named tunnels are still manual) survives.
 """
 from __future__ import annotations
 
@@ -51,64 +51,84 @@ def test_dream_endpoints_marked_did_not_ship():
     )
 
 
-def test_admin_tunnels_marked_inert_in_chatgpt_doc():
-    """`docs/connectors/chatgpt-pro-developer-mode.md` must keep
-    a clear "currently inert" / "not implemented" warning near
-    the `/admin/tunnels/*` reference, since the daemon-side
-    endpoints + the ngrok-bridge module don't exist."""
+def test_admin_tunnels_doc_no_longer_claims_the_feature_is_inert():
+    """`/admin/tunnels/*` shipped in v6.4.0. The connector doc must not
+    still tell operators the helper is inert — that would send them to
+    the manual path for a feature that works."""
     src = (REPO / "docs" / "connectors"
            / "chatgpt-pro-developer-mode.md").read_text()
-    if "/admin/tunnels/" not in src and "mnemos-tunnel-setup" not in src:
-        return
-    has_warning = (
-        "currently inert" in src
-        or "not implemented" in src
-        or "has not shipped" in src
-        or "neither has shipped" in src
-    )
-    assert has_warning, (
-        "chatgpt-pro-developer-mode.md still describes the "
-        "mnemos-tunnel-setup helper / `/admin/tunnels/*` but "
-        "lost the inert/not-implemented warning. Operators copy-"
-        "pasting from this doc would hit a broken contract."
+    stale = [
+        phrase for phrase in (
+            "currently inert",
+            "neither has shipped",
+            "aspirational contract",
+        )
+        if phrase in src
+    ]
+    assert not stale, (
+        f"chatgpt-pro-developer-mode.md still carries pre-6.4.0 "
+        f"not-implemented language {stale!r} for /admin/tunnels/*, which "
+        f"shipped. Describe the working flow instead."
     )
 
 
-def test_admin_tunnels_marked_not_implemented_in_connectors_readme():
-    """`docs/connectors/README.md` stability commitments must
-    note that `/admin/tunnels/*` is not implemented yet."""
+def test_admin_tunnels_doc_states_the_host_opt_in():
+    """The routes are gated behind MNEMOS_TUNNELS_ENABLED on top of root
+    auth. An operator who doesn't know that reads the 403 as a broken
+    token, so the doc has to name the flag."""
+    src = (REPO / "docs" / "connectors"
+           / "chatgpt-pro-developer-mode.md").read_text()
+    assert "MNEMOS_TUNNELS_ENABLED" in src, (
+        "chatgpt-pro-developer-mode.md documents the assisted tunnel path "
+        "without naming the MNEMOS_TUNNELS_ENABLED host opt-in that gates it."
+    )
+
+
+def test_connectors_readme_no_longer_lists_tunnels_as_unimplemented():
+    """`docs/connectors/README.md` stability commitments must not still
+    list `/admin/tunnels/*` under 'not implemented'."""
     src = (REPO / "docs" / "connectors" / "README.md").read_text()
-    if "/admin/tunnels/" not in src:
-        return
-    assert "not implemented" in src, (
-        "docs/connectors/README.md describes "
-        "`/admin/tunnels/*` without the not-implemented "
-        "warning. Surface that the assisted-tunnel path is "
-        "aspirational so operators don't expect it to work."
+    assert "/admin/tunnels/*` are **not implemented**" not in src, (
+        "docs/connectors/README.md still lists /admin/tunnels/* as not "
+        "implemented; those routes shipped in v6.4.0."
+    )
+    # ...and must still be honest about what did NOT ship: named tunnels.
+    assert "Named" in src, (
+        "docs/connectors/README.md lost the caveat that only EPHEMERAL "
+        "tunnels are managed and Cloudflare Named tunnels are still manual. "
+        "Dropping it oversells the feature."
     )
 
 
-def test_tunnel_script_refuses_without_force_flag():
-    """Codex round-1 of #198 caught that the
-    `scripts/mnemos_tunnel_setup.py` script presented itself as
-    live, so a user could run it and hit /admin/tunnels/start
-    (404) before reading the docs. The script is now gated
-    behind a `--force` flag and prints an "inert" warning. Pin
-    the gate's presence."""
+def test_tunnel_script_is_no_longer_gated_behind_force():
+    """The --force gate and 'currently inert' banner existed only because
+    the daemon endpoints were missing. Both must be gone now that they
+    aren't, or the helper stays unusable by default."""
     src = (REPO / "scripts" / "mnemos_tunnel_setup.py").read_text()
-    assert 'if "--force" not in sys.argv' in src \
-        or '"--force"' in src, (
-        "scripts/mnemos_tunnel_setup.py no longer gates execution "
-        "behind --force. Until /admin/tunnels/* + "
-        "mnemos.tunnels.ngrok_bridge ship, the script must refuse "
-        "to run by default so users don't hit a non-existent "
-        "endpoint."
+    assert 'if "--force" not in sys.argv' not in src, (
+        "scripts/mnemos_tunnel_setup.py still refuses to run without "
+        "--force. /admin/tunnels/* shipped in v6.4.0; drop the gate."
     )
-    # Pin the warning text so tone of voice doesn't drift.
-    assert "currently inert" in src, (
-        "The 'currently inert' warning in mnemos_tunnel_setup.py "
-        "is gone — without it, --force would silently mask the "
-        "missing-endpoint state."
+    assert "currently inert" not in src, (
+        "scripts/mnemos_tunnel_setup.py still prints the 'currently inert' "
+        "warning for endpoints that now exist."
+    )
+
+
+def test_tunnel_daemon_modules_the_script_promises_actually_exist():
+    """The counterpart to the old aspirational pin: the modules and routes
+    the script's docstring names must be real, so this file keeps catching
+    a docstring that promises more than the package ships."""
+    tunnels = REPO / "mnemos" / "tunnels"
+    for name in ("__init__.py", "base.py", "ngrok_bridge.py", "cloudflare_bridge.py"):
+        assert (tunnels / name).is_file(), f"mnemos/tunnels/{name} is missing"
+
+    routes = (REPO / "mnemos" / "api" / "routes" / "tunnels.py").read_text()
+    for path in ('"/start"', '"/status"', '"/stop"'):
+        assert path in routes, f"{path} route missing from mnemos/api/routes/tunnels.py"
+    assert 'prefix="/admin/tunnels"' in routes, (
+        "the tunnels router no longer mounts under /admin/tunnels; the "
+        "connector docs and helper script both hardcode that prefix."
     )
 
 

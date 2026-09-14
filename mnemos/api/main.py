@@ -29,6 +29,7 @@ from mnemos.api.routes.oauth import router as oauth_router
 from mnemos.api.routes.openai_compat import router as openai_compat_router
 from mnemos.api.routes.sessions import router as sessions_router
 from mnemos.api.routes.state import router as state_router
+from mnemos.api.routes.tunnels import router as tunnels_router
 from mnemos.api.routes.versions import router as versions_router
 from mnemos.api.routes.webhooks import router as webhooks_router
 from mnemos.api.lifecycle_hooks import register_lifespan_hooks
@@ -452,6 +453,7 @@ if _settings.layers.enable_charon:
     _include_optional_router("charon", "mnemos.api.routes.ingest", label="CHARON")
 app.include_router(admin_router)
 app.include_router(mcp_audit_router)  # Phase-D MCP audit (#146)
+app.include_router(tunnels_router)  # /admin/tunnels/*: public tunnel bridge (root + MNEMOS_TUNNELS_ENABLED)
 app.include_router(kronos_router)
 app.include_router(versions_router)
 app.include_router(journal_router)

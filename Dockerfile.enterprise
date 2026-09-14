@@ -58,6 +58,57 @@ RUN python -m pip install --no-cache-dir \
     fi && \
     python -m pip check
 
+# ─── Tunnel agents for /admin/tunnels/* (v6.4.0) ─────────────────────────────
+# mnemos/tunnels/{cloudflare,ngrok}_bridge.py shell out to these binaries.
+# Without them in the image the tunnel routes return 503 "not installed" —
+# correct behaviour, but it makes the feature inert in every container
+# deployment, which is the only deployment most operators have.
+#
+# Installed HERE and only here, deliberately. mnemos-enterprise is the single
+# published container image (AGENTS.md: "the ONLY published container image...
+# every container deployment gets the full driver set"), so the other
+# Dockerfiles are local/CI build targets that nobody deploys from. Adding ~75 MB
+# of Go binaries to each of them would grow images no one runs.
+#
+# Both vendors publish amd64 AND arm64 Linux builds; every URL below was
+# verified to return 200 for both arches on 2026-09-14, and the downloaded
+# cloudflared binaries confirmed as statically-linked ELF for their target arch.
+#
+# cloudflared: version-pinned with a per-arch sha256, since Cloudflare publishes
+# immutable per-release GitHub assets.
+ARG CLOUDFLARED_VERSION=2026.9.1
+ARG CLOUDFLARED_SHA256_amd64=03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc
+ARG CLOUDFLARED_SHA256_arm64=3d97437c71848bd8df68041e12436b484a661d95073ea1937f01a845ce88faa3
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    case "$arch" in \
+      amd64) sha="${CLOUDFLARED_SHA256_amd64}" ;; \
+      arm64) sha="${CLOUDFLARED_SHA256_arm64}" ;; \
+      *) echo "unsupported TARGETARCH for cloudflared: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/cloudflared \
+      "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${arch}"; \
+    echo "${sha}  /tmp/cloudflared" | sha256sum -c -; \
+    install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared; \
+    rm -f /tmp/cloudflared; \
+    cloudflared --version
+
+# ngrok: the official static tarball from ngrok's own host. NOT checksum-pinned,
+# and not by oversight — ngrok publishes only a rolling "stable" channel URL per
+# arch, with no immutable per-version artifact to pin against, so a hardcoded
+# digest would break the build on ngrok's next release rather than protect it.
+# Transport integrity is TLS to ngrok's host; `--fail` keeps a proxy error page
+# from being unpacked as if it were the archive.
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    case "$arch" in amd64|arm64) ;; *) echo "unsupported TARGETARCH for ngrok: $arch" >&2; exit 1 ;; esac; \
+    curl -fsSL -o /tmp/ngrok.tgz \
+      "https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-linux-${arch}.tgz"; \
+    tar -xzf /tmp/ngrok.tgz -C /usr/local/bin ngrok; \
+    chmod 0755 /usr/local/bin/ngrok; \
+    rm -f /tmp/ngrok.tgz; \
+    ngrok --version
+
 # Default to Oracle; override MNEMOS_DATABASE_DSN at runtime to pick any backend.
 ENV MNEMOS_PERSISTENCE_BACKEND=oracle
 
