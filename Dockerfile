@@ -84,6 +84,11 @@ COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/pytho
 # Copy application code
 COPY . .
 
+# setuptools is required by the PEP 517 build backend below and is not
+# preinstalled in python:3.13-slim; --no-build-isolation means pip cannot
+# fetch it itself at install time, so it must be present beforehand.
+RUN python -m pip install --no-cache-dir setuptools
+
 # Register the package itself so importlib.metadata.version("mnemos-os")
 # matches pyproject.toml. --no-deps because deps are already installed
 # from requirements.txt above.
