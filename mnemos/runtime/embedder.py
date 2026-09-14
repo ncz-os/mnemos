@@ -40,6 +40,7 @@ schema is provisioned.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 from pathlib import Path
@@ -708,6 +709,14 @@ class InProcessEmbedder:
         # texts to NPU and long to the primary backend.
         self._npu_sidecar: _CixNpuBackend | None = None
         self._lock = asyncio.Lock()
+        # F15: dedicated single-worker thread pool for the non-reentrant
+        # in-process backend (llamacpp / openvino / cix-npu). Even if two
+        # `.embed()` coroutines race past `_lock` because the awaiter is
+        # cancelled mid-call, the executor serializes the actual backend
+        # work. Without this, two `_embed_sync` calls can run on parallel
+        # default-pool threads and hit the non-reentrant backend
+        # concurrently.
+        self._serial_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
     def _make_backend(self, name: str):
         if name == "openvino":
@@ -818,14 +827,79 @@ class InProcessEmbedder:
         return self._backend_name
 
     async def _ensure_loaded(self) -> None:
+        # F15: use the serial executor so the non-reentrant backend's
+        # load is co-serialized with subsequent embed calls. Without
+        # this, the default thread pool would let a load run in parallel
+        # with an embed that already passed _lock via a cancellation.
         if not (self._backend and self._backend.loaded):
-            await asyncio.get_running_loop().run_in_executor(None, self._load_sync)
+            await self._run_serial_sync(self._load_sync)
         if self._npu_sidecar and not self._npu_sidecar.loaded:
             try:
-                await asyncio.get_running_loop().run_in_executor(None, self._npu_sidecar._load_sync)
+                await self._run_serial_sync(self._npu_sidecar._load_sync)
             except Exception:
                 logger.warning("[EMBED] hybrid NPU sidecar failed to load; falling back to primary backend")
                 self._npu_sidecar = None
+
+    def _ensure_serial_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the single-worker executor used for non-reentrant backends.
+
+        Created lazily on first call so the embedder does not allocate a
+        thread at import-time. The pool only runs one task at a time, so
+        concurrent `.embed()` callers serialize at the executor even if
+        their awaiting coroutine gets cancelled mid-call (F15: the
+        bare ``asyncio.Lock`` does not hold across cancellation; the
+        single-worker executor does — it serializes the actual backend
+        work regardless of how the asyncio-side cancellation lands).
+        """
+        if self._serial_executor is None:
+            self._serial_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"mnemos-embed-{id(self):x}",
+            )
+        return self._serial_executor
+
+    async def _run_serial_sync(self, sync_fn, *args):
+        """Run a sync callable on the serial executor.
+
+        The returned coroutine completes only when the underlying
+        thread-pool work finishes, even if the awaiting task is cancelled
+        before then. We ``asyncio.shield`` the underlying future so
+        cancellation of the awaiting task doesn't cancel the thread; the
+        ``finally`` then re-awaits the real future so the lock is only
+        released after the work is truly done.
+
+        Returns the callable's return value, or re-raises its exception
+        (including ``CancelledError`` propagating out of the shielded
+        await so callers can still observe cancellation on a future
+        round-trip).
+        """
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(self._ensure_serial_executor(), sync_fn, *args)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # Awaiter cancelled; do NOT cancel the underlying work.
+            # Wait for the executor future to actually finish before
+            # propagating so the surrounding ``async with self._lock:``
+            # releases only after the backend call returns (F15).
+            try:
+                await future
+            except Exception:
+                # Work raised; we're cancelling anyway, swallow here so
+                # the CancelledError the awaiter observed still wins.
+                pass
+            raise
+        except BaseException:
+            # Non-cancellation exception from sync_fn: surface it, but
+            # make sure the underlying future is consumed before we
+            # return control to the caller so the executor doesn't
+            # hold a dangling reference.
+            if not future.done():
+                try:
+                    await future
+                except Exception:
+                    pass
+            raise
 
     async def embed(self, text: str) -> list[float]:
         """Embed a single string. Returns [] on error or empty input.
@@ -839,6 +913,13 @@ class InProcessEmbedder:
         For the http backend, the call is async (httpx) — no executor
         thread. On empty result the optional local fallback is invoked
         per mem_1779334716543_f8ebd4 EXCEPTION clause.
+
+        Concurrency: the in-process backends (llamacpp / openvino /
+        cix-npu / http-local-fallback) are NOT reentrant — see the
+        ``InProcessEmbedder`` class docstring. ``_run_serial_sync``
+        dispatches their ``_embed_sync`` / ``_load_sync`` to a dedicated
+        single-worker thread pool so concurrent callers serialize at the
+        executor regardless of asyncio-side cancellation (F15).
         """
         truncated = (text or "")[: self.max_text_chars]
         if not truncated.strip():
@@ -861,12 +942,8 @@ class InProcessEmbedder:
                             return vec
                     # Then in-process local llamacpp.
                     if self._http_fallback is not None:
-                        if not self._http_fallback.loaded:
-                            await asyncio.get_running_loop().run_in_executor(None, self._http_fallback._load_sync)
                         logger.warning("[EMBED][http] remote+fallback failed -> llamacpp local")
-                        return await asyncio.get_running_loop().run_in_executor(
-                            None, self._http_fallback._embed_sync, truncated
-                        )
+                        return await self._run_serial_sync(self._http_fallback._embed_sync, truncated)
                     return []
                 use_npu = (
                     self._npu_sidecar is not None
@@ -874,15 +951,18 @@ class InProcessEmbedder:
                     and len(truncated) <= self.npu_threshold_chars
                 )
                 backend = self._npu_sidecar if use_npu else self._backend
-                return await asyncio.get_running_loop().run_in_executor(None, backend._embed_sync, truncated)
+                return await self._run_serial_sync(backend._embed_sync, truncated)
+            except asyncio.CancelledError:
+                # Awaiter cancelled mid-call; the serial executor will
+                # still finish the in-flight backend work before our lock
+                # is released. Surface cancellation, don't swallow it.
+                raise
             except Exception:
                 logger.exception("[EMBED] failed to embed text len=%d", len(truncated))
                 # On hybrid NPU failure, retry on primary backend
                 if self._npu_sidecar and self._backend:
                     try:
-                        return await asyncio.get_running_loop().run_in_executor(
-                            None, self._backend._embed_sync, truncated
-                        )
+                        return await self._run_serial_sync(self._backend._embed_sync, truncated)
                     except Exception:
                         logger.exception("[EMBED] primary backend retry also failed")
                 return []
@@ -919,12 +999,12 @@ class InProcessEmbedder:
                         # Local fallback for any rows still empty.
                         if any(not v for v in vecs) and self._http_fallback is not None:
                             if not self._http_fallback.loaded:
-                                await asyncio.get_running_loop().run_in_executor(None, self._http_fallback._load_sync)
+                                await self._run_serial_sync(self._http_fallback._load_sync)
                             for i, (v, t) in enumerate(zip(vecs, texts_list)):
                                 if not v and t and t.strip():
                                     logger.warning("[EMBED][http] batch local-fallback idx=%d", i)
-                                    vecs[i] = await asyncio.get_running_loop().run_in_executor(
-                                        None, self._http_fallback._embed_sync, t[: self.max_text_chars]
+                                    vecs[i] = await self._run_serial_sync(
+                                        self._http_fallback._embed_sync, t[: self.max_text_chars]
                                     )
                         return vecs
                 except Exception:
