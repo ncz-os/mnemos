@@ -6341,8 +6341,16 @@ class OracleConsultationsRepository(ConsultationsRepository):
             prev_row = await _row_to_dict(cursor, await _call(cursor.fetchone))
             prev_chain = prev_row["chain_hash"] if prev_row else kwargs["genesis_hash"]
             # Signed after the insert, once sequence_num exists -- it is bound
-            # into the v2 hash. See mnemos/core/audit_chain.py.
-            chain_hash = ""
+            # into the v2 hash. See mnemos/core/audit_chain.py. Postgres/
+            # SQLite use "" as the pre-sign placeholder (both distinguish ""
+            # from NULL), but Oracle famously coerces an empty VARCHAR2 bind
+            # to NULL -- chain_hash is NOT NULL, so "" raised ORA-01400
+            # "cannot insert NULL into CHAIN_HASH" on every consultation
+            # against real production Oracle (2026-09-14). Use a same-length
+            # (64 hex chars, matching a real SHA-256 hex digest) non-empty
+            # sentinel instead; it's overwritten by the UPDATE below inside
+            # the same transaction and never visible outside it.
+            chain_hash = "0" * 64
             audit_id = uuid.uuid4().hex
             # provider is NOT NULL on Oracle but winning_muse can be None on
             # all-muses-failed consensus path (route at consultations.py L361

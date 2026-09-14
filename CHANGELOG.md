@@ -57,6 +57,34 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [6.3.10] — 2026-09-14
+
+- **Fixed**: with `6.3.9`'s quota-lock fix live, every GRAEAE consultation
+  against Oracle failed a step further in, with a *different* 503:
+  `Consultation persistence failed; audit trail is required.` Root cause,
+  this time in `mnemos-core` itself (not the `mnemos-graeae` add-on):
+  `OracleConsultationsRepository.create_consultation_with_audit` inserts
+  `graeae_audit_log` in two steps — a placeholder `chain_hash` (the real
+  HMAC hash needs `sequence_num`, which doesn't exist until the row is
+  inserted), then an `UPDATE` once it's computed. Postgres and SQLite use
+  `""` as that placeholder because both distinguish an empty string from
+  `NULL`. Oracle does not — an empty `VARCHAR2` bind is coerced to `NULL`,
+  and `graeae_audit_log.chain_hash` is `NOT NULL`
+  (`db_migrations/migrations_oracle/0002_graeae.sql`) — so `""` raised
+  `ORA-01400: cannot insert NULL into ("MNEMOS"."GRAEAE_AUDIT_LOG".
+  "CHAIN_HASH")` on every single consultation. Fixed in
+  `mnemos/persistence/oracle.py` by using a non-empty, same-length
+  (64 hex chars) sentinel placeholder instead, overwritten by the same
+  `UPDATE` inside the same transaction.
+- **Process note**: this bug was invisible until `6.3.9` fixed the
+  earlier quota-lock crash — every prior request had already 503'd
+  before reaching this code path, so the Oracle-only NULL-coercion defect
+  had zero production traffic to surface it. New regression test:
+  `tests/test_oracle_audit_chain_placeholder.py` (driver-free, captures
+  the bound SQL params the way `test_oracle_recency_dialect.py` does).
+  Verified against the pre-fix code: fails with `AssertionError` on the
+  empty placeholder; passes with the fix.
+
 ## [6.3.9] — 2026-09-14
 
 - **Fixed**: `6.3.8`'s fix for the GRAEAE consult quota 503 was itself
