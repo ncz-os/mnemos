@@ -1,5 +1,5 @@
 -- migration: 0004_hive_events
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- schema:    HIVE_MIND
 -- purpose:   Hive Mind event audit log. SQLite -> Oracle port.
 --            SQLite used AUTOINCREMENT integer id; Oracle uses identity

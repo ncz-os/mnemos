@@ -1,5 +1,5 @@
 -- migration: 0028_federation_peers_copy_embeddings
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- purpose:   v6.1 F-1 — add opt-in per-peer flag controlling whether
 --            /v1/federation/feed payload includes the embedding column.
 -- design:    docs/v6.1-federation-embeddings-copy.md

@@ -7,7 +7,7 @@
 -- deploy the table is absent here and the seed below (and 0044's pricing
 -- ALTERs) fail with ORA-00942. This guarded CREATE makes the Oracle suite
 -- self-contained: it provisions the canonical model_registry shape (mirrors
--- migrations_model_registry.sql; Oracle 23ai types, NUMBER(1) booleans,
+-- migrations_model_registry.sql; Oracle 26ai types, NUMBER(1) booleans,
 -- CLOB-IS-JSON for capabilities/raw_payload) only when no table exists yet.
 -- Idempotent (guarded by USER_TABLES); pricing columns are added by 0044.
 DECLARE

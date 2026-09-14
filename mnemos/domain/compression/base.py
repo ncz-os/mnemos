@@ -44,7 +44,7 @@ BASE_CHUNK_RATIO: float = 0.4              # default: keep 40% of tokens
 # MIN_CHUNK_RATIO floor: catch empty / degenerate output, NOT aggressive
 # dense encoding. APOLLO's schema path produces ~99% reduction by design
 # (500-char portfolio → 5-char "PORTFOLIO:name=..." slot), and a 0.15
-# floor miscategorised those as broken (live PYTHIA contest 2026-04-24
+# floor miscategorised those as broken (live the production host contest 2026-04-24
 # had APOLLO 0-wins / 60 judged because composite was always 0).
 # Use a tighter floor that still catches actual empties (ratio ≈ 0
 # when compressed_tokens ≤ 1) without punishing legitimate dense

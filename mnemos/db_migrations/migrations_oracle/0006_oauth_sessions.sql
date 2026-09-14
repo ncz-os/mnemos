@@ -1,4 +1,4 @@
--- 0006_oauth_sessions.sql — Oracle 23ai/26ai port for MNEMOS parity.
+-- 0006_oauth_sessions.sql — Oracle 26ai/26ai port for MNEMOS parity.
 --
 -- Canonical oauth_sessions matches PostgreSQL (db/migrations_v3_oauth.sql):
 -- DB-backed, revocable session store keyed by session_id, with user_id,

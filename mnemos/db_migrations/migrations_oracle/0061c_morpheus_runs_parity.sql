@@ -1,4 +1,4 @@
--- 0061c_morpheus_runs_parity.sql — Oracle 23ai retcon for MNEMOS parity
+-- 0061c_morpheus_runs_parity.sql — Oracle 26ai retcon for MNEMOS parity
 -- (item 11/11a).
 --
 -- The pre-11a Oracle/DB2 ``morpheus_runs`` shape was an abandoned early
@@ -48,12 +48,12 @@ ALTER TABLE morpheus_runs ADD (triples_extracted               NUMBER(19) DEFAUL
 ALTER TABLE morpheus_runs ADD (memories_processed_for_extraction NUMBER(19) DEFAULT 0 NOT NULL);
 
 -- Canonical shape uses CLOB CHECK (... IS JSON) for ``config`` (Oracle
--- 23ai's native JSON validation). The legacy table had ``metrics CLOB
+-- 26ai's native JSON validation). The legacy table had ``metrics CLOB
 -- CHECK (metrics IS JSON)``; we drop ``metrics`` and add ``config``.
 ALTER TABLE morpheus_runs ADD (config CLOB CHECK (config IS JSON));
 ALTER TABLE morpheus_runs ADD (namespace VARCHAR2(256));
 
--- ── 2. drop legacy ``run_type`` + ``metrics`` columns (Oracle 23ai
+-- ── 2. drop legacy ``run_type`` + ``metrics`` columns (Oracle 26ai
 --       supports DROP COLUMN). Greps confirm neither column is read by
 --       any production path; ``morpheus_runs.run_type`` was an early
 --       "what kind of dream is this" label that never reconciled with

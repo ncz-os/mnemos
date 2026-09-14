@@ -8,7 +8,15 @@ hash-chained audit record for each committed consultation.
 
 ## Runtime Modules
 
-| Capability | Current module | Notes |
+GRAEAE ships as the separate `mnemos-graeae` distribution (`pip install
+mnemos-core[graeae]`, or the `server`/`full` bundles). The
+`mnemos/domain/graeae/*` paths below are runtime paths under the shared
+`mnemos.*` PEP 420 namespace once that wheel is installed alongside
+`mnemos-core` — they are not files present in a `mnemos-core`-only checkout.
+The `mnemos/core/resilience.py` rows are the exception: the resilience
+primitives are core, and GRAEAE consumes them.
+
+| Capability | Runtime module | Notes |
 |---|---|---|
 | Provider routing | `mnemos/domain/graeae/engine.py` | Config-driven providers with OpenAI-compatible, Anthropic, and Gemini adapter paths. |
 | Circuit breaking | `mnemos/core/resilience.py` | Per-provider CLOSED / OPEN / HALF_OPEN guard; Redis-backed in server multi-worker mode, in-process fallback otherwise. |
@@ -61,8 +69,8 @@ request validation with HTTP 422.
 
 OpenAI-compatible access is separate but uses the same routing engine:
 `POST /v1/chat/completions`, `GET /v1/models`, and `GET /v1/models/{model_id}`.
-In v5.0, generation controls propagate when the selected provider supports
-them; unsupported tools, response formats, and multimodal requests are rejected
+Generation controls propagate when the selected provider supports them;
+unsupported tools, response formats, and multimodal requests are rejected
 instead of silently ignored.
 
 ## Audit Model
@@ -76,7 +84,12 @@ Committed consultations write three related records in one transaction:
   consultation, when applicable.
 
 If the audit write fails, consultation persistence fails too. This is the
-current compliance boundary for GRAEAE. MNEMOS does not have one generic
-`audit_log` table for every memory operation in v5.0; memory integrity is
-tracked through the version DAG, webhook delivery rows, compression contest
-records, and subsystem-specific audit tables.
+compliance boundary for GRAEAE.
+
+The `graeae_audit_log` chain covers consultations specifically. It is not a
+single generic `audit_log` table spanning every subsystem, and no such table
+exists — audit is per-subsystem. Memory writes have their own tamper-evident
+chain in `memory_audit_chain` / `memory_audit_roots` (per-memory linear chain
+plus periodic Merkle roots; see [AUDIT_CHAIN.md](AUDIT_CHAIN.md)). Memory
+integrity is tracked additionally through the version DAG, webhook delivery
+rows, and compression contest records.

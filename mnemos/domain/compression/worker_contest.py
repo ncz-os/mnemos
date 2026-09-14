@@ -481,7 +481,7 @@ async def process_contest_queue(
 
     `min_content_length` (default 0 = no gate) skips memories below
     the threshold BEFORE running the contest. Surfaced by the 2026-04-23
-    CERBERUS benchmark: short templated content (git commit headers,
+    a GPU host benchmark: short templated content (git commit headers,
     GRAEAE consultation stubs) can't be meaningfully compressed by any
     engine at the balanced profile's floor. Setting this to e.g. 500
     tells the worker

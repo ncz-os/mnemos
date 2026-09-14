@@ -1,5 +1,5 @@
 -- migration: 0031_memory_category_decay
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- purpose:   v6.2 M-2.2.4 — per-category temporal-decay table for the
 --            retrieval scoring pipeline. Seeded with reasonable defaults;
 --            admin endpoint allows runtime overrides.

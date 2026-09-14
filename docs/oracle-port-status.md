@@ -1,166 +1,218 @@
-# Oracle Porting Status & Gaps
+# Oracle Backend — Status and Coverage
 
-**Date:** 2026-05-21
-**Status:** M7 functionally complete — repository surface fully wired
-against Oracle Database 26ai; functional probes pass. Outstanding work
-is limited to live-pytest parity (gated on env), supporting-module
-port (ConsultationAudit), and operational polish (P3 below).
+**Backend:** Oracle AI Database 26ai (Free and Enterprise), via `python-oracledb`
+async thin client.
+**Status:** Shipped and on `master`. The Oracle backend is a first-class
+`PersistenceBackend` implementation alongside Postgres, SQLite, MySQL/MariaDB
+and Db2.
+**Originally drafted:** 2026-05-21 during the M7 port. Content below describes
+the current implementation, not the state at that date.
 
-## What Works
-- Oracle 26ai Free container running on oracle-host (FREEPDB1)
-- `mnemos` user created + connects
-- CHARON export from production (.67) succeeded (8157 memories)
-- 8157 memories imported into Oracle `memories` table
-- Raw Oracle micro-queries fast (COUNT 0.001s, filter 0.014s, scan100 0.008s)
-- Production API export100 ~0.107s (higher level)
-- **Lifecycle wired (M7 P0):** `mnemos/core/lifecycle.py` recognises
-  `oracle://` and `oracle+oracledb://` DSNs, builds an async oracledb
-  pool via `mnemos.persistence.oracle.create_oracle_pool`, and selects
-  the `oracle` backend branch in `lifespan()`.
-- **OracleBackend ABC-conformant:** all 9 repository properties return
-  instantiable subclasses. Attribute lookups never raise — only
-  unimplemented methods do, with explicit `NotImplementedError`
-  pointing back to this doc.
-- **Migration idempotency:** bare `ALTER TABLE memories ADD (...)` is
-  replaced with a PL/SQL block guarded by `user_tab_columns`; backfill
-  `UPDATE` guarded by EXISTS check on legacy `created_at` /
-  `updated_at`. The migration is safe to replay.
-- **Sidecar schema (M7 P1.3):** migration 0001 now creates
-  `memory_branches`, `state`, `federation_peers`,
-  `webhook_subscriptions`, `memory_compression_candidates`, and
-  `memory_compressed_variants`.
-- **Smoke-verified against oracle-host** (see end of doc).
+Authoritative module: `mnemos/persistence/oracle.py`. Migrations:
+`mnemos/db_migrations/migrations_oracle/`. The legacy `mnemos/db/oracle.py`
+is retained only for CHARON-import script compatibility.
 
-## Repository surface coverage (post-M7 sprint)
+---
 
-| Repository | Wired methods | Stubbed (call-time NotImplementedError) |
+## Selection and wiring
+
+`mnemos/core/lifecycle.py` selects the Oracle backend from the DSN scheme:
+
+```
+oracle://user:pass@host:port/service
+oracle+oracledb://user:pass@host:port/service
+```
+
+It builds an async pool via `mnemos.persistence.oracle.create_oracle_pool` and
+instantiates `OracleBackend`. Handlers and the API layer are dialect-agnostic —
+they consume the `PersistenceBackend` ABC, so switching to Oracle is a DSN
+change and nothing else.
+
+`OracleBackend.capabilities` declares `core`, `oauth`, `sessions`,
+`consultations`, `federation`, `audit`, `state` and `acl`.
+
+## Repository surface
+
+`OracleBackend` exposes 17 repository properties, every one backed by a
+concrete Oracle implementation. Attribute lookup never raises.
+
+| Repository property | Class | Methods |
 |---|---|---|
-| `MemoryRepository` | insert, fetch_by_id, set_suppress_version_snapshot (no-op), fetch_versioned_memory_ids, fetch_memory_head_checks, gather_stats, get_memory, list_memories, update_memory, delete_memory, fts_search (LIKE/INSTR fallback), assert_memory_readable, fetch_memory_export, fetch_referenced_memory_allowlist, find_active_duplicate_by_content_hash (ORA_HASH), fetch_memory_log, fetch_checkout_commit, fetch_diff_commit_pair, bump_recall_and_get_memory, find_duplicate_content_groups, consolidate_duplicate_memories, semantic_search (Oracle Database 26ai VECTOR_DISTANCE COSINE), fetch_memory_context | — |
-| `KGRepository` | insert_kg_triple, fetch_kg_triple_by_id, fetch_kg_triples_for_export | — |
-| `VersionRepository` | insert_memory_version, fetch_memory_version_by_id, fetch_memory_versions_for_export, fetch_memory_versions_by_ids | — |
-| `BranchRepository` | upsert_memory_branch_head, create_memory_branch, delete_memory_branches_for_memories, fetch_memory_branch_heads | — |
-| `CompressionRepository` | compression_candidate_exists, insert_compressed_variant (MERGE upsert), fetch_compressed_variant_by_memory_id, gather_stats, fetch_compressed_variants_for_export | — |
-| `WebhookRepository` | dispatch_event (subscription scan + INSERT into webhook_deliveries) | — |
-| `StateRepository` | get, set (MERGE upsert), delete (soft), list_namespace, delete_namespace | — |
-| `FederationRepository` | full peer CRUD (create_peer, list_peers, get_peer, update_peer, upsert_peer, delete_peer, list_due_peers), fetch_memory_page, feed_query, get_feed_memory, get_sync_peer, fetch_sync_log, create_sync_log, finish_sync_log, record_sync_error, record_sync_success, record_schema_abort, update_peer_schema_check (writes `peer_mnemos_version` + `last_schema_check_at` on `federation_peers`; columns shipped 2026-05-21), fetch_federated_memory_marker, insert_federated_memory, update_federated_memory_if_newer, apply_consolidation_tombstone (writes federation_consolidation_tombstones + soft-delete), delete_federated_memory | — |
-| `ConsultationAuditRepository` | all 5 — safe-default returns (`None` / `[]`) so the GRAEAE engine falls back to its built-in provider defaults | — (real Oracle port of model_registry tables is the proper next step) |
+| `memories` | `OracleMemoryRepository` | 28 |
+| `kg_triples` | `OracleKGRepository` | 3 |
+| `memory_versions` | `OracleVersionRepository` | 4 |
+| `memory_branches` | `OracleBranchRepository` | 4 |
+| `compression` | `OracleCompressionRepository` | 5 |
+| `compression_queue` | `OracleCompressionQueueRepository` | 7 |
+| `morpheus` | `OracleMorpheusRepository` | 17 |
+| `webhooks` | `OracleWebhookRepository` | 13 |
+| `nats_dispatch_log` | `OracleNatsDispatchLogRepository` | 1 |
+| `consultations_audit` | `OracleConsultationAuditRepository` | 11 |
+| `oauth` | `OracleOAuthRepository` | 12 |
+| `sessions` | `OracleSessionsRepository` | 9 |
+| `consultations` | `OracleConsultationsRepository` | 8 |
+| `federation` | `OracleFederationRepository` | 23 |
+| `state_kv` | `OracleStateRepository` | 5 |
+| `audit_chain` | `OracleAuditChainRepository` | 9 |
+| `acl` | `OracleAclRepository` | 4 |
+
+Semantic search runs on Oracle AI Database 26ai `VECTOR(*, FLOAT32)` columns with
+`VECTOR_DISTANCE(..., COSINE)`; the `(*, dim)` typing lets one column serve
+every configured embedding dimension.
+
+### Model registry / consultation audit
+
+`OracleConsultationAuditRepository` is a real implementation, not a
+safe-default shim. It reads and writes the Oracle `model_registry` and
+`model_registry_sync_log` tables directly:
+
+- `fetch_available_models` / `_registry_rows` — `SELECT` over `model_registry`
+  filtered on `available = 1 AND NVL(deprecated, 0) = 0`, preferring the
+  authoritative `provider` column and falling back to model-id/family
+  derivation only for legacy rows with a NULL provider.
+- `lookup_provider_for_model`, `fetch_model_provider` — provider resolution by
+  `model_id`.
+- `upsert_model`, `mark_models_unavailable`, `update_arena_score`,
+  `upsert_model_pricing`, `write_price_history`, `write_model_sync_log` —
+  the full registry-sync write path.
+
+The usage ledger reads `price_in` / `price_out` / `price_cached` from
+`model_registry` to compute `est_cost_usd`; reasoning tokens fall back to the
+output rate because the Oracle `model_registry` carries no reasoning-cost
+column. A missing registry row or missing price is logged and recorded as
+`est_cost_usd=0` rather than failing the call.
 
 ## VisibilityFilter rendering
 
 `_render_visibility(filter, *, table_alias, param_prefix)` in
-`mnemos/persistence/oracle.py` translates `VisibilityScope` into an
-Oracle WHERE clause with named binds:
+`mnemos/persistence/oracle.py` renders a `VisibilityFilter` into an Oracle
+`WHERE` clause with named binds. It is a complete port of the multi-user
+policy used by Postgres and SQLite — not a partial one.
 
-- `ROOT_BYPASS` → no clause (or `namespace = :ns` if pinned).
+- `ROOT_BYPASS` → no tenancy clause, or `namespace = :ns` when pinned.
 - `OWN_ONLY` → `owner_id = :owner AND namespace = :ns`.
-- `READABLE` → world/federation visibility expansion + owner clause,
-  matching the Postgres renderer's `read-visibility predicate set`
-  (live memory reads: owner / federation / world / group). Group
-  membership is gated through the same `group_ids` parameter binder
-  used by `PostgresBackend.assert_memory_readable`; expand-coverage
-  for the v1_multiuser group-policy unix-bits expansion remains a
-  follow-up (P1.4) for the few code paths that still take the
-  partial-scope branch.
+- `READABLE` → the full predicate, namespace-pinned:
+  - `owner_id = :owner` (own rows), **OR**
+  - `federation_source IS NOT NULL` (federated rows), **OR**
+  - `MOD(NVL(permission_mode, 0), 10) >= 4` (world read bit), **OR**
+  - `MOD(TRUNC(NVL(permission_mode, 0) / 10), 10) >= 4 AND group_id IS NOT NULL
+    AND group_id IN (...)` (group read bit **plus** caller group membership —
+    the unix-bits group expansion), **OR**
+  - `EXISTS (SELECT 1 FROM memory_acl macl WHERE macl.memory_id = id AND
+    macl.principal IN (...) AND BITAND(macl.perm, ACL_READ_BIT) > 0)`
+    (explicit ACL grant, over `acl_principals(user_id, group_ids)`).
+- A `None` namespace on any non-root scope renders `1=0`, matching Postgres.
 
-`None` namespace on a non-root scope falls back to `1=0` (same as
-Postgres).
+On top of the tenancy predicate, `_render_visibility` ANDs a vault-subtraction
+term for any namespace in `visibility.exclude_namespaces`:
 
-## Smoke baseline (2026-05-19)
+```sql
+(namespace IS NULL OR namespace NOT IN (:vis_xns_0, ...))
+```
 
-Against oracle-host Oracle 26ai with the 8157-memory baseline:
+This is deliberately applied **even under `ROOT_BYPASS`**, which otherwise
+emits no tenancy filter and would expose vault rows to a root token. The
+`namespace IS NULL` disjunct is load-bearing: `NOT IN` evaluates to UNKNOWN for
+NULL namespaces, which would silently drop legitimate non-vault rows. Vault
+rows always carry a non-NULL namespace, so NULL is never a secret.
 
-- **State** — set+get returns materialized `'hello'` (CLOB OK), delete
-  reports `True`, list after delete reports `[]`.
-- **Federation** — list_peers / list_due_peers / delete_peer (no peers
-  configured) all return cleanly.
-- **Memory CRUD** — fetch_memory_by_id returns 20-column row;
-  gather_stats reports `total=8157 native=8157 federated=0`. Synthetic
-  insert + update + delete cycle passes including OWN_ONLY wrong-owner
-  BLOCK + post-delete invisibility.
-- **Visibility** — `list_memories(ROOT_BYPASS, limit=3)` →
-  3 rows / total=8157; `fts_search('mnemos', limit=3)` → 3 rows;
-  `get_memory(OWN_ONLY same-owner)` → OK,
-  `get_memory(OWN_ONLY wrong-owner)` → None.
-- **Exports & sidecars** — fetch_memory_export(limit=3) → 3 rows;
-  fetch_referenced_memory_allowlist(3 ids) → 3 rows;
-  KG / Version / Branch / Compression `for_export` queries execute
-  cleanly (return 0 because sidecars are empty on oracle-host).
-- **Version DAG** — insert_memory_version × 2 commits, fetch_memory_log
-  returns 2 rows top version_num=2; fetch_checkout_commit("commit-a"):
-  OK; fetch_diff_commit_pair("commit-a", "commit-b"): both OK;
-  create_memory_branch("feature", "commit-a") points head at
-  resolved version_id.
+`_render_visibility_core` provides the tenancy-only render without the vault
+subtraction, for callers that compose their own outer predicate.
 
-## Remaining work (M7 P1+ follow-ups)
+## Migrations and replay safety
 
-### P1 — COMPLETE (0 stubs remaining; was ~71)
-All MemoryRepository / KGRepository / VersionRepository /
-BranchRepository / CompressionRepository / WebhookRepository /
-StateRepository / FederationRepository abstract methods are wired
-with real Oracle SQL. ConsultationAudit returns safe defaults so the
-engine falls back to its built-in provider routing (model_registry
-port is the proper next step).
+Oracle migrations live in `mnemos/db_migrations/migrations_oracle/` as a
+numbered chain (`0001_core_schema.sql` through the current head).
 
-### Deferred (Oracle port of supporting modules)
-- **ConsultationAudit** currently returns safe defaults so the engine
-  does not crash. A full port requires the Oracle equivalents of
-  `mnemos.db.mcp_repo` + `mnemos.db.openai_compat_repo` plus the
-  `model_registry` / `model_recommendations` / `provider_routing`
-  tables. Until then, GRAEAE uses its built-in provider defaults.
-- **peer_mnemos_version / last_schema_check_at columns** on
-  `federation_peers` — Postgres carries these; Oracle now also writes
-  them via `update_peer_schema_check`. (Reconciled 2026-05-21: the
-  code path was active but the doc lagged. Audit finding O9 closed.)
-- **memories.consolidated_into / consolidated_at** columns — Postgres
-  uses these for in-place consolidation metadata; the Oracle path
-  records the canonicalisation in `federation_consolidation_tombstones`
-  + soft-deletes the source instead.
+**Replay safety is a chain-wide property, not a property of one file.** The
+migration runner has no applied-state tracking and replays the full chain on
+every start, so every statement must be safe against both a fresh and an
+already-migrated database. See
+[`docs/PERSISTENCE_ABC_STANDARDIZATION.md`](PERSISTENCE_ABC_STANDARDIZATION.md)
+"Item 5" for the standing principle and for how replay is verified against
+live Oracle and Db2 instances.
 
-### P2 — Tested scope & remaining gaps
+For `0001_core_schema.sql` specifically: Oracle 23c+ supports
+`CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS` but **not**
+`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, so every multi-column `ALTER` is
+wrapped in a PL/SQL block that checks `user_tab_columns` before issuing the
+DDL, and backfill `UPDATE`s are guarded by an `EXISTS` check on the legacy
+column. Do not generalise that specific verification to the rest of the chain —
+each migration carries its own guards.
 
-**Tested (live oracle-host Oracle Database 26ai, 8157-memory baseline):**
-- Functional probes pass on Oracle EE 23.26.1.
-- Memory CRUD, FTS search, visibility filtering, version DAG,
-  branch HEAD upsert, sidecar exports (KG / Version / Branch /
-  Compression), state set/get/delete, federation peer CRUD, MERGE
-  upsert semantics.
-- Migration idempotency (replayable PL/SQL guards).
-- `mnemos/persistence/oracle.py` ABC conformance: all 9 repository
-  properties return instantiable subclasses.
+`scripts/oracle_apply_migration.py` splits a migration file on sqlplus `/` and
+`;` terminators and runs each statement through `oracledb` async, treating
+ORA-00955 / ORA-02275 / ORA-01430 / ORA-04081 as idempotent-replay signals.
 
-**Remaining gaps:**
-- Full live pytest parity in `tests/test_persistence_parity.py` —
-  the Oracle arm is recognized when `ORACLE_DSN` is set but currently
-  skips because the per-backend cleanup helper isn't yet wired; live
-  probe lives in `tests/test_oracle_live.py`.
-- End-to-end CHARON import/export via `/v1/import` and `/v1/export`
-  with Oracle as the live target.
-- Expand CI beyond the basic `test:oracle-smoke` job (run pytest
-  subset, exercise federation sync paths once implemented).
-- Index tuning + Oracle Text / VECTOR setup.
+## Schema notes
 
-### P3 — Polish
-- Dedicated `oraclebench` user on oracle-host (replaces root SSH in
-  `scripts/oracle_vs_pythia_perf.py`).
-- Final docs + merge `feat/oracle-port` → master.
+`0001_core_schema.sql` creates the core tables plus the sidecars:
+`memory_branches`, `state`, `federation_peers`, `federation_sync_log`,
+`federation_consolidation_tombstones`, `webhook_subscriptions`,
+`webhook_deliveries`, `memory_compression_candidates` and
+`memory_compressed_variants`. On `memories` it adds `federation_source`,
+`federation_remote_updated`, `recall_count`, `last_recalled_at`,
+`content_hash` and `embedding`.
 
-## Current Branch
-Oracle port changes are on `feat/oracle-port` (not yet on master).
-Authoritative module is `mnemos/persistence/oracle.py`; legacy
-`mnemos/db/oracle.py` is kept for CHARON-import script compatibility.
+Two deliberate divergences from the Postgres schema:
 
-## Perf Harness Environment
-`scripts/oracle_vs_pythia_perf.py` reads all credentials from environment variables and fails before making network calls if any are missing:
+- **`peer_mnemos_version` / `last_schema_check_at`** on `federation_peers` are
+  present and written by `update_peer_schema_check`.
+- **`memories.consolidated_into` / `consolidated_at`** — the Oracle path
+  records canonicalisation in `federation_consolidation_tombstones` and
+  soft-deletes the source row instead of carrying in-place consolidation
+  metadata on `memories`.
 
-- `MNEMOS_TOKEN`: bearer token for the pg-host MNEMOS API
-- `oracle-host_SSH_PASS`: SSH password consumed by `sshpass -e` through `SSHPASS`
-- `ORACLE_PASS`: Oracle password for the `mnemos` database user on oracle-host
-- `oracle-host_USER` (optional): SSH user (default `root`). **Strongly recommended**: create a dedicated low-privilege `oraclebench` user on oracle-host with forced command limited to the Oracle query script.
-- `oracle-host_HOST` (optional): override target host (default <host>)
+## Testing
 
-The harness uses `ssh -o StrictHostKeyChecking=yes`; dev-workstation must already trust the oracle-host host key before the script is run.
+- `tests/test_persistence_interface.py` — ABC contract conformance.
+- `tests/test_persistence_parity.py` — cross-backend parity; the Oracle arm
+  activates when `ORACLE_DSN` is set.
+- `tests/test_oracle_live.py` — live probe against a running instance.
+- `tests/test_oracle_recency_dialect.py`,
+  `tests/test_oracle_vector_validation.py` — dialect and vector-bind pinning.
+- `scripts/oracle_proof_run.py` — runnable repository-surface proof harness,
+  emits a signed JSON artifact from a live instance.
 
-**Codex note (high):** Root SSH for read-only benchmark has host-level blast radius. Replace with dedicated benchmark user before operational use.
+Known live-test constraint: Oracle write-path verification requires the test
+container's CDB to be open READ WRITE. A CDB opened READ ONLY fails with
+`ORA-65054`; see `docs/PERSISTENCE_ABC_STANDARDIZATION.md` "Open items".
 
-**Owner:** jperlow
-**Last updated:** 2026-05-21
+## Operational follow-ups
+
+These are genuine open items, not blockers on the backend itself:
+
+- **Oracle Text FTS.** `fts_search` uses a `DBMS_LOB.INSTR` substring locator
+  as its deterministic fallback. An inverted index
+  (`CREATE INDEX ... INDEXTYPE IS CTXSYS.CONTEXT`) plus tokenizer setup and
+  index maintenance is the production answer for large corpora.
+- **Vector index tuning.** Linear scan is sub-millisecond at small row counts.
+  `CREATE VECTOR INDEX` (IVF on Free, HNSW on Enterprise with
+  `vector_memory_size` allocated) is worth adding at scale.
+- **Planner statistics.** Run `DBMS_STATS.GATHER_TABLE_STATS` after a bulk
+  load; range-scan plans are otherwise chosen on stale cardinality estimates.
+- **CI breadth.** The `test:oracle-smoke` job could run a wider pytest subset
+  and exercise federation sync paths.
+
+## Performance harness environment
+
+`scripts/oracle_vs_pythia_perf.py` reads all credentials from environment
+variables and fails before making any network call if one is missing. The
+required set is the `REQUIRED_ENV` tuple at the top of the script:
+
+- `MNEMOS_TOKEN` — bearer token for the source MNEMOS API.
+- `ORACLE_PASS` — Oracle password for the `mnemos` database user.
+- an SSH-password variable, consumed by `sshpass -e` through `SSHPASS`.
+
+Two optional variables override the SSH user (default `root`) and the target
+host. The SSH variable names are prefixed with the deployment's Oracle host
+name, so the exact literals are not reproduced here — read them from
+`REQUIRED_ENV` and the `os.environ.get` calls at the top of the script.
+
+The harness uses `ssh -o StrictHostKeyChecking=yes`, so the invoking
+workstation must already trust the target host key.
+
+**Security note (unresolved):** the harness defaults to SSH as `root` for a
+read-only benchmark, which carries host-level blast radius. Create a dedicated
+low-privilege benchmark account with a forced command limited to the Oracle
+query script before any operational use.

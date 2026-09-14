@@ -1,4 +1,4 @@
--- 0047_sessions_chat_columns.sql — Oracle 23ai/26ai port for MNEMOS parity.
+-- 0047_sessions_chat_columns.sql — Oracle 26ai/26ai port for MNEMOS parity.
 --
 -- The chat SessionsRepository (create_session, get_session, add_message)
 -- expects the PostgreSQL v2_sessions shape: sessions carry namespace/model/

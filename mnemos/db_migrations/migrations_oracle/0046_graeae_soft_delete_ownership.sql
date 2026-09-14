@@ -1,4 +1,4 @@
--- 0046_graeae_soft_delete_ownership.sql — Oracle 23ai parity.
+-- 0046_graeae_soft_delete_ownership.sql — Oracle 26ai parity.
 --
 -- Mirrors db/migrations/0046_graeae_soft_delete_ownership.sql.
 --

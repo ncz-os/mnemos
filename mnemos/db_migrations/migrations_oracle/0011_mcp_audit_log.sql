@@ -1,4 +1,4 @@
--- 0011_mcp_audit_log.sql — Oracle 23ai port for MNEMOS parity.
+-- 0011_mcp_audit_log.sql — Oracle 26ai port for MNEMOS parity.
 
 CREATE TABLE mcp_audit_log (
     id VARCHAR2(36) PRIMARY KEY,

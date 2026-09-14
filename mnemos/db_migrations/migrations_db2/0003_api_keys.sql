@@ -1,5 +1,5 @@
 -- 0003_api_keys.sql — Db2 12.1.5 (Oracle Compat) port for MNEMOS parity.
--- Adapted from Oracle 23ai version with Db2 timestamp / CLOB handling.
+-- Adapted from Oracle 26ai version with Db2 timestamp / CLOB handling.
 
 CREATE TABLE api_keys (
     id VARCHAR(36) NOT NULL PRIMARY KEY,

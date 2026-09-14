@@ -1,5 +1,5 @@
 -- migration: 0003_hive_messages
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- schema:    HIVE_MIND
 -- purpose:   Hive Mind agent-to-agent messages. SQLite -> Oracle port.
 --

@@ -1,4 +1,4 @@
--- 0010_morpheus_extract_run_memories.sql — Oracle 23ai port for MNEMOS parity.
+-- 0010_morpheus_extract_run_memories.sql — Oracle 26ai port for MNEMOS parity.
 
 CREATE TABLE morpheus_extract_run_memories (
     run_id VARCHAR2(36) NOT NULL,

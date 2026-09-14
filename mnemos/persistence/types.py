@@ -51,7 +51,7 @@ def _coerce_text(value: Any) -> str | None:
 def _coerce_json(value: Any) -> Any:
     """Return parsed JSON for a ``model_variants``-style column.
 
-    Drivers hand this back as a dict/list (asyncpg JSONB, Oracle 23ai JSON
+    Drivers hand this back as a dict/list (asyncpg JSONB, Oracle 26ai JSON
     type) or as a JSON string/CLOB (Oracle ``CLOB CHECK (... IS JSON)``,
     sqlite TEXT). Pass structured values through untouched; parse str/bytes;
     on invalid JSON keep the raw materialised text rather than raising.

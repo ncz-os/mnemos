@@ -389,7 +389,7 @@ MNEMOS supports six persistence backends:
 * **PostgreSQL** (`postgres` profile) — the original production target.
   pgvector HNSW for embeddings, asyncpg for I/O, full transactional
   semantics with optional RLS.
-* **Oracle Database 23ai** (enterprise) — HNSW INMEMORY NEIGHBOR GRAPH on the
+* **Oracle AI Database 26ai** (enterprise) — HNSW INMEMORY NEIGHBOR GRAPH on the
   native `VECTOR(768, FLOAT32)` type; JSON Duality View; TDE column
   encryption; oracledb thin-mode driver by default. Module:
   `mnemos/persistence/oracle.py`.
@@ -472,7 +472,7 @@ The trade-off: SQLite serialization-level concurrency is worse
 than Postgres MVCC, and pgvector's HNSW index outperforms
 sqlite-vec's LSH at scale. For 10k-memory edge deployments,
 SQLite is fine; for 10M-memory production, choose PostgreSQL,
-Oracle Database 23ai, IBM Db2 12.1.5, MySQL 9.0+ Enterprise/HeatWave, or
+Oracle AI Database 26ai, IBM Db2 12.1.5, MySQL 9.0+ Enterprise/HeatWave, or
 MariaDB 11.7+ — the five large-scale backends serve the MNEMOS workload
 identically, with vendor-specific value-adds (Oracle: HNSW INMEMORY
 NEIGHBOR GRAPH + JSON Duality + TDE; Db2: DiskANN + native column
@@ -571,7 +571,7 @@ round-trip on the native subset.
 * **Vector index optimization at install time.** Vector-index
   parameter tuning is the operator's job; MNEMOS picks safe
   defaults but doesn't auto-tune. This applies across all
-  large-scale backends — pgvector HNSW (PostgreSQL), Oracle Database 23ai
+  large-scale backends — pgvector HNSW (PostgreSQL), Oracle AI Database 26ai
   HNSW INMEMORY NEIGHBOR GRAPH (Oracle), and DiskANN (Db2 12.1.5)
   each expose vendor-specific tuning knobs that the operator
   sizes against their corpus.
@@ -604,7 +604,7 @@ round-trip on the native subset.
 * `STREAMING_REPLICATION.md` — federation pull/push semantics.
 * `SQLITE_PROFILE.md` — edge-tier deployment guide.
 * `SCALING.md` — production sizing + horizontal scale.
-* `oracle-port-status.md` — Oracle Database 23ai backend status + parity coverage.
+* `oracle-port-status.md` — Oracle AI Database 26ai backend status + parity coverage.
 * `db2-oracle-ee-test-plan.md` — enterprise-backend test topology.
 
 ---

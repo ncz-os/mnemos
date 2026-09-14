@@ -1,8 +1,8 @@
 # MNEMOS Specification
 
 **Version**: v6.3.7 current (patch release on the v6.0.0 split-distribution line; supersedes the v5.0.1 / v5.0.0
-GA line from 2026-05-02). Adds Oracle Database 26ai + IBM Db2 12.1.5 backends behind
-the EPIMONE `PersistenceBackend` ABC.
+GA line from 2026-05-02). Oracle AI Database 26ai, IBM Db2 12.1.5, MySQL and MariaDB
+backends sit behind the EPIMONE `PersistenceBackend` ABC alongside PostgreSQL and SQLite.
 
 > **Packaging note (v6.0.0).** Where this spec says "the `mnemos/` package," that is
 > now the **`mnemos-core`** distribution plus separately installable `mnemos.*`
@@ -13,9 +13,9 @@ the EPIMONE `PersistenceBackend` ABC.
 > [MNEMOS_CORE_BOUNDARY.md](MNEMOS_CORE_BOUNDARY.md), [INSTALL.md](INSTALL.md), and
 > [LAYERED_INSTALL.md](LAYERED_INSTALL.md).
 
-**Status**: Authoritative for MNEMOS 6.1.
-The persistence surface is PostgreSQL, SQLite, Oracle Database 26ai,
-IBM Db2 12.1.5 and MySQL/MariaDB. Behavior
+**Status**: Authoritative for MNEMOS 6.3.
+The persistence surface is PostgreSQL, SQLite, Oracle AI Database 26ai,
+IBM Db2 12.1.5, MySQL and MariaDB — six backends. Behavior
 not described here is either undefined (report as a bug) or scoped to a
 future release via `ROADMAP.md`.
 **Purpose**: supply enough structural detail that a scoping tool
@@ -29,7 +29,7 @@ API_DOCUMENTATION.md respectively.
 ## 1. Abstract
 
 MNEMOS is a memory operating system for agentic software. It is a Python
-3.11+ package (`mnemos/`) exposing a FastAPI service on port 5002, MCP stdio
+3.13+ package (`mnemos/`) exposing a FastAPI service on port 5002, MCP stdio
 and HTTP/SSE transports, background workers, installer helpers, and one
 operator CLI (`mnemos`). It runs in three deployment profiles:
 
@@ -52,22 +52,25 @@ backends, deployment profiles, a unified CLI, and Redis-coordinated
 multi-worker support, plus GDPR
 deletion-request workers, the closed MORPHEUS divergent dream-state pipeline,
 PERSEPHONE archival, PANTHEON, KRONOS, NATS routing-audit substrate, DAG wiring
-for compression derivations, and MCP cross-tenant security gates. The
-`feat/oracle-port` branch (v6 candidate) adds **Oracle Database 26ai** and **IBM Db2
-12.1.5** as first-class persistence backends behind the same
-`PersistenceBackend` ABC, exercised by the shared parity test suite. Apache-2.0.
+for compression derivations, and MCP cross-tenant security gates.
+**Oracle AI Database 26ai**, **IBM Db2 12.1.5**, **MySQL** and **MariaDB** are
+first-class persistence backends behind the same `PersistenceBackend` ABC,
+exercised by the shared parity test suite. Apache-2.0.
 
 ## 2. System Scope
 
-### 2.1 In scope at v5.0.1
+### 2.1 In scope
 
 - **Memory**: CRUD, search, DAG versioning with branch/merge, knowledge-graph
   triples, categories + namespaces, background compression with persisted audit.
-- **Persistence**: `mnemos.persistence.base.PersistenceBackend` with four
+- **Persistence**: `mnemos.persistence.base.PersistenceBackend` with six
   concrete backends, swapped at startup based on `MNEMOS_DATABASE_DSN` /
   `MNEMOS_PERSISTENCE_BACKEND` / `MNEMOS_PROFILE`:
-  - `PostgresBackend` (asyncpg + pgvector HNSW + RLS + LISTEN/NOTIFY)
-  - `OracleBackend` (oracledb + Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH +
+  - `PostgresBackend` (asyncpg + pgvector HNSW + RLS + LISTEN/NOTIFY) —
+    `mnemos/persistence/postgres.py`
+  - `SqliteBackend` (aiosqlite + sqlite-vec + FTS5 + JSON1 + WAL) —
+    `mnemos/persistence/sqlite.py`
+  - `OracleBackend` (oracledb + Oracle AI Database 26ai HNSW INMEMORY NEIGHBOR GRAPH +
     JSON Duality + optional TDE) — `mnemos/persistence/oracle.py`
   - `Db2Backend` (ibm_db + Db2 12.1.5 EAP `VECTOR(768, FLOAT32)` + DiskANN
     vector index — functionality validated using `EUCLIDEAN`, the metric
@@ -77,13 +80,24 @@ for compression derivations, and MCP cross-tenant security gates. The
     translation (`SYSTIMESTAMP`→`CURRENT TIMESTAMP`, `:name` binds → `?`
     positional, etc.) at query time. This carries parse-time overhead and
     prevents the Db2 optimizer from seeing native dialect tokens directly;
-    a full **native Db2 dialect port** is tracked on the v6.x roadmap
-    (`docs/v6.1-roadmap.md`) and will A/B native vs Oracle-compat on the
+    a full **native Db2 dialect port** is planned in
+    `docs/native-db2-port-plan.md` and will A/B native vs Oracle-compat on the
     same DiskANN index. `Db2MemoryRepository.semantic_search` is already
     overridden with native Db2 SQL (`VECTOR_DISTANCE(..., EUCLIDEAN)` +
     `FETCH APPROX FIRST`) so the DiskANN index actually engages on the
     user-facing query path. Module: `mnemos/persistence/db2.py`
-  - `SqliteBackend` (aiosqlite + sqlite-vec + FTS5 + JSON1 + WAL)
+  - `MySQLBackend` (aiomysql + MySQL 9.0+ `VECTOR` columns and
+    `VECTOR_DISTANCE` / `TO_VECTOR`). `VECTOR_DISTANCE` ships in MySQL
+    Enterprise / HeatWave and the managed services built on them, not in
+    Community Edition — this is the Enterprise/cloud MySQL-family backend.
+    Module: `mnemos/persistence/mysql.py`
+  - `MariaDBBackend` (aiomysql + MariaDB 11.7+ `VECTOR` columns,
+    `VEC_DISTANCE_COSINE` / `VEC_FromText`, HNSW `VECTOR INDEX`). MariaDB
+    Community ships native vector search, making this the default
+    open-source self-hosted backend. It reuses the MySQL pool, transaction,
+    cursor, and repository machinery and overrides only the vector DDL and
+    the JSON-binding paths (MariaDB has no native `CAST(... AS JSON)`).
+    Module: `mnemos/persistence/mariadb.py`
 - **Reasoning (GRAEAE)**: multi-LLM consultation across registered providers
   with cryptographic hash-chain audit, Custom Query lineup selection,
   routing-strategy modes (`auto`, `local`, `external`, `all`), reasoning-shape
@@ -126,7 +140,7 @@ for compression derivations, and MCP cross-tenant security gates. The
 - **Two-protocol surface**: REST over HTTP plus MCP over stdio and HTTP/SSE
   from one tool registry.
 
-### 2.2 Explicitly out of scope at v5.0.1
+### 2.2 Explicitly out of scope
 
 - A target-scope write fence for the GDPR final-verify race. The v5.0
   deletion-request workflow ships with the bounded verify loop documented in
@@ -149,20 +163,26 @@ for compression derivations, and MCP cross-tenant security gates. The
 
 ## 3. Architecture And Subsystem Inventory
 
-The v5.0 source tree is organized by boundary:
+The source tree is organized by boundary:
 
 ```text
 mnemos/
   api/routes/      FastAPI route adapters
   core/            config, lifecycle, visibility, pool, resilience primitives
   db/              repository functions and SQL access helpers
+  db_migrations/   ordered SQL migration chains, one per dialect
   domain/          business logic: compression, GRAEAE, MORPHEUS, portability
-  persistence/     backend ABC plus Postgres and SQLite implementations
+  persistence/     backend ABC plus the six concrete backend implementations
+  audit/           audit-chain key material and proof generation
+  federation/      cross-instance pull client and schema preflight
+  nats/            routing-audit publication and consumer
+  portability/     MPF reader/writer and sidecar handling
+  runtime/         embedder backends and hardware probing
   mcp/             stdio + HTTP/SSE transports and tool registry
   webhooks/        validation, dispatcher, delivery/recovery/repair workers
   workers/         out-of-process background workers
   installer/       install wizard, db bootstrap, service generation
-  tools/           CHaron/MPF utilities and adapters
+  tools/           CHARON/MPF utilities and adapters
   cli/             unified Typer command surface
 ```
 
@@ -188,8 +208,8 @@ dependencies; persistence has no upward dependencies.
 
 | ID | REST router / module | DB tables | Role |
 |----|----------------------|-----------|------|
-| consultations | `mnemos/api/routes/consultations.py` + `mnemos/domain/graeae/engine.py` | `graeae_consultations`, `graeae_audit_log`, `consultation_memory_refs` | Multi-LLM reasoning with hash-chain audit |
-| providers | `mnemos/api/routes/providers.py` + `mnemos/domain/graeae/provider_sync.py` | `model_registry`, `model_registry_sync_log` | Provider inventory + model registry + scheduled sync |
+| consultations | `mnemos/api/routes/consultations.py` + `mnemos/domain/graeae/engine.py` | `graeae_consultations`, `graeae_audit_log`, `consultation_memory_refs` | Multi-LLM reasoning with hash-chain audit (GRAEAE add-on) |
+| providers | `mnemos/api/routes/providers.py` + `mnemos/domain/graeae/provider_sync.py` | `model_registry`, `model_registry_sync_log` | Provider inventory + model registry + scheduled sync (GRAEAE add-on) |
 
 GRAEAE reliability modules live under `mnemos/domain/graeae/`. Redis-backed
 rate limiter, circuit breaker, and concurrency limiter coordinate multi-worker
@@ -208,22 +228,32 @@ warning when used with multiple workers.
 | visibility | `mnemos/core/visibility.py` | - | Live and historical read predicates; `MN001` conflict mapping |
 | federation | `mnemos/api/routes/federation.py` | `federation_peers`, `federation_sync_log` | Pull-based peer sync and schema preflight |
 | webhooks | `mnemos/api/routes/webhooks.py`, `mnemos/webhooks/` | `webhook_subscriptions`, `webhook_deliveries` | Outbound delivery, leases, repair/recovery |
-| portability | `mnemos/api/routes/portability.py`, `mnemos/domain/portability/` | - | `/v1/export` + `/v1/import` (MPF v0.1) |
-| document_import | `mnemos/api/routes/document_import.py` | - | Docling-based PDF/DOCX/HTML extraction |
+| portability | `mnemos/api/routes/portability.py`, `mnemos/portability/` | - | `/v1/export` + `/v1/import` (MPF v0.1; CHARON add-on) |
+| ingest | `mnemos/api/routes/ingest.py` | - | Universal ingest and Docling-based PDF/DOCX/HTML extraction (CHARON add-on) |
 
 ### 3.4 Persistence feature matrix
 
-| Capability | PostgresBackend | OracleBackend | Db2Backend | SqliteBackend |
-|---|---|---|---|---|
-| Driver | asyncpg | oracledb (thin by default) | ibm_db | aiosqlite |
-| Vector search | pgvector HNSW (`vector` type) | Oracle Database 26ai HNSW INMEMORY NEIGHBOR GRAPH (`VECTOR(768, FLOAT32)`) | Db2 12.1.5 EAP DiskANN (`VECTOR(768, FLOAT32)`; native Db2 `semantic_search` override implemented — emits `VECTOR_DISTANCE(..., EUCLIDEAN)` + `FETCH APPROX FIRST K ROWS ONLY` to engage the DiskANN index; `MNEMOS_DB2_VECTOR_INDEX=approx|exact` toggles index engagement; `Db2Backend.open` probes `DB2_VECTOR_INDEXING=YES` registry var and warns when missing) | sqlite-vec when available, cosine fallback otherwise |
-| Full-text search | PostgreSQL FTS / tsvector | Oracle Text (LIKE/INSTR fallback today) | LIKE/INSTR fallback (Db2 TEXT_SEARCH planned) | FTS5 |
-| JSON | jsonb | JSON Duality View (Oracle Database 26ai) | JSON BSON | JSON text + JSON1 |
-| Transactions | ACID, row locks, advisory locks | ACID, row locks | ACID, row locks | WAL, serialized writer mutex |
-| Tenancy enforcement | application predicates + optional RLS | application predicates (visibility renderer) | application predicates (visibility renderer) | application predicates only |
-| Notifications | LISTEN/NOTIFY | AQ (planned) | event queue (planned) | polling |
-| Multi-worker profile | supported with Redis | supported with Redis | supported with Redis | not recommended; edge/dev are single-worker |
-| TDE / column encryption | optional via pgcrypto | Oracle TDE (verified) | Db2 native encryption | n/a |
+| Capability | Postgres | SQLite | Oracle | Db2 | MySQL | MariaDB |
+|---|---|---|---|---|---|---|
+| Module | `persistence/postgres.py` | `persistence/sqlite.py` | `persistence/oracle.py` | `persistence/db2.py` | `persistence/mysql.py` | `persistence/mariadb.py` |
+| Driver | asyncpg | aiosqlite | oracledb (thin by default) | ibm_db | aiomysql | aiomysql |
+| Minimum server | PostgreSQL 15+ with pgvector | SQLite 3.35.0 (enforced at open by `_check_sqlite_version`) | Oracle AI Database 26ai | Db2 12.1.5 EAP | MySQL 9.0+ (Enterprise / HeatWave) | MariaDB 11.7+ |
+| Vector search | pgvector HNSW (`vector`) | sqlite-vec when available, cosine fallback otherwise | HNSW INMEMORY NEIGHBOR GRAPH (`VECTOR(768, FLOAT32)`) | DiskANN (`VECTOR(768, FLOAT32)`, `EUCLIDEAN`) — see note | `VECTOR` + `TO_VECTOR` / `VECTOR_DISTANCE` | `VECTOR` + `VEC_FromText` / `VEC_DISTANCE_COSINE`, HNSW `VECTOR INDEX` |
+| Full-text search | tsvector / `plainto_tsquery` | FTS5 | Oracle Text (LIKE/INSTR fallback today) | LIKE/INSTR fallback | `FULLTEXT` + `MATCH … AGAINST` | `FULLTEXT` + `MATCH … AGAINST` |
+| JSON | `jsonb` | JSON text + JSON1 | JSON Duality View | JSON BSON | native `JSON` columns | `LONGTEXT` + `JSON_VALID` CHECK (no `CAST(… AS JSON)`) |
+| Placeholders | `$n` numeric | `?` positional | `:name` named | `?` positional (translated from `:name`) | `%s` positional | `%s` positional |
+| Transactions | ACID, row locks, advisory locks | WAL, serialized writer mutex | ACID, row locks | ACID, row locks | InnoDB ACID, row locks | InnoDB ACID, row locks |
+| Tenancy enforcement | application predicates + optional RLS | application predicates only | application predicates (visibility renderer) | application predicates (visibility renderer) | application predicates (visibility renderer) | application predicates (visibility renderer) |
+| Notifications | LISTEN/NOTIFY | polling | AQ (planned) | event queue (planned) | polling | polling |
+| Multi-worker profile | supported with Redis | not recommended; edge/dev are single-worker | supported with Redis | supported with Redis | supported with Redis | supported with Redis |
+| TDE / column encryption | optional via pgcrypto | n/a | Oracle TDE | Db2 native encryption | InnoDB tablespace encryption | InnoDB tablespace encryption |
+
+Db2 vector note: `Db2MemoryRepository.semantic_search` is overridden with native
+Db2 SQL (`VECTOR_DISTANCE(..., EUCLIDEAN)` + `FETCH APPROX FIRST K ROWS ONLY`)
+so the DiskANN index engages on the user-facing query path.
+`MNEMOS_DB2_VECTOR_INDEX=approx|exact` toggles index engagement, and
+`Db2Backend.open` probes the `DB2_VECTOR_INDEXING=YES` registry variable and
+warns when it is missing.
 
 ### 3.5 Workers, compression, and client protocols
 
@@ -292,9 +322,17 @@ of memory_id + version_num + content + snapshot_at). Unique index.
 
 ### 4.2 Migrations
 
-SQL migrations in `db/` and `db/migrations_sqlite/` are idempotent. Canonical
-order is defined in `mnemos/installer/db.py`, mirrored by `docker-compose.yml`
-and `docker-compose.staging.yml` initdb mounts:
+SQL migrations live under `mnemos/db_migrations/`, are idempotent, and are
+ordered per dialect: the Postgres chain at the top level of that directory plus
+`mnemos/db_migrations/migrations/`, and dialect mirrors in
+`mnemos/db_migrations/migrations_sqlite/`, `migrations_oracle/`,
+`migrations_db2/`, `migrations_mysql/`, and `migrations_mariadb/`.
+
+The canonical Postgres order is the 76-entry `migration_files` list in
+`mnemos/installer/db.py`, mirrored by the `docker-compose.yml` and
+`docker-compose.staging.yml` initdb mounts. Component-scoped installs apply a
+subset of it via `selected_migration_groups()`; the order within the subset is
+preserved because later migrations assume earlier schema.
 
 1. `migrations.sql` (v1 baseline)
 2. `migrations_v1_multiuser.sql` (users, api_keys, groups, RLS policies)
@@ -334,10 +372,53 @@ and `docker-compose.staging.yml` initdb mounts:
 36. `migrations_v3_5_session_compression_ratio_drop.sql` (drop fiction ratio columns)
 37. `migrations_v3_5_session_compression_legacy_drop.sql` (drop legacy session compression fields)
 38. `migrations_v3_5_sessions_consultations_namespace.sql` (sessions/consultations namespace)
+39. `migrations_v4_2_users_username.sql` (`users.username`)
+40. `migrations_v4_2_compression_candidates_nullable_tokens.sql` (nullable token counts)
+41. `migrations_v4_2_state_value_text.sql` (widen `state.value` to text)
+42. `migrations_v4_2_document_import_chunk_idempotency.sql` (per-chunk import idempotency)
+43. `migrations_v4_2_deletion_requests.sql` (GDPR deletion-request table)
+44. `migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql` (blank-namespace backfill)
+45. `migrations_v4_2_deletion_requests_soft_delete_columns.sql` (soft-delete columns)
+46. `migrations_v4_2_deletion_requests_sweep_verifying.sql` (sweep/verifying states)
+47. `migrations_v4_2_compression_dag.sql` (compression-derivation DAG wiring)
+48. `migrations_v4_2_morpheus_consolidate.sql` (MORPHEUS CONSOLIDATE phase)
+49. `migrations_v4_2_morpheus_extract.sql` (MORPHEUS EXTRACT phase)
+50. `migrations_v4_2_persephone.sql` (PERSEPHONE archival tables)
+51. `migrations_v4_2_pantheon_routing_audit.sql` (PANTHEON routing audit)
+52. `migrations_v5_0_consolidated_at.sql` (`consolidated_at` marker)
+53. `migrations_v5_0_morpheus_extract_run_memories.sql` (extract-run ↔ memory join)
+54. `migrations_v5_0_2_artemis_dedup.sql` (ARTEMIS candidate dedup)
+55. `migrations_v5_0_3_timestamp_tz_upgrade.sql` (timestamptz upgrade)
+56. `migrations_v5_1_0_deletion_log.sql` (append-only deletion log)
+57. `migrations_v5_2_0_nats_outbox_idempotency.sql` (NATS outbox idempotency)
+58. `migrations_v5_2_2_fts_gin_index.sql` (FTS GIN index)
+59. `migrations_v5_3_3_deletion_log_export_index.sql` (deletion-log export index)
+60. `migrations_v5_3_4_mcp_audit_log.sql` (MCP audit log)
+61. `migrations_v5_3_5_model_registry_capabilities_gin.sql` (registry capabilities GIN)
+62. `migrations_v5_4_0_mcp_oauth.sql` (MCP OAuth client/token tables)
+63. `migrations_v5_4_1_morpheus_extract_failures.sql` (extract failure records)
+64. `migrations/0021_hive_agents.sql` (hive agent registry; created before entry 69 alters it)
+65. `migrations/0032_usage_ledger.sql` (usage ledger)
+66. `migrations/0033_subscription_plans.sql` (subscription plans)
+67. `migrations/0034_usage_ledger_session_tracking.sql` (per-session usage tracking)
+68. `migrations/0035_subscription_plans_date_aware.sql` (date-aware plan limits)
+69. `migrations/0036_hive_agents_subscription_pools.sql` (agent ↔ subscription pools)
+70. `migrations/0037_deepseek_direct_provider_seed.sql` (registry provider seed)
+71. `migrations/0038_oauth_sessions_consultations.sql` (OAuth session ↔ consultation link)
+72. `migrations/0039_knemon_dispatch_rule_refresh.sql` (dispatch-rule refresh)
+73. `migrations/0039_subscription_plan_current_limits.sql` (current plan limits)
+74. `migrations/0043_memory_acl.sql` (per-principal memory ACL grants)
+75. `migrations/0048_memory_versions_visibility.sql` (per-snapshot visibility columns)
+76. `migrations/0054_memory_tags.sql` (memory tags)
+
+Entries 1–63 sit at the top level of `mnemos/db_migrations/`; entries 64–76 are
+relative to `mnemos/db_migrations/migrations/`.
 
 All migrations pattern: `BEGIN; <add-column>/<backfill>/<set-default>
 /<set-not-null>/<add-constraint>; COMMIT;`. Idempotent via
-`IF NOT EXISTS` and `ADD COLUMN IF NOT EXISTS`.
+`IF NOT EXISTS` and `ADD COLUMN IF NOT EXISTS`. A migration that is absent on
+disk is skipped rather than failing; the first migration that errors aborts the
+run, because later migrations assume earlier schema.
 
 ### 4.3 Referential integrity
 
@@ -369,30 +450,41 @@ belongs to the same memory before ordinary UPDATE/DELETE writes.
 
 ## 5. Interface Contracts
 
-### 5.1 REST (101 route declarations, 21 routers)
+### 5.1 REST (114 route declarations, 21 routers)
 
-Surface breakdown:
+Core surface breakdown, one row per router module in `mnemos/api/routes/`:
 
-| Area | Endpoints | Representative path |
-|------|-----------|---------------------|
-| Memories CRUD + search | 10 | `POST /v1/memories/search`, `GET /v1/memories/{id}`, `POST /v1/memories/rehydrate` |
-| Versioning + DAG | 9 | `GET /v1/memories/{id}/versions`, `POST /v1/memories/{id}/branch`, `POST /v1/memories/{id}/merge` |
-| Knowledge graph | 5 | `POST /v1/kg/triples`, `GET /v1/kg/triples`, `GET /v1/kg/timeline/{subject}` |
-| Entities | 7 | `POST /entities`, `GET /entities/{id}`, `POST /entities/{id}/link` |
-| State | 4 | `GET /state/{key}`, `PUT /state/{key}` |
-| Journal | 3 | `GET /journal`, `POST /journal` |
-| Sessions | 5 | `POST /v1/sessions`, `POST /v1/sessions/{id}/messages` |
-| Consultations (GRAEAE) | 7 | `POST /v1/consultations`, `GET /v1/consultations/audit/verify` |
-| Providers + registry | 5 | `GET /v1/providers`, `GET /v1/providers/health`, `GET /v1/providers/recommend`, `GET /v1/models` |
-| Gateway (OpenAI-compat) | 1 | `POST /v1/chat/completions` |
-| Federation | 10 | `POST /v1/federation/peers`, `GET /v1/federation/feed`, `GET /v1/federation/schema` |
-| Webhooks | 5 | `POST /v1/webhooks`, `GET /v1/webhooks/{id}/deliveries` |
-| Ingest + documents | 3 | `POST /ingest/session`, `POST /v1/documents/import`, `POST /v1/documents/batch-import` |
-| Portability (MPF) | 2 | `GET /v1/export`, `POST /v1/import` |
-| Admin | 15 | `POST /admin/users`, `POST /admin/users/{id}/apikeys`, `POST /admin/compression/enqueue-all` |
-| OAuth | 5 | `GET /auth/oauth/{provider}/login`, `GET /auth/oauth/{provider}/callback` |
-| Health + metrics | 3 | `GET /health`, `GET /stats`, `GET /metrics` |
-| MORPHEUS | 3 | `GET /v1/morpheus/runs`, `GET /v1/morpheus/runs/{id}`, `GET /v1/morpheus/runs/{id}/clusters` |
+| Router | Routes | Representative path |
+|--------|--------|---------------------|
+| `admin.py` | 25 | `POST /admin/users`, `POST /admin/users/{id}/apikeys`, `POST /admin/compression/enqueue-all` |
+| `federation.py` | 11 | `POST /v1/federation/peers`, `GET /v1/federation/feed`, `GET /v1/federation/schema` |
+| `memories.py` | 9 | `POST /v1/memories/search`, `GET /v1/memories/{id}`, `POST /v1/memories/rehydrate` |
+| `entities.py` | 7 | `POST /entities`, `GET /entities/{id}`, `POST /entities/{id}/link` |
+| `dag.py` | 5 | `GET /v1/memories/{id}/log`, `POST /v1/memories/{id}/branch`, `POST /v1/memories/{id}/merge` |
+| `kg.py` | 5 | `POST /v1/kg/triples`, `GET /v1/kg/triples`, `GET /v1/kg/timeline/{subject}` |
+| `morpheus.py` | 5 | `GET /v1/morpheus/runs`, `GET /v1/morpheus/runs/{id}/clusters` |
+| `oauth.py` | 5 | `GET /auth/oauth/{provider}/login`, `GET /auth/oauth/{provider}/callback` |
+| `sessions.py` | 5 | `POST /v1/sessions`, `POST /v1/sessions/{id}/messages` |
+| `webhooks.py` | 5 | `POST /v1/webhooks`, `GET /v1/webhooks/{id}/deliveries` |
+| `audit.py` | 4 | `GET …/pubkey`, `GET …/proof`, `GET …/inclusion_proof` |
+| `openai_compat.py` | 4 | `POST /v1/chat/completions`, `GET /v1/models` |
+| `state.py` | 4 | `GET /state/{key}`, `PUT /state/{key}` |
+| `versions.py` | 4 | `GET /v1/memories/{id}/versions`, `GET /v1/memories/{id}/diff` |
+| `acl.py` | 3 | per-principal memory grants |
+| `admin_decay.py` | 3 | category-decay administration |
+| `journal.py` | 3 | `GET /journal`, `POST /journal` |
+| `kronos.py` | 3 | `GET /v1/kronos/anomalies`, `GET /v1/kronos/drift`, `GET /v1/kronos/forecast` |
+| `health.py` | 2 | `GET /health`, `GET /stats` |
+| `mcp_audit.py` | 1 | `POST /mcp_audit` |
+| `narrate.py` | 1 | `GET /v1/memories/{id}/narrate` (APOLLO dense-form narration) |
+
+Add-on distributions mount further routers on top of these when installed and
+enabled: GRAEAE adds `consultations` and `providers`, CHARON adds `portability`
+and `ingest` (MPF export/import and document import), PANTHEON adds
+`/pantheon/v1`, and KNEMON adds the ledger, dashboard, router, and utilization
+surfaces. Core boots and serves the table above with none of them present; the
+Prometheus `/metrics` router is mounted separately from
+`mnemos/core/observability.py`.
 
 All REST endpoints use Pydantic request/response models (defined in
 `mnemos/domain/models.py`). All non-public endpoints require Bearer auth or
@@ -592,9 +684,10 @@ timestamp)`. Chain-verify endpoint: `GET /v1/consultations/audit/verify`
 
 ### 8.1 Required runtime
 
-- **Python 3.11+**. The `tomllib` stdlib dependency bounds us.
-- **PostgreSQL 15+** with `pgvector` extension. Latency target: <5 ms
-  for the worker's dequeue path.
+- **Python 3.13+** (`requires-python` in `pyproject.toml`).
+- **A supported database**: PostgreSQL 15+ with `pgvector` on the `server`
+  profile, SQLite on `edge` / `dev`, or one of the Oracle / Db2 / MySQL /
+  MariaDB backends. Latency target: <5 ms for the worker's dequeue path.
 - **Filesystem**: ~1 KB/row for memory text; ~1.5× row count at
   ~2 KB/row for compression candidates; rolling backups 2× live
   corpus.
@@ -604,59 +697,108 @@ timestamp)`. Chain-verify endpoint: `GET /v1/consultations/audit/verify`
 
 ### 8.2 Python dependencies (required core runtime)
 
+The 18 entries in `[project].dependencies`:
+
 ```
-fastapi>=0.115.0           # HTTP surface
-uvicorn[standard]>=0.30.0  # ASGI server
-starlette>=0.40.0          # Middleware + session cookie
-pydantic>=2.8.0            # Models / validation
-python-multipart>=0.0.9    # File upload handling
-asyncpg>=0.29.0            # Postgres async driver (primary)
-httpx>=0.27.0              # Outbound HTTP (providers, federation, webhooks)
-slowapi>=0.1.9             # Rate limiting
-limits>=3.6.0              # SlowAPI backend
-redis>=5.0.0               # Optional SlowAPI/cache backend
-python-dotenv>=1.0.0       # .env loading
-mcp>=1.0.0                 # MCP stdio server
-authlib>=1.3.0             # OAuth/OIDC
-itsdangerous>=2.2.0        # Starlette session signing
-prometheus_client>=0.20.0  # /metrics exposition
-typer>=0.9.0               # Unified CLI
+fastapi>=0.115.0,<0.137       # HTTP surface; upper bound below the router-nesting refactor
+uvicorn[standard]>=0.30.0     # ASGI server
+gunicorn>=22.0.0              # Multi-worker process manager
+starlette>=0.40.0             # Middleware + session cookie
+pydantic>=2.8.0               # Models / validation
+pydantic-settings>=2.0.0,<2.12 # Settings singleton; upper bound preserves env-over-init precedence
+python-multipart>=0.0.9       # File upload handling
+asyncpg>=0.29.0               # Postgres async driver (primary)
+httpx>=0.27.0                 # Outbound HTTP (providers, federation, webhooks)
+llama-cpp-python>=0.3         # In-process GGUF embedding generation
+slowapi>=0.1.9                # Rate limiting
+limits>=3.6.0                 # SlowAPI backend
+python-dotenv>=1.0.0          # .env loading
+mcp>=1.0.0,<2                 # MCP stdio + HTTP/SSE server
+authlib>=1.3.0                # OAuth/OIDC
+PyJWT>=2.8.0                  # Token signing/verification
+itsdangerous>=2.2.0           # Starlette session signing
+typer>=0.9.0                  # Unified CLI
 ```
+
+Two upper bounds are load-bearing rather than conservative. FastAPI 0.137
+nests included routes under `_IncludedRouter`, which breaks the `app.routes`
+introspection the codebase, the tests, and the MCP path-wiring check rely on.
+pydantic-settings 2.12 inverted the precedence between `validation_alias` env
+vars and init kwargs; MNEMOS constructs `_DatabaseSettings(**db_section)` from
+TOML and relies on `PG_BACKEND` / `PG_DSN` env vars overriding those values.
+Lift either pin only after the corresponding path is re-verified.
+
+`psycopg` / `psycopg2` are deliberately not dependencies: both are LGPL-3.0 and
+the runtime closure is kept on permissive licenses. The installer's API-key path
+uses asyncpg against a real Postgres and otherwise shells out to the operator's
+own `psql` binary.
+
+Every other embedder backend — the OpenVINO / optimum-intel path, the
+transformers/torch path, fastembed — is an opt-in extra. `mnemos/runtime/embedder.py`
+imports them lazily and falls back to llama-cpp when absent.
 
 ### 8.3 Python dependencies (optional extras)
 
+35 extras on the `mnemos-core` distribution. Bundle extras recurse through
+`mnemos-core[...]`, so they require pip >= 21.2 or uv.
+
 ```
 [project.optional-dependencies]
-tracing   = [opentelemetry-api, opentelemetry-sdk, opentelemetry-exporter-otlp-proto-http >=1.27.0]
-structlog = [structlog >=25.0.0]
-docling   = [docling >=2.5.0, docling-core >=2.0.0, pillow >=10.0.0]
-morpheus  = [numpy >=1.24]
+# Infrastructure
+redis      = [redis >=5.0.0]                    # shared rate-limit / resilience counters
+tracing    = [opentelemetry-api >=1.27.0, opentelemetry-sdk >=1.27.0,
+              opentelemetry-exporter-otlp-proto-http >=1.27.0]
+structlog  = [structlog >=25.0.0]
+metrics    = [prometheus_client >=0.20.0]       # real /metrics scrape output
+docling    = [docling >=2.5.0, docling-core >=2.0.0, pillow >=10.0.0]
+
+# Backends
+sqlite     = [aiosqlite >=0.20.0, sqlite-vec >=0.1.6]
+oracle     = [oracledb >=4.0.1]                 # thin mode; no Instant Client required
+db2        = [ibm_db >=3.2.4]                   # pulls the Db2 CLI driver at build time
+mysql      = [aiomysql >=0.2.0]                 # MySQL 9.0+ and MariaDB 11.7+
+enterprise = [mnemos-core[oracle,db2,mysql]]
+
+# Feature layers
+morpheus   = [numpy >=1.24]
 persephone = [zstandard >=0.25]
-pantheon  = []
-kronos    = [numpy >=1.24]
-knossos   = []
-apollo    = []
-artemis   = [networkx >=3.3]                                      # ARTEMIS TextRank fallback
-nats      = [nats-py >=2.14.0]
-hot       = [mnemos-hot >=0.2.0]
-edge      = [aiosqlite >=0.20.0, sqlite-vec >=0.1.6]
-server    = [mnemos-os[nats,persephone,pantheon]]
-ml        = [mnemos-os[morpheus,kronos,apollo,artemis,hot]]
-interop   = [mnemos-os[knossos]]
-full      = [mnemos-os[morpheus,persephone,pantheon,kronos,knossos,apollo,artemis,nats,hot,edge]]
-semantic  = [fastembed >=0.3.0]                                    # CPU embeddings, ONNX, no torch
-gpu       = [fastembed-gpu >=0.3.0]                                # NVIDIA CUDA EP via fastembed-gpu
-phi       = [openvino-genai >=2024.4.0, fastembed >=0.3.0]         # Intel iGPU via OpenVINO
-sqlite    = [aiosqlite >=0.20.0, sqlite-vec >=0.1.6]
-dev       = [pytest >=8.0.0, pytest-asyncio >=0.23.0, pytest-cov >=5.0.0, ruff >=0.5.0]
+pantheon   = [mnemos-pantheon >=0.2,<0.3]
+kronos     = [numpy >=1.24]
+kronos-gpu = [cupy >=12]
+knossos    = []
+apollo     = []
+artemis    = [networkx >=3.3, scipy >=1.11]
+nats       = [nats-py >=2.14.0]
+hot        = [mnemos-hot >=0.2.0]
+knemon     = [mnemos-knemon >=0.1,<0.2]
+graeae     = [mnemos-graeae >=0.1,<0.2]
+charon     = [mnemos-charon >=0.1,<0.2]
+
+# Deployment bundles
+edge       = [aiosqlite >=0.20.0, sqlite-vec >=0.1.6]
+server     = [mnemos-core[nats,persephone,pantheon,knemon,graeae,charon]]
+ml         = [mnemos-core[morpheus,kronos,apollo,artemis,hot]]
+interop    = [mnemos-core[knossos]]
+full       = [mnemos-core[morpheus,persephone,kronos,knossos,apollo,artemis,nats,hot,edge],
+              mnemos-pantheon, mnemos-knemon, mnemos-graeae, mnemos-charon]
+
+# Embedder acceleration
+semantic   = [fastembed >=0.3.0]                # CPU embeddings, ONNX, no torch
+gpu        = [fastembed-gpu >=0.3.0]            # NVIDIA CUDA EP via fastembed-gpu
+phi        = [openvino-genai >=2024.4.0, fastembed >=0.3.0]  # Intel iGPU via OpenVINO
+openvino   = [openvino >=2025.0, optimum-intel[openvino] >=1.20, transformers >=4.40]
+cuda       = [torch >=2.3, transformers >=4.40]  # install with the PyTorch CUDA index
+amd        = [torch >=2.3, transformers >=4.40]  # install with the PyTorch ROCm index
+
+dev        = [import-linter >=2.0.0, pytest >=8.0.0, pytest-asyncio >=0.23.0,
+              pytest-cov >=5.0.0, ruff >=0.5.0]
 ```
 
-The semantic/gpu/phi runtime extras are deliberately **torch-free**. ``fastembed`` uses
-ONNX runtime for the same MiniLM/Nomic embedding model family that
-``sentence-transformers`` exposes via torch, but ships ~10–20 MB
-instead of ~700 MB–1 GB of torch + nvidia binary weight. This
-matches the production blueprint at pg-host :5002 (``phi_server.py``
-uses ``fastembed`` + ``openvino_genai`` with no ``import torch``).
+The `semantic` / `gpu` / `phi` runtime extras are deliberately **torch-free**.
+`fastembed` uses ONNX runtime for the same MiniLM/Nomic embedding model family
+that `sentence-transformers` exposes via torch, but ships ~10–20 MB instead of
+~700 MB–1 GB of torch + NVIDIA binary weight. The `openvino` / `cuda` / `amd`
+extras are the heavier transformers-based alternatives for hosts that want them.
 
 GPU acceleration is gated behind the ``[gpu]`` extra (NVIDIA CUDA EP)
 or ``[phi]`` extra (Intel iGPU OpenVINO). Apple Silicon hosts use
@@ -682,29 +824,42 @@ the pip install.
 
 ## 9. Configuration
 
-### 9.1 Environment-variable surface (~35 `MNEMOS_` vars)
+### 9.1 Environment-variable surface (~105 `MNEMOS_` vars)
 
-Grouped by concern:
+`mnemos/core/config.py` declares roughly 160 settings aliases, ~105 of them
+`MNEMOS_`-prefixed; the rest are per-subsystem standards (`PG_*`, `OTEL_*`,
+`GPU_PROVIDER_*`). The groups below are the load-bearing ones.
 
 **Bind + DB**
 - `MNEMOS_BIND` (127.0.0.1), `MNEMOS_PORT` (5002)
 - `MNEMOS_DATABASE_DSN` — **preferred** single-DSN backend selector.
-  Scheme determines backend (`postgres://`, `oracle://`, `db2://`,
-  `sqlite:///`). Overrides per-backend env vars below.
-- `MNEMOS_PERSISTENCE_BACKEND` / `PG_BACKEND` — explicit backend selector
-  (`postgres` | `oracle` | `db2` | `sqlite`); used when DSN is not set.
+  Scheme determines backend. Accepted prefixes, per
+  `mnemos/core/lifecycle.py`: `postgres:` / `postgresql:`, `sqlite:`,
+  `oracle:` / `oracle+oracledb:`, `db2:` / `ibm_db2:` / `db2+ibm_db:`,
+  `mysql:` / `mysql+aiomysql:`, `mariadb:` / `mariadb+aiomysql:`.
+  Overrides the per-backend env vars below.
+- `MNEMOS_PERSISTENCE_BACKEND` / `PG_BACKEND` — explicit backend selector, used
+  when no DSN is set. Accepted names: `postgres` / `postgresql` / `pg`,
+  `sqlite` / `sqlite3`, `oracle` / `oracledb` / `oracle+oracledb`, `db2` /
+  `ibm_db2` / `ibmdb2` / `db2+ibm_db`, `mysql` / `mysql+aiomysql`, `mariadb` /
+  `mariadb+aiomysql`, or `auto`. Anything else fails startup with
+  "expected postgres, sqlite, oracle, db2, mysql, mariadb, or auto".
 - `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD`
   (the `_DatabaseSettings` class in `mnemos/core/config.py`
   uses `env_prefix="PG_"`)
-- `ORACLE_DSN` — Oracle Database 26ai connection string,
+- `ORACLE_DSN` — Oracle AI Database 26ai connection string,
   e.g. `oracle://user:pass@host:1521/service_name`
   (consumed by `_parse_oracle_dsn` in `mnemos/persistence/oracle.py`).
 - `DB2_DSN` — IBM Db2 12.1.5 connection string,
   e.g. `db2://user:pass@host:50000/dbname`
   (consumed by `_parse_db2_dsn` in `mnemos/persistence/db2.py`).
+- MySQL and MariaDB are selected through `MNEMOS_DATABASE_DSN` only,
+  e.g. `mysql://user:pass@host:3306/mnemos` or
+  `mariadb://user:pass@host:3306/mnemos`. Selecting either backend without a
+  matching DSN fails startup with the scheme it expected.
 - `PG_POOL_MIN` (5), `PG_POOL_MAX` (20)
 
-**Oracle pool + vector knobs (2026-05-21 audit posture)**
+**Oracle pool + vector knobs**
 - `MNEMOS_ORACLE_POOL_MIN` (2), `MNEMOS_ORACLE_POOL_MAX` (10),
   `MNEMOS_ORACLE_POOL_INCREMENT` (1) — `oracledb.create_pool_async`
   sizing.
@@ -724,12 +879,16 @@ Grouped by concern:
   by the Oracle / Db2 `semantic_search` paths. NaN / Inf are always
   rejected; the cap protects against accidental giant-array binds.
 
-Backend selection precedence (highest first):
+Backend selection precedence, resolved by `_select_backend_name()` in
+`mnemos/core/lifecycle.py` (highest first):
 
-1. `MNEMOS_DATABASE_DSN` scheme
-2. Per-backend DSN env vars (`ORACLE_DSN`, `DB2_DSN`, `PG_*`)
-3. `MNEMOS_PERSISTENCE_BACKEND` / `PG_BACKEND`
-4. `MNEMOS_PROFILE` defaults (`server` → postgres, `edge`/`dev` → sqlite)
+1. An explicitly set `MNEMOS_DATABASE_DSN` — its scheme decides
+2. An explicitly set `MNEMOS_PERSISTENCE_BACKEND` / `PG_BACKEND` other than `auto`
+3. `ORACLE_DSN` → oracle, then `DB2_DSN` → db2
+4. Explicit Postgres connection config (`PG_HOST` / `PG_PORT` / `PG_USER` …) → postgres
+5. An inherited (non-explicit) backend name other than `auto`
+6. An inherited DSN's scheme
+7. `MNEMOS_PROFILE` defaults (`edge` / `dev` → sqlite, otherwise postgres)
 
 **Auth**
 - `MNEMOS_API_KEY` (default root), `MNEMOS_KEYS_PATH`
@@ -813,7 +972,7 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
   reconciliation guidance instead of a silent cross-memory parent write.
 - RLS group-select policy uses the same Unix group-read bit math as
   application visibility after
-  `db/migrations_v3_5_rls_group_select_unix_bits.sql`.
+  `mnemos/db_migrations/migrations_v3_5_rls_group_select_unix_bits.sql`.
 
 ### 10.4 Known gaps (as of v6.3.7)
 
@@ -865,25 +1024,26 @@ or single-worker opt-out and is unsafe for horizontally scaled production.
 
 ## 12. Complexity Indicators
 
-Raw metrics at v5.0.1, measured from the checked-out tree unless noted.
+Raw metrics measured from the checked-out tree unless noted.
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| Total Python LOC | ~108,000 | Excludes virtualenvs; simple `wc -l` over Python files |
-| Production LOC | ~61,500 | `mnemos/` package + scripts/tools |
-| Test LOC | ~46,600 | tests/ only |
-| Python files | 198+ | Primary modules, excluding tests |
-| Test files | 146 | Unit + integration + live-gated E2E |
-| Test count | 1055+ passing cases in the doc-sweep tier | `pytest` collection includes parametrized cases; DB-gated tests are selectively ignored in CI/doc sweeps |
-| REST endpoints | 102 mounted application routes | Across 21 routers; excludes generated FastAPI docs/openapi routes |
+| Total Python LOC | ~212,000 | `wc -l` over `mnemos/`, `tests/`, `scripts/`, `cli/`, `integrations/`, `benchmarks/`; excludes virtualenvs |
+| Production LOC | ~107,600 | `mnemos/` package only; `scripts/` adds ~11,400 |
+| Test LOC | ~92,600 | `tests/` only |
+| Python files | 206 | Modules under `mnemos/`, excluding tests |
+| Test files | 297 | `tests/**/test_*.py`; unit + integration + live-gated E2E |
+| Test count | ~3,780 collected cases | `pytest --collect-only`; includes parametrized cases. Modules gated on an uninstalled extra fail collection rather than being counted |
+| REST endpoints | 114 route declarations | Across 21 core routers in `mnemos/api/routes/`; add-on distributions mount more (§5.1) |
 | MCP tools | 25 registered | Memory CRUD + KG + stats + DAG + model recommendation + PANTHEON + GRAEAE + deletions + KRONOS; optional PANTHEON/GRAEAE/KRONOS tools are filtered from `tools/list` when their extras are unavailable |
 | DB tables | 32 | See §4.1 |
-| Migrations | 51 Postgres SQL files + 40-file SQLite mirror chain | Idempotent, ordered |
+| Migrations | 76 ordered Postgres migrations | Canonical list in `mnemos/installer/db.py`; dialect mirrors for SQLite, Oracle, Db2, MySQL, MariaDB under `mnemos/db_migrations/` |
 | Named concepts | ~40 | See Appendix H |
-| External service protocols | 4 | Postgres wire, HTTP (providers + peers + webhooks + GPU), OAuth/OIDC, MCP stdio |
-| Required Python deps | 18+ | See §8.2 |
-| Optional dep groups | 6 | build, sqlite, tracing, structlog, docling, full/phi |
-| Env vars (MNEMOS_ prefix) | ~30 | See §9.1 |
+| Persistence backends | 6 | Postgres, SQLite, Oracle, Db2, MySQL, MariaDB |
+| External service protocols | 4 | Database wire, HTTP (providers + peers + webhooks + GPU), OAuth/OIDC, MCP stdio |
+| Required Python deps | 18 | See §8.2 |
+| Optional dep groups | 35 | See §8.3 |
+| Env vars (MNEMOS_ prefix) | ~105 | Of ~160 total settings aliases in `mnemos/core/config.py`; see §9.1 |
 | FK edges | 22+ | Explicit ON DELETE on every edge |
 | Invariants | 15 | See §4.4 |
 | State machines | 5 | Circuit breaker, queue, DAG, OAuth state, audit hash-chain |
@@ -901,9 +1061,10 @@ Registered MCP tools in `mnemos/mcp/tools/__init__.py`: `search_memories`,
 
 Dimensions a scoping tool should weigh separately:
 
-- **Stateful surface**: Postgres schema (32 tables, 22+ FKs, 17
-  migrations) + pgvector integration + advisory locks + hash-chained
-  audit = the single largest complexity driver.
+- **Stateful surface**: the schema (32 tables, 22+ FKs, 76 ordered Postgres
+  migrations plus five dialect mirrors) + vector-index integration + advisory
+  locks + hash-chained audit = the single largest complexity driver. Six
+  backends multiply it: every repository method has a dialect-specific form.
 - **Integration breadth**: 4 external service protocols × N provider
   adapters (currently 8+) × 3 MCP-addressable clients = wide
   integration surface.
@@ -938,10 +1099,10 @@ A scoping tool estimating cost from scratch should bucket:
 | MCP stdio server | 0.5× baseline | Thin wrapper over REST; contract-wire regression test is the complexity |
 | Install / config / ops | 1.0× baseline | Not trivial (profiles, migrations, service unit, Docker) |
 
-Roughly **11-14 full-bucket subsystems** at baseline equivalence. The
-current branch is about 41k LOC of production Python plus 25k LOC of
-tests; v3.5.0 added hardening and tenancy closure rather than a new
-standalone user-facing subsystem.
+Roughly **11-14 full-bucket subsystems** at baseline equivalence, against
+~107,600 LOC of production Python and ~92,600 LOC of tests. The buckets above
+price a single-backend implementation; each additional persistence backend adds
+a full dialect port of every repository method plus its own migration mirror.
 
 ## 13. Version history (summary)
 
@@ -1027,13 +1188,13 @@ See `CHANGELOG.md` for the authoritative list. Selected milestones:
 10. openai_compat  11. sessions       12. health
 13. admin          14. oauth          15. federation
 16. webhooks       17. ingest         18. portability
-19. document_import 20. distillation worker 21. registry_sync
+19. ingest          20. distillation worker 21. registry_sync
 22. MCP stdio/HTTP server 23. persistence backends 24. unified CLI
 
-## B. REST endpoint inventory (102 mounted application routes, router-grouped)
+## B. REST endpoint inventory (114 core route declarations, router-grouped)
 
-(see §5.1 for the count breakdown; full list in the router modules
-at `mnemos/api/routes/*.py`)
+See §5.1 for the per-router breakdown; the full list is in the router modules at
+`mnemos/api/routes/*.py`. Enabled add-on distributions mount additional routers.
 
 ## C. Table inventory (32)
 
@@ -1051,12 +1212,15 @@ memory_stats.
 
 ## D. Migration inventory
 
-Postgres and SQLite migration chains are ordered as applied (see §4.2 for the
-Postgres list and `db/migrations_sqlite/` for the SQLite mirror).
+All migration chains are ordered as applied. §4.2 carries the canonical
+76-entry Postgres order; the dialect mirrors live in
+`mnemos/db_migrations/migrations_sqlite/`, `migrations_oracle/`,
+`migrations_db2/`, `migrations_mysql/`, and `migrations_mariadb/`.
 
-## E. Test inventory (74 test files)
+## E. Test inventory (297 test files)
 
-Unit + integration + live-GPU-gated E2E:
+`tests/**/test_*.py`, unit + integration + live-GPU-gated E2E. A
+representative slice of the top-level suite:
 
 admin_compression_enqueue, admin_federation_role,
 admin_user_namespace, apollo_adversarial, apollo_code,

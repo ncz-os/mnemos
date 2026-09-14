@@ -1,6 +1,6 @@
 # MNEMOS Operations — Multi-Node Deployment & Maintenance
 
-**Status:** Canonical (v6.3.7 production line, updated 2026-07-10)
+**Status:** Canonical (v6.3.7 production line)
 **Audience:** Operators, SREs, release engineers
 **Scope:** Continuous operation and maintenance of MNEMOS production + staging + test clusters
 
@@ -25,7 +25,12 @@ What this doc does NOT cover:
 - High-level architecture (see `README.md` and `docs/MEMORY_ARCHITECTURE.md`)
 - User-facing API (see `API_DOCUMENTATION.md` (root) and `docs/SPECIFICATION.md`)
 
-**Last verified:** 2026-04-26 (all three remotes converged, prod healthy, staging not yet live)
+**Version placeholders:** shell examples use `$MNEMOS_VERSION` for the release being
+deployed; prose and tables use `<current-version>`. Resolve it from the checkout:
+
+```bash
+MNEMOS_VERSION=$(python -c "from mnemos._version import __version__; print(__version__)")
+```
 
 ---
 
@@ -34,28 +39,25 @@ What this doc does NOT cover:
 ### 2.1 Diagram and physical nodes
 
 ```
-                        nas-host (.101)
+                        nas-host
                          nginx LB
                          :80/:443
                       ____|____
                      /         \
                     /           \
-              pg-host (.67)    gpu-host (.96)
-              v5.3 prod       dark prod / GPU host
-              pg17 primary    standby + inference
-              11,756 memories + Apollo Gemma 4 (ports 8080/8081)
-              5,045 compressions
-              pgha-primary
+              pg-host          gpu-host
+              prod             dark prod / GPU host
+              pg16 primary     standby + inference
+              pgha-primary     + GPU inference (ports 8080/8081)
                     |
                     | replication
                     |
                 pgha-standby
-                (gpu-host pg17)
+                (gpu-host pg16)
 
 
-              oracle-host (.25)
+              oracle-host
               staging / restore-drill target
-              Intel i7-6700, 60GB RAM
               Runs latest cut during release drills
               GPU calls proxy to gpu-host
 ```
@@ -64,14 +66,14 @@ What this doc does NOT cover:
 
 | Host | IP | OS | CPU | RAM | GPU | Role | MNEMOS version | Status |
 |---|---|---|---|---|---|---|---|---|
-| **pg-host** | <host> | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v5.3 stable target | ✅ Operational |
-| **gpu-host** | <host> | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v5.3 stable target | ✅ Operational |
-| **oracle-host** | <host> | Debian 12 | Intel i7-6700 | 60GB | — | Staging + restore-drill target | latest cut / release drills | ✅ Used for drills |
+| **pg-host** | <host> | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod, pg16) + GRAEAE + CNXN | current stable tag | ✅ Operational |
+| **gpu-host** | <host> | Debian 12 | 24-core | 125GB | yes | Secondary/dark prod (pg16 standby) + GPU inference | current stable tag | ✅ Operational |
+| **oracle-host** | <host> | Debian 12 | 4-core | 60GB | — | Staging + restore-drill target | latest cut / release drills | ✅ Used for drills |
 | **nas-host** | <host> | TrueNAS | — | — | — | NFS + git origin (planned: LB) | nginx 1.26 (TrueNAS UI proxy only) | ✅ Running |
 
 ### 2.3 Network & authentication
 
-> **Current-state caveat (verified 2026-04-26):** The nginx running on nas-host today is the TrueNAS web UI proxy, **NOT** a MNEMOS HTTP load balancer. All `proxy_pass` entries route to `127.0.0.1:6000` (TrueNAS middleware). There is **no HTTP LB in front of MNEMOS today** — clients hit pg-host at `<host>:5002` directly. gpu-host `:5003` is currently *dark prod* (running but not externally routed). Standing up a real LB on nas-host (or elsewhere) is a **production rollout prerequisite** for the blue-green deploy pattern below to function. Until that's done, "drain a node" means "stop sending it traffic from clients you control" — there's no upstream pool to manipulate.
+> **Load-balancer prerequisite:** The nginx running on nas-host is the TrueNAS web UI proxy, **NOT** a MNEMOS HTTP load balancer — its `proxy_pass` entries route to TrueNAS middleware on loopback. Until a real LB is stood up in front of MNEMOS, clients hit pg-host `<host>:5002` directly and gpu-host `:5003` runs as *dark prod* (up but not externally routed). A real LB is a **prerequisite** for the blue-green deploy pattern in §4 to work as written; without one, "drain a node" means "stop sending it traffic from clients you control" — there is no upstream pool to manipulate.
 
 - **External (planned):** nas-host nginx LB listens on :80 (http) and :443 (https); backends are pg-host + gpu-host on private :5002 + :5003. Status: NOT YET CONFIGURED.
 - **External (today):** Clients hit pg-host `<host>:5002` directly. No fronting LB.
@@ -88,7 +90,7 @@ Production MNEMOS runs on a **canary + ratchet** model: new features bake in sta
 
 | Tier | Host(s) | Version target | Stability | Deployment source |
 |---|---|---|---|---|
-| **Prod** | pg-host + gpu-host | *latest stable* (v5.0.x) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
+| **Prod** | pg-host + gpu-host | latest stable tag (`v<current-version>`) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
 | **Staging** | oracle-host | *latest cut* / next release branch | alpha/rc, real federation | release branch, merged + tagged |
 | **Test** | docker-compose + mnemos-test-pg on gpu-host | *feature branches* | ephemeral, parallel | PR builds via CI, cleaned up post-merge |
 
@@ -112,28 +114,32 @@ oracle-host continues to lead (tests features for next release)
 ### 4.1 Merge to master (alpha stage)
 
 When a feature branch is merged to master:
-1. CI runs (lint + unit tests + integration tests on gpu-host pg17 test instance)
-2. On success, tag `v<major>.<minor>.<patch>-alpha.<N>` (e.g., `v3.4.0-alpha.1`)
-3. Push tag to github + gitlab + argonas
+1. CI runs (lint + unit tests + integration tests on the gpu-host pg16 test instance)
+2. On success, tag `v<major>.<minor>.<patch>-alpha.<N>` (i.e. `v$MNEMOS_VERSION-alpha.<N>`)
+3. Push the tag to every configured git remote (canonical forge + mirrors)
 4. Changelog updated in `CHANGELOG.md` with link to alpha tag
-5. CI publishes `mnemos:v3.4.0-alpha.1` to ghcr.io
+5. Pushing a `vX.Y.Z` tag triggers `.github/workflows/release-images.yml`, which builds
+   amd64 + arm64 and publishes the single supported container package,
+   `ghcr.io/ncz-os/mnemos-enterprise`, as a tagged multi-arch manifest. The core and
+   everything layers are intermediate build stages and are never pushed.
 
 ### 4.2 Deploy to oracle-host (staging bake)
 
 After alpha tag, deploy to staging:
 ```bash
 # On oracle-host via SSH
-sshpass -p $oracle-host_SUDO_PASS ssh root@<host> "
+TAG="v$MNEMOS_VERSION-alpha.1"
+ssh root@<host> "
   cd /opt/mnemos && \
-  git fetch origin v3.4.0-alpha.1 && \
-  git checkout v3.4.0-alpha.1 && \
+  git fetch origin $TAG && \
+  git checkout $TAG && \
   pip install -e . && \
-  sudo systemctl restart mnemos
+  systemctl restart mnemos
 "
 
 # Verify
-curl -H "Authorization: Bearer $TOKEN" http://<host>:5002/health
-# Expected: {"version": "6.3.7", "status": "healthy", ...}
+curl http://<host>:5002/health
+# Expected: HTTP 200, "status": "healthy", and "version" equal to the tag just deployed
 ```
 
 Staging runs for 1–2 weeks. During this period:
@@ -145,8 +151,10 @@ Staging runs for 1–2 weeks. During this period:
 
 When staging is ready, tag stable:
 ```bash
-git tag -a v3.4.0 -m "MNEMOS v3.4.0 — stable" <sha>
-git push origin v3.4.0 gitlab v3.4.0 argonas v3.4.0
+git tag -a "v$MNEMOS_VERSION" -m "MNEMOS v$MNEMOS_VERSION — stable" <sha>
+for remote in $(git remote); do
+  git push "$remote" "v$MNEMOS_VERSION"
+done
 ```
 
 Then **blue-green upgrade** of production:
@@ -165,25 +173,25 @@ ssh root@<host> "
 **Phase 2: Upgrade pg-host**
 ```bash
 # On pg-host
-sshpass -p $pg-host_SUDO_PASS ssh root@<host> "
+ssh root@<host> "
   # Pre-upgrade backup
   pg_dump -U postgres mnemos | gzip > \
-    /mnt/argonas/backups/mnemos/pre-v3.4.0-upgrade-$(date +%Y%m%d_%H%M%S).sql.gz
+    /mnt/backups/mnemos/pre-v$MNEMOS_VERSION-upgrade-\$(date +%Y%m%d_%H%M%S).sql.gz
 
   # Upgrade
   cd /opt/mnemos && \
-  git fetch origin v3.4.0 && \
-  git checkout v3.4.0 && \
-  pip install -e . && \
+  git fetch origin v$MNEMOS_VERSION && \
+  git checkout v$MNEMOS_VERSION && \
+  pip install -e .
 
   # Run migrations (see §5 for safety checks)
   python -m mnemos.installer --upgrade
 
   # Restart
-  sudo systemctl restart mnemos
+  systemctl restart mnemos
 
   # Verify
-  curl -H 'Authorization: Bearer $TOKEN' http://localhost:5002/health
+  curl http://localhost:5002/health
 "
 ```
 
@@ -233,7 +241,10 @@ Every migration must be **safely re-runnable without data loss or corruption**. 
 - For column additions: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` (PostgreSQL 10+)
 - For column drops: wrap in a function with exception handling, or use conditional logic
 
-**Empirical validation:** Migration `db/migrations_charon_trigger_guard.sql` (v3.3) verified as idempotent on 2026-04-25: re-ran it twice on test database, schema and data unchanged both times.
+**Validation:** Prove idempotency before shipping a migration — apply it twice against a
+test database and confirm schema and data are unchanged the second time. Migrations such
+as `mnemos/db_migrations/migrations_charon_trigger_guard.sql` are written to this
+standard and are safe to re-run.
 
 ### 5.2 Migration execution
 
@@ -245,7 +256,7 @@ python -m mnemos.installer --upgrade
 
 # Manually (if needed)
 sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 \
-  -f db/migrations_v3_5_trigger_same_memory_parent.sql
+  -f mnemos/db_migrations/migrations_v3_5_trigger_same_memory_parent.sql
 ```
 
 See `mnemos/installer/db.py` for the canonical migration order. Docker compose,
@@ -257,11 +268,11 @@ Before any migration on production:
 
 ```bash
 # Full dump to NFS (preserves both schema and data)
-pg_dump -U postgres mnemos | gzip > \
-  /mnt/argonas/backups/mnemos/pre-<version>-<timestamp>.sql.gz
+DUMP=/mnt/backups/mnemos/pre-v$MNEMOS_VERSION-$(date +%Y%m%d_%H%M%S).sql.gz
+pg_dump -U postgres mnemos | gzip > "$DUMP"
 
 # Verify dump
-gunzip -t /mnt/argonas/backups/mnemos/pre-v3.4.0-20260426_120000.sql.gz
+gunzip -t "$DUMP"
 # (should exit 0 with no errors)
 ```
 
@@ -277,9 +288,9 @@ Consequence: After upgrading pg-host to a new version with a new migration:
 
 Do not attempt to run a migration directly on the standby.
 
-### 5.5 v3.5 trigger replacement migration
+### 5.5 Trigger replacement migration (same-memory parent guard)
 
-`db/migrations_v3_5_trigger_same_memory_parent.sql` replaces
+`mnemos/db_migrations/migrations_v3_5_trigger_same_memory_parent.sql` replaces
 `mnemos_version_snapshot()` with the same-memory branch HEAD guard.
 The migration is `CREATE OR REPLACE FUNCTION`, so it is safe to re-run.
 
@@ -304,7 +315,7 @@ Manual equivalent for bare-metal or systemd deployments:
 
 ```bash
 sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 \
-  -f db/migrations_v3_5_trigger_same_memory_parent.sql
+  -f mnemos/db_migrations/migrations_v3_5_trigger_same_memory_parent.sql
 ```
 
 Post-apply smoke check:
@@ -357,9 +368,9 @@ Reconciliation procedure:
 5. Retry the original write after the branch row resolves to a
    same-memory version.
 
-Do not repair by reusing another memory's version ID. Slice 2 made that
-failure explicit so corrupt ancestry cannot be hidden by the next normal
-write.
+Do not repair by reusing another memory's version ID. The trigger raises
+`MN001` precisely so corrupt ancestry surfaces instead of being hidden by
+the next normal write.
 
 ---
 
@@ -372,8 +383,8 @@ Daily automated backup at **03:00 UTC** to nas-host NFS:
 ```bash
 # Cron on pg-host (or nas-host as a separate job)
 0 3 * * * pg_dump -U postgres mnemos | gzip > \
-  /mnt/argonas/backups/mnemos/daily-$(date +\%Y\%m\%d-\%H\%M\%S).sql.gz && \
-  find /mnt/argonas/backups/mnemos/ -name 'daily-*.sql.gz' -mtime +30 -delete
+  /mnt/backups/mnemos/daily-$(date +\%Y\%m\%d-\%H\%M\%S).sql.gz && \
+  find /mnt/backups/mnemos/ -name 'daily-*.sql.gz' -mtime +30 -delete
 ```
 
 **Retention:** 30 days rolling (oldest backup is ~29 days old at any given time).
@@ -385,19 +396,20 @@ In addition to daily backup, take an explicit snapshot before any production mig
 ```bash
 # Named for traceability
 pg_dump -U postgres mnemos | gzip > \
-  /mnt/argonas/backups/mnemos/<version>-pre-<datestamp>.sql.gz
+  /mnt/backups/mnemos/<version>-pre-<datestamp>.sql.gz
 ```
 
 ### 6.3 Restore procedure (quarterly drill)
 
-**Status:** Dev↔prod MPF restore drill documented and last run for v3.4.1; repeat before high-risk schema work.
-Repeat quarterly and before high-risk schema work.
+Run the restore drill quarterly and before any high-risk schema work. The full
+dev↔prod MPF procedure is in `docs/RESTORE-DRILL.md`; the short form below restores a
+dump to the staging host.
 
 To restore from backup to oracle-host (test/staging host):
 
 ```bash
 # 1. Get latest backup
-BACKUP=/mnt/argonas/backups/mnemos/daily-20260426-030000.sql.gz
+BACKUP=$(ls -t /mnt/backups/mnemos/daily-*.sql.gz | head -1)
 
 # 2. Verify integrity
 gunzip -t $BACKUP
@@ -424,10 +436,10 @@ The pgha-primary/pgha-standby replication layer is **failover**, not **backup**.
 
 ## 7. Monitoring and alerting
 
-### 7.1 Current state (verified 2026-04-26)
+### 7.1 Current state
 
 **Existing monitoring:**
-- Grafana + Prometheus + cAdvisor on pg-host (4+ days uptime)
+- Grafana + Prometheus + cAdvisor on pg-host
 - Per-node `/health` endpoint (returns JSON status + version)
 - Structured logging via `structlog` → stdout → journalctl (or docker logs)
 - Request-ID correlation via `mnemos/core/observability.py` (soft-optional deps)
@@ -476,9 +488,9 @@ Response (JSON):
 Simple dashboard (Grafana or custom HTML) that queries each node's `/health` and shows:
 
 ```
-pg-host:   5.0.1         (prod target)
-gpu-host: 5.0.1         (dark prod / GPU host)
-oracle-host:  next cut      (staging / restore-drill target)
+pg-host:      <current-version>   (prod target)
+gpu-host:     <current-version>   (dark prod / GPU host)
+oracle-host:  next cut            (staging / restore-drill target)
 ```
 
 Update frequency: 5 minutes (sufficient for drift detection).
@@ -487,11 +499,10 @@ Update frequency: 5 minutes (sufficient for drift detection).
 
 ## 8. LB drain and rejoin
 
-### 8.1 nas-host nginx configuration (TBD)
+### 8.1 nas-host nginx configuration
 
-**Status:** Config location and exact structure not yet read (permission rate-limit on 2026-04-26). To be confirmed next ops cycle.
-
-**Expected pattern:**
+The MNEMOS upstream pool is not yet provisioned (see the load-balancer prerequisite in
+§2.3). Stand it up in this shape:
 
 ```nginx
 upstream mnemos_backends {
@@ -567,7 +578,7 @@ upstream mnemos_backends {
 }
 ```
 
-With this config, if a node's `/health` returns non-200 three times in a row, nginx stops routing to it automatically. **Status:** Not yet confirmed on nas-host; requires ngx_http_upstream_check_module (non-standard).
+With this config, if a node's `/health` returns non-200 three times in a row, nginx stops routing to it automatically. This requires `ngx_http_upstream_check_module`, which is not part of a stock nginx build — confirm it is compiled in before relying on it.
 
 ---
 
@@ -575,10 +586,11 @@ With this config, if a node's `/health` returns non-200 three times in a row, ng
 
 ### 9.1 Problem
 
-During the 2026-04-26 audit:
-- CLAUDE.md claimed pg-host was v3.2.0; reality was v3.3-alpha.1
-- gpu-host had both v3.1.0 (dev artifact on port 5002) and v3.2.0 (prod on port 5003) running simultaneously
-- No automated detection caught the drift
+Version drift is silent: nothing in the deploy path compares what a node is actually
+running against what it is declared to run. The two failure shapes to detect are a node
+whose `/health` version differs from its declared target, and a node running more than
+one MNEMOS container at once (a leftover dev artifact on a second port still answering
+traffic and holding resources).
 
 ### 9.2 Solution: weekly version check
 
@@ -587,23 +599,23 @@ Implement `scripts/ops/version_check.sh`:
 ```bash
 #!/bin/bash
 # Check each node's version vs. declared target
+set -uo pipefail
 
-pg-host_DECLARED="5.0.1"
-gpu-host_DECLARED="5.0.1"
-oracle-host_DECLARED="next-cut"
+: "${MNEMOS_VERSION:?set to the declared stable version, e.g. from mnemos/_version.py}"
+PG_HOST_DECLARED="$MNEMOS_VERSION"
+GPU_HOST_DECLARED="$MNEMOS_VERSION"
+ORACLE_HOST_DECLARED="next-cut"
 
-pg-host_ACTUAL=$(curl -s -H "Authorization: Bearer $TOKEN" \
-  http://<host>:5002/health | jq -r .version)
-gpu-host_ACTUAL=$(curl -s -H "Authorization: Bearer $TOKEN" \
-  http://<host>:5003/health | jq -r .version)
+PG_HOST_ACTUAL=$(curl -s http://<host>:5002/health | jq -r .version)
+GPU_HOST_ACTUAL=$(curl -s http://<host>:5003/health | jq -r .version)
 
-if [[ "$pg-host_ACTUAL" != "$pg-host_DECLARED" ]]; then
-  echo "DRIFT: pg-host actual=$pg-host_ACTUAL, declared=$pg-host_DECLARED"
+if [[ "$PG_HOST_ACTUAL" != "$PG_HOST_DECLARED" ]]; then
+  echo "DRIFT: pg-host actual=$PG_HOST_ACTUAL, declared=$PG_HOST_DECLARED"
   logger -t mnemos-drift "pg-host version mismatch"
 fi
 
-if [[ "$gpu-host_ACTUAL" != "$gpu-host_DECLARED" ]]; then
-  echo "DRIFT: gpu-host actual=$gpu-host_ACTUAL, declared=$gpu-host_DECLARED"
+if [[ "$GPU_HOST_ACTUAL" != "$GPU_HOST_DECLARED" ]]; then
+  echo "DRIFT: gpu-host actual=$GPU_HOST_ACTUAL, declared=$GPU_HOST_DECLARED"
   logger -t mnemos-drift "gpu-host version mismatch"
 fi
 ```
@@ -615,40 +627,39 @@ fi
 Quarterly, audit running containers on each node and retire stale ones:
 
 ```bash
-# On gpu-host (find stale MNEMOS containers)
-docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+# On gpu-host (find stale MNEMOS containers, running and exited)
+docker ps -a --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | grep mnemos
 
-# Example stale artifact from 2026-04-26:
-# mnemos-v3.1.0-dev   Exited (137) 3 weeks ago   mnemos:v3.1.0
+# A stale artifact looks like a dev container from a superseded release still
+# present alongside the prod one:
+#   mnemos-<old-version>-dev   Exited (137) 3 weeks ago   ghcr.io/ncz-os/mnemos-enterprise:<old-version>
 
-# Remove:
-docker rm mnemos-v3.1.0-dev
-docker rmi mnemos:v3.1.0
+# Remove the container, then the image it pinned:
+docker rm mnemos-<old-version>-dev
+docker rmi ghcr.io/ncz-os/mnemos-enterprise:<old-version>
 ```
 
 ---
 
 ## 10. GitHub platform incident response
 
-If the `perlowja` GitHub account becomes unreachable for pushes, run this diagnostic before assuming rate-limit / billing / outage:
+If the project's GitHub account becomes unreachable for pushes, run this diagnostic before assuming rate-limit / billing / outage:
 
 | Check | Result if T&S-restricted |
 |---|---|
 | `curl -H "Authorization: token $GH_TOKEN" https://api.github.com/rate_limit` | All headroom unused — NOT rate-limit |
 | `curl -H "Authorization: token $GH_TOKEN" https://api.github.com/user` | 200 OK — auth still works |
-| `curl https://api.github.com/users/perlowja` (no auth) | 404 even though account exists — the tell |
+| `curl https://api.github.com/users/<account>` (no auth) | 404 even though account exists — the tell |
 | GitHub UI banner | "Plan upgrades blocked" + future-dated "reset" → enforcement, not billing |
 
 The combination `rate-limit-clean + auth-works + public-404` = T&S account-hide. NOT rate-limit, NOT billing.
 
-**Resolution path (established 2026-04-26):**
-1. Outreach to GitHub Head of OSPO via LinkedIn-direct, LF-affiliation framing
-2. Continue dev on GitLab + nas-host bare repos during restriction (NEVER create new GitHub repos/branches/gists during the window — confirms abuse-heuristic suspicion)
-3. Resume GitHub pushes only after restriction is lifted
+**Resolution path:**
+1. Open a platform-enforcement escalation through an established contact; routine billing or quota issues go through https://support.github.com/ first
+2. Continue development on GitLab + the NFS bare repos for the duration (NEVER create new GitHub repos, branches, or gists during the window — that confirms the abuse heuristic)
+3. Resume GitHub pushes only after the restriction is lifted
 
-Goodwill is finite — escalation channel is for real platform-enforcement only, not routine support. Routine billing/quota issues go through https://support.github.com/ first.
-
-See `~/.claude/rules/github-behavior.md` for full rate-limit rules and the rationale.
+Escalation goodwill is finite — reserve the channel for genuine platform enforcement. Independently, keep push cadence modest (a handful of PRs per upstream per day, paced force-pushes) so the heuristic is never tripped in the first place.
 
 ---
 
@@ -658,12 +669,14 @@ See `~/.claude/rules/github-behavior.md` for full rate-limit rules and the ratio
 
 Federation (peer-to-peer memory sync) is specified in `mnemos/api/routes/federation.py`. Key points:
 
-- Each MNEMOS node maintains a `federation_peers` table (schema in `db/migrations_v3_federation.sql`)
+- Each MNEMOS node maintains a `federation_peers` table (schema in `mnemos/db_migrations/migrations_v3_federation.sql`)
 - Sync is **pull-based:** node A asks node B for updates since the last sync point
 - Compound-cursor pagination over `(updated, id)` (not full-dump on every sync)
-- **Status as of 2026-05-02:** Schema-compat preflight, restore drills, the
-  stable compound cursor, and v5 package boundaries are validated. Peer
-  heartbeat and per-peer ACL remain future work.
+- Schema-compat preflight, restore drills, and the stable compound cursor are
+  validated; peer heartbeat and per-peer ACL remain future work
+- NATS carries federation *nudges*, not content; the authorized HTTP feed
+  (`GET /v1/federation/feed`) remains the transfer path. See
+  `docs/NATS_OPERATIONS.md` for subject layout and account scoping.
 
 ### 11.2 What happens when a peer is unreachable
 
@@ -719,13 +732,13 @@ Use this checklist before **any** deployment, upgrade, or migration on pg-host o
 - [ ] **Pre-change backup:** Take explicit pg_dump to NFS
   ```bash
   pg_dump -U postgres mnemos | gzip > \
-    /mnt/argonas/backups/mnemos/pre-<version>-<date>.sql.gz
+    /mnt/backups/mnemos/pre-<version>-<date>.sql.gz
   ```
 
 - [ ] **Rollback path documented:** Write down exact git sha/tag to revert to
   ```bash
-  # Save for rollback:
-  ROLLBACK_TAG=v3.5.0
+  # Save for rollback — the tag currently deployed, before the upgrade:
+  ROLLBACK_TAG=$(git -C /opt/mnemos describe --tags --abbrev=0)
   ```
 
 - [ ] **Migration path selected:** For Docker existing volumes, confirm
@@ -756,7 +769,7 @@ The following three shell scripts codify operational patterns and reduce manual 
 
 **Purpose:** Detect version drift between actual and declared.
 
-**Inputs:** pg-host_DECLARED, gpu-host_DECLARED (environment vars or config file).
+**Inputs:** `PG_HOST_DECLARED`, `GPU_HOST_DECLARED` (environment vars or config file).
 
 **Outputs:** Logs mismatches to syslog `mnemos-drift` tag.
 
@@ -776,7 +789,7 @@ The following three shell scripts codify operational patterns and reduce manual 
 **Outputs:** Success/failure message, rollback point saved.
 
 **Sequence:**
-1. `pg_dump` to `/mnt/argonas/backups/mnemos/pre-<ts>.sql.gz`
+1. `pg_dump` to `/mnt/backups/mnemos/pre-<ts>.sql.gz`
 2. Run migration via `sudo -u postgres psql -f <file>`
 3. Run smoke test: `SELECT 1; SELECT COUNT(*) FROM memories;`
 4. If smoke fails: `gunzip < backup | psql` → restore
@@ -785,7 +798,7 @@ The following three shell scripts codify operational patterns and reduce manual 
 **Success criteria:**
 - [ ] Idempotent (can be re-run without additional data loss)
 - [ ] Rollback is automatic on smoke failure
-- [ ] Works for all migration file formats in `db/migrations_*.sql`
+- [ ] Works for all migration file formats in `mnemos/db_migrations/migrations_*.sql`
 - [ ] Confirms backup viability before applying
 
 ### 13.3 `scripts/ops/blue_green_deploy.sh`
@@ -819,16 +832,16 @@ The following three shell scripts codify operational patterns and reduce manual 
 
 | Item | Status | Impact | Owner | Target |
 |---|---|---|---|---|
-| nas-host nginx config location | TBD (permission rate-limit) | Can't read LB config or verify drain setup | ops | Next cycle |
-| Health-check probe interval/timeout | TBD | Don't know if nginx can auto-detect backend failure | ops | Next cycle |
-| gpu-host port 5002 v3.1.0 cleanup | ⏳ Planned | Stale container running, wastes VRAM | ops | v3.5 quarterly pass |
-| Restore drill | ✅ Dev↔prod drill documented and run | Repeat quarterly, not a one-time substitute for backup monitoring | ops | quarterly |
-| Slack/Signal alerting | ⏳ Not wired | On-call relies on manual checking | ops | v3.5 |
-| Federation peer heartbeat | ⏳ No detection | Silent failure if peer unreachable >1h | dev | v3.5 |
-| oracle-host deployment | ✅ Used for v3.4.1 restore/schema drills | Keep as staging proving ground | ops+dev | ongoing |
-| Version check script | ⏳ Not written | Drift detection manual-only | ops | v3.5 |
-| Migration wrapper script | ⏳ Not written | No safe migration automation | ops | v3.5 |
-| Blue-green deploy script | ⏳ Not written | Prod upgrades manual-only | ops | v3.5 |
+| MNEMOS LB upstream on nas-host | ⏳ Not provisioned | No upstream pool to drain; blue-green is manual | ops | Next cycle |
+| Health-check probe interval/timeout | ⏳ Unconfirmed | Unknown whether nginx can auto-detect backend failure | ops | Next cycle |
+| Stale container cleanup on gpu-host | ⏳ Planned | Superseded dev containers hold GPU memory | ops | Quarterly pass |
+| Restore drill | ✅ Documented and exercised | Repeat quarterly; not a substitute for backup monitoring | ops | Quarterly |
+| Slack/Signal alerting | ⏳ Not wired | On-call relies on manual checking | ops | Next release |
+| Federation peer heartbeat | ⏳ No detection | Silent failure if peer unreachable >1h | dev | Next release |
+| oracle-host deployment | ✅ Used for restore/schema drills | Keep as staging proving ground | ops+dev | Ongoing |
+| Version check script | ⏳ Not written | Drift detection manual-only | ops | Next release |
+| Migration wrapper script | ⏳ Not written | No safe migration automation | ops | Next release |
+| Blue-green deploy script | ⏳ Not written | Prod upgrades manual-only | ops | Next release |
 
 ---
 
@@ -837,9 +850,12 @@ The following three shell scripts codify operational patterns and reduce manual 
 - **Feature roadmap:** `docs/history/V3_5_CHARTER.md`, `docs/history/V3_6_CHARTER.md`, `docs/history/V4_PLAN.md` (historical planning docs)
 - **Architecture:** `README.md`, `docs/MEMORY_ARCHITECTURE.md`, `docs/SPECIFICATION.md`
 - **API docs:** `API_DOCUMENTATION.md` (root) + the live FastAPI OpenAPI spec at `/docs` on a running instance
-- **Database:** `db/migrations_*.sql` and `db/migrations_sqlite/` (schema changes), `mnemos/installer/db.py` (canonical migration order)
-- **Observability:** `mnemos/core/observability.py` (request-ID middleware, Prometheus, OTEL)
-- **Federation:** `mnemos/api/routes/federation.py` (peer sync logic)
+- **Database:** `mnemos/db_migrations/migrations_*.sql` and `mnemos/db_migrations/migrations_sqlite/` (schema changes), `mnemos/installer/db.py` (canonical migration order)
+- **Observability:** `docs/OBSERVABILITY.md`, `mnemos/core/observability.py` (request-ID middleware, Prometheus, OTEL)
+- **Federation:** `mnemos/api/routes/federation.py` (peer sync logic), `docs/NATS_OPERATIONS.md` (substrate, subjects, account scoping)
+- **HA and replication:** `docs/HA_AUTOMATION.md` (Patroni), `docs/STREAMING_REPLICATION.md` (primary/standby)
+- **Restore drill:** `docs/RESTORE-DRILL.md`
+- **Release process:** `docs/RELEASE_CHECKLIST.md`
 
 ---
 
@@ -879,14 +895,14 @@ ssh <user>@<host> "docker stop <container-name>"
 pg_dump -U postgres mnemos | gzip > backup-$(date +%Y%m%d).sql.gz
 
 # List backups on nas-host
-ssh <user>@<host> "ls -lh /mnt/argonas/backups/mnemos/"
+ssh <user>@<host> "ls -lh /mnt/backups/mnemos/"
 
 # Restore from backup
 gunzip < backup.sql.gz | psql -U postgres -d mnemos
 
 # Run a migration
 sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 \
-  -f db/migrations_v3_5_trigger_same_memory_parent.sql
+  -f mnemos/db_migrations/migrations_v3_5_trigger_same_memory_parent.sql
 ```
 
 ### Load balancer (nas-host)
@@ -917,7 +933,5 @@ sudo journalctl -u mnemos -f
 
 ---
 
-**Document version:** 1.0
-**Last updated:** 2026-07-10
 **Maintained by:** Operations team
-**Status:** Active, current for v6.3.7 production line
+**Status:** Active, current for the v6.3.7 production line

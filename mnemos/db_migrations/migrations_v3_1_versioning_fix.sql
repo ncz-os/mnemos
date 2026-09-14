@@ -10,7 +10,7 @@
 -- output) — trigger "invalid input syntax for type bytea" and reject
 -- the INSERT/UPDATE outright.
 --
--- Surfaced during the v3.1 CERBERUS test deployment seeding
+-- Surfaced during the v3.1 a GPU host test deployment seeding
 -- (2026-04-23). The benchmark drain workaround was to DISABLE the
 -- trigger for the bulk load; production installs don't have that
 -- luxury. This migration replaces the function body with

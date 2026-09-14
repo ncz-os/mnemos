@@ -12,9 +12,10 @@ groq/claude/perplexity/xai/gemini concurred).
 > codeberg mirror). Turnkey images are published to `ghcr.io/ncz-os`
 > (`mnemos-core`, `mnemos`, `mnemos-enterprise`, `mnemos-stiphos`).
 > Phases 2 and 3 below are therefore **done**; the document is retained as the
-> ratified design/decision record. The single deferred item — the
-> `lifecycle.py::_close_graeae_engine_if_loaded()` lazy-import — is tracked for the
-> hook-inversion follow-up. See [INSTALL.md](INSTALL.md), [LAYERED_INSTALL.md](LAYERED_INSTALL.md),
+> ratified design/decision record. One cleanup remains open — the
+> `lifecycle.py::_close_graeae_engine_if_loaded()` lazy-import, which is guarded
+> and inert rather than broken (see [Phase-1 status](#phase-1-status-this-track)).
+> See [INSTALL.md](INSTALL.md), [LAYERED_INSTALL.md](LAYERED_INSTALL.md),
 > and [../AGENTS.md](../AGENTS.md) for the current install/topology surface.
 
 ## Decision
@@ -102,15 +103,20 @@ These define `mnemos-core`. Rules for the extracted packages:
   **one-way** dependence already (add-ons import core, not vice versa). Embedding is
   `mnemos.runtime.embedder` (core-adjacent, in-process — not an extracted add-on), so no
   `Embedder` injection needed. Budget (KNEMON) is never imported by core. **Sole remaining
-  coupling:** `mnemos/core/lifecycle.py::_close_graeae_engine_if_loaded()` lazy-imports
+  coupling:** `mnemos/core/lifecycle.py::_close_graeae_engine_if_loaded()` names
   `mnemos.domain.graeae.engine.get_graeae_engine` to close the engine at shutdown.
-  - Fix (deferred, **bundle with Phase-3 extraction**): invert via the existing
-    `_lifespan_cleanup_hooks` — GRAEAE registers its own engine-close hook; core stops
-    importing graeae. Delicate (handles the "API-hook-registration-skipped" shutdown path)
-    + harmless today (lazy import, doesn't break core import-time), so it is intentionally
-    NOT changed unattended; it breaks only when graeae physically leaves the tree (Phase 3,
-    operator-gated) and is fixed there.
+- ⚠️ **Hook inversion: still outstanding, but no longer a breakage risk.** GRAEAE has
+  physically left the tree, and the coupling survived the move because the lazy import is
+  guarded: `_close_graeae_engine_if_loaded()` wraps the import in `try/except ImportError`
+  and returns early when the add-on is absent, and the shutdown call site additionally logs
+  and swallows any exception from it. A `mnemos-core`-only install therefore shuts down
+  cleanly; the coupling is **inert**, not broken. What has not happened is the inversion
+  itself — core still hardcodes a `mnemos.domain.graeae` module path.
+  - Fix (still open): invert via the existing `_lifespan_cleanup_hooks` — GRAEAE registers
+    its own engine-close hook and core stops naming graeae at all. It is delicate because
+    the hook must still cover the "API-hook-registration-skipped" shutdown path, which is
+    exactly why the guarded lazy import was left in place.
 
-Net: **Phase-1 is functionally complete.** Phase-2 (carve `mnemos-core` package) and
-Phase-3 (move add-ons to `ncz-os`, incl. the one cleanup-hook inversion) are operator-gated
-structural moves; `ncz-os` code-move stays operator-gated (confirmed with the hive-build track).
+Net: **Phase-1, Phase-2 and Phase-3 are complete** — `mnemos-core` is carved and the add-ons
+ship as separate `ncz-os` distributions. The one open item is the cleanup-hook inversion
+above, which is a tidiness fix rather than a functional gap.

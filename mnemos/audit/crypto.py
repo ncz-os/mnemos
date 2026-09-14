@@ -145,7 +145,7 @@ def derive_writer_keypair(
     """HKDF-SHA256 derive a writer's Ed25519 private key.
 
     ``session_secret`` is normally ``settings.server.session_secret``
-    bytes. ``writer_id`` is the caller user_id (or e.g. ``"fed:pythia"``
+    bytes. ``writer_id`` is the caller user_id (or e.g. ``"fed:the production host"``
     for federation replicates). Returns (private_key, public_key_bytes_raw).
 
     Same writer_id under the same session secret derives the same key.

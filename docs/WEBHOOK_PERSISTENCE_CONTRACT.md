@@ -1,9 +1,15 @@
 # Webhook persistence contract
 
-Status: canonical target for the ABC-compliance sequence, item 2. This document
-defines the state and repository semantics that every persistence backend must
-implement. It does not claim that non-PostgreSQL delivery is available yet;
-`supports_webhooks` and the `webhooks` capability remain the runtime truth.
+Status: canonical. This document defines the state and repository semantics that
+every persistence backend implements. Concrete `WebhookRepository` classes exist
+for PostgreSQL, SQLite, MySQL, MariaDB, Oracle, and Db2.
+
+Contract conformance is not the same as runtime delivery. `supports_webhooks`
+and the `webhooks` capability remain the runtime truth: the claim/send/finalize
+worker is asyncpg-specific, so PostgreSQL is the only backend that advertises
+end-to-end delivery. Every other backend appends durable outbox rows while
+`supports_webhooks` stays `False`, and the lifecycle hooks refuse to start
+webhook workers against a backend that does not advertise the capability.
 
 ## Decision
 
@@ -165,19 +171,21 @@ All repository methods are database-only and operate inside the supplied
 response streaming stay above the repository boundary. NATS is a best-effort
 nudge; durable delivery rows and polling recovery are authoritative.
 
-The newly declared methods use non-abstract `NotImplementedError` defaults for
-the staged rollout. Making them abstract in this item would prevent every
-existing backend class from being instantiated before its implementation item.
-Later items replace those defaults backend by backend; capability advertising
-must stay false until the entire end-to-end path is wired and verified.
+Only `dispatch_event` is abstract. The remaining methods carry non-abstract
+`NotImplementedError` defaults on the ABC so a backend whose schema has not yet
+landed stays instantiable. Method presence alone never means delivery is
+supported; capability advertising is the authority.
 
-## Existing-schema mapping
+## Backend schema status
 
-PostgreSQL and SQLite already supply most or all canonical delivery fields.
-Later backend items must close their remaining schema/adapter gaps without
-changing the contract.
+PostgreSQL, SQLite, MySQL, and MariaDB provision the canonical delivery columns,
+including `payload_hash`, `attempt_num`, `superseded`, `lease_token`,
+`lease_expires_at`, and `writer_revision`, plus chain uniqueness and
+terminal-success enforcement.
 
-Oracle and Db2 currently map only approximately:
+Oracle and Db2 repository classes are implemented ahead of their migration. The
+Oracle and Db2 schemas still carry the legacy single-row shape and map only
+approximately:
 
 | Oracle/Db2 field | Canonical meaning |
 | --- | --- |
@@ -192,24 +200,8 @@ Oracle and Db2 currently map only approximately:
 Those schemas still need `payload_hash`, `response_status`, `response_body`,
 `delivered_at`, `superseded`, `lease_token`, `lease_expires_at`, and
 `writer_revision`, plus chain uniqueness and terminal-success enforcement.
-That migration and each concrete repository implementation are intentionally
-outside item 2.
+`supports_webhooks` stays `False` on Oracle and Db2 until that migration lands.
 
-MySQL/MariaDB also remain outside this item. Their eventual implementation must
-materialize this same model rather than defining a third state vocabulary.
-
-The current `PostgresWebhookRepository.dispatch_event` still publishes NATS
-inline. That is known staging drift from the target database-only contract,
-not evidence that this item migrated runtime behavior. Item 7 must remove the
-inline publication when the webhook subsystem is switched to this repository
-surface; post-commit scheduling remains the orchestration layer's job.
-
-## Explicit non-goals for item 2
-
-- No concrete PostgreSQL, SQLite, Oracle, Db2, MySQL, or MariaDB repository
-  implementation changes.
-- No changes to the nine `mnemos.webhooks` delivery modules.
-- No API route migration to the repository.
-- No capability-advertising change and no claim of non-PostgreSQL runtime
-  support.
-- No schema migration; this document is the target for the later backend MRs.
+A backend adding webhook support materializes this same model rather than
+defining a third state vocabulary. Extending the contract means changing this
+document first, then every repository, rather than letting one backend diverge.

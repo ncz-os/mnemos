@@ -1,5 +1,5 @@
 -- migration: 0032_usage_ledger
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- purpose:   KNEMON MVP Step 1 — token/cost usage ledger.
 -- design:    /Users/jasonperlow/knemon-design-draft.md section 1
 -- Mirrors db/migrations/0032_usage_ledger.sql (PostgreSQL).

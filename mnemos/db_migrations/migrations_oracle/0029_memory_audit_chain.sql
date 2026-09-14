@@ -1,5 +1,5 @@
 -- migration: 0029_memory_audit_chain
--- target:    Oracle 23ai PDB ORCLPDB1
+-- target:    Oracle 26ai PDB ORCLPDB1
 -- purpose:   v6.2 M-2.2.1 — per-memory append-only audit chain. One entry
 --            per memory write (create/update/delete/archive). Linear chain
 --            via prev_entry_hash; global Merkle root populated by sealer

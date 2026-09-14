@@ -9,7 +9,7 @@
 --
 -- Idempotent: each ADD COLUMN guarded by user_tab_columns lookup;
 -- re-running is a no-op. Apply with:
---   docker exec -i pythia-oracle bash -c "sqlplus -S mnemos/mnemos_dev@localhost:1521/ORCLPDB1 < /tmp/0011_hive_mind_extended_columns.sql"
+--   docker exec -i the production host-oracle bash -c "sqlplus -S mnemos/mnemos_dev@localhost:1521/ORCLPDB1 < /tmp/0011_hive_mind_extended_columns.sql"
 
 WHENEVER SQLERROR EXIT FAILURE;
 

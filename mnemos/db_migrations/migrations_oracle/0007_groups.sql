@@ -1,4 +1,4 @@
--- 0007_groups.sql — Oracle 23ai port for MNEMOS parity.
+-- 0007_groups.sql — Oracle 26ai port for MNEMOS parity.
 
 CREATE TABLE groups (
     id VARCHAR2(36) PRIMARY KEY,

@@ -1,4 +1,4 @@
--- 0018_session_memory_injections.sql — Oracle 23ai port for MNEMOS parity.
+-- 0018_session_memory_injections.sql — Oracle 26ai port for MNEMOS parity.
 
 CREATE TABLE session_memory_injections (
     id VARCHAR2(36) PRIMARY KEY,

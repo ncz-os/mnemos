@@ -8,7 +8,7 @@ ABC-conformant subclasses for every repository surface
 
 Each repo instantiates with full :class:`~abc.ABC` coverage. Methods
 that have real implementations against the Oracle schema land in this
-module; method bodies awaiting the Oracle 23ai VECTOR / Text rollout
+module; method bodies awaiting the Oracle 26ai VECTOR / Text rollout
 or the namespace-policy visibility predicate raise
 :class:`NotImplementedError` at call time (not attribute access), so
 attribute lookups remain safe across the whole backend graph.
@@ -106,7 +106,7 @@ def _validate_and_format_vector(
     """Validate ``embedding`` and emit the Oracle ``TO_VECTOR`` literal.
 
     The result is the bracketed comma-joined float string consumed by
-    ``TO_VECTOR(:q)`` on Oracle 23ai and ``TO_VECTOR(:q)`` on Db2
+    ``TO_VECTOR(:q)`` on Oracle 26ai and ``TO_VECTOR(:q)`` on Db2
     12.1.x (Oracle-compat mode). Reuses the same helper from
     :mod:`mnemos.persistence.db2` so both backends share one
     rejection contract.
@@ -1203,7 +1203,7 @@ class OracleMemoryRepository(MemoryRepository):
     Implements the lightweight CRUD surface that maps cleanly to the
     Oracle schema in ``mnemos/db_migrations/migrations_oracle/0001_core_schema.sql``.
     Visibility-filtered, vector, and FTS paths are stubbed pending
-    Oracle 23ai VECTOR setup and a namespace-policy translation of the
+    Oracle 26ai VECTOR setup and a namespace-policy translation of the
     Postgres ``read_visibility_predicate`` helper (P1 follow-up).
     """
 
@@ -2220,10 +2220,10 @@ class OracleMemoryRepository(MemoryRepository):
                 )
             params["q"] = vec_literal
             params["limit"] = max(limit, min(limit * 4, 200)) if boost_recency else limit
-            # Oracle 23ai VECTOR_DISTANCE returns 0 for identical vectors
+            # Oracle 26ai VECTOR_DISTANCE returns 0 for identical vectors
             # and grows with dissimilarity, so ORDER BY ASC matches the
             # Postgres pgvector ``<=>`` ordering. Keep ORDER BY as the
-            # bare distance so Oracle 23ai can serve top-K from the
+            # bare distance so Oracle 26ai can serve top-K from the
             # native vector index; recency boost is applied after fetch.
             rank = "VECTOR_DISTANCE(m.embedding, TO_VECTOR(:q), COSINE)"
             sql = (
@@ -2469,7 +2469,7 @@ class OracleCompressionRepository(CompressionRepository):
 
 
 class OracleMorpheusRepository(MorpheusRepository):
-    """Oracle 23ai impl of :class:`MorpheusRepository` (item 11a).
+    """Oracle 26ai impl of :class:`MorpheusRepository` (item 11a).
 
     Schema is the result of item 11a's
     ``0061c_morpheus_runs_parity.sql`` — the canonical 19-column
@@ -2486,7 +2486,7 @@ class OracleMorpheusRepository(MorpheusRepository):
       in the same way Postgres does; we keep parity with Postgres by
       generating client-side).
     * **JSON operators**: ``memories.metadata`` is a ``CLOB`` with a
-      ``CHECK (metadata IS JSON)`` constraint on Oracle 23ai — the
+      ``CHECK (metadata IS JSON)`` constraint on Oracle 26ai — the
       repository uses ``JSON_VALUE`` / ``JSON_EXISTS`` for
       extraction/check and ``JSON_TRANSFORM`` (or read-modify-write
       fallback) for key deletion.
@@ -2749,7 +2749,7 @@ class OracleMorpheusRepository(MorpheusRepository):
                 await _call(cursor.close)
         n_extract_reset = len(affected_ids)
         # Step 4: restore consolidated originals from the metadata audit key.
-        # Oracle 23ai supports JSON_TRANSFORM but only in PL/SQL or in the
+        # Oracle 26ai supports JSON_TRANSFORM but only in PL/SQL or in the
         # JSON data-guide update syntax — neither is clean here. Fall back
         # to read-modify-write: SELECT id, metadata WHERE JSON_EXISTS, then
         # UPDATE id=:id SET metadata = JSON_MERGEPATCH(...). The admin
@@ -2921,14 +2921,14 @@ class OracleMorpheusRepository(MorpheusRepository):
         run_id: str,
         max_input_count: int,
     ) -> ClusterCandidateRow | None:
-        """Oracle 23ai impl of MORPHEUS fetch_cluster_candidates — item 11b.
+        """Oracle 26ai impl of MORPHEUS fetch_cluster_candidates — item 11b.
 
         Returns the run's cluster-window config + the candidate rows
         pre-materialised to ``list[float]`` in a single transaction.
-        Oracle 23ai stores embeddings as ``VECTOR(*, FLOAT32)``;
+        Oracle 26ai stores embeddings as ``VECTOR(*, FLOAT32)``;
         ``oracledb`` returns the column as an
         ``array.array('f', [...])`` (verified live on a real
-        ``gvenzl/oracle-free:23-slim`` instance on HYDRA — see
+        ``gvenzl/oracle-free:23-slim`` instance on a test host — see
         ``OracleMorpheusRepository.begin_run`` docstring), which
         trivially becomes a ``list[float]`` via ``list(...)``.
 
@@ -3076,9 +3076,9 @@ class OracleMorpheusRepository(MorpheusRepository):
         *,
         patch: dict[str, Any],
     ) -> None:
-        """Oracle 23ai impl of MORPHEUS merge_run_config — item 11b.
+        """Oracle 26ai impl of MORPHEUS merge_run_config — item 11b.
 
-        Read-modify-write on the ``config`` column (Oracle 23ai
+        Read-modify-write on the ``config`` column (Oracle 26ai
         stores it as ``CLOB`` with a ``CHECK (config IS JSON)``
         constraint). Oracle's ``JSON_MERGEPATCH`` accepts path
         expressions only as literals (ORA-40454 rejects bind
@@ -3127,7 +3127,7 @@ class OracleMorpheusRepository(MorpheusRepository):
         try:
             import oracledb
 
-            # ``config`` is a CLOB on Oracle 23ai — oracledb's default
+            # ``config`` is a CLOB on Oracle 26ai — oracledb's default
             # bind-type inference for a Python str picks CHAR/VARCHAR2,
             # which ORA-00932 mismatches the CLOB column. Force it
             # explicitly, same pattern as the metadata rollback step.
@@ -3545,7 +3545,7 @@ class OracleMorpheusRepository(MorpheusRepository):
 
 
 class OracleCompressionQueueRepository(CompressionQueueRepository):
-    """Oracle 23ai impl of the v3.1 compression work queue (job 019e7049
+    """Oracle 26ai impl of the v3.1 compression work queue (job 019e7049
     CHILD A). Mirrors the canonical Postgres semantics
     (mnemos/domain/compression/worker_contest.py) so the distillation
     contest behaves identically on Oracle.
@@ -3823,7 +3823,7 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
             await _call(cursor.close)
 
     async def get_queue_stats(self, tx: Transaction) -> dict[str, int]:
-        """Oracle 23ai stats snapshot for the v3.5 distillation worker.
+        """Oracle 26ai stats snapshot for the v3.5 distillation worker.
 
         Two SELECTs inside the supplied ``tx`` (one for the queue
         status aggregates, one for the variant count). Oracle cannot
@@ -6051,7 +6051,7 @@ class OracleOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
         ``revoked_at`` as TIMESTAMP WITH TIME ZONE; bound parameters
         substitute SYSTIMESTAMP, NUMTODSINTERVAL-style math, and the
         caller-supplied ``now`` so the same code path works on Oracle
-        23ai and Db2 12.1.5 (Db2 OAuth inherits from this method).
+        26ai and Db2 12.1.5 (Db2 OAuth inherits from this method).
         """
         _ = now  # Oracle uses SYSTIMESTAMP directly; accepted for ABC parity
         cursor = await _call(_conn_from_tx(tx).cursor)
@@ -6295,7 +6295,7 @@ class OracleConsultationsRepository(ConsultationsRepository):
         """Insert a consultation + audit-chain link + memory refs in one tx.
 
         Mirrors SqliteConsultationsRepository.create_consultation_with_audit
-        (mnemos/persistence/sqlite.py); Oracle 23ai schema at
+        (mnemos/persistence/sqlite.py); Oracle 26ai schema at
         db/migrations_oracle/0002_graeae.sql defines graeae_consultations,
         graeae_audit_log, consultation_memory_refs with VARCHAR2(36) PKs and
         app-side UUIDs.
@@ -7325,7 +7325,7 @@ class OracleFederationRepository(FederationRepository):
             if since_updated is not None and since_id is not None:
                 where.append("(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))")
                 # Explicit TIMESTAMP_TZ bind to avoid thin-mode coercion to VARCHAR
-                # which was causing infinite-loop pulls on ACHILLES (id < since_id).
+                # which was causing infinite-loop pulls on an edge host (id < since_id).
                 import oracledb
 
                 upd_var = cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ)

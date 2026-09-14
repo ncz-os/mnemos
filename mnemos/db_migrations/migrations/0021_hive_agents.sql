@@ -1,8 +1,8 @@
 -- migration: 0021_hive_agents
--- target:    PostgreSQL 16 + pgvector (development + cixmini edge)
+-- target:    PostgreSQL 16 + pgvector (development + an ARM edge host edge)
 -- schema:    public (or HIVE_MIND if separate schema configured)
 -- purpose:   GRAEAE Hive Mind agent registry — Phase 2 SQLite -> PG port.
---            Mirrors Oracle 23ai version (db/migrations_oracle/0021_hive_agents.sql)
+--            Mirrors Oracle 26ai version (db/migrations_oracle/0021_hive_agents.sql)
 --            with PG-native types (JSONB, BIGINT) and identical column names.
 
 CREATE TABLE IF NOT EXISTS hive_agents (

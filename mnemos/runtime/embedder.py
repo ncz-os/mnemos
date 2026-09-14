@@ -12,9 +12,9 @@ Backends:
              CPU 20.86 rec/s — both significantly faster than llama-cpp
              on the same hardware.
   llamacpp   llama-cpp-python with a local GGUF. Works anywhere with a
-             gguf file. Phase 1B fleet results: CERBERUS RTX 4500 Ada
-             CUDA 523.79 rec/s, TYPHON RTX 5060 CUDA 479.84, PYTHIA CPU
-             11.06, PROTEUS CPU 13.65, m66 Cix Sky1 ARM CPU 12.20.
+             gguf file. Phase 1B fleet results (rec/s): RTX 4500 Ada CUDA
+             523.79, RTX 5060 CUDA 479.84, x86 CPU 11.06-13.65, Cix Sky1
+             ARM CPU 12.20.
 
 Backend selection:
   MNEMOS_EMBED_BACKEND=auto|openvino|llamacpp (default auto).
@@ -76,12 +76,12 @@ DEFAULT_HYBRID = False
 DEFAULT_NPU_THRESHOLD_CHARS = 1000  # ~256 tokens at 4 chars/token
 DEFAULT_MODEL_PATH = "/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf"
 # HTTP backend (mem_1779334716543_f8ebd4 EXCEPTION clause 2026-05-23):
-# operator-authorized MEDUSA llama.cpp Vulkan endpoint at
+# operator-authorized a fallback host llama.cpp Vulkan endpoint at
 # http://192.168.207.64:8090/v1/embeddings. Same memo forbids ollama or
-# any other HTTP embed provider; MEDUSA is the sole exception. Must
+# any other HTTP embed provider; a fallback host is the sole exception. Must
 # circuit-break + fall through to llamacpp on >30s outage.
-DEFAULT_HTTP_URL = "http://192.168.207.61:8090/v1/embeddings"  # TYPHON RTX 5060 CUDA
-DEFAULT_HTTP_URL_FALLBACK = "http://192.168.207.64:8090/v1/embeddings"  # MEDUSA AMD NAVI14 Vulkan
+DEFAULT_HTTP_URL = "http://192.168.207.61:8090/v1/embeddings"  # a GPU host RTX 5060 CUDA
+DEFAULT_HTTP_URL_FALLBACK = "http://192.168.207.64:8090/v1/embeddings"  # a fallback host AMD NAVI14 Vulkan
 DEFAULT_HTTP_MODEL = "bge-m3"
 DEFAULT_HTTP_TIMEOUT = 30.0
 DEFAULT_HTTP_CB_THRESHOLD = 5  # consecutive failures before opening breaker
@@ -259,8 +259,8 @@ class _LlamaCppBackend:
         # the [0, 2] range score_to_similarity()'s euclidean_unit metric
         # assumes for unit vectors -- every result silently clamps to a
         # similarity of 0.0 and gets floor-filtered, with no exception
-        # anywhere in the stack (found 2026-07-10 debugging PEGASUS/
-        # ACHILLES semantic search returning 0 rows despite embeddings
+        # anywhere in the stack (found 2026-07-10 debugging an edge host/
+        # an edge host semantic search returning 0 rows despite embeddings
         # being generated and stored correctly).
         norm = sum(x * x for x in vec) ** 0.5
         if norm > 0:
@@ -283,7 +283,7 @@ class _CixNpuBackend:
     a Compass NN Compiler IR + weights blob built from an ONNX source via
     the Arm-China Compass_MiniPkg toolchain (proprietary, x86 Linux only —
     see https://aijishu.com/a/1060000000215443). Available only on hosts
-    that present /dev/aipu + libnoe Python wheel (cixmini Sky1).
+    that present /dev/aipu + libnoe Python wheel (an ARM edge host Sky1).
 
     Model conventions follow Arm-China Compass Whisper / ai_model_hub:
     fixed input shape, INT8-quantized weights, tokenizer matches the ONNX
@@ -394,7 +394,7 @@ class _HttpBackend:
     """OpenAI-compatible /v1/embeddings HTTP backend.
 
     Operator-locked decision (mem_1779334716543_f8ebd4 EXCEPTION clause
-    2026-05-23) restricts this backend to the MEDUSA llama.cpp Vulkan
+    2026-05-23) restricts this backend to the a fallback host llama.cpp Vulkan
     endpoint at http://192.168.207.64:8090/v1/embeddings (or another
     operator-vetted local-LAN llama-server). ollama at any host remains
     forbidden — the 2026-05-21 90-day silent-stall incident was caused
@@ -696,8 +696,8 @@ class InProcessEmbedder:
         self.n_threads = int(n_threads if n_threads is not None else embed_threads_env())
         self.n_gpu_layers = int(n_gpu_layers if n_gpu_layers is not None else embed_gpu_layers_env())
         self.http_url = http_url or embed_http_url_env()
-        # Fallback URL: empty string disables; default = MEDUSA so the primary
-        # TYPHON outage path falls to MEDUSA before in-process llamacpp.
+        # Fallback URL: empty string disables; default = a fallback host so the primary
+        # a GPU host outage path falls to a fallback host before in-process llamacpp.
         self.http_url_fallback = http_url_fallback if http_url_fallback is not None else embed_http_url_fallback_env()
         self.http_model = http_model or embed_http_model_env()
         self.http_timeout = float(http_timeout if http_timeout is not None else embed_http_timeout_env())
@@ -889,7 +889,7 @@ class InProcessEmbedder:
 
     async def embed_batch(self, texts: Iterable[str]) -> list[list[float]]:
         """Embed multiple strings. For the http backend, sends one POST
-        with input=list[str] (MEDUSA llama.cpp handles batch). For
+        with input=list[str] (a fallback host llama.cpp handles batch). For
         local backends, falls back to per-text sequential calls since
         neither in-process backend is reentrant.
         """
@@ -900,8 +900,8 @@ class InProcessEmbedder:
                     await self._ensure_loaded()
                     if isinstance(self._backend, _HttpBackend):
                         vecs = await self._backend.embed_batch_async(texts_list)
-                        # Remote-fallback first for failed rows (MEDUSA :8090
-                        # when TYPHON primary failed). Batch only the failed
+                        # Remote-fallback first for failed rows (a fallback host :8090
+                        # when a GPU host primary failed). Batch only the failed
                         # subset to keep wire payload tight.
                         if any(not v for v in vecs) and self._http_fallback_remote is not None:
                             miss_idx = [i for i, v in enumerate(vecs) if not v]
