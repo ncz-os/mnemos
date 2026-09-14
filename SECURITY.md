@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| 6.3.x | Yes — current release line |
-| 6.2.x | Security fixes only; upgrade to 6.3 |
+| 6.4.x | Yes — current release line |
+| 6.3.x | Security fixes only; upgrade to 6.4 |
 | Earlier | No |
 
 Only the most recent release line receives fixes. If you are on an
