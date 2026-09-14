@@ -161,8 +161,21 @@ async def test_mysql_federation_feed_embedding_bind_precedes_filters() -> None:
 
     assert "%s as embedding_model" in sql
     assert sql.index("%s as embedding_model") < sql.index("where m.federation_source is null")
+    # F07: the withdrawal branch repeats the live-branch filters. The
+    # resulting param tuple shape is:
+    #   embed-model (select_params[0]),
+    #   live branch:       since, since, cursor-id, tenant-a, keep
+    #   tombstone branch:  since, since, cursor-id, tenant-a, keep
+    #   withdrawal branch: since, since, cursor-id, tenant-a, keep
+    #   trailing limit (25)
+    # i.e. 1 + 5 + 5 + 5 + 1 = 17.
     assert params == (
         "embed-model",
+        since,
+        since,
+        "cursor-id",
+        "tenant-a",
+        "keep",
         since,
         since,
         "cursor-id",
