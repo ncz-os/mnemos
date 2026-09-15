@@ -61,17 +61,23 @@ jobs:
       - name: Set up Python
         run: uv python install 3.11
 
-      # Run the generator in CHECK mode. ``--check`` runs the matrix
-      # assembly and compares the result against the committed copy
-      # of ``docs/BACKEND_PARITY.md`` WITHOUT writing it back. The
-      # previous version of this job ran the generator in write mode
-      # and then ``git diff --exit-code``; that is a no-op because the
-      # generator's just-written file trivially matches the working
-      # copy and ``git diff`` always returns empty (exit 0). ``--check``
-      # is the only configuration that actually gates drift.
+      # Run the generator in WRITE mode and then ``git diff --exit-code``.
+      # The generator's rendered markdown contains NO wall-clock
+      # timestamp and NO HEAD SHA — both would re-render to a
+      # different string each run, defeating the drift gate. The
+      # file is therefore a pure function of the input tree
+      # (``mnemos/persistence/``, ``mnemos/api/routes/``, ``tests/``,
+      # ``scripts/generate_backend_parity_matrix.py``) and produces
+      # byte-identical output against the same tree, so ``git
+      # diff --exit-code`` after a fresh regeneration is the
+      # authoritative drift check: a non-empty diff means the
+      # matrix content (capability table, summary, legend) has
+      # drifted from the live code and the commit forgot to
+      # include a regenerated ``docs/BACKEND_PARITY.md``.
       - name: Verify matrix has not drifted
         run: |
-          uv run --python 3.11 --no-project -- python scripts/generate_backend_parity_matrix.py --check
+          uv run --python 3.11 --no-project -- python scripts/generate_backend_parity_matrix.py
+          git diff --exit-code docs/BACKEND_PARITY.md
 
       # Print the committed matrix on success — the matrix is the
       # artifact reviewers should look at first when a backend PR
