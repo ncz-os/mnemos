@@ -61,25 +61,17 @@ jobs:
       - name: Set up Python
         run: uv python install 3.11
 
-      # Run the generator. The script will regenerate
-      # ``docs/BACKEND_PARITY.md`` in place — its diff against the
-      # committed copy is the signal this job emits.
-      - name: Regenerate docs/BACKEND_PARITY.md
-        run: |
-          uv run --python 3.11 --no-project -- python scripts/generate_backend_parity_matrix.py
-
-      # Fail the build if regeneration changed the matrix. This is the
-      # exact same command the task description specifies for local
-      # validation:
-      #
-      #     python scripts/generate_backend_parity_matrix.py \
-      #         && git diff --exit-code docs/BACKEND_PARITY.md
-      #
-      # We split them into separate ``run`` steps so that the failure
-      # log shows BOTH the regeneration output and the diff, which is
-      # much easier to debug than a single ``&&`` chain.
+      # Run the generator in CHECK mode. ``--check`` runs the matrix
+      # assembly and compares the result against the committed copy
+      # of ``docs/BACKEND_PARITY.md`` WITHOUT writing it back. The
+      # previous version of this job ran the generator in write mode
+      # and then ``git diff --exit-code``; that is a no-op because the
+      # generator's just-written file trivially matches the working
+      # copy and ``git diff`` always returns empty (exit 0). ``--check``
+      # is the only configuration that actually gates drift.
       - name: Verify matrix has not drifted
-        run: git diff --exit-code docs/BACKEND_PARITY.md
+        run: |
+          uv run --python 3.11 --no-project -- python scripts/generate_backend_parity_matrix.py --check
 
       # Print the committed matrix on success — the matrix is the
       # artifact reviewers should look at first when a backend PR
