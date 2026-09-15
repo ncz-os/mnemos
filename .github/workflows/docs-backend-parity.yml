@@ -15,6 +15,14 @@ name: docs-backend-parity
 # honest: if a backend gains or loses a capability without regenerating
 # the matrix, the diff has to land alongside the code change.
 #
+# The generator's rendered markdown carries NO wall-clock timestamp and
+# NO HEAD SHA — both would re-render to a different string each run,
+# defeating the drift gate. The file is therefore a pure function of
+# the input tree and produces byte-identical output against the same
+# tree, which makes ``git diff --exit-code docs/BACKEND_PARITY.md`` an
+# honest check: any non-empty diff is real drift (matrix content
+# changed), not clock drift or commit-SHA drift.
+#
 # To refresh the matrix after editing mnemos/persistence/*.py:
 #
 #     python scripts/generate_backend_parity_matrix.py
