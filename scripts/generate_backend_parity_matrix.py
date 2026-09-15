@@ -1940,9 +1940,16 @@ def _render_markdown(cells: list[Cell]) -> str:
     invocation = "python scripts/generate_backend_parity_matrix.py"
     table = _format_table(cells)
     legend = _format_legend()
-    impl_count = sum(1 for c in cells if c.implemented)
     full_count = sum(1 for c in cells if c.implemented and c.tested)
+    impl_only = sum(1 for c in cells if c.implemented and not c.tested)
+    stub_with_test = sum(1 for c in cells if not c.implemented and c.tested)
     gaps = sum(1 for c in cells if not c.implemented and not c.tested)
+    # The four categories sum to len(cells); if they don't, the renderer
+    # would be silently undercounting one of the categories — fail loudly
+    # so the matrix never lies about itself.
+    assert (
+        full_count + impl_only + stub_with_test + gaps == len(cells)
+    ), f"category counts do not sum to {len(cells)}"
     # The header carries NO wall-clock timestamp and NO HEAD SHA on
     # purpose. Either would make the file a non-pure function of the
     # input tree (the timestamp ticks each second, the SHA changes
@@ -1979,9 +1986,12 @@ def _render_markdown(cells: list[Cell]) -> str:
         f"   `test_<capability>_<backend>*.py`?\n"
         f"\n"
         f"Summary: **{full_count}/{len(cells)}** cells are fully covered\n"
-        f"(✅ implemented+tested), **{impl_count - full_count}** cells are\n"
-        f"implemented but untested, **{gaps}** cells have neither\n"
-        f"implementation nor test.\n"
+        f"(✅ implemented+tested), **{impl_only}** cells are implemented\n"
+        f"but untested, **{stub_with_test}** cells have a test against a\n"
+        f"stub backend implementation, and **{gaps}** cells have neither\n"
+        f"implementation nor test. (Categories sum to {len(cells)}: "
+        f"{full_count} + {impl_only} + {stub_with_test} + {gaps} = "
+        f"{full_count + impl_only + stub_with_test + gaps}.)\n"
         f"\n"
         f"## Matrix\n"
         f"\n"
