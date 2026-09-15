@@ -1937,7 +1937,6 @@ def _format_legend() -> str:
 
 
 def _render_markdown(cells: list[Cell]) -> str:
-    invocation = "python scripts/generate_backend_parity_matrix.py"
     table = _format_table(cells)
     legend = _format_legend()
     full_count = sum(1 for c in cells if c.implemented and c.tested)
