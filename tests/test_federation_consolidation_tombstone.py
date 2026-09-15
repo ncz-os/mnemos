@@ -6,6 +6,14 @@ from datetime import datetime, timezone
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def legacy_transaction_adapter(monkeypatch):
+    # These protocol unit tests use pre-journal raw connection adapters.
+    from mnemos.persistence import federation_journal
+
+    monkeypatch.setattr(federation_journal, "supports_journal", lambda tx: False)
+
+
 class _Acquire:
     def __init__(self, conn):
         self.conn = conn
@@ -49,6 +57,10 @@ class _Backend:
 
         self.pool = pool
         self.federation = PostgresFederationRepository()
+        # This fake connection models the v1 SQL contract; journal behavior is
+        # exercised against real engines in test_federation_journal.py.
+        self.federation.feed_query = self.federation._legacy_feed_query
+        self.federation.get_feed_memory = self.federation._legacy_get_feed_memory
 
     @asynccontextmanager
     async def transactional(self):
@@ -63,36 +75,36 @@ async def test_feed_emits_consolidation_tombstone(monkeypatch):
     from mnemos.api.routes import federation as handler
 
     consolidated_at = datetime(2026, 5, 2, 12, 0, tzinfo=timezone.utc)
-    conn = _FeedConn({
-        "type": "consolidation",
-        "id": "duplicate",
-        "content": None,
-        "category": None,
-        "subcategory": None,
-        "metadata": None,
-        "quality_rating": None,
-        "verbatim_content": None,
-        "owner_id": None,
-        "namespace": "default",
-        "permission_mode": None,
-        "source_model": None,
-        "source_provider": None,
-        "source_session": None,
-        "source_agent": None,
-        "created": consolidated_at,
-        "updated": consolidated_at,
-        "archived_at": None,
-        "consolidated_into": "canonical",
-        "consolidated_at": consolidated_at,
-        "compressed_content": None,
-    })
+    conn = _FeedConn(
+        {
+            "type": "consolidation",
+            "id": "duplicate",
+            "content": None,
+            "category": None,
+            "subcategory": None,
+            "metadata": None,
+            "quality_rating": None,
+            "verbatim_content": None,
+            "owner_id": None,
+            "namespace": "default",
+            "permission_mode": None,
+            "source_model": None,
+            "source_provider": None,
+            "source_session": None,
+            "source_agent": None,
+            "created": consolidated_at,
+            "updated": consolidated_at,
+            "archived_at": None,
+            "consolidated_into": "canonical",
+            "consolidated_at": consolidated_at,
+            "compressed_content": None,
+        }
+    )
     pool = _Pool(conn)
     monkeypatch.setattr(lc, "_pool", pool)
     monkeypatch.setattr(lc, "_persistence_backend", _Backend(pool))
 
-    response = await handler.federation_feed(
-        None, None, since=None, namespace=None, category=None, limit=10
-    )
+    response = await handler.federation_feed(None, None, since=None, namespace=None, category=None, limit=10)
 
     [event] = response.memories
     assert event.type == "consolidation"
@@ -137,12 +149,14 @@ async def test_peer_applies_consolidation_redirect_for_imported_duplicate():
         PostgresFederationRepository(),
         PostgresTransaction(conn, _NoopRawTx()),
         "peer",
-        [{
-            "type": "consolidation",
-            "id": "duplicate",
-            "consolidated_into": "canonical",
-            "consolidated_at": "2026-05-02T12:00:00Z",
-        }],
+        [
+            {
+                "type": "consolidation",
+                "id": "duplicate",
+                "consolidated_into": "canonical",
+                "consolidated_at": "2026-05-02T12:00:00Z",
+            }
+        ],
     )
 
     assert new_n == 0

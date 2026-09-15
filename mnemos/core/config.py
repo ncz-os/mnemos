@@ -1774,7 +1774,12 @@ def session_secret_required() -> bool:
 
 def audit_chain_enabled_flag() -> bool:
     """Return whether MNEMOS_AUDIT_CHAIN enables audit-chain writes."""
-    return runtime_env_value("MNEMOS_AUDIT_CHAIN", "").lower() == "on"
+    return runtime_env_value("MNEMOS_AUDIT_CHAIN", "").lower() in {"on", "required"}
+
+
+def audit_chain_required_flag() -> bool:
+    """Require audited mutation callers to roll back if signing fails."""
+    return runtime_env_value("MNEMOS_AUDIT_CHAIN", "").lower() == "required"
 
 
 def system_hive_url_env() -> str:

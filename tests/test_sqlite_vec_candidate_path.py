@@ -1,40 +1,11 @@
-"""Regression tests for the SQLite vec0 candidate-path semantic_search.
+"""Real sqlite-vec visibility, candidate growth and Python-call regressions.
 
-The previous implementation called the in-SQL Python cosine UDF over
-every row in ``memory_embeddings`` (linear in corpus size), even though
-``sqlite-vec`` was loaded and a ``memory_embedding_vec`` virtual table
-existed. The candidate-path fix in ``mnemos/persistence/sqlite.py``:
-
-  1. Generates a KNN candidate pool via vec0 ``MATCH`` + ``k`` (native
-     ANN, log-time).
-  2. Fetches the authoritative memory rows by id (so visibility /
-     tenant / ACL / namespace / soft-delete / metadata filters layer
-     on top of the index, NEVER trusting vec0 for authorization).
-  3. Re-ranks the surviving rows with the existing
-     ``mnemos_cosine_similarity`` UDF.
-  4. Retries with a larger (still bounded) candidate window when too
-     few authorized survivors survive, then stops.
-
-These tests verify the three properties a reviewer asked for:
-
-  * CORRECTNESS (test_unauthorized_memory_does_not_leak): a row in a
-    different namespace / owned by a different user MUST NOT appear in
-    the result, even if it is a strong vec0 KNN candidate.
-  * PERFORMANCE (test_query_does_not_scale_linearly_with_corpus_size):
-    a small ``limit`` over a 10x larger eligible corpus returns in
-    roughly the same time, not 10x slower (the legacy UDF scan was
-    linear in eligible_rows).
-  * BOUNDED RE-QUERY (test_requery_with_larger_window_when_too_few_authorized_survivors):
-    when the initial candidate pool shrinks after visibility filtering,
-    the search retries once with a larger window before stopping at
-    however many rows survived.
-
-Each test runs end-to-end against a real SqliteBackend with the
-embedded sqlite-vec wheel loaded in-process — same shape the production
-deployment uses. We pin to ROOT_BYPASS only for the linear-scale
-microbenchmark; the correctness + requery tests use OWN_ONLY to exercise
-the visibility-filtering path.
+vec0 performs native exact cosine search. These tests verify authorization
+and reduced Python cosine calls, not logarithmic complexity or a latency SLA.
+When native candidates cannot satisfy the requested result count, the
+repository falls back to the authoritative filtered embeddings.
 """
+
 from __future__ import annotations
 
 import math
@@ -44,7 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from mnemos.persistence import SqliteBackend
-from mnemos.persistence.sqlite import _execute, _fetch_one
+from mnemos.persistence.sqlite import _fetch_one
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 
@@ -107,7 +78,7 @@ async def test_unauthorized_memory_does_not_leak(tmp_path):
 
     The pre-fix UDF scan also gated by the same where-clause, but it
     had to scan the whole corpus linearly to enforce it. The
-    candidate-path fix relies on a Vec0 ANN that is NOT
+    candidate-path fix relies on a Vec0 KNN that is NOT
     authorization-aware — visibility MUST be re-applied against the
     authoritative ``memories`` table for the KNN ids returned. This
     test pins that contract: if the candidate-path ever relaxes the
@@ -133,9 +104,12 @@ async def test_unauthorized_memory_does_not_leak(tmp_path):
     try:
         async with backend.transactional() as tx:
             await _insert_memory(
-                backend, tx, memory_id=alice_id,
+                backend,
+                tx,
+                memory_id=alice_id,
                 content="alice needle — high cosine to query",
-                owner_id="alice", namespace="ns-alice",
+                owner_id="alice",
+                namespace="ns-alice",
                 updated_at=now,
             )
             await _persist_embedding(backend, tx, alice_id, [1.0, 0.0, 0.0])
@@ -145,9 +119,12 @@ async def test_unauthorized_memory_does_not_leak(tmp_path):
             # them as the strongest KNN matches.
             for fid in (foreign_id_a, foreign_id_b):
                 await _insert_memory(
-                    backend, tx, memory_id=fid,
+                    backend,
+                    tx,
+                    memory_id=fid,
                     content=f"{fid} foreign owner + namespace",
-                    owner_id="bob", namespace="ns-other",
+                    owner_id="bob",
+                    namespace="ns-other",
                     updated_at=now,
                 )
                 await _persist_embedding(backend, tx, fid, [0.99, 0.14, 0.0])
@@ -173,7 +150,7 @@ async def test_unauthorized_memory_does_not_leak(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_query_does_not_scale_linearly_with_corpus_size(tmp_path):
+async def test_native_candidates_bound_python_cosine_calls(tmp_path):
     """PERFORMANCE: a small limit query over a larger eligible corpus
     returns well under the legacy UDF linear-scan cost.
 
@@ -206,9 +183,12 @@ async def test_query_does_not_scale_linearly_with_corpus_size(tmp_path):
         async with backend.transactional() as tx:
             for i in range(1_500):
                 await _insert_memory(
-                    backend, tx, memory_id=f"{prefix}{i}",
+                    backend,
+                    tx,
+                    memory_id=f"{prefix}{i}",
                     content=f"corpus row {i}",
-                    owner_id="perf-owner", namespace="default",
+                    owner_id="perf-owner",
+                    namespace="default",
                     updated_at=now,
                 )
                 # Rotate embeddings so vec0 has real work to do (not
@@ -221,26 +201,26 @@ async def test_query_does_not_scale_linearly_with_corpus_size(tmp_path):
             # Sanity: every embedding landed in vec0.
             assert count == 1_500, count
 
-            import time as _time
+            from mnemos.persistence.sqlite import _call, _cosine_similarity
 
-            n_iters = 5
-            t0 = _time.perf_counter()
-            for _ in range(n_iters):
-                rows = await backend.memories.semantic_search(
-                    tx,
-                    embedding=[1.0, 0.0, 0.0],
-                    limit=5,
-                    visibility=root_vis,
-                )
-            elapsed_ms = (_time.perf_counter() - t0) * 1000.0 / n_iters
+            calls = 0
 
-        assert len(rows) <= 5
-        # Real legacy UDF cost on 1500 rows is ~75ms; vec0 path is
-        # ~1-5ms. Cap at 50ms per query for generous CI headroom.
-        assert elapsed_ms < 50.0, (
-            f"vec0 query is too slow: {elapsed_ms:.2f}ms over 1500 rows "
-            "(pre-fix linear UDF scan would be ~75ms)"
-        )
+            def counted_cosine(left, right):
+                nonlocal calls
+                calls += 1
+                return _cosine_similarity(left, right)
+
+            await _call(tx.conn.create_function, "mnemos_cosine_similarity", 2, counted_cosine)
+            rows = await backend.memories.semantic_search(
+                tx,
+                embedding=[1.0, 0.0, 0.0],
+                limit=5,
+                visibility=root_vis,
+            )
+        assert len(rows) == 5
+        # Native distance work remains linear; expensive Python reranking
+        # must be confined to the selected IDs, not all 1,500 memories.
+        assert 5 <= calls <= 100
     finally:
         await backend.close()
 
@@ -277,9 +257,12 @@ async def test_requery_with_larger_window_when_too_few_authorized_survivors(tmp_
             # Alice's row: lower cosine than the bob ones, so it would
             # NOT be in the top-K initial window if K=100.
             await _insert_memory(
-                backend, tx, memory_id=alice_id,
+                backend,
+                tx,
+                memory_id=alice_id,
                 content="alice authorized needle",
-                owner_id="alice", namespace="ns-alice",
+                owner_id="alice",
+                namespace="ns-alice",
                 updated_at=now,
             )
             await _persist_embedding(backend, tx, alice_id, [0.3, 0.95, 0.0])
@@ -289,9 +272,12 @@ async def test_requery_with_larger_window_when_too_few_authorized_survivors(tmp_
             for i in range(60):
                 fid = f"sqlite-vec-requery-foreign-{i}"
                 await _insert_memory(
-                    backend, tx, memory_id=fid,
+                    backend,
+                    tx,
+                    memory_id=fid,
                     content=f"foreign row {i}",
-                    owner_id="bob", namespace="ns-other",
+                    owner_id="bob",
+                    namespace="ns-other",
                     updated_at=now,
                 )
                 await _persist_embedding(backend, tx, fid, [1.0 - 0.001 * i, 0.04, 0.0])
@@ -310,6 +296,4 @@ async def test_requery_with_larger_window_when_too_few_authorized_survivors(tmp_
     # initial 100-candidate window would be entirely the high-cosine
     # unauthorized set (60 rows above alice's cosine), so without the
     # bounded retry the result would be empty.
-    assert ids == [alice_id], (
-        f"expected alice's row to surface via bounded re-query, got {ids!r}"
-    )
+    assert ids == [alice_id], f"expected alice's row to surface via bounded re-query, got {ids!r}"

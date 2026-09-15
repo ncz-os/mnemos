@@ -1,7 +1,0 @@
-[project]
-name = "mnemos-graeae"
-version = "0.1.0"
-description = "Local stub for F01 testing — graeae add-on is not published to PyPI."
-requires-python = ">=3.13"
-license = { text = "Apache-2.0" }
-dependencies = []

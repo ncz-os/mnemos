@@ -21,6 +21,7 @@ async def fetch_memory_export(
     limit: int,
     offset: int,
     include_secrets: bool = False,
+    record_cursor: Optional[tuple[Any, str]] = None,
 ):
     conditions: list[str] = ["deleted_at IS NULL"]
     params: list[Any] = []
@@ -42,6 +43,11 @@ async def fetch_memory_export(
         params.append(category)
         idx += 1
 
+    if record_cursor is not None:
+        conditions.append(f"(created, id) > (${idx}, ${idx + 1})")
+        params.extend(record_cursor)
+        idx += 2
+
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     sql = (
         "SELECT id, content, category, subcategory, created, updated, "
@@ -59,7 +65,7 @@ async def fetch_memory_export(
         "source_memories, federation_source "
         "FROM memories "
         f"{where} "
-        f"ORDER BY created ASC "
+        f"ORDER BY created ASC, id ASC "
         f"LIMIT ${idx} OFFSET ${idx + 1}"
     )
     params.extend([limit, offset])
@@ -299,7 +305,7 @@ async def fetch_referenced_memory_allowlist(
     scope_owner: Optional[str] = None,
     scope_namespace: Optional[str] = None,
 ):
-    sql = "SELECT id, owner_id, namespace FROM memories " "WHERE id = ANY($1::text[]) AND deleted_at IS NULL"
+    sql = "SELECT id, owner_id, namespace FROM memories WHERE id = ANY($1::text[]) AND deleted_at IS NULL"
     params: list[Any] = [list(referenced_ids)]
     if scope_owner is not None:
         sql += " AND owner_id = $2"
@@ -410,7 +416,7 @@ async def delete_memory_branches_for_memories(conn, memory_ids: Sequence[str]) -
 
 async def fetch_versioned_memory_ids(conn, memory_ids: Sequence[str]):
     return await conn.fetch(
-        "SELECT DISTINCT memory_id FROM memory_versions " "WHERE memory_id = ANY($1::text[]) AND deleted_at IS NULL",
+        "SELECT DISTINCT memory_id FROM memory_versions WHERE memory_id = ANY($1::text[]) AND deleted_at IS NULL",
         list(memory_ids),
     )
 
@@ -652,7 +658,7 @@ async def compression_candidate_exists(
     owner_id: str,
 ) -> bool:
     exists = await conn.fetchval(
-        "SELECT 1 FROM memory_compression_candidates " "WHERE id = $1::uuid AND memory_id = $2 " "AND owner_id = $3",
+        "SELECT 1 FROM memory_compression_candidates WHERE id = $1::uuid AND memory_id = $2 AND owner_id = $3",
         candidate_id,
         memory_id,
         owner_id,
@@ -733,3 +739,27 @@ async def fetch_compressed_variant_by_memory_id(conn, memory_id: str):
         "WHERE memory_id = $1",
         memory_id,
     )
+
+
+async def fetch_visible_export_memory_ids(
+    conn,
+    *,
+    memory_ids: Sequence[str],
+    effective_owner: Optional[str],
+    effective_ns: Optional[str],
+    include_secrets: bool = False,
+) -> set[str]:
+    """Resolve provenance targets across pages without exposing other tenants."""
+    if not memory_ids:
+        return set()
+    conditions = ["id = ANY($1::text[])", "deleted_at IS NULL"]
+    params: list[Any] = [list(memory_ids)]
+    for column, value in (("owner_id", effective_owner), ("namespace", effective_ns)):
+        if value:
+            params.append(value)
+            conditions.append(f"{column} = ${len(params)}")
+    if not include_secrets:
+        params.append(VAULT_NAMESPACE)
+        conditions.append(f"(namespace IS NULL OR namespace <> ${len(params)})")
+    rows = await conn.fetch("SELECT id FROM memories WHERE " + " AND ".join(conditions), *params)
+    return {row["id"] for row in rows}

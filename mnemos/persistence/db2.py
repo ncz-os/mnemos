@@ -869,15 +869,10 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 clause, vis_params = _render_visibility(visibility, table_alias="m")
                 if clause:
                     where.append(_BIND_RE.sub("?", clause))
-                    params.extend(
-                        vis_params[match.group(1)]
-                        for match in _BIND_RE.finditer(clause)
-                    )
+                    params.extend(vis_params[match.group(1)] for match in _BIND_RE.finditer(clause))
             await _call(
                 cursor.execute,
-                "SELECT m.id FROM memories m WHERE "
-                + " AND ".join(where)
-                + " FOR UPDATE",
+                "SELECT m.id FROM memories m WHERE " + " AND ".join(where) + " FOR UPDATE",
                 tuple(params),
             )
             if await _call(cursor.fetchone) is None:
@@ -975,8 +970,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             if tags:
                 placeholders = ", ".join("?" for _ in tags)
                 where.append(
-                    "EXISTS (SELECT 1 FROM memory_tags mt "
-                    f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                    f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
                 )
                 where_params.extend(tags)
 
@@ -1382,8 +1376,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             if tags:
                 placeholders = ", ".join("?" for _ in tags)
                 where.append(
-                    "EXISTS (SELECT 1 FROM memory_tags mt "
-                    f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                    f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
                 )
                 params_list.extend(tags)
             where_sql = " AND ".join(where)
@@ -1625,8 +1618,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             if tags:
                 placeholders = ", ".join("?" for _ in tags)
                 where.append(
-                    "EXISTS (SELECT 1 FROM memory_tags mt "
-                    f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                    f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
                 )
                 params_list.extend(tags)
             params_list.append(limit)
@@ -2831,8 +2823,7 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
             try:
                 await _call(
                     cursor.execute,
-                    f"UPDATE memories SET triples_extracted_at = NULL "
-                    f"WHERE id IN ({placeholders})",
+                    f"UPDATE memories SET triples_extracted_at = NULL WHERE id IN ({placeholders})",
                     tuple(affected_ids),
                 )
             finally:
@@ -3417,8 +3408,7 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
             # unavailable (or stale) once the cursor is closed below.
             cols = [c[0].lower() for c in cursor.description]
             result = [
-                _oracle_webhook_claim(dict(zip(cols, r)), lease_token=lease_token, claim_now=claim_now)
-                for r in rows
+                _oracle_webhook_claim(dict(zip(cols, r)), lease_token=lease_token, claim_now=claim_now) for r in rows
             ]
         finally:
             await _call(cursor.close)
@@ -4154,7 +4144,12 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
 
     # ── feed queries ─────────────────────────────────────────────────────
 
-    async def feed_query(
+    async def feed_query(self, tx, **kwargs):
+        from mnemos.persistence.federation_journal import feed_query
+
+        return await feed_query(self, tx, **kwargs)
+
+    async def _legacy_feed_query(
         self,
         tx: Any,
         *,
@@ -4269,7 +4264,12 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         finally:
             await _call(cursor.close)
 
-    async def get_feed_memory(
+    async def get_feed_memory(self, tx, memory_id, *, namespaces, categories):
+        from mnemos.persistence.federation_journal import get_feed_memory
+
+        return await get_feed_memory(self, tx, memory_id, namespaces=namespaces, categories=categories)
+
+    async def _legacy_get_feed_memory(
         self,
         tx: Any,
         memory_id: str,
@@ -4503,7 +4503,6 @@ class Db2OAuthRepository(OracleOAuthRepository):
         # Native Db2 uses question-mark binds; never rely on Oracle translation.
         return sql, params
 
-
     async def register_oauth_token(
         self,
         tx: Any,
@@ -4653,9 +4652,7 @@ class Db2OAuthRepository(OracleOAuthRepository):
     # ``migrations_db2/0003_api_keys.sql`` and ``0006_oauth_sessions.sql``
     # is what allows the same SQL shape with positional binds.
 
-    async def lookup_api_key(
-        self, tx: Any, key_hash: str
-    ) -> Row | None:
+    async def lookup_api_key(self, tx: Any, key_hash: str) -> Row | None:
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
             await _call(
@@ -4692,15 +4689,12 @@ class Db2OAuthRepository(OracleOAuthRepository):
         finally:
             await _call(cursor.close)
 
-    async def resolve_active_session(
-        self, tx: Any, session_id: str, *, now: Any
-    ) -> Row | None:
+    async def resolve_active_session(self, tx: Any, session_id: str, *, now: Any) -> Row | None:
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
             await _call(
                 cursor.execute,
-                "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions "
-                "WHERE session_id = ?",
+                "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions WHERE session_id = ?",
                 (session_id,),
             )
             row = await _row_to_dict(cursor, await _call(cursor.fetchone))
@@ -4713,8 +4707,7 @@ class Db2OAuthRepository(OracleOAuthRepository):
                 return None
             await _call(
                 cursor.execute,
-                "UPDATE oauth_sessions SET last_used_at = CURRENT TIMESTAMP "
-                "WHERE session_id = ?",
+                "UPDATE oauth_sessions SET last_used_at = CURRENT TIMESTAMP WHERE session_id = ?",
                 (session_id,),
             )
             return row

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -253,6 +253,7 @@ def _memory_item_from_row(
     fed_verbatim = redact_content(row["verbatim_content"]) if row["verbatim_content"] else row["verbatim_content"]
     return MemoryItem(
         id=row["id"],
+        federation_sequence=row.get("federation_sequence"),
         content=fed_content,
         category=row["category"],
         subcategory=row["subcategory"],
@@ -297,6 +298,7 @@ def _feed_item_from_row(
             id=row["id"],
             consolidated_into=row["consolidated_into"],
             consolidated_at=_iso_value(consolidated_at) or "",
+            federation_sequence=row.get("federation_sequence"),
         )
     if item_type == "withdrawal":
         # F07: explicit withdrawal/tombstone signal for a row that has
@@ -312,6 +314,7 @@ def _feed_item_from_row(
             namespace=namespace_val if namespace_val else None,
             withdrawn_at=_iso_value(withdrawn_at_raw) or "",
             reason="ineligible",
+            federation_sequence=row.get("federation_sequence"),
         )
     return _memory_item_from_row(
         row,
@@ -734,11 +737,19 @@ async def federation_feed(
         logger.exception("[federation/feed] unexpected error in feed_query")
         raise
 
-    has_more = len(rows) > limit
+    checkpoint = getattr(rows, "checkpoint", None)
+    pending = getattr(rows, "pending", False)
+    page_full = len(rows) > limit
+    has_more = page_full or pending
     rows = rows[:limit]
 
-    if rows and rows[-1]["updated"]:
-        next_cursor = _fed._encode_feed_cursor(_cursor_datetime(rows[-1]["updated"]), rows[-1]["id"])
+    if checkpoint is not None and not page_full:
+        next_cursor = _fed._encode_feed_cursor(datetime.now(timezone.utc), f"journal:{checkpoint}")
+    elif rows and rows[-1]["updated"]:
+        next_cursor = _fed._encode_feed_cursor(
+            _cursor_datetime(rows[-1].get("cursor_updated", rows[-1]["updated"])),
+            rows[-1].get("cursor_id", rows[-1]["id"]),
+        )
     else:
         next_cursor = since
 
@@ -777,7 +788,7 @@ async def federation_feed(
     )
 
 
-@router.get("/memory/{memory_id}", response_model=MemoryItem)
+@router.get("/memory/{memory_id}", response_model=MemoryItem | FederationWithdrawalEvent | FederationConsolidationEvent)
 async def federation_memory(
     memory_id: str,
     _: UserContext = Depends(_require_federation_role),
@@ -820,4 +831,4 @@ async def federation_memory(
 
     if row is None:
         raise HTTPException(status_code=404, detail="memory not found")
-    return _memory_item_from_row(row)
+    return _feed_item_from_row(row)

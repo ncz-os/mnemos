@@ -224,30 +224,13 @@ async def _write_document_import_audit_entry(
     metadata: dict[str, Any] | None,
     writer_id: str,
 ) -> None:
-    if getattr(backend, "audit_chain", None) is None:
-        return
-    from mnemos.audit import write_audit_entry
-    from mnemos.core.config import get_settings
-    from mnemos.workers.audit_sealer import audit_chain_enabled
+    from mnemos.audit.route_helper import write_configured_audit_entry
 
-    if not audit_chain_enabled():
-        return
-    session_secret = (getattr(get_settings().server, "session_secret", "") or "").encode("utf-8")
-    if not session_secret:
-        logger.warning(
-            "[document_import] MNEMOS_AUDIT_CHAIN=on but session_secret is empty; skipping audit write"
-        )
-        return
-    await write_audit_entry(
+    await write_configured_audit_entry(
         backend,
         tx,
         op="create",
         memory_id_str=memory_id,
-        content=content,
-        category=category,
-        subcategory=subcategory,
-        metadata=metadata,
-        embedding=None,
+        snapshot={"content": content, "category": category, "subcategory": subcategory, "metadata": metadata},
         writer_id=writer_id,
-        session_secret=session_secret,
     )
