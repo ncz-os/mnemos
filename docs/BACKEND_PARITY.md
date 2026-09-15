@@ -22,41 +22,41 @@ mariadb, oracle, db2) and answers two questions for every cell:
    over the backend name or via a file named
    `test_<capability>_<backend>*.py`?
 
-Summary: **62/162** cells are fully covered
-(✅ implemented+tested), **49** cells are
-implemented but untested, **43** cells have neither
+Summary: **75/162** cells are fully covered
+(✅ implemented+tested), **44** cells are
+implemented but untested, **34** cells have neither
 implementation nor test.
 
 ## Matrix
 
 | Capability | sqlite | postgres | mysql | mariadb | oracle | db2 |
 |---|---|---|---|---|---|---|
-| memory_crud (MemoryRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| memory_crud (MemoryRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
 | vector_search (semantic_search) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
-| fts_search (FTS5 / native FTS) | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
-| kg (KGRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
-| versions (VersionRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
-| branches (BranchRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
-| compression (CompressionRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
-| compression_queue (CompressionQueueRepository) | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test |
-| morpheus (MorpheusRepository) | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test |
-| webhooks (end-to-end delivery) | ⚠️ test exists, stub impl | ✅ implemented+tested | ⚠️ test exists, stub impl | ❌ neither | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl |
-| nats_dispatch_log (idempotency dedupe) | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test |
-| consultations_audit (model recommendation) | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
-| oauth (OAuthRepository) | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| fts_search (FTS5 / native FTS) | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
+| kg (KGRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
+| versions (VersionRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
+| branches (BranchRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
+| compression (CompressionRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
+| compression_queue (CompressionQueueRepository) | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test |
+| morpheus (MorpheusRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
+| webhooks (end-to-end delivery) | ⚠️ test exists, stub impl | ✅ implemented+tested | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl |
+| nats_dispatch_log (idempotency dedupe) | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test |
+| consultations_audit (model recommendation) | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| oauth (OAuthRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
 | sessions (SessionsRepository) | ⚠️ implemented, no test | ⚠️ implemented, no test | ❌ neither | ❌ neither | ✅ implemented+tested | ✅ implemented+tested |
-| consultations (ConsultationsRepository) | ⚠️ implemented, no test | ⚠️ implemented, no test | ❌ neither | ❌ neither | ✅ implemented+tested | ✅ implemented+tested |
-| federation (FederationRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
-| state (StateRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| consultations (ConsultationsRepository) | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ test exists, stub impl | ❌ neither | ✅ implemented+tested | ✅ implemented+tested |
+| federation (FederationRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested |
+| state (StateRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
 | audit_chain (AuditChainRepository) | ✅ implemented+tested | ✅ implemented+tested | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl | ✅ implemented+tested | ✅ implemented+tested |
-| acl (AclRepository) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ⚠️ implemented, no test | ⚠️ implemented, no test |
-| journal (KNEMON journal entries) | ❌ neither | ❌ neither | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
-| ledger (KNEMON usage_ledger) | ⚠️ test exists, stub impl | ❌ neither | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
+| acl (AclRepository) | ⚠️ test exists, stub impl | ⚠️ implemented, no test | ❌ neither | ❌ neither | ⚠️ implemented, no test | ⚠️ implemented, no test |
+| journal (KNEMON journal entries) | ⚠️ implemented, no test | ⚠️ implemented, no test | ❌ neither | ❌ neither | ⚠️ implemented, no test | ⚠️ implemented, no test |
+| ledger (KNEMON usage_ledger) | ✅ implemented+tested | ⚠️ implemented, no test | ❌ neither | ❌ neither | ⚠️ implemented, no test | ⚠️ implemented, no test |
 | row_level_security (Postgres RLS) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
 | listen_notify (Postgres LISTEN/NOTIFY) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
 | advisory_locks (Postgres advisory locks) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
-| federation_journal (distinct journal table) | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test |
-| morpheus HTTP-trigger (POST /admin/morpheus/runs) | ⚠️ test exists, stub impl | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
+| federation_journal (distinct journal table) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
+| morpheus HTTP-trigger (POST /admin/morpheus/runs) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
 | kronos routes (POSTGRES-only) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
 
 
