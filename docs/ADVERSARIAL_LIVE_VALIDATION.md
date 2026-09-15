@@ -57,3 +57,14 @@ separate service now materializes Oracle JSON and description CLOBs before
 returning claims; its canonical-schema test claimed 1,000 jobs across eight
 workers without duplicate or missing claims. KNEMON and CHARON CI now run their
 PostgreSQL reservation and snapshot contracts on every branch push.
+
+
+## Installation-profile checks
+
+Core-only tests and the combined core/GRAEAE/KNEMON/PANTHEON/CHARON install both
+run in CI. The combined job checks out `.github/addons.lock.json` pins, installs
+the real distributions, and runs the core suite. Tests of optional availability
+set their dependency state explicitly; the MCP registry still checks an exact
+allowlist for installed modules. Fake HTTP transport tests use explicit
+unbudgeted settings and no database; the separate live admission tests continue
+to assert budget and quota denial. STIPHOS remains a separately tested service.

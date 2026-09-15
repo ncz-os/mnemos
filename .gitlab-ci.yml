@@ -522,3 +522,33 @@ test:journal-sql:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
+
+
+# Validate the supported combined install as well as the core-only contract.
+test:composition:
+  stage: test
+  image: python:3.13-slim
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git build-essential cmake
+    - |
+      python - <<'PYTHON'
+      import json
+      import subprocess
+      from pathlib import Path
+      pins = json.loads(Path(".github/addons.lock.json").read_text())
+      for name in ("graeae", "knemon", "pantheon", "charon"):
+          target = "../composition-" + name
+          subprocess.run(["git", "clone", "https://gitlab.com/ncz-os/" + name + ".git", target], check=True)
+          subprocess.run(["git", "-C", target, "checkout", pins[name]], check=True)
+      PYTHON
+    - python -m pip install --quiet -e ".[dev,sqlite,nats,persephone]" -e ../composition-graeae -e ../composition-knemon -e ../composition-pantheon -e ../composition-charon
+  script:
+    - python -m pytest tests/ --ignore=tests/test_live_e2e.py --tb=short -q --junitxml=composition.xml
+  artifacts:
+    when: always
+    reports:
+      junit: composition.xml
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
