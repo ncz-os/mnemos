@@ -253,6 +253,7 @@ def _translate_sql_cached(sql: str) -> tuple[str, tuple[str, ...]]:
     adapted = masked_sql
     for oracle_tok, db2_tok in _ORA_TO_DB2_PAIRS:
         adapted = adapted.replace(oracle_tok, db2_tok)
+    adapted = re.sub(r"\bFROM\s+DUAL\b", "FROM SYSIBM.SYSDUMMY1", adapted, flags=re.IGNORECASE)
     adapted = _TO_VECTOR_RE.sub("VECTOR", adapted)
     names = tuple(_BIND_RE.findall(adapted))
     adapted = _BIND_RE.sub("?", adapted)
@@ -2885,19 +2886,13 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
                 n_restored += int(getattr(cursor, "rowcount", 0) or 0)
             finally:
                 await _call(cursor.close)
-        # Step 5: audit log. Db2 has STANDARD_HASH... actually Db2 12.1
-        # does not have STANDARD_HASH; use HEX(HASH256(c)) if the
-        # build supports it, otherwise fall back to SHA-256 done in
-        # Python — but the deletion_log schema on Db2 (migration 0050)
-        # stores content_hash as VARCHAR(64), so any 64-char lowercase
-        # hex digest works. HASH256 is a Db2 built-in; if the build
-        # doesn't have it we leave content_hash NULL on Db2.
+        # Step 5: audit the complete content before deletion.
         cursor = await _call(conn.cursor)
         try:
             await _call(
                 cursor.execute,
                 """
-                SELECT id FROM memories
+                SELECT id, content FROM memories
                  WHERE morpheus_run_id = ?
                    AND provenance = 'morpheus_local'
                    AND deleted_at IS NULL
@@ -2911,14 +2906,7 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
             mid = row[0]
             cursor = await _call(conn.cursor)
             try:
-                # Db2 built-in HASH256() returns a 32-byte binary; we
-                # cast to VARCHAR(64) for the lowercase hex form via
-                # HEX(). The migration's content_hash column is
-                # VARCHAR(64). Some Db2 12.1 Fix Packs expose HEX as
-                # HEX(int) only; fall back to HEX(BIGINT) of a single
-                # hash row if HEX(CLOB) raises. Operators running
-                # older Fix Packs may need to upgrade — same caveat as
-                # the compression queue migration.
+                # Hash the complete content using the same portable digest as writes.
                 await _call(
                     cursor.execute,
                     """
@@ -2927,7 +2915,7 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
                         requested_by, requested_at, request_kind, reason, source
                     )
                     SELECT id,
-                           HEX(HASH256(COALESCE(content, ''))),
+                           ?,
                            owner_id, namespace,
                            ?, CURRENT TIMESTAMP, 'admin_purge', ?, ?
                       FROM memories
@@ -2936,9 +2924,10 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
                        AND deleted_at IS NULL
                     """,
                     (
+                        _content_hash(str(row[1] or "")),
                         str(requested_by),
                         f"MORPHEUS rollback {run_id}",
-                        f"morpheus.rollback,{run_id}",
+                        json.dumps({"operation": "morpheus.rollback", "run_id": run_id}),
                         mid,
                     ),
                 )
@@ -3854,7 +3843,6 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                     local_canonical_id,
                     canonical_remote_id,
                     consolidated_at,
-                    consolidated_at,
                     peer_name,
                     remote_id,
                     local_id,
@@ -3888,13 +3876,12 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
             await _call(
                 cursor.execute,
                 """
-                UPDATE memories
-                   SET deleted_at = CURRENT TIMESTAMP
-                 WHERE id = ?
+                DELETE FROM memories
+                 WHERE id IN (?, ?)
                    AND federation_source = ?
                    AND deleted_at IS NULL
                 """,
-                (memory_id, peer_name),
+                (memory_id, f"fed:{peer_name}:{memory_id}", peer_name),
             )
             return int(getattr(cursor, "rowcount", 0) or 0)
         finally:
@@ -5019,6 +5006,8 @@ class Db2Backend(OracleBackend):
     exact scan even when ``MNEMOS_DB2_VECTOR_INDEX=approx`` is set.
     """
 
+    _LIVENESS_PROBE_SQL = "SELECT 1 FROM SYSIBM.SYSDUMMY1"
+
     supports_listen_notify = False
     supports_advisory_locks = False
     supports_row_level_security = False
@@ -5579,14 +5568,64 @@ class Db2Backend(OracleBackend):
         return (self._db2_vector_indexing_value or "").upper() == "YES"
 
 
+class _Db2MorpheusTransaction:
+    """Keep the caller's physical transaction while adapting inherited SQL."""
+
+    def __init__(self, tx):
+        self._tx = tx
+        self.conn = _Db2AsyncConnection(tx.conn._conn)
+
+    def __getattr__(self, name):
+        return getattr(self._tx, name)
+
+
+def _morpheus_native_bridge(method):
+    from functools import wraps
+
+    @wraps(method)
+    async def call(self, tx, *args, **kwargs):
+        if isinstance(tx.conn, _Db2NativeAsyncConnection):
+            tx = _Db2MorpheusTransaction(tx)
+        return await method(self, tx, *args, **kwargs)
+
+    return call
+
+
+class Db2MorpheusNativeBridge(Db2MorpheusRepository):
+    """Explicit compatibility island for MORPHEUS's inherited Oracle statements.
+
+    This does not open a second connection, commit, or change database mode.
+    All other repositories retain the strict native cursor. Removing this bridge
+    requires porting and testing the full MORPHEUS SQL surface, rather than
+    claiming inheritance has already made that surface native.
+    """
+
+    begin_run = _morpheus_native_bridge(Db2MorpheusRepository.begin_run)
+    set_phase = _morpheus_native_bridge(Db2MorpheusRepository.set_phase)
+    update_counters = _morpheus_native_bridge(Db2MorpheusRepository.update_counters)
+    increment_extract_counters = _morpheus_native_bridge(Db2MorpheusRepository.increment_extract_counters)
+    finish_run = _morpheus_native_bridge(Db2MorpheusRepository.finish_run)
+    fail_run = _morpheus_native_bridge(Db2MorpheusRepository.fail_run)
+    sweep_orphan_runs = _morpheus_native_bridge(Db2MorpheusRepository.sweep_orphan_runs)
+    rollback_run = _morpheus_native_bridge(Db2MorpheusRepository.rollback_run)
+    fetch_cluster_candidates = _morpheus_native_bridge(Db2MorpheusRepository.fetch_cluster_candidates)
+    replay_scan_count = _morpheus_native_bridge(Db2MorpheusRepository.replay_scan_count)
+    merge_run_config = _morpheus_native_bridge(Db2MorpheusRepository.merge_run_config)
+    phase_consolidate = _morpheus_native_bridge(Db2MorpheusRepository.phase_consolidate)
+    phase_synthesise_load = _morpheus_native_bridge(Db2MorpheusRepository.phase_synthesise_load)
+    phase_synthesise_store = _morpheus_native_bridge(Db2MorpheusRepository.phase_synthesise_store)
+    phase_extract_load = _morpheus_native_bridge(Db2MorpheusRepository.phase_extract_load)
+    phase_extract_failure = _morpheus_native_bridge(Db2MorpheusRepository.phase_extract_failure)
+    phase_extract_store = _morpheus_native_bridge(Db2MorpheusRepository.phase_extract_store)
+
+
 class Db2BackendNative(Db2Backend):
     """Db2 backend with native-cursor pass-through (no Oracle→Db2 token translation).
 
     Suitable for deployments where every repository method emits Db2-native
     SQL natively (i.e. uses ``?`` positional binds, ``CURRENT TIMESTAMP``,
-    ``FROM SYSIBM.SYSDUMMY1``, etc.). MNEMOS as of PR #9c has every
-    persistence repository natively overridden, so this is the production
-    posture going forward.
+    ``FROM SYSIBM.SYSDUMMY1``, etc.). MORPHEUS is an explicit exception: its
+    inherited SQL uses Db2MorpheusNativeBridge on the same transaction.
 
     Operators on older versions OR ones who have customized repositories
     with Oracle-shape SQL should stay on :class:`Db2Backend` (the compat
@@ -5610,6 +5649,7 @@ class Db2BackendNative(Db2Backend):
         # settings, _closed, vector-indexing probe — inherits from
         # Db2Backend unchanged.
         super().__init__(pool, settings)
+        self._morpheus_repo = Db2MorpheusNativeBridge()
 
 
 __all__ = [

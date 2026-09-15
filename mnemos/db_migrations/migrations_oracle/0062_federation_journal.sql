@@ -17,9 +17,9 @@ BEGIN
  END IF;
 END;
 /
-CREATE OR REPLACE TRIGGER fed_journal_update AFTER UPDATE OF content,category,subcategory,namespace,owner_id,permission_mode,deleted_at,archived_at,consolidated_into,updated,embedding,metadata,verbatim_content,source_model,source_provider,source_agent,source_session ON memories FOR EACH ROW
+CREATE OR REPLACE TRIGGER fed_journal_update AFTER UPDATE ON memories FOR EACH ROW
 BEGIN
- IF (:OLD.federation_source IS NULL AND (:OLD.namespace IS NULL OR :OLD.namespace<>'vault')) OR (:NEW.federation_source IS NULL AND (:NEW.namespace IS NULL OR :NEW.namespace<>'vault')) THEN
+ IF (UPDATING('content') OR UPDATING('category') OR UPDATING('subcategory') OR UPDATING('namespace') OR UPDATING('owner_id') OR UPDATING('permission_mode') OR UPDATING('deleted_at') OR UPDATING('archived_at') OR UPDATING('consolidated_into') OR UPDATING('updated') OR UPDATING('embedding') OR UPDATING('metadata') OR UPDATING('verbatim_content') OR UPDATING('source_model') OR UPDATING('source_provider') OR UPDATING('source_agent') OR UPDATING('source_session') OR UPDATING('federation_source')) AND ((:OLD.federation_source IS NULL AND (:OLD.namespace IS NULL OR :OLD.namespace<>'vault')) OR (:NEW.federation_source IS NULL AND (:NEW.namespace IS NULL OR :NEW.namespace<>'vault'))) THEN
  INSERT INTO federation_changes(memory_id,changed_at,old_namespace,old_category,old_public,old_exportable,new_namespace,new_category,new_public,new_exportable) VALUES(:NEW.id,SYS_EXTRACT_UTC(SYSTIMESTAMP),:OLD.namespace,:OLD.category,CASE WHEN MOD(:OLD.permission_mode,10)>=4 THEN 1 ELSE 0 END,CASE WHEN :OLD.federation_source IS NULL AND (:OLD.namespace IS NULL OR :OLD.namespace<>'vault') AND :OLD.deleted_at IS NULL AND :OLD.archived_at IS NULL AND :OLD.consolidated_into IS NULL THEN 1 ELSE 0 END,:NEW.namespace,:NEW.category,CASE WHEN MOD(:NEW.permission_mode,10)>=4 THEN 1 ELSE 0 END,CASE WHEN :NEW.federation_source IS NULL AND (:NEW.namespace IS NULL OR :NEW.namespace<>'vault') AND :NEW.deleted_at IS NULL AND :NEW.archived_at IS NULL AND :NEW.consolidated_into IS NULL THEN 1 ELSE 0 END);
  END IF;
 END;

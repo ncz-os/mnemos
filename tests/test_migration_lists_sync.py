@@ -156,6 +156,7 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "0048_memory_versions_visibility.sql",
     "0054_memory_tags.sql",
     "0062_federation_journal.sql",
+    "0064_federation_journal_dialects.sql",
 ]
 
 
