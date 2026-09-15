@@ -57,6 +57,30 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+## [7.0.0.dev0] — 2026-09-15
+
+### Development began
+
+v7 development line opened per operator directive. Tracks the non-bug
+roadmap items from the 2026-09-14 adversarial review that were deferred
+pending architecture design (each preceded by a GRAEAE consultation):
+
+- Split the largest backend files by repository domain, starting with
+  one mechanical, contract-verified extraction (audit/journal methods)
+  as a proof of the pattern before touching the rest.
+- Generate a backend parity matrix (`docs/BACKEND_PARITY.md`) from real
+  test-collection markers and implementation stubs, CI-gated against
+  drift.
+- Critical-path coverage gates (required-audit write path first) using
+  named required fault-injection tests plus branch coverage scoped to
+  those files only, not a global percentage.
+- CHARON: intra-page streaming export output as a safe interim step,
+  distinct from the deferred MPF v0.3 cross-page snapshot consistency
+  work.
+- Real benchmark execution, Phase 1 only (1k/10k corpus, concurrency
+  1/5/10, local SQLite) — Phase 2 (100k/1M, packing density) stays
+  blocked on an operator hardware-allocation decision.
+
 ## [6.4.1] — 2026-09-14
 
 ### Fixed — docs
