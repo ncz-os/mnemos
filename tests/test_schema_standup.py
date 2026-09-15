@@ -50,7 +50,13 @@ class _FakePgConn:
         self.index_method = index_method
         self.statements: list[str] = []
 
-    async def execute(self, statement: str) -> str:
+    async def execute(self, statement: str, *_args: Any) -> str:
+        # *_args: fix/concurrent-migration-race's pg_advisory_lock /
+        # pg_advisory_unlock calls pass a parameter
+        # (`conn.execute("SELECT pg_advisory_unlock($1)", key)`); every
+        # prior caller in this fake's exercised paths only ever ran
+        # param-less DDL, so the single-argument signature was never
+        # wrong until this new call site.
         self.statements.append(statement)
         return "OK"
 
@@ -61,6 +67,18 @@ class _FakePgConn:
             return 0
         if "idx_memories_embedding" in query and "am.amname" in query:
             return self.index_method
+        if "pg_try_advisory_lock" in query:
+            # A fake single-connection pool has no real contention, so
+            # the schema-migration advisory lock (fix/concurrent-
+            # migration-race) must acquire immediately. Returning the
+            # default `None` here (falsy) made
+            # `_pg_advisory_session_lock_polling` treat every poll as
+            # "still locked" and spin for up to its 600s max_wait —
+            # every test in this file that reaches `ensure_postgres_
+            # schema`/`ensure_postgres_oauth_schema` hung instead of
+            # failing fast, caught 2026-09-15 by running the suite
+            # against real Postgres and noticing the run never finished.
+            return True
         return None
 
 
