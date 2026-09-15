@@ -52,6 +52,7 @@ from mnemos.core.config import (
     embed_cix_model_path_env,
     embed_cix_tokenizer_id_env,
     embed_gpu_layers_env,
+    embed_http_concurrency_env,
     embed_http_model_env,
     embed_http_timeout_env,
     embed_http_url_env,
@@ -670,6 +671,7 @@ class InProcessEmbedder:
         http_url_fallback: str | None = None,
         http_model: str | None = None,
         http_timeout: float | None = None,
+        http_concurrency: int | None = None,
         # hybrid knobs
         hybrid: bool | None = None,
         npu_threshold_chars: int | None = None,
@@ -702,6 +704,11 @@ class InProcessEmbedder:
         self.http_url_fallback = http_url_fallback if http_url_fallback is not None else embed_http_url_fallback_env()
         self.http_model = http_model or embed_http_model_env()
         self.http_timeout = float(http_timeout if http_timeout is not None else embed_http_timeout_env())
+        self.http_concurrency = int(
+            http_concurrency if http_concurrency is not None else embed_http_concurrency_env()
+        )
+        if self.http_concurrency < 1:
+            self.http_concurrency = 1
         self.max_text_chars = int(max_text_chars if max_text_chars is not None else embed_max_chars_env())
         self._backend = None  # type: ignore[assignment]
         self._backend_name: str | None = None
@@ -709,6 +716,15 @@ class InProcessEmbedder:
         # texts to NPU and long to the primary backend.
         self._npu_sidecar: _CixNpuBackend | None = None
         self._lock = asyncio.Lock()
+        # Bounded concurrency for the HTTP (httpx async) path. The HTTP
+        # backend is fully reentrant on the asyncio side, so a mutex would
+        # be pointlessly serializing concurrent calls — but UNBOUNDED
+        # concurrency to a remote GPU host is its own outage mode. A
+        # semaphore caps in-flight HTTP calls at `http_concurrency` (env
+        # MNEMOS_EMBED_HTTP_CONCURRENCY, default 10). This is independent
+        # of ``_lock``: ``_lock`` protects non-reentrant local-backend
+        # serialization (F15); the semaphore only caps the HTTP path.
+        self._http_semaphore = asyncio.Semaphore(self.http_concurrency)
         # F15: dedicated single-worker thread pool for the non-reentrant
         # in-process backend (llamacpp / openvino / cix-npu). Even if two
         # `.embed()` coroutines race past `_lock` because the awaiter is
@@ -831,14 +847,26 @@ class InProcessEmbedder:
         # load is co-serialized with subsequent embed calls. Without
         # this, the default thread pool would let a load run in parallel
         # with an embed that already passed _lock via a cancellation.
-        if not (self._backend and self._backend.loaded):
-            await self._run_serial_sync(self._load_sync)
-        if self._npu_sidecar and not self._npu_sidecar.loaded:
-            try:
-                await self._run_serial_sync(self._npu_sidecar._load_sync)
-            except Exception:
-                logger.warning("[EMBED] hybrid NPU sidecar failed to load; falling back to primary backend")
-                self._npu_sidecar = None
+        #
+        # Double-checked locking: HTTP-primary callers reach here WITHOUT
+        # holding ``_lock`` (they only acquire ``_http_semaphore`` around
+        # the actual call), so two concurrent HTTP-first callers must not
+        # race past the ``self._backend is None`` check and double-init.
+        # We re-check inside the lock so already-loaded embedders skip
+        # the lock acquisition entirely on the hot path.
+        if self._backend and self._backend.loaded and (
+            self._npu_sidecar is None or self._npu_sidecar.loaded
+        ):
+            return
+        async with self._lock:
+            if not (self._backend and self._backend.loaded):
+                await self._run_serial_sync(self._load_sync)
+            if self._npu_sidecar and not self._npu_sidecar.loaded:
+                try:
+                    await self._run_serial_sync(self._npu_sidecar._load_sync)
+                except Exception:
+                    logger.warning("[EMBED] hybrid NPU sidecar failed to load; falling back to primary backend")
+                    self._npu_sidecar = None
 
     def _ensure_serial_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the single-worker executor used for non-reentrant backends.
@@ -914,37 +942,63 @@ class InProcessEmbedder:
         thread. On empty result the optional local fallback is invoked
         per mem_1779334716543_f8ebd4 EXCEPTION clause.
 
-        Concurrency: the in-process backends (llamacpp / openvino /
-        cix-npu / http-local-fallback) are NOT reentrant — see the
-        ``InProcessEmbedder`` class docstring. ``_run_serial_sync``
-        dispatches their ``_embed_sync`` / ``_load_sync`` to a dedicated
-        single-worker thread pool so concurrent callers serialize at the
-        executor regardless of asyncio-side cancellation (F15).
+        Concurrency:
+          * HTTP-primary path: capped by ``_http_semaphore`` (default 10,
+            env MNEMOS_EMBED_HTTP_CONCURRENCY). Two concurrent calls run
+            in parallel up to that bound, not serialized to one-at-a-time.
+          * Non-reentrant local backend (llamacpp / openvino / cix-npu /
+            http-local-fallback): ``_run_serial_sync`` dispatches their
+            ``_embed_sync`` / ``_load_sync`` to a dedicated single-worker
+            thread pool so concurrent callers serialize at the executor
+            regardless of asyncio-side cancellation (F15).
         """
         truncated = (text or "")[: self.max_text_chars]
         if not truncated.strip():
             return []
-        async with self._lock:
-            try:
-                await self._ensure_loaded()
-                if isinstance(self._backend, _HttpBackend):
+        # Lazy backend construction is gated on ``self._backend is None``;
+        # ``_ensure_loaded`` re-checks inside a narrow ``_lock`` to avoid
+        # two coroutines racing past the ``None`` check and
+        # double-initializing. Once the backend is built, the HTTP
+        # primary path goes through ``_http_semaphore`` — NOT ``_lock``
+        # — so concurrent HTTP calls run in parallel up to the
+        # configured cap.
+        #
+        # ``_ensure_loaded()`` is inside the ``try`` so a missing-GGUF
+        # FileNotFoundError (or any other load failure) is caught and
+        # returned as ``[]`` — preserving the pre-fix behaviour where
+        # ``embed()`` swallows backend-construction errors.
+        try:
+            await self._ensure_loaded()
+            if isinstance(self._backend, _HttpBackend):
+                # HTTP primary + remote-fallback: bounded concurrency via
+                # the semaphore. The semaphore is independent of ``_lock``
+                # so we don't serialize these calls to one-at-a-time.
+                async with self._http_semaphore:
                     vec = await self._backend.embed_async(truncated)
+                if vec:
+                    return vec
+                # Empty -> breaker open or remote failed; try remote-fallback first.
+                if self._http_fallback_remote is not None:
+                    logger.warning(
+                        "[EMBED][http] primary failed -> remote-fallback %s",
+                        self._http_fallback_remote.url,
+                    )
+                    async with self._http_semaphore:
+                        vec = await self._http_fallback_remote.embed_async(truncated)
                     if vec:
                         return vec
-                    # Empty -> breaker open or remote failed; try remote-fallback first.
-                    if self._http_fallback_remote is not None:
-                        logger.warning(
-                            "[EMBED][http] primary failed -> remote-fallback %s",
-                            self._http_fallback_remote.url,
-                        )
-                        vec = await self._http_fallback_remote.embed_async(truncated)
-                        if vec:
-                            return vec
-                    # Then in-process local llamacpp.
-                    if self._http_fallback is not None:
-                        logger.warning("[EMBED][http] remote+fallback failed -> llamacpp local")
+                # Then in-process local llamacpp — non-reentrant, must run
+                # under _lock so the single-worker executor (F15)
+                # serializes any concurrent callers.
+                if self._http_fallback is not None:
+                    logger.warning("[EMBED][http] remote+fallback failed -> llamacpp local")
+                    async with self._lock:
                         return await self._run_serial_sync(self._http_fallback._embed_sync, truncated)
-                    return []
+                return []
+            # Non-HTTP path: the primary backend (or NPU sidecar) is
+            # non-reentrant, so the whole serialize-and-dispatch lives
+            # under ``_lock`` exactly as F15 left it.
+            async with self._lock:
                 use_npu = (
                     self._npu_sidecar is not None
                     and self._npu_sidecar.loaded
@@ -952,52 +1006,75 @@ class InProcessEmbedder:
                 )
                 backend = self._npu_sidecar if use_npu else self._backend
                 return await self._run_serial_sync(backend._embed_sync, truncated)
-            except asyncio.CancelledError:
-                # Awaiter cancelled mid-call; the serial executor will
-                # still finish the in-flight backend work before our lock
-                # is released. Surface cancellation, don't swallow it.
-                raise
-            except Exception:
-                logger.exception("[EMBED] failed to embed text len=%d", len(truncated))
-                # On hybrid NPU failure, retry on primary backend
-                if self._npu_sidecar and self._backend:
+        except asyncio.CancelledError:
+            # Awaiter cancelled mid-call; the serial executor will
+            # still finish the in-flight backend work before our lock
+            # is released. Surface cancellation, don't swallow it.
+            raise
+        except Exception:
+            logger.exception("[EMBED] failed to embed text len=%d", len(truncated))
+            # On hybrid NPU failure, retry on primary backend
+            if self._npu_sidecar and self._backend:
+                async with self._lock:
                     try:
                         return await self._run_serial_sync(self._backend._embed_sync, truncated)
                     except Exception:
                         logger.exception("[EMBED] primary backend retry also failed")
-                return []
+            return []
 
     async def embed_batch(self, texts: Iterable[str]) -> list[list[float]]:
         """Embed multiple strings. For the http backend, sends one POST
         with input=list[str] (a fallback host llama.cpp handles batch). For
         local backends, falls back to per-text sequential calls since
         neither in-process backend is reentrant.
+
+        The HTTP primary + remote-fallback batch calls go through
+        ``_http_semaphore`` (bounded concurrency); the local-fallback
+        per-row ``_run_serial_sync`` calls stay under ``_lock`` so the
+        single-worker executor (F15) serializes entries into the
+        non-reentrant local backend.
         """
         texts_list = list(texts)
         if isinstance(self._backend, _HttpBackend) or self.backend_choice == "http":
-            async with self._lock:
-                try:
-                    await self._ensure_loaded()
-                    if isinstance(self._backend, _HttpBackend):
+            # ``_ensure_loaded()`` is inside the ``try`` so a missing-GGUF
+            # FileNotFoundError (or any other load failure) is caught and
+            # falls through to the per-text fallback path — preserving
+            # the pre-fix behaviour where the load-failure exception
+            # was caught by the surrounding ``async with self._lock``
+            # block.
+            try:
+                await self._ensure_loaded()
+                if isinstance(self._backend, _HttpBackend):
+                    # HTTP batch: bounded concurrency, NOT serialized to
+                    # one-at-a-time. Two concurrent embed_batch() callers
+                    # run in parallel up to ``http_concurrency``.
+                    async with self._http_semaphore:
                         vecs = await self._backend.embed_batch_async(texts_list)
-                        # Remote-fallback first for failed rows (a fallback host :8090
-                        # when a GPU host primary failed). Batch only the failed
-                        # subset to keep wire payload tight.
-                        if any(not v for v in vecs) and self._http_fallback_remote is not None:
-                            miss_idx = [i for i, v in enumerate(vecs) if not v]
-                            miss_texts = [texts_list[i] for i in miss_idx]
-                            logger.warning(
-                                "[EMBED][http] batch primary missed %d/%d; remote-fallback %s",
-                                len(miss_idx),
-                                len(vecs),
-                                self._http_fallback_remote.url,
-                            )
+                    # Remote-fallback first for failed rows (a fallback host :8090
+                    # when a GPU host primary failed). Batch only the failed
+                    # subset to keep wire payload tight. Also bounded by
+                    # the semaphore (one in-flight HTTP call at a time on
+                    # this branch, but other callers' HTTP primary calls
+                    # still run concurrently with us).
+                    if any(not v for v in vecs) and self._http_fallback_remote is not None:
+                        miss_idx = [i for i, v in enumerate(vecs) if not v]
+                        miss_texts = [texts_list[i] for i in miss_idx]
+                        logger.warning(
+                            "[EMBED][http] batch primary missed %d/%d; remote-fallback %s",
+                            len(miss_idx),
+                            len(vecs),
+                            self._http_fallback_remote.url,
+                        )
+                        async with self._http_semaphore:
                             remote_vecs = await self._http_fallback_remote.embed_batch_async(miss_texts)
-                            for j, i in enumerate(miss_idx):
-                                if remote_vecs[j]:
-                                    vecs[i] = remote_vecs[j]
-                        # Local fallback for any rows still empty.
-                        if any(not v for v in vecs) and self._http_fallback is not None:
+                        for j, i in enumerate(miss_idx):
+                            if remote_vecs[j]:
+                                vecs[i] = remote_vecs[j]
+                    # Local fallback for any rows still empty — touches the
+                    # non-reentrant local backend, so it goes back under
+                    # ``_lock`` (and the single-worker executor serializes).
+                    if any(not v for v in vecs) and self._http_fallback is not None:
+                        async with self._lock:
                             if not self._http_fallback.loaded:
                                 await self._run_serial_sync(self._http_fallback._load_sync)
                             for i, (v, t) in enumerate(zip(vecs, texts_list)):
@@ -1006,9 +1083,9 @@ class InProcessEmbedder:
                                     vecs[i] = await self._run_serial_sync(
                                         self._http_fallback._embed_sync, t[: self.max_text_chars]
                                     )
-                        return vecs
-                except Exception:
-                    logger.exception("[EMBED] http batch failed; per-text fallback")
+                    return vecs
+            except Exception:
+                logger.exception("[EMBED] http batch failed; per-text fallback")
         return [await self.embed(t) for t in texts_list]
 
 
