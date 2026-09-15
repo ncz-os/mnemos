@@ -520,3 +520,399 @@ async def test_serial_executor_only_one_worker():
     )
     # Idempotent: a second call returns the same instance.
     assert e._ensure_serial_executor() is executor
+
+
+# ─── HTTP-backend concurrent embed must NOT serialize to one-at-a-time ────────
+#
+# Regression: the pre-fix ``InProcessEmbedder.embed`` wrapped its entire body
+# in ``async with self._lock:``, so HTTP calls (which are plain ``httpx``
+# async calls — fully reentrant on the asyncio side, no thread, no in-process
+# state) were forced to wait for each other. Reviewer's reproduction: 10
+# concurrent simulated 50ms HTTP embeds serialized through the lock ran at
+# concurrency 1 and took 508.8ms total instead of ~50-100ms.
+#
+# The fix replaces that single lock with a BOUNDED ``asyncio.Semaphore``
+# (``_http_semaphore``) for the HTTP path only. Local non-reentrant backends
+# still serialize through ``_lock`` + the single-worker executor (F15).
+#
+# These tests use a fake ``_HttpBackend`` whose ``embed_async`` sleeps
+# ~50ms then returns a fixed vector; they then fire N concurrent
+# ``.embed()`` calls and assert the wall time matches bounded-parallel,
+# not serialized.
+
+
+import time as _time
+from mnemos.runtime import embedder as _emb_mod
+
+
+class _FakeHttpBackend(_emb_mod._HttpBackend):
+    """Drop-in for ``_HttpBackend`` that sleeps for ~``delay_s`` and returns
+    a fixed vector. Tracks in-flight call count so we can assert real
+    concurrency (overlap > 1) when ``http_concurrency >= 2``.
+
+    Inherits from ``_HttpBackend`` so ``isinstance`` checks in the
+    embedder's HTTP branch correctly fire AND attribute lookups for
+    ``loaded`` / ``embed_dim`` etc. resolve correctly.
+    """
+
+    def __init__(self, delay_s: float = 0.05, dim: int = 4) -> None:
+        # Bypass real ``_HttpBackend.__init__`` (which builds an httpx
+        # client + circuit breaker we don't need for tests) by setting
+        # the attributes the read-only ``@property`` accessors look up
+        # directly. ``loaded`` is overridden as a plain attribute (the
+        # parent class has it as a property too, but we override here).
+        self.delay_s = delay_s
+        self._embed_dim = dim
+        self._client = None  # the @property ``loaded`` reads this
+        self.loaded = True
+        self._in_flight = 0
+        self._max_in_flight = 0
+        self.call_count = 0
+        # Required attributes that the real backend exposes for fallback
+        # wiring / diagnostics / hybrid retry.
+        self.url = "http://fake/embeddings"
+        self.timeout = 1.0
+        self.max_chars = 8000
+        self.model = "fake-embed-model"
+        # Circuit breaker state — read by some paths.
+        self._breaker_opened_at: float | None = None
+        self._cb_failures = 0
+        # Empty fallback chain: tests exercise primary path only.
+        self._fallback_remote = None
+        self._fallback_local = None
+
+    # Override the parent's read-only ``loaded`` property — we want a
+    # plain attribute set in __init__, not one that reads ``_client``.
+    loaded: bool = True
+
+    async def embed_async(self, text: str) -> list[float]:
+        self._in_flight += 1
+        self._max_in_flight = max(self._max_in_flight, self._in_flight)
+        self.call_count += 1
+        try:
+            await asyncio.sleep(self.delay_s)
+            return [float(len(text))] + [0.0] * (self.embed_dim - 1)
+        finally:
+            self._in_flight -= 1
+
+    async def embed_batch_async(self, texts: list[str]) -> list[list[float]]:
+        # Treat a batch call as one in-flight; sleep proportionally to the
+        # number of texts so the per-row equivalent matches.
+        self._in_flight += 1
+        self._max_in_flight = max(self._max_in_flight, self._in_flight)
+        self.call_count += 1
+        try:
+            await asyncio.sleep(self.delay_s * max(1, len(texts)))
+            return [[float(len(t))] + [0.0] * (self.embed_dim - 1) for t in texts]
+        finally:
+            self._in_flight -= 1
+
+    def _embed_sync(self, text: str) -> list[float]:
+        raise AssertionError(
+            "_FakeHttpBackend._embed_sync called — tests should not exercise "
+            "the non-reentrant local-fallback path on this fake."
+        )
+
+
+@pytest.mark.asyncio
+async def test_http_embed_runs_concurrently_not_serialized():
+    """Regression: 10 concurrent HTTP embed() calls must run in parallel up
+    to ``http_concurrency``, not serialize through ``_lock``.
+
+    Pre-fix: wall time ≈ 10 * 50ms = 500ms (serialized).
+    Post-fix (with http_concurrency=10): wall time ≈ ~50ms (all parallel).
+    """
+    n = 10
+    delay = 0.05  # 50ms per HTTP call
+    e = InProcessEmbedder(
+        backend="http",
+        http_concurrency=10,
+        http_url="http://fake/embeddings",
+        http_url_fallback="",  # disable local + remote fallback so we exercise primary only
+        hybrid=False,
+    )
+    fake = _FakeHttpBackend(delay_s=delay)
+    e._backend = fake  # type: ignore[assignment]
+    e._backend_name = "http"
+
+    started = _time.monotonic()
+    results = await asyncio.gather(*[e.embed(f"text-{i}") for i in range(n)])
+    elapsed = _time.monotonic() - started
+
+    assert all(len(v) > 0 for v in results), f"every embed must return a non-empty vector, got {results!r}"
+    assert fake.call_count == n, f"primary HTTP backend called {fake.call_count} times, expected {n}"
+    # Concurrent overlap observed must be > 1 — if it were 1 we'd be back to
+    # the pre-fix serialized behaviour.
+    assert fake._max_in_flight > 1, (
+        f"HTTP embeds serialized to max_in_flight={fake._max_in_flight}; expected >1 (bounded-parallel)"
+    )
+    # Wall time should be roughly ceil(n / http_concurrency) * delay, plus
+    # scheduling overhead. Allow generous slack for slow CI runners (3x).
+    serial_lower_bound = (n // 10) * delay  # = 1 * delay if concurrency >= n
+    serial_upper_bound = (n // 10 + 1) * delay * 3.0  # generous ceiling
+    assert elapsed < n * delay, (
+        f"10 concurrent 50ms embeds took {elapsed*1000:.1f}ms — close to the serialized 500ms. "
+        f"HTTP path is still being serialized through _lock instead of _http_semaphore."
+    )
+    # And it should NOT be 0 — they actually had to do some work.
+    assert elapsed >= serial_lower_bound * 0.5, (
+        f"elapsed {elapsed*1000:.1f}ms suspiciously short for {n} x {delay*1000:.0f}ms HTTP calls"
+    )
+    assert elapsed < serial_upper_bound, (
+        f"elapsed {elapsed*1000:.1f}ms exceeds expected ceiling {serial_upper_bound*1000:.1f}ms"
+    )
+
+
+@pytest.mark.asyncio
+async def test_http_embed_bounded_by_semaphore_size():
+    """With http_concurrency=3, only 3 of N=10 concurrent calls can be
+    in-flight at once — assert max_in_flight <= 3 and wall time scales
+    with ceil(N / 3) * delay."""
+    n = 10
+    delay = 0.05
+    e = InProcessEmbedder(
+        backend="http",
+        http_concurrency=3,
+        http_url="http://fake/embeddings",
+        http_url_fallback="",
+        hybrid=False,
+    )
+    fake = _FakeHttpBackend(delay_s=delay)
+    e._backend = fake
+    e._backend_name = "http"
+
+    started = _time.monotonic()
+    results = await asyncio.gather(*[e.embed(f"text-{i}") for i in range(n)])
+    elapsed = _time.monotonic() - started
+
+    assert all(len(v) > 0 for v in results)
+    assert fake.call_count == n
+    # Concurrency cap holds: no more than http_concurrency=3 simultaneous.
+    assert fake._max_in_flight <= 3, (
+        f"semaphore did not cap concurrency: max_in_flight={fake._max_in_flight} > 3"
+    )
+    # And concurrency did happen — at least 2 in flight at peak. If
+    # max_in_flight==1 we serialized (regression).
+    assert fake._max_in_flight >= 2, (
+        f"semaphore accidentally serialized calls: max_in_flight={fake._max_in_flight} == 1"
+    )
+    # Wall time scales with ceil(10/3) * 50ms ≈ 200ms. Allow 3x slack for CI.
+    expected_min_batches = (n + 3 - 1) // 3  # 4
+    assert elapsed >= expected_min_batches * delay * 0.7, (
+        f"elapsed {elapsed*1000:.1f}ms shorter than expected ceil(10/3)*50ms={expected_min_batches*delay*1000:.1f}ms"
+    )
+    # And it should NOT have serialized to 10*50ms = 500ms (regression guard).
+    assert elapsed < n * delay * 1.2, (
+        f"elapsed {elapsed*1000:.1f}ms ≈ serialized 500ms; semaphore not actually parallelizing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_http_embed_concurrency_env_propagates():
+    """MNEMOS_EMBED_HTTP_CONCURRENCY env var must drive http_concurrency,
+    and the constructed ``_http_semaphore`` must reflect that bound.
+    """
+    os.environ["MNEMOS_EMBED_HTTP_CONCURRENCY"] = "6"
+    try:
+        e = InProcessEmbedder(backend="http", http_url="http://fake/", http_url_fallback="")
+        assert e.http_concurrency == 6
+        # ``_http_semaphore`` is an ``asyncio.Semaphore`` whose internal
+        # ``_value`` mirrors the bound at construction. (Touching private
+        # state is justified here — the public surface of Semaphore
+        # doesn't expose its bound.)
+        assert isinstance(e._http_semaphore, asyncio.Semaphore)
+        assert e._http_semaphore._value == 6  # type: ignore[attr-defined]
+    finally:
+        del os.environ["MNEMOS_EMBED_HTTP_CONCURRENCY"]
+
+
+@pytest.mark.asyncio
+async def test_http_embed_invalid_concurrency_clamps_to_one():
+    """Invalid / non-positive MNEMOS_EMBED_HTTP_CONCURRENCY clamps to 1."""
+    os.environ["MNEMOS_EMBED_HTTP_CONCURRENCY"] = "0"
+    try:
+        e = InProcessEmbedder(backend="http", http_url="http://fake/", http_url_fallback="")
+        assert e.http_concurrency == 1
+    finally:
+        del os.environ["MNEMOS_EMBED_HTTP_CONCURRENCY"]
+
+    os.environ["MNEMOS_EMBED_HTTP_CONCURRENCY"] = "not-a-number"
+    try:
+        e = InProcessEmbedder(backend="http", http_url="http://fake/", http_url_fallback="")
+        assert e.http_concurrency == 10, f"non-numeric env should fall back to default 10, got {e.http_concurrency}"
+    finally:
+        del os.environ["MNEMOS_EMBED_HTTP_CONCURRENCY"]
+
+
+@pytest.mark.asyncio
+async def test_http_embed_batch_runs_concurrently_not_serialized():
+    """Regression for ``embed_batch``: 10 concurrent batch calls (each with
+    4 texts) on the http backend must overlap, not serialize through
+    ``_lock``."""
+    n = 10
+    delay = 0.05
+    e = InProcessEmbedder(
+        backend="http",
+        http_concurrency=10,
+        http_url="http://fake/embeddings",
+        http_url_fallback="",
+        hybrid=False,
+    )
+    fake = _FakeHttpBackend(delay_s=delay)
+    e._backend = fake
+    e._backend_name = "http"
+
+    batches = [[f"text-{i}-{j}" for j in range(4)] for i in range(n)]
+    started = _time.monotonic()
+    results = await asyncio.gather(*[e.embed_batch(b) for b in batches])
+    elapsed = _time.monotonic() - started
+
+    assert len(results) == n
+    assert all(len(r) == 4 and all(len(v) > 0 for v in r) for r in results)
+    # At least 2 in flight concurrently — proves we didn't serialize.
+    assert fake._max_in_flight > 1, (
+        f"http embed_batch serialized: max_in_flight={fake._max_in_flight}"
+    )
+    # Each batch call sleeps `delay * 4` = 200ms. Serialized: 2000ms. With
+    # http_concurrency=10 they all overlap → ~200ms. Assert < 1000ms.
+    assert elapsed < 1.0, (
+        f"10 concurrent 200ms batches took {elapsed*1000:.0f}ms — close to serialized 2000ms; "
+        f"embed_batch still serializing HTTP calls through _lock"
+    )
+
+
+# ─── F15 invariant unchanged: local non-reentrant backend NEVER entered concurrently
+# ───
+#
+# The F15 fix (single-worker executor) MUST survive this refactor. The
+# existing ``test_cancel_then_reembed_never_enters_backend_concurrently``
+# already covers the canonical cancellation-pressure scenario; this second
+# test exercises a different shape: 10 concurrent ``.embed()`` calls
+# against a non-reentrant fake backend, then assert no concurrent entry
+# was ever observed.
+
+
+class _StrictNonReentrantBackend:
+    """Backend that asserts single-entry under ALL circumstances."""
+
+    def __init__(self) -> None:
+        self._in_use = 0
+        self._max_overlap = 0
+        self.loaded = True
+        self.embed_dim = 4
+
+    def _embed_sync(self, text: str) -> list[float]:
+        assert self._in_use == 0, (
+            f"non-reentrant backend entered while in_use={self._in_use} "
+            f"(F15 regression: serial executor failed under concurrent load)"
+        )
+        self._in_use += 1
+        try:
+            import time as _t
+
+            _t.sleep(0.02)
+            return [0.1] * 4
+        finally:
+            self._in_use -= 1
+            self._max_overlap = max(self._max_overlap, 1)
+
+
+@pytest.mark.asyncio
+async def test_local_backend_unchanged_concurrent_embeds_never_overlap():
+    """Concurrent embed() calls against the local (non-reentrant) backend
+    MUST still serialize at the single-worker executor — F15 guarantee
+    must not regress after the HTTP-semaphore refactor.
+
+    Fire 10 concurrent embed() calls; assert max_overlap never exceeded 1.
+    """
+    e = InProcessEmbedder(backend="llamacpp", model_path="/nonexistent/path.gguf")
+    fake = _StrictNonReentrantBackend()
+    e._backend = fake  # type: ignore[assignment]
+    e._backend_name = "fake"
+
+    # 10 concurrent embed() calls — F15's executor serializes them, so
+    # wall time ≈ 10 * 20ms = 200ms but max_overlap stays at 1.
+    started = _time.monotonic()
+    results = await asyncio.gather(*[e.embed(f"text-{i}") for i in range(10)])
+    elapsed = _time.monotonic() - started
+
+    assert all(r == [0.1] * 4 for r in results), f"every embed should return the fixed vector, got {results!r}"
+    # Crucial invariant: never more than one entry into the non-reentrant
+    # backend at a time, regardless of concurrency.
+    assert fake._max_overlap == 1, (
+        f"non-reentrant backend observed max_overlap={fake._max_overlap} under concurrent load; "
+        f"F15's single-worker executor regressed"
+    )
+    # Wall time should reflect serialization: 10 * 20ms ≈ 200ms (or more
+    # on slow CI). Allow generous slack: must be > 10 * 5ms and < 10 * 200ms.
+    assert 0.05 <= elapsed <= 2.0, (
+        f"unexpected wall time {elapsed*1000:.0f}ms for 10 serialized 20ms embeds"
+    )
+
+
+# ─── _ensure_loaded double-checked lock: safe under concurrent HTTP-first callers
+# ───
+
+
+@pytest.mark.asyncio
+async def test_ensure_loaded_double_checked_lock_under_concurrent_calls():
+    """Two concurrent first-time embed() calls (HTTP backend, lazy init)
+    must not race past ``self._backend is None`` and double-invoke
+    ``_build_backend``.
+
+    The narrow ``_lock`` inside ``_ensure_loaded`` (post-fix) re-checks
+    ``self._backend is not None`` inside the critical section, so only
+    one coroutine actually runs through the lazy-init path. Pre-fix,
+    both would.
+    """
+    e = InProcessEmbedder(
+        backend="http",
+        http_concurrency=10,
+        http_url="http://fake/embeddings",
+        http_url_fallback="",
+    )
+    # DO NOT pre-pin _backend — exercise the lazy-init race.
+    assert e._backend is None
+
+    build_count = {"n": 0}
+    load_count = {"n": 0}
+    real_build = _emb_mod.InProcessEmbedder._build_backend
+    real_load = _emb_mod.InProcessEmbedder._load_sync
+
+    def counting_build(self):  # type: ignore[no-untyped-def]
+        build_count["n"] += 1
+        return real_build(self)
+
+    def counting_load(self):  # type: ignore[no-untyped-def]
+        load_count["n"] += 1
+        return real_load(self)
+
+    e._build_backend = counting_build.__get__(e, _emb_mod.InProcessEmbedder)  # type: ignore[method-assign]
+    e._load_sync = counting_load.__get__(e, _emb_mod.InProcessEmbedder)  # type: ignore[method-assign]
+
+    # After the first call completes, the embedder will have a real
+    # _HttpBackend pointing at http://fake/... and any subsequent
+    # .embed() will try to hit that URL and likely fail. That's fine —
+    # we only care about counting build/load invocations. Wrap each in
+    # a try/except so the failure doesn't mask the assertion.
+    try:
+        await asyncio.gather(e.embed("text-a"), e.embed("text-b"))
+    except Exception:
+        pass
+
+    # The double-checked lock guarantees _load_sync runs at most once
+    # (the expensive part — builds the httpx client). ``_build_backend``
+    # is also idempotent thanks to its own ``is not None`` guard, but
+    # the narrow lock prevents the race even if that guard were absent.
+    assert load_count["n"] == 1, (
+        f"_load_sync was invoked {load_count['n']} times for 2 concurrent "
+        f"first-time embed() calls; expected exactly 1 (double-checked lock regressed)"
+    )
+    # _build_backend may run 1 or 2 times depending on race timing —
+    # both are safe because the function's own ``is not None`` guard
+    # is the actual gate. The key invariant is that the EXPENSIVE load
+    # runs exactly once.
+    assert build_count["n"] <= 2, (
+        f"_build_backend invoked {build_count['n']} times (>2) under concurrent "
+        f"first-time calls; some race is escaping both guards"
+    )
