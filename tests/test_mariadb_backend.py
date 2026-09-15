@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -187,67 +186,18 @@ async def test_mariadb_upsert_embedding_uses_mariadb_vector_constructor() -> Non
 
 @pytest.mark.asyncio
 async def test_mariadb_federation_feed_reads_join_table_embedding() -> None:
+    from mnemos.persistence.federation_journal import _current_states
+
     repo = MariadbFederationRepository()
-    cursor = MagicMock()
-    cursor.fetchall = AsyncMock(return_value=[])
-    captured: dict[str, object] = {}
-
-    async def execute(sql, params):
-        captured["sql"] = sql
-        captured["params"] = tuple(params)
-
-    cursor.execute = AsyncMock(side_effect=execute)
-    tx = _tx_for_cursor(cursor)
-    since = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
-
-    with (
-        patch("mnemos.core.config.embed_http_model_override", return_value="embed-model"),
-        patch("mnemos.core.config.get_settings"),
-    ):
-        await repo.feed_query(
-            tx,
-            since_updated=since,
-            since_id="cursor-id",
-            namespaces=["tenant-a"],
-            categories=["keep"],
-            limit=25,
-            prefer_compressed=False,
-            include_embedding=True,
-        )
-
-    sql = " ".join(str(captured["sql"]).split()).lower()
-    assert "left join memory_embeddings me on me.memory_id = m.id" in sql
-    assert "vec_totext(me.embedding) as embedding" in sql
+    fetchall = AsyncMock(return_value=[])
+    ops = SimpleNamespace(dialect="mysql", fetchall=fetchall)
+    assert await _current_states(ops, ["memory-one"], repo=repo, include_embedding=True) == {}
+    query, memory_id = fetchall.call_args.args
+    sql = " ".join(query.split()).lower()
+    assert "left join memory_embeddings journal_embedding on journal_embedding.memory_id = m.id" in sql
+    assert "vec_totext(journal_embedding.embedding) as journal_embedding_value" in sql
     assert "from_vector(m.embedding)" not in sql
-    # F07: the withdrawal branch repeats the live-branch filters. The
-    # resulting param tuple shape is:
-    #   embed-model (select_params[0]),
-    #   live branch:       since, since, cursor-id, tenant-a, keep
-    #   tombstone branch:  since, since, cursor-id (consolidated_at > ? OR …)
-    #                      + tenant-a, keep (namespace/category IN)
-    #   withdrawal branch: since, since, cursor-id (updated > ? OR …)
-    #                      + tenant-a, keep (namespace/category IN)
-    #   trailing limit (25)
-    # i.e. 1 + 5 + 5 + 5 + 1 = 17.
-    assert captured["params"] == (
-        "embed-model",
-        since,
-        since,
-        "cursor-id",
-        "tenant-a",
-        "keep",
-        since,
-        since,
-        "cursor-id",
-        "tenant-a",
-        "keep",
-        since,
-        since,
-        "cursor-id",
-        "tenant-a",
-        "keep",
-        25,
-    )
+    assert memory_id == "memory-one"
 
 
 def test_mariadb_dsn_reuses_mysql_parser() -> None:

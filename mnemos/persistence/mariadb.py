@@ -1063,7 +1063,10 @@ class MariadbFederationRepository(MysqlFederationRepository):
     _JSON_BIND = "%s"
     _JSON_METADATA_EXPR = "COALESCE(NULLIF(metadata, ''), JSON_OBJECT())"
 
-    async def feed_query(
+    _journal_embedding_sql = "VEC_ToText(journal_embedding.embedding)"
+    _journal_embedding_join = " LEFT JOIN memory_embeddings journal_embedding ON journal_embedding.memory_id = m.id"
+
+    async def _legacy_feed_query(
         self,
         tx: Transaction,
         *,
@@ -1394,7 +1397,7 @@ class MariadbBackend(MysqlBackend):
                         await cursor.execute(ddl)
                 await _ensure_mysql_oauth_schema(conn)
                 await _ensure_mysql_webhook_schema(conn)
-                await _ensure_mysql_federation_journal(conn)
+                await _ensure_mysql_federation_journal(conn, separate_embeddings=True)
                 await _ensure_mysql_columns(
                     conn,
                     "memories",

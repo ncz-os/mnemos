@@ -14,9 +14,10 @@ from mnemos.domain.federation import _store_memories, _apply_withdrawal
 from mnemos.api.routes.federation import _feed_item_from_row
 
 
-@pytest_asyncio.fixture(params=["sqlite", "postgres"])
+@pytest_asyncio.fixture(params=["sqlite", "postgres", "mysql", "mariadb", "oracle", "db2"])
 async def backend(request, tmp_path, monkeypatch):
     monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "0")
+    monkeypatch.setenv("MNEMOS_EMBEDDING_DIM", "3")
     settings = SimpleNamespace(database=SimpleNamespace(embedding_dim=3))
     if request.param == "sqlite":
         from mnemos.persistence.sqlite import SqliteBackend
@@ -24,6 +25,66 @@ async def backend(request, tmp_path, monkeypatch):
         instance = SqliteBackend(tmp_path / "journal.db", settings)
         await instance.open()
         try:
+            yield instance
+        finally:
+            await instance.close()
+    elif request.param in {"mysql", "mariadb"}:
+        dsn = os.getenv("MNEMOS_TEST_" + request.param.upper() + "_DSN")
+        if not dsn:
+            pytest.skip("set MNEMOS_TEST_" + request.param.upper() + "_DSN for live journal tests")
+        import aiomysql
+        from mnemos.persistence.mysql import MysqlBackend, create_mysql_pool
+        from mnemos.persistence.mariadb import MariadbBackend, create_mariadb_pool
+
+        parsed = urlsplit(dsn)
+        name = "mnemos_journal_" + uuid.uuid4().hex[:16]
+        admin = await aiomysql.connect(
+            host=parsed.hostname,
+            port=parsed.port or 3306,
+            user=parsed.username,
+            password=parsed.password or "",
+            autocommit=True,
+        )
+        instance = None
+        try:
+            async with admin.cursor() as cursor:
+                await cursor.execute(f"CREATE DATABASE `{name}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+            factory, cls = (
+                (create_mysql_pool, MysqlBackend) if request.param == "mysql" else (create_mariadb_pool, MariadbBackend)
+            )
+            pool = await factory(
+                urlunsplit(parsed._replace(path="/" + name)), min_size=1, max_size=4, settings=settings
+            )
+            instance = cls(pool, settings)
+            await instance.open()
+            yield instance
+        finally:
+            if instance is not None:
+                await instance.close()
+            async with admin.cursor() as cursor:
+                await cursor.execute(f"DROP DATABASE IF EXISTS `{name}`")
+            admin.close()
+    elif request.param in {"oracle", "db2"}:
+        # These DSNs must point at disposable, dedicated databases/schemas.
+        # Require a second explicit opt-in before clearing their fixture data.
+        dsn = os.getenv("MNEMOS_TEST_" + request.param.upper() + "_DSN")
+        if not dsn or os.getenv("MNEMOS_TEST_ALLOW_RESET") != "1":
+            pytest.skip("set a dedicated test DSN and MNEMOS_TEST_ALLOW_RESET=1")
+        if request.param == "oracle":
+            from mnemos.persistence.oracle import OracleBackend, create_oracle_pool
+
+            instance = OracleBackend(await create_oracle_pool(dsn, min_size=1, max_size=4, settings=settings), settings)
+        else:
+            from mnemos.persistence.db2 import Db2BackendNative, create_db2_native_pool
+
+            instance = Db2BackendNative(await create_db2_native_pool(dsn, min_size=1, max_size=4), settings)
+        try:
+            await instance.open()
+            async with instance.transactional() as tx:
+                ops = _Ops(tx, transaction_dialect(tx))
+                for table in ("memories", "federation_changes", "federation_receive_state", "federation_peer_cursors"):
+                    await ops.execute("DELETE FROM " + table)
+                await ops.execute("UPDATE federation_change_clock SET value = 0 WHERE id = 1")
             yield instance
         finally:
             await instance.close()
@@ -51,21 +112,31 @@ async def backend(request, tmp_path, monkeypatch):
             await admin.close()
 
 
+async def _insert_tx(tx, mid="journal_one", namespace="A", mode=644):
+    ops = _Ops(tx, transaction_dialect(tx))
+    fields = ["id", "content", "category", "owner_id", "namespace", "permission_mode", "created", "updated"]
+    values = [
+        mid,
+        "ordinary facts",
+        "facts",
+        "alice",
+        namespace,
+        mode,
+        datetime(2020, 1, 1, tzinfo=timezone.utc),
+        datetime(2020, 1, 1, tzinfo=timezone.utc),
+    ]
+    # PostgreSQL generates content_hash; MySQL-family schemas require a value.
+    if ops.dialect != "postgres":
+        fields.append("content_hash")
+        values.append("hash-" + mid)
+    await ops.execute(
+        "INSERT INTO memories(" + ",".join(fields) + ") VALUES (" + ",".join("?" for _ in fields) + ")", *values
+    )
+
+
 async def insert(backend, mid="journal_one", namespace="A", mode=644):
     async with backend.transactional() as tx:
-        ops = _Ops(tx, transaction_dialect(tx))
-        await ops.execute(
-            "INSERT INTO memories(id,content,category,owner_id,namespace,permission_mode,created,updated) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            mid,
-            "ordinary facts",
-            "facts",
-            "alice",
-            namespace,
-            mode,
-            datetime(2020, 1, 1, tzinfo=timezone.utc),
-            datetime(2020, 1, 1, tzinfo=timezone.utc),
-        )
+        await _insert_tx(tx, mid, namespace, mode)
 
 
 async def mutate(backend, sql, *params):
@@ -73,7 +144,7 @@ async def mutate(backend, sql, *params):
         return await _Ops(tx, transaction_dialect(tx)).execute(sql, *params)
 
 
-async def feed(backend, cursor=None, namespaces=None, limit=100):
+async def feed(backend, cursor=None, namespaces=None, limit=100, include_embedding=False):
     async with backend.transactional() as tx:
         return await backend.federation.feed_query(
             tx,
@@ -83,6 +154,7 @@ async def feed(backend, cursor=None, namespaces=None, limit=100):
             categories=[],
             limit=limit,
             prefer_compressed=False,
+            include_embedding=include_embedding,
         )
 
 
@@ -165,7 +237,12 @@ async def test_receiver_rejects_stale_delete_and_resurrection_same_timestamp(bac
         row = await _Ops(tx, transaction_dialect(tx)).fetchone(
             "SELECT content FROM memories WHERE id = ?", "fed:peer:remote"
         )
-        assert row["content"] == "new revision same timestamp"
+        content = row["content"]
+        if hasattr(content, "read"):
+            from mnemos.persistence.worker_lifecycle import _await
+
+            content = await _await(content.read())
+        assert content == "new revision same timestamp"
         assert (
             await _apply_withdrawal(
                 backend.federation,
@@ -258,16 +335,7 @@ async def test_late_commit_is_published_after_cursor_without_blocking_other_writ
 
     async def delayed_transaction():
         async with backend.transactional() as tx:
-            ops = _Ops(tx, transaction_dialect(tx))
-            await ops.execute(
-                "INSERT INTO memories(id,content,category,owner_id,namespace,permission_mode) VALUES(?,?,?,?,?,?)",
-                "late",
-                "late transaction",
-                "facts",
-                "alice",
-                "A",
-                644,
-            )
+            await _insert_tx(tx, "late")
             inserted.set()
             await release.wait()
 
@@ -409,3 +477,74 @@ async def test_sparse_filtered_feed_advances_empty_checkpoint(backend, monkeypat
     assert [m.id for m in second.memories] == ["visible_tail"]
     assert second.has_more is False
     assert _decode_feed_cursor(second.next_cursor).memory_id == "journal:258"
+
+
+@pytest.mark.asyncio
+async def test_source_provenance_change_revokes_then_republishes(backend):
+    await insert(backend)
+    first = (await feed(backend))[0]
+    await mutate(backend, "UPDATE memories SET federation_source = ? WHERE id = ?", "peer", "journal_one")
+    withdrawal = (await feed(backend, first))[0]
+    assert withdrawal["type"] == "withdrawal"
+    await mutate(backend, "UPDATE memories SET federation_source = NULL WHERE id = ?", "journal_one")
+    live = (await feed(backend, withdrawal))[0]
+    assert live["type"] is None
+    assert live["federation_sequence"] > withdrawal["federation_sequence"]
+
+
+@pytest.mark.asyncio
+async def test_private_consolidation_hides_target_identity(backend):
+    await insert(backend, mid="secret-canonical-id", mode=600)
+    await insert(backend)
+    first = (await feed(backend))[0]
+    await mutate(
+        backend,
+        "UPDATE memories SET consolidated_into = ?, permission_mode = 600 WHERE id = ?",
+        "secret-canonical-id",
+        "journal_one",
+    )
+    revoked = (await feed(backend, first))[0]
+    assert revoked["type"] == "withdrawal"
+    assert "consolidated_into" not in revoked
+
+
+@pytest.mark.asyncio
+async def test_embedding_mutation_publishes_decodable_current_vector(backend):
+    await insert(backend)
+    first = (await feed(backend))[0]
+    async with backend.transactional() as tx:
+        await backend.memories.upsert_memory_embedding(tx, "journal_one", [0.25, 0.5, 0.75])
+    events = await feed(backend, first, include_embedding=True)
+    assert events
+    item = _feed_item_from_row(events[-1], include_embedding=True)
+    assert item.embedding_dim == 3 and item.embedding
+    import base64
+    import struct
+
+    assert struct.unpack("<3f", base64.b64decode(item.embedding)) == (0.25, 0.5, 0.75)
+    assert "embedding" not in (await feed(backend, first))[0]
+
+
+@pytest.mark.asyncio
+async def test_new_sequence_restores_previously_consolidated_replica(backend):
+    async with backend.transactional() as tx:
+        await _store_memories(backend.federation, tx, "peer", [memory(1), {**memory(1), "id": "canonical"}])
+        await _store_memories(
+            backend.federation,
+            tx,
+            "peer",
+            [
+                {
+                    "id": "remote",
+                    "type": "consolidation",
+                    "consolidated_into": "canonical",
+                    "consolidated_at": "2020-01-01T00:00:00Z",
+                    "federation_sequence": 2,
+                }
+            ],
+        )
+        await _store_memories(backend.federation, tx, "peer", [memory(3, "re-shared facts")])
+        row = await _Ops(tx, transaction_dialect(tx)).fetchone(
+            "SELECT id, deleted_at, consolidated_into FROM memories WHERE id = ?", "fed:peer:remote"
+        )
+        assert row and row["deleted_at"] is None and row["consolidated_into"] is None
