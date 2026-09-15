@@ -6,6 +6,16 @@ scorer). Purpose: answer the empirical question "is
 APOLLO effective, and under what conditions?" with enough data
 to be more than directional.
 
+## Other benchmarks in this repo
+
+- **SQLite persistence throughput — Phase 1 (v7 F5/5)** — synthetic,
+  no inference endpoint, no live DB. Lives outside this README at
+  [`docs/benchmarks/sqlite-throughput-phase1-2026-09-15.md`](../docs/benchmarks/sqlite-throughput-phase1-2026-09-15.md)
+  with the committed artifact at
+  [`docs/proof/bench-sqlite-phase1-20260915T181615Z.json`](../docs/proof/bench-sqlite-phase1-20260915T181615Z.json).
+  Phase 1 only (corpus sizes 1k / 10k, concurrency 1 / 5 / 10);
+  Phase 2 is blocked on an operator hardware-allocation decision.
+
 ## Corpus
 
 `compression_corpus_v3_3.jsonl` — 50 memories, stratified across
