@@ -547,17 +547,271 @@ def _class_attr_implemented(view: _ClassView, attr_names: tuple[str, ...]) -> bo
 
 
 def _capability_details_implemented(view: _ClassView, detail: str) -> bool:
-    """True iff ``capability_details`` includes ``detail`` (literal name)."""
+    """True iff the backend's ``capability_details`` includes ``detail``.
+
+    ``detail`` is a *constant name* like ``"LEDGER_CAPABILITY"`` or
+    ``"JOURNAL_CAPABILITY"``; we resolve it through
+    :data:`_CAPABILITY_DETAIL_NAMES` to the literal capability name
+    (e.g. ``"ledger"``) before matching. ``capability_details`` bodies
+    in this repo look like one of:
+
+    * ``return set(FULL_STORAGE_CAPABILITY_DETAILS)``
+    * ``return {*MYSQL_CAPABILITY_DETAILS, KG_CAPABILITY, STATE_DETAIL_CAPABILITY, "oauth"}``
+    * ``return {*POSTGRES_CAPABILITY_DETAILS, "audit"}``
+
+    The literal-name check the previous version used
+    (``if detail in body``) missed every one of these because the
+    constant references resolve to strings at runtime, not at AST
+    time. We resolve the constant references via
+    :func:`_resolve_capability_constant_set`, then check both the
+    resolved set membership AND any literal string constants the
+    body contains.
+    """
+    _ensure_capability_constants_loaded()
+    assert _CAPABILITY_DETAIL_NAMES is not None
+    target_name = _CAPABILITY_DETAIL_NAMES.get(detail, detail)
+
     body = view.property_fget_bodies.get("capability_details")
     if body is None:
         return False
-    # capability_details often returns ``set(FULL_STORAGE_CAPABILITY_DETAILS)``
-    # or ``{*MYSQL_CAPABILITY_DETAILS, ...}``. A name lookup is therefore a
-    # weak heuristic; rely on the *literal* occurrence in the body to mean
-    # the backend explicitly advertises it.
-    if detail in body:
+
+    resolved_names = _resolve_capability_constant_set(body)
+    if target_name in resolved_names:
         return True
+
+    # Literal strings adjoined in the body (``{"oauth"}`` etc.).
+    for node in ast.walk(ast.parse(body)):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if node.value == target_name:
+                return True
+
     return False
+
+
+# ---------------------------------------------------------------------------
+# Static resolver for ``*_CAPABILITY_DETAILS`` constant sets declared in
+# ``mnemos/persistence/base.py``.
+# ---------------------------------------------------------------------------
+
+
+_BASE_PY_PATH = REPO_ROOT / "mnemos" / "persistence" / "base.py"
+
+# Map ``<NAME>`` -> the resolved set of capability name strings.
+_CAPABILITY_DETAIL_SETS: dict[str, frozenset[str]] | None = None
+
+# Map ``<NAME>`` -> the single capability name string. Used to resolve
+# individual references like ``LEDGER_CAPABILITY`` or ``KG_CAPABILITY``
+# when they appear alongside a set constant in a body.
+_CAPABILITY_DETAIL_NAMES: dict[str, str] | None = None
+
+
+def _load_capability_detail_sets() -> tuple[
+    dict[str, frozenset[str]], dict[str, str]
+]:
+    """Parse ``base.py`` and return two maps:
+
+    * ``detail_sets``: ``{CONSTANT_NAME: frozenset(capability_names)}``
+    * ``detail_names``: ``{CONSTANT_NAME: capability_name}`` for the
+      singular constants (e.g. ``LEDGER_CAPABILITY -> "ledger"``).
+
+    Walked once at module import time and cached on the module-level
+    globals. The walker handles direct ``frozenset({...})`` literals
+    and ``frozenset({*OTHER_SET, "literal"})`` splat forms, both of
+    which appear in ``base.py``.
+    """
+    src = _BASE_PY_PATH.read_text(encoding="utf-8", errors="replace")
+    tree = ast.parse(src, filename=str(_BASE_PY_PATH))
+
+    names: dict[str, str] = {}
+    sets: dict[str, frozenset[str]] = {}
+
+    for node in tree.body:
+        if not isinstance(node, ast.AnnAssign):
+            continue
+        target = node.target
+        if not isinstance(target, ast.Name):
+            continue
+
+        # Singular: ``LEDGER_CAPABILITY: DetailedCapabilityName = "ledger"``
+        if (
+            isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            names[target.id] = node.value.value
+            continue
+
+        # Set: ``FULL_STORAGE_CAPABILITY_DETAILS: frozenset[...] = frozenset({...})``
+        if not isinstance(node.value, ast.Call):
+            continue
+        call = node.value
+        func = call.func
+        if not (
+            isinstance(func, ast.Name) and func.id in {"frozenset", "set"}
+        ):
+            continue
+        if not call.args:
+            continue
+        arg = call.args[0]
+        members: set[str] = set()
+        if isinstance(arg, ast.Set):
+            elts: Iterable[ast.AST] = arg.elts
+        elif isinstance(arg, (ast.List, ast.Tuple)):
+            elts = arg.elts
+        else:
+            continue
+
+        ok = True
+        for elt in elts:
+            if isinstance(elt, ast.Name):
+                if elt.id in names:
+                    members.add(names[elt.id])
+                elif elt.id in sets:
+                    members.update(sets[elt.id])
+                else:
+                    # Unknown name — skip rather than guess.
+                    ok = False
+                    break
+            elif isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                members.add(elt.value)
+            elif isinstance(elt, ast.Starred):
+                inner = elt.value
+                if isinstance(inner, ast.Name):
+                    if inner.id in sets:
+                        members.update(sets[inner.id])
+                    elif inner.id in names:
+                        members.add(names[inner.id])
+                    else:
+                        ok = False
+                        break
+                else:
+                    ok = False
+                    break
+            else:
+                ok = False
+                break
+        if not ok:
+            continue
+        sets[target.id] = frozenset(members)
+
+    return sets, names
+
+
+def _ensure_capability_constants_loaded() -> None:
+    global _CAPABILITY_DETAIL_SETS, _CAPABILITY_DETAIL_NAMES
+    if _CAPABILITY_DETAIL_SETS is None or _CAPABILITY_DETAIL_NAMES is None:
+        sets, names = _load_capability_detail_sets()
+        _CAPABILITY_DETAIL_SETS = sets
+        _CAPABILITY_DETAIL_NAMES = names
+
+
+def _resolve_capability_constant_set(body: str) -> frozenset[str]:
+    """Resolve every ``Name`` referenced in ``body`` to its capability names.
+
+    The body is the unparsed source of a ``capability_details``
+    property; we parse it and walk every ``Name`` plus every nested
+    set / list / tuple / call to accumulate the resolved names. The
+    output is the union of every set-constant reference plus every
+    singular-constant reference plus every literal string adjoined.
+
+    Set arithmetic (``FULL_STORAGE_CAPABILITY_DETAILS - {LEDGER_CAPABILITY}``)
+    is handled by recursing into the BinOp operands and applying the
+    operator: ``-`` / ``|`` / ``+`` / ``&`` produce difference /
+    union / union / intersection respectively. Without this,
+    set-difference expressions would leak the subtracted member back
+    into the resolved set because both operands would contribute
+    their ``Name`` references individually.
+
+    The walker is a structural AST visitor (``_walk``) that respects
+    the BinOp operator — each top-level Return / Assign / Expr
+    statement is visited as one expression, so set-difference and
+    set-union expressions evaluate to the correct resolved set
+    rather than the union of every operand's contribution.
+    """
+    _ensure_capability_constants_loaded()
+    assert _CAPABILITY_DETAIL_SETS is not None
+    assert _CAPABILITY_DETAIL_NAMES is not None
+    sets = _CAPABILITY_DETAIL_SETS
+    names_map = _CAPABILITY_DETAIL_NAMES
+
+    try:
+        tree = ast.parse(body)
+    except SyntaxError:
+        return frozenset()
+
+    def _walk(node: ast.AST) -> set[str]:
+        out: set[str] = set()
+        if isinstance(node, ast.Name):
+            if node.id in names_map:
+                out.add(names_map[node.id])
+            elif node.id in sets:
+                out.update(sets[node.id])
+            return out
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            out.add(node.value)
+            return out
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            for elt in node.elts:
+                out.update(_walk(elt))
+            return out
+        if isinstance(node, ast.Call):
+            for arg in node.args:
+                out.update(_walk(arg))
+            for kw in node.keywords:
+                out.update(_walk(kw.value))
+            return out
+        if isinstance(node, ast.BinOp):
+            left = _walk(node.left)
+            right = _walk(node.right)
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, (ast.BitOr, ast.Add)):
+                return left | right
+            if isinstance(node.op, ast.BitAnd):
+                return left & right
+            return left | right
+        # Starred / subscript / attribute / etc. — recurse into children.
+        for child in ast.iter_child_nodes(node):
+            out.update(_walk(child))
+        return out
+
+    # Visit each Return / Assign / Expr statement ONCE (not via
+    # ast.walk which re-enters every nested node independently and
+    # would lose the BinOp context). The body of a property is a
+    # single ``return`` statement in practice, but we walk past any
+    # ``FunctionDef`` / ``AsyncFunctionDef`` wrapper too because the
+    # source string we receive starts with ``@property``.
+    resolved: set[str] = set()
+
+    def _visit(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for sub in node.body:
+                _visit(sub)
+            return
+        if isinstance(node, ast.If):
+            for sub in node.body:
+                _visit(sub)
+            for sub in node.orelse:
+                _visit(sub)
+            return
+        if isinstance(node, ast.Try):
+            for sub in node.body:
+                _visit(sub)
+            for sub in node.orelse:
+                _visit(sub)
+            for h in node.handlers:
+                _visit(h)
+            return
+        if isinstance(node, ast.ExceptHandler):
+            _visit(node.body[0]) if node.body else None
+            return
+        value = getattr(node, "value", None)
+        if value is not None:
+            resolved.update(_walk(value))
+
+    for stmt in tree.body:
+        _visit(stmt)
+
+    return frozenset(resolved)
 
 
 def _federation_journal_implemented(backend: str) -> bool:
@@ -619,51 +873,46 @@ def _iter_test_files() -> Iterable[Path]:
 
 
 def _test_file_matches(test_path: Path, backend: str, capability_id: str) -> bool:
-    """Three heuristics, calibrated on this repo's existing tests:
+    """Public wrapper for the match function.
 
-    1. File name encodes both capability + backend
-       (``test_db2_dialect_parity.py``, ``test_oracle_live.py``,
-       ``test_kronos_backends.py``, ``test_mysql_recency_dialect.py``,
-       ``test_backend_audit_chain_attribute.py``).
-    2. ``@pytest.mark.parametrize`` / ``@pytest_asyncio.fixture(params=...)``
-       over backend names AND at least one test function name in the
-       file contains the capability id (or a synonym).
-    3. Backend-specific file with capability-named tests — the
-       canonical shape of ``test_<backend>_<something>.py`` files in
-       this repo, which exercise one backend directly without a
-       parametrize over backends.
+    Reads and parses the test file's source on demand, then
+    delegates to :func:`_test_file_matches_inner`. The index-driven
+    code path (``_build_test_index``) calls the inner function
+    directly with a pre-parsed tree to avoid the per-cell
+    re-parse/re-read cost.
 
-    All three heuristics are deliberately tight to avoid over-matching:
-    a test named ``test_single_memory_authorized_fetch_returns_durable_delete``
-    inside ``test_federation_journal.py`` is about federation semantics
-    and only matches the federation_journal row, not memory_crud.
+    See ``_test_file_matches_inner`` for the layered heuristics;
+    they are unchanged from the previous version. This wrapper
+    exists so that any external / interactive use of the function
+    (e.g. ``python -c "from ... import _test_file_matches"``)
+    still works.
     """
     name = test_path.name.lower()
     if name.endswith(".py"):
         name = name[:-3]
     parts = [p for p in re.split(r"[_.]", name) if p]
-
-    # Heuristic 1: filename encodes capability + backend.
-    if _file_name_matches_capability(name, parts, capability_id) and backend in parts:
-        return True
-    if backend in parts:
-        idx = parts.index(backend)
-        for candidate in (parts[:idx], parts[idx + 1 :]):
-            if any(_parts_share_token(p, capability_id) for p in candidate if len(p) >= 3):
-                return True
-
     try:
         src = test_path.read_text(encoding="utf-8", errors="replace")
         tree = ast.parse(src)
-    except SyntaxError:
+    except (SyntaxError, OSError):
         return False
+    return _test_file_matches_inner(
+        name, parts, src, tree, backend, capability_id
+    )
 
-    if not _any_test_function_references_capability(tree, capability_id, backend=backend):
-        return False
 
-    # Heuristic 2: parametrize over backend names — covers cross-backend
-    # parametrized tests (``test_persistence_parity.py``,
-    # ``test_federation_journal.py``).
+def _file_has_parametrize_or_fixture_on_backend(tree: ast.Module, backend: str) -> bool:
+    """True iff any ``@pytest.mark.parametrize`` or ``@pytest_asyncio.fixture``
+    in this module targets ``backend``.
+
+    This is the combined backend-signal helper used by heuristic B and
+    heuristic D above. It deliberately stays close to the existing
+    ``_parametrize_hits_backend`` and ``_fixture_params_hits_backend``
+    helpers — both of which were just tightened to recognise
+    ``@pytest.mark.parametrize("dialect", ["mysql", ...])`` patterns
+    where the parameter *name* does not contain the backend but the
+    value list does.
+    """
     prior = dict(_BACKEND_LIST_RESOLVERS)
     _BACKEND_LIST_RESOLVERS.clear()
     try:
@@ -678,41 +927,102 @@ def _test_file_matches(test_path: Path, backend: str, capability_id: str) -> boo
                 if _parametrize_hits_backend(node, backend):
                     return True
             elif func.attr == "fixture":
-                # ``@pytest_asyncio.fixture(params=_backend_params())``
-                # is the most common backend-parameterization form in
-                # this repo (``test_persistence_parity.py``,
-                # ``test_admin_lifecycle_routes_no_503.py``,
-                # ``test_postgres_only_503_invariant.py``).
                 if _fixture_params_hits_backend(node, backend, tree):
                     return True
     finally:
         _BACKEND_LIST_RESOLVERS.clear()
         _BACKEND_LIST_RESOLVERS.update(prior)
+    return False
 
-    # Heuristic 3: backend-specific file with capability-named tests.
-    # Pattern: ``test_<backend>_<something>.py`` whose test functions
-    # mention the capability id. Real examples:
-    # ``test_oracle_recency_dialect.py`` -> tests
-    # ``test_oracle_semantic_search_*`` (vector_search capability);
-    # ``test_mysql_state_live.py`` -> tests ``test_mysql_state_*``
-    # (state capability). The capability gate above
-    # (``_any_test_function_references_capability``) already required
-    # the file to contain capability-named tests, so all we need to
-    # verify here is that the backend name appears in the filename.
-    if backend in parts:
-        return True
 
+def _any_test_function_has_backend_prefix(tree: ast.Module, backend: str) -> bool:
+    """True iff at least one ``test_*`` function in the file starts with ``test_<backend>``.
+
+    A ``test_<backend>_acl_grant_*`` style function is a strong signal
+    the file targets that backend, regardless of whether the
+    capability synonym appears anywhere in the function name. We use
+    this signal only as a *backend pointer*, never as a capability
+    pointer — pairing it with the capability proven by the filename
+    (heuristic B) or by another test function (heuristic C) is what
+    actually decides the cell.
+    """
+    prefix = f"test_{backend}"
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith(prefix):
+                return True
+        elif isinstance(node, ast.ClassDef):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if sub.name.startswith(prefix):
+                        return True
+    return False
+
+
+def _file_has_test_functions_for_multiple_backends(tree: ast.Module) -> bool:
+    """True iff the file has ``test_<backend>_*`` functions for >=3 distinct backends.
+
+    Used by heuristic B as a structural test for "this file is a
+    cross-backend capability suite" — files of that form
+    (``test_morpheus_phase_abc_dialects.py``,
+    ``test_db2_dialect_parity.py``) almost always have one
+    backend-prefix test function per backend, and we accept the
+    capability as "tested on backend X" whenever one of those
+    per-backend functions targets X.
+
+    A coincidental ``test_<backend>_other_stuff`` function in a
+    generic file (e.g. ``test_oracle_oauth_sessions_consultations.py``
+    with its single ``test_sqlite_protocol_roundtrip_*``) does NOT
+    pass this floor because the file does not also have
+    corresponding ``test_postgres_*`` / ``test_mysql_*`` etc.
+    functions. The floor of 3 (any backend + at least two others)
+    leaves room for genuinely cross-backend files that list every
+    backend except one (e.g. a file with ``test_postgres_*``,
+    ``test_oracle_*`` and ``test_db2_*`` that is missing sqlite
+    still counts, which matches the real-world shape of
+    ``test_morpheus_phase_abc_dialects.py``'s ``test_mysql_and_
+    mariadb_share_*``).
+    """
+    found: set[str] = set()
+    for backend in BACKENDS:
+        if _any_test_function_has_backend_prefix(tree, backend):
+            found.add(backend)
+        if len(found) >= 3:
+            return True
     return False
 
 
 def _parametrize_hits_backend(call: ast.Call, backend: str) -> bool:
+    """Detect ``@pytest.mark.parametrize(<name>, <values>)`` targeting ``backend``.
+
+    Two complementary checks — a real parametrize that names the
+    backend in either the parameter name or the value list counts:
+
+    1. The parameter name (first arg) — when it contains the backend id
+       the test author has explicitly typed it (e.g.
+       ``@pytest.mark.parametrize("backend", [...])``). We also accept
+       the second arg (values) here.
+    2. The value list (second arg) — for parametrize over an unrelated
+       parameter name but with backend names in the values, e.g.
+       ``@pytest.mark.parametrize("dialect", ["mysql", "mariadb", ...])``
+       in ``test_morpheus_phase_abc_dialects.py``. The previous version
+       of this function only checked ``ids=`` when the param name did not
+       contain the backend, which dropped these matches.
+    """
     if not call.args:
         return False
     first = call.args[0]
     if isinstance(first, ast.Constant) and isinstance(first.value, str):
-        if backend not in first.value.lower():
-            return _ids_arg_hits_backend(call, backend)
-        return len(call.args) >= 2 and _value_arg_hits_backend(call.args[1], backend)
+        name_hits = backend in first.value.lower()
+        if name_hits:
+            return len(call.args) >= 2 and _value_arg_hits_backend(
+                call.args[1], backend
+            )
+        # Name doesn't contain the backend — fall back to ids= AND/OR the
+        # value list. Real-world parametrize-over-dialects falls here.
+        if len(call.args) >= 2 and _value_arg_hits_backend(call.args[1], backend):
+            return True
+        return _ids_arg_hits_backend(call, backend)
     if isinstance(first, ast.Tuple):
         if len(call.args) >= 2 and _value_arg_hits_backend(call.args[1], backend):
             return True
@@ -849,26 +1159,53 @@ def _expr_hits_backend(node: ast.AST, scope: list[ast.stmt], backend: str) -> bo
 
 
 def _parts_share_token(part: str, capability_id: str) -> bool:
-    return part.startswith(capability_id) or capability_id.startswith(part)
+    """True when a filename part is the same identifier as the capability.
+
+    We deliberately require equality (not prefix containment) so a file
+    like ``test_morpheus_cluster_abc_sqlite.py`` does NOT count as a
+    test for the ``morpheus_http_trigger`` capability just because
+    ``morpheus`` is a prefix of ``morpheus_http_trigger``. The original
+    prefix-based check caused false positives across the matrix; the
+    equality check still allows genuine token overlaps
+    (``test_db2_acl_routes.py`` -> parts ``[db2, acl, routes]`` matches
+    the ``acl`` capability because ``acl == acl``).
+    """
+    return part == capability_id
 
 
 def _file_name_matches_capability(name: str, parts: list[str], capability_id: str) -> bool:
     """Return True when the file name actually encodes the capability.
 
-    We require the file's stem (the joined ``parts`` excluding the
-    ``.py`` extension) to contain the capability id's tokens OR one
-    of its synonyms. For a multi-token capability (``memory_crud``,
-    ``fts_search``, ``vector_search``) every token of the matched
-    synonym must appear as a separate ``_``-bounded segment. For
-    single-token capability ids (``morpheus``, ``federation``,
-    ``kronos``) we match when any part starts with or equals the
-    token (or one of its synonyms).
+    Two cases, kept distinct:
+
+    * **Multi-token** capability id (``memory_crud``, ``fts_search``,
+      ``vector_search``, ``federation_journal``): every token of a
+      matching synonym must appear as a separate ``_``-bounded
+      segment of ``parts``. For ``test_db2_semantic_search_dialect``
+      the multi-token synonym ``semantic_search`` -> tokens
+      ``[semantic, search]`` are both segments, and the row matches.
+
+    * **Single-token** capability id (``morpheus``, ``federation``,
+      ``kronos``, ``journal``): we accept a single-token synonym
+      when it equals a segment of the filename, OR a multi-token
+      synonym whose **every** token is a separate segment.
+
+    The single-token path must NOT take just the first token of a
+    multi-token synonym and treat that prefix as a sufficient match.
+    The previous version did exactly that — ``memory_journal`` would
+    match ``test_memory_tag_locking.py`` for the standalone
+    ``journal`` capability because ``memory`` was in the filename,
+    even though the file has nothing to do with KNEMON journal
+    entries. We now require the full multi-token synonym to match
+    (every token in the filename), not just its first slice.
 
     This is deliberately stricter than a substring scan so a file
     named ``test_federation_journal.py`` does NOT count as a test
-    for the ``journal`` capability — it has to match
-    ``federation_journal`` end-to-end. But it is permissive enough
-    to match real-world variations like
+    for the standalone ``journal`` capability — its filename
+    actually encodes ``federation_journal`` end-to-end, and we
+    prefer that compound match.
+
+    It is permissive enough to match real-world variations like
     ``test_db2_semantic_search_dialect.py`` against the
     ``vector_search`` capability (synonym: ``semantic_search``).
     """
@@ -876,12 +1213,40 @@ def _file_name_matches_capability(name: str, parts: list[str], capability_id: st
     if not cap_tokens:
         return False
     synonyms = _CAPABILITY_SYNONYMS.get(capability_id, (capability_id,))
+    # The capability id itself is always a valid synonym for itself.
+    if capability_id not in synonyms:
+        synonyms = (capability_id, *synonyms)
     if len(cap_tokens) == 1:
         for syn in synonyms:
-            syn_first = syn.split("_", 1)[0]
-            if not syn_first:
+            syn_tokens = syn.split("_")
+            # Multi-token synonym: every token must appear as a
+            # separate segment of the filename.
+            if len(syn_tokens) > 1:
+                if all(tok in parts for tok in syn_tokens):
+                    # Prefer the compound match. If a longer
+                    # multi-token capability id also matches (e.g.
+                    # ``federation_journal`` for the file
+                    # ``test_federation_journal.py``), drop to that
+                    # path so the standalone row doesn't over-match.
+                    if not _part_is_subtoken_of_longer_compound_match(
+                        syn_tokens, parts, capability_id
+                    ):
+                        return True
                 continue
-            if any(part == syn_first or part.startswith(syn_first) for part in parts):
+            # Single-token synonym: require exact equality with a
+            # segment, not prefix. ``memory`` doesn't match the
+            # ``journal`` capability just because it appears next to
+            # ``tag`` in ``test_memory_tag_locking.py``.
+            if any(part == syn_tokens[0] for part in parts):
+                # Same ``federation_journal`` vs ``journal``
+                # disambiguation as above: if the matched segment
+                # is one slice of a longer compound capability id
+                # that ALSO fully matches this filename, prefer the
+                # compound and skip the standalone row.
+                if _part_is_subtoken_of_longer_compound_match(
+                    list(syn_tokens), parts, capability_id
+                ):
+                    continue
                 return True
         return False
     # Multi-token capability: try every synonym as the canonical split.
@@ -889,6 +1254,39 @@ def _file_name_matches_capability(name: str, parts: list[str], capability_id: st
         syn_tokens = syn.split("_")
         if all(tok in parts for tok in syn_tokens):
             return True
+    return False
+
+
+def _part_is_subtoken_of_longer_compound_match(
+    matched_tokens: list[str], parts: list[str], capability_id: str
+) -> bool:
+    """True when ``matched_tokens`` form a strict subset of another
+    multi-token capability id whose own tokens all appear in ``parts``.
+
+    Used by :func:`_file_name_matches_capability` to suppress
+    over-matches where a multi-token synonym for a single-token
+    capability id is itself a slice of a longer capability id that
+    fully matches the filename. Example: with capability_id
+    ``journal`` and matched tokens ``[journal]``, the function looks
+    for any OTHER multi-token capability id (``federation_journal``,
+    ``memory_journal``) whose tokens are all in ``parts``. If
+    ``federation`` is in ``parts`` for ``test_federation_journal.py``,
+    we suppress the standalone ``journal`` match in favour of the
+    compound ``federation_journal`` row, which will also match this
+    file.
+    """
+    matched_set = set(matched_tokens)
+    for other_id, other_synonyms in _CAPABILITY_SYNONYMS.items():
+        if other_id == capability_id:
+            continue
+        for syn in other_synonyms:
+            syn_tokens = syn.split("_")
+            if len(syn_tokens) <= len(matched_tokens):
+                continue
+            if not matched_set.issubset(set(syn_tokens)):
+                continue
+            if all(tok in parts for tok in syn_tokens):
+                return True
     return False
 
 
@@ -904,7 +1302,11 @@ def _file_name_matches_capability(name: str, parts: list[str], capability_id: st
 _CAPABILITY_SYNONYMS: dict[str, tuple[str, ...]] = {
     "memory_crud": ("memory_crud", "memory_repository", "memory"),
     "vector_search": ("vector_search", "semantic_search", "vector", "semantic"),
-    "fts_search": ("fts_search", "fulltext_search", "fts", "fulltext"),
+    # ``fts5`` is the SQLite FTS-extension name used in real test
+    # function names (``test_sqlite_fts5_relevance_ordering``); adding
+    # it as a synonym closes a coverage gap where every other fts
+    # variant was matched except the canonical SQLite one.
+    "fts_search": ("fts_search", "fulltext_search", "fts", "fts5", "fulltext"),
     "kg": ("kg_repo", "kg_triple", "kg"),
     "versions": ("version_repo", "memory_version", "version"),
     "branches": ("branch_repo", "memory_branch", "branch"),
@@ -913,16 +1315,32 @@ _CAPABILITY_SYNONYMS: dict[str, tuple[str, ...]] = {
     "morpheus": ("morpheus",),
     "webhooks": ("webhook_repo", "webhook"),
     "nats_dispatch_log": ("nats_dispatch_log", "dispatch_log"),
-    "consultations_audit": ("consultation_audit", "model_registry"),
+    # ``consultation`` and ``consultations`` (with and without ``s``)
+    # match real test names like
+    # ``test_db2_consultation_fetch_recommended_model_native`` and
+    # ``test_oracle_consultations_*``. The previous synonym list only
+    # had ``consultation_audit``, which dropped these matches.
+    "consultations_audit": (
+        "consultation_audit",
+        "consultations_audit",
+        "consultations",
+        "consultation",
+        "model_registry",
+    ),
     "oauth": ("oauth_repo", "oauth"),
     "sessions": ("sessions_repo", "session_repo", "session"),
-    "consultations": ("consultation_repo", "graeae_consultation"),
+    "consultations": (
+        "consultations",
+        "consultation",
+        "consultation_repo",
+        "graeae_consultation",
+    ),
     "federation": ("federation_repo", "federation"),
     "state": ("state_kv", "state_repo", "state"),
     "audit_chain": ("audit_chain", "memory_audit", "audit"),
     "acl": ("acl_repo", "memory_acl", "acl"),
     "journal": ("knemon_journal", "journal_entry", "memory_journal"),
-    "ledger": ("usage_ledger", "knemon_ledger"),
+    "ledger": ("usage_ledger", "knemon_ledger", "ledger"),
     "row_level_security": ("row_level_security",),
     "listen_notify": ("listen_notify",),
     "advisory_locks": ("advisory_lock",),
@@ -1125,10 +1543,278 @@ def _value_arg_hits_backend(node: ast.AST, backend: str) -> bool:
 
 
 def _capability_tested(capability_id: str, backend: str) -> bool:
-    """True if any test in tests/ exercises (capability_id, backend)."""
+    """True if any test in tests/ exercises (capability_id, backend).
+
+    Backed by :data:`_TEST_FILE_INDEX`, which is built once per
+    script run in :func:`_build_test_index`. The previous version
+    re-scanned every test file for every (capability, backend) cell
+    (162 cells × ~311 test files ≈ 50 000 file reads per run, ~60s);
+    the indexed lookup keeps the same precision in <1s.
+    """
+    return _get_test_file_index().get((backend, capability_id), False)
+
+
+# Populated by :func:`_build_test_index`. Maps (backend, capability) -> True
+# for every (backend, capability) pair that at least one test file covers.
+_TEST_FILE_INDEX: dict[tuple[str, str], bool] | None = None
+
+
+def _get_test_file_index() -> dict[tuple[str, str], bool]:
+    global _TEST_FILE_INDEX
+    if _TEST_FILE_INDEX is None:
+        _TEST_FILE_INDEX = _build_test_index()
+    return _TEST_FILE_INDEX
+
+
+def _build_test_index() -> dict[tuple[str, str], bool]:
+    """Walk every test file once and build (backend, capability) -> True.
+
+    Replaces the per-cell scan in the previous version of
+    :func:`_capability_tested`. The trade-off is a slightly larger
+    memory footprint (162 booleans worst case) for a 50× speed-up.
+    """
+    covered: dict[tuple[str, str], bool] = {}
+    for backend in BACKENDS:
+        for cap in _capabilities():
+            covered[(backend, cap.id)] = False
+
+    # Pre-parse every test file once. Most of the per-cell cost in
+    # the previous version came from re-parsing the same files;
+    # ``_test_file_matches_inner`` also recomputes things like the
+    # set of backend-prefix function names per (file, capability,
+    # backend) tuple, so we cache that on the tree via
+    # ``_tree_metadata`` below.
+    parsed: list[tuple[Path, str, list[str], str, ast.Module, _TreeMeta]] = []
     for test_path in _iter_test_files():
-        if _test_file_matches(test_path, backend, capability_id):
+        try:
+            src = test_path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(src)
+        except (SyntaxError, OSError):
+            continue
+        name = test_path.name.lower()
+        if name.endswith(".py"):
+            name = name[:-3]
+        parts = [p for p in re.split(r"[_.]", name) if p]
+        meta = _tree_metadata(tree)
+        parsed.append((test_path, name, parts, src, tree, meta))
+
+    # Pre-compute (backend -> True/False) for the
+    # ``_file_has_test_functions_for_multiple_backends`` floor and
+    # for ``_any_test_function_has_backend_prefix``. ``meta.backend_prefixes``
+    # is computed once per file and reused for every capability row.
+    backend_prefix_cache: dict[tuple[int, str], bool] = {}
+    multi_backend_cache: dict[int, bool] = {}
+
+    # Parametrize/fixture resolution per (file, backend). The helper
+    # walks the tree again per call; we cache per (file, backend).
+    parametrize_cache: dict[tuple[int, str], bool] = {}
+
+    def _has_parametrize(backend: str, tree: ast.Module, src: str) -> bool:
+        key = (id(tree), backend)
+        if key in parametrize_cache:
+            return parametrize_cache[key]
+        result = _file_has_parametrize_or_fixture_on_backend_cached(tree, backend)
+        parametrize_cache[key] = result
+        return result
+
+    def _has_prefix(backend: str, meta: _TreeMeta) -> bool:
+        key = (id(meta.tree), backend)
+        if key in backend_prefix_cache:
+            return backend_prefix_cache[key]
+        result = any(name.startswith(f"test_{backend}") for name in meta.test_func_names)
+        backend_prefix_cache[key] = result
+        return result
+
+    def _is_multi_backend(meta: _TreeMeta) -> bool:
+        key = id(meta.tree)
+        if key in multi_backend_cache:
+            return multi_backend_cache[key]
+        found: set[str] = set()
+        for backend in BACKENDS:
+            if any(name.startswith(f"test_{backend}") for name in meta.test_func_names):
+                found.add(backend)
+            if len(found) >= 3:
+                break
+        result = len(found) >= 3
+        multi_backend_cache[key] = result
+        return result
+
+    for test_path, name, parts, src, tree, meta in parsed:
+        for backend in BACKENDS:
+            backend_in_filename = backend in parts
+            fn_has_backend_prefix = _has_prefix(backend, meta)
+            file_targets_backend = backend_in_filename or _has_parametrize(
+                backend, tree, src
+            )
+            multi = _is_multi_backend(meta)
+            for cap in _capabilities():
+                key = (backend, cap.id)
+                if covered[key]:
+                    continue
+                if _test_file_matches_inner_cached(
+                    name=name,
+                    parts=parts,
+                    src=src,
+                    tree=tree,
+                    backend=backend,
+                    capability_id=cap.id,
+                    fn_has_backend_prefix=fn_has_backend_prefix,
+                    file_targets_backend=file_targets_backend,
+                    multi_backend_coverage=multi,
+                ):
+                    covered[key] = True
+
+    return covered
+
+
+@dataclass
+class _TreeMeta:
+    """Cached structural facts about a parsed test file."""
+
+    tree: ast.Module
+    test_func_names: list[str]
+
+
+def _tree_metadata(tree: ast.Module) -> _TreeMeta:
+    """Collect per-file structural facts once per file.
+
+    ``test_func_names`` is the flat list of every ``test_*``
+    function (top-level and class-method). The matching heuristics
+    re-scan this list several times per cell, so caching it once
+    per file matters.
+    """
+    names: list[str] = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test_"):
+                names.append(node.name)
+        elif isinstance(node, ast.ClassDef):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if sub.name.startswith("test_"):
+                        names.append(sub.name)
+    return _TreeMeta(tree=tree, test_func_names=names)
+
+
+def _file_has_parametrize_or_fixture_on_backend_cached(
+    tree: ast.Module, backend: str
+) -> bool:
+    """Cacheable version of :func:`_file_has_parametrize_or_fixture_on_backend`.
+
+    Same logic, just factored out so the index builder can wrap it.
+    """
+    prior = dict(_BACKEND_LIST_RESOLVERS)
+    _BACKEND_LIST_RESOLVERS.clear()
+    try:
+        _module_top_level_lists(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr == "parametrize":
+                if _parametrize_hits_backend(node, backend):
+                    return True
+            elif func.attr == "fixture":
+                if _fixture_params_hits_backend(node, backend, tree):
+                    return True
+    finally:
+        _BACKEND_LIST_RESOLVERS.clear()
+        _BACKEND_LIST_RESOLVERS.update(prior)
+    return False
+
+
+def _test_file_matches_inner_cached(
+    *,
+    name: str,
+    parts: list[str],
+    src: str,
+    tree: ast.Module,
+    backend: str,
+    capability_id: str,
+    fn_has_backend_prefix: bool,
+    file_targets_backend: bool,
+    multi_backend_coverage: bool,
+) -> bool:
+    """Cached version of :func:`_test_file_matches_inner`.
+
+    Receives pre-computed values for the helpers whose cost
+    dominated the index build:
+
+    * ``fn_has_backend_prefix``: result of
+      :func:`_any_test_function_has_backend_prefix` for this backend.
+    * ``file_targets_backend``: True iff the filename encodes the
+      backend OR there's a parametrize / fixture that names it.
+    * ``multi_backend_coverage``: True iff the file has
+      ``test_<backend>_*`` functions for ≥3 distinct backends.
+    """
+    if _file_name_matches_capability(name, parts, capability_id) and backend in parts:
+        return True
+
+    filename_has_cap = _file_name_matches_capability(name, parts, capability_id)
+    fn_refs_cap = _any_test_function_references_capability(
+        tree, capability_id, backend=backend
+    )
+    backend_in_filename = backend in parts
+
+    if filename_has_cap:
+        if file_targets_backend:
             return True
+        if fn_has_backend_prefix and multi_backend_coverage:
+            return True
+
+    if fn_refs_cap and fn_has_backend_prefix:
+        return True
+
+    if backend_in_filename and fn_refs_cap:
+        return True
+
+    return False
+
+
+def _test_file_matches_inner(
+    name: str,
+    parts: list[str],
+    src: str,
+    tree: ast.Module,
+    backend: str,
+    capability_id: str,
+) -> bool:
+    """The real match function, factored out so the index builder can
+    avoid re-reading files. See :func:`_test_file_matches` for the
+    wrapper that re-reads when no tree is supplied.
+    """
+    # A. filename encodes both capability and backend.
+    if _file_name_matches_capability(name, parts, capability_id) and backend in parts:
+        return True
+
+    filename_has_cap = _file_name_matches_capability(name, parts, capability_id)
+    backend_in_filename = backend in parts
+    fn_refs_cap = _any_test_function_references_capability(
+        tree, capability_id, backend=backend
+    )
+    fn_has_backend_prefix = _any_test_function_has_backend_prefix(tree, backend)
+    file_targets_backend = (
+        backend_in_filename
+        or _file_has_parametrize_or_fixture_on_backend(tree, backend)
+    )
+    file_has_multi_backend_coverage = _file_has_test_functions_for_multiple_backends(
+        tree
+    )
+
+    if filename_has_cap:
+        if file_targets_backend:
+            return True
+        if fn_has_backend_prefix and file_has_multi_backend_coverage:
+            return True
+
+    if fn_refs_cap and fn_has_backend_prefix:
+        return True
+
+    if backend_in_filename and fn_refs_cap:
+        return True
+
     return False
 
 
@@ -1156,9 +1842,30 @@ class Cell:
 
 
 def _backend_view(backend: str) -> _ClassView:
+    """Structural view of the backend's facade class.
+
+    Cached per backend. The previous version of this function
+    re-parsed the persistence module and re-walked the inheritance
+    graph on every call, which made ``_build_matrix`` ~10 seconds
+    on a 6×27 cell grid (162 calls). Caching drops the same path
+    to under a second.
+    """
     module_name, class_name = BACKEND_CLASSES[backend]
     rel = module_name.replace(".", "/") + ".py"
     return _view_for_class(REPO_ROOT / rel, class_name)
+
+
+_VIEW_CACHE: dict[str, _ClassView] = {}
+
+
+def _get_backend_view(backend: str) -> _ClassView:
+    """Memoised :func:`_backend_view`."""
+    cached = _VIEW_CACHE.get(backend)
+    if cached is not None:
+        return cached
+    view = _backend_view(backend)
+    _VIEW_CACHE[backend] = view
+    return view
 
 
 def _build_matrix() -> list[Cell]:
@@ -1174,7 +1881,7 @@ def _build_matrix() -> list[Cell]:
             elif cap.impl_kind == "federation_journal":
                 impl = _federation_journal_implemented(backend)
             else:
-                view = _backend_view(backend)
+                view = _get_backend_view(backend)
                 if cap.impl_kind == "repo_property":
                     impl = _property_implemented(view, cap.impl_property)
                 elif cap.impl_kind == "flag":
