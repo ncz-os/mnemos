@@ -62,10 +62,23 @@ async def persephone_archival_worker_loop(
 
 
 async def main() -> None:
+    """Standalone entry point (``python -m mnemos.workers.persephone_archival_worker``).
+
+    Routes through the real ``PostgresBackend`` persistence interface
+    rather than a bare asyncpg pool, so ``sweep_for_archival``'s
+    ``hasattr(pool, "transactional")`` dispatch (mnemos/domain/persephone/
+    runner.py) takes the portable ``mnemos.persistence.worker_lifecycle``
+    path — the same path the in-process lifecycle worker already uses —
+    instead of falling through to the legacy raw-SQL branch. The
+    connection-pool construction is unchanged; only what gets handed to
+    the archival loop changed, from the raw pool to the backend wrapping
+    it.
+    """
     import asyncpg
 
     from mnemos.core.config import PG_CONFIG as _PG_CONFIG
     from mnemos.core.pool import wrap_pool_with_timeout
+    from mnemos.persistence.postgres import PostgresBackend
 
     raw_pool = await asyncpg.create_pool(
         min_size=1,
@@ -78,8 +91,9 @@ async def main() -> None:
         port=_PG_CONFIG["port"],
     )
     pool = wrap_pool_with_timeout(raw_pool)
+    backend = PostgresBackend(pool, get_settings())
     try:
-        await persephone_archival_worker_loop(pool)
+        await persephone_archival_worker_loop(backend)
     finally:
         await pool.close()
 
