@@ -921,7 +921,6 @@ async def test_write_configured_audit_entry_reads_file_like_fields(
     """write_configured_audit_entry: file-like content/metadata/embedding must be
     awaited via ``.read()`` before they reach ``write_audit_entry`` (large-memory
     upload path)."""
-    import io
 
     from mnemos.audit.route_helper import write_configured_audit_entry
     from mnemos.core import config
@@ -1007,7 +1006,6 @@ async def test_write_audit_entry_expected_prev_head_no_predecessor(
     prior entry must raise (no fallback to installing a peer-supplied head)."""
     from mnemos.audit.route_helper import (
         AuditChainContinuityError,
-        memory_id_to_audit_bytes,
         write_audit_entry,
     )
 
@@ -1056,7 +1054,6 @@ async def test_write_audit_entry_expected_prev_head_mismatch(sqlite_backend):
     but the heads do NOT match -- must raise."""
     from mnemos.audit.route_helper import (
         AuditChainContinuityError,
-        memory_id_to_audit_bytes,
         write_audit_entry,
     )
 
@@ -1123,11 +1120,8 @@ async def test_write_audit_entry_expected_prev_head_match_succeeds(
     NOT ``(entry_id, prev_entry_hash_column)``. ``latest_hash`` is the hash
     of the previous entry's canonical bytes + signature, which is what the
     next entry's ``prev_entry_hash`` column will hold."""
-    from mnemos.audit import latest_hash as latest_hash_pub
     from mnemos.audit.crypto import (
         AuditEntry,
-        canonical_payload_hash,
-        sign_entry,
         derive_writer_keypair,
     )
     from mnemos.audit.route_helper import (
@@ -1166,7 +1160,6 @@ async def test_write_audit_entry_expected_prev_head_match_succeeds(
     # Rebuild the entry's signed_at by trying every candidate the helper
     # would try. (Cleanest approach is to just construct it from the
     # fields on the row.)
-    from mnemos.audit.crypto import canonical_entry_bytes
 
     # The simplest reliable way: the prev_entry_hash that the chain stores
     # for entry N+1 is ``latest_hash(entry_N, signature_N)``. We can
@@ -1390,7 +1383,6 @@ async def test_audit_prev_head_raises_on_invalid_signature(
 def test_audit_prev_head_returns_head_for_valid_signature():
     """_audit_prev_head: when verify_entry succeeds on the first candidate,
     returns (entry_id, latest_hash) without raising."""
-    from datetime import datetime, timezone
 
     from mnemos.audit import build_entry, latest_hash
     from mnemos.audit.route_helper import _audit_entry_from_row, _audit_prev_head, _signed_at_candidates
