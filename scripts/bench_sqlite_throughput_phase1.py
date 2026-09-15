@@ -15,22 +15,19 @@ Scope (Phase 1):
   ``scripts/embed_throughput_bench.py``.
 - runtime budget: ~30 minutes for the full 2 x 3 = 6 matrix.
 
-What this bench measures (and what it does NOT measure):
+Architectural note (not a benchmark artifact):
 
-- The SqliteBackend serializes every insert through one
-  ``asyncio.Lock`` plus a single ``BEGIN IMMEDIATE`` connection
-  (see ``SqliteBackend.transactional`` at line ~7401 of
-  ``mnemos/persistence/sqlite.py``). That means concurrency > 1 does
-  NOT give us parallel SQLite writes — it tells us how many tasks
-  queue up at the lock. The bench is honest about this: we report
-  the per-task latency distribution and aggregate wall-time, and the
-  report explicitly calls out the serialized path so a reader cannot
-  misread the throughput plateau as a hardware limit.
-- We do NOT call any inference endpoint; mock vectors are deterministic
-  per corpus size, so the JSON artifact is bit-for-bit reproducible
-  per (corpus_size, concurrency) pair on the same hardware.
+``SqliteBackend.transactional()`` (line ~7401 of
+``mnemos/persistence/sqlite.py``) acquires a single ``asyncio.Lock``
+and opens one connection that runs ``BEGIN IMMEDIATE`` per
+transaction. All writes therefore serialize through one path regardless
+of how many concurrent writer tasks the bench dispatches. We report the
+per-task latency distribution and aggregate wall time honestly — the
+markdown summary surfaces this property as a single global note so a
+reader cannot misread the throughput plateau as a hardware ceiling.
 
 Phase 2 (explicitly NOT in this script):
+
 - 100k / 1M corpus, concurrency 25 / 50 / 100
 - multi-instance / packing-density testing
 - blocked on an operator hardware-allocation decision.
@@ -65,6 +62,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 REPO = Path(__file__).resolve().parent.parent
@@ -153,12 +151,12 @@ async def _run_one(
     """
     from mnemos.persistence.sqlite import SqliteBackend
 
-    # Settings object: just enough to satisfy SqliteBackend's
-    # `_resolve_embedding_dim()` and the `_require_dim()` invariant
-    # on insert_memory. We don't pass any other settings — the bench
-    # doesn't need the full MnemosSettings graph.
-    settings = type("S", (), {})()
-    settings.database = type("DB", (), {"embedding_dim": embedding_dim})()
+    # SqliteBackend only needs `settings.database.embedding_dim` (see
+    # `_resolve_embedding_dim()` at line ~7380 of
+    # ``mnemos/persistence/sqlite.py``). We use SimpleNamespace to expose the
+    # one attribute it reads — matching the convention in the existing
+    # test-suite fixtures (e.g. ``tests/test_boost_recency_supersession.py``).
+    settings = SimpleNamespace(database=SimpleNamespace(embedding_dim=embedding_dim))
 
     workdir = Path(tempfile.mkdtemp(prefix=f"mnemos-bench-sqlite-p1-{corpus_size}-{concurrency}-"))
     db_path = workdir / "bench.db"
@@ -219,12 +217,13 @@ async def _run_one(
     for idx in range(corpus_size):
         queue.put_nowait(idx)
 
+    # asyncio is single-threaded; concurrent appends are safe without a
+    # lock. We keep a list of per-task latencies to compute p50/p95/p99
+    # after gather() finishes — one float per insert.
     latencies: list[float] = []
-    latencies_lock = asyncio.Lock()
     started_at = time.perf_counter()
-    started_perf = started_at
 
-    async def worker(task_id: int) -> None:
+    async def worker() -> None:
         while True:
             try:
                 rec_idx = queue.get_nowait()
@@ -244,12 +243,11 @@ async def _run_one(
                 dt = time.perf_counter() - t0
             finally:
                 queue.task_done()
-            async with latencies_lock:
-                latencies.append(dt)
+            latencies.append(dt)
 
-    workers = [asyncio.create_task(worker(i)) for i in range(concurrency)]
+    workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
     await asyncio.gather(*workers)
-    insert_wall = time.perf_counter() - started_perf
+    insert_wall = time.perf_counter() - started_at
 
     # Optional small read-back pass: how long does a single gather_stats on
     # the freshly-loaded corpus take? This isn't the headline metric for
@@ -316,6 +314,10 @@ def _write_json_artifact(payload: dict[str, Any], path: Path) -> None:
 
 def _render_markdown(payload: dict[str, Any]) -> str:
     cells = payload["cells"]
+    # All cells share the same schema_note (SqliteBackend's serialized
+    # path is a property of the backend, not of (corpus, concurrency)),
+    # so we render it once globally rather than once per cell.
+    schema_note = cells[0]["schema_note"] if cells else ""
     lines: list[str] = []
     lines.append("# MNEMOS SQLite throughput bench — Phase 1")
     lines.append("")
@@ -341,23 +343,21 @@ def _render_markdown(payload: dict[str, Any]) -> str:
             f"{cell['insert_wall_seconds']} | {cell['wall_seconds']} |"
         )
     lines.append("")
-    lines.append("## Per-cell schema note (repeated for offline readers)")
+    lines.append("## Architectural note")
     lines.append("")
-    for cell in cells:
-        lines.append(
-            f"- **corpus={cell['corpus_size']} concurrency={cell['concurrency']}** — {cell['schema_note']}"
-        )
+    lines.append(schema_note)
     lines.append("")
     lines.append("## Phase 2 (NOT done)")
     lines.append("")
     lines.append(
-        "Phase 1 stops at corpus sizes {1k, 10k} x concurrency {1, 5, 10}. Phase 2 "
-        "would extend to 100k / 1M corpus and concurrency 25 / 50 / 100, plus "
-        "multi-instance packing-density testing. Blocked on an operator "
-        "hardware-allocation decision. The CLI flags on this script "
-        "(`--corpus-sizes`, `--concurrency`) accept larger values, so the natural "
-        "extension point is to widen the matrix when Phase 2 is unblocked — no "
-        "script rewrite needed."
+        "Phase 1 stops at corpus sizes 1k and 10k, concurrency levels 1, 5, "
+        "and 10. Phase 2 would extend the corpus to 100k and 1M, the "
+        "concurrency to 25, 50, and 100, and add multi-instance "
+        "packing-density testing. Blocked on an operator hardware-allocation "
+        "decision. The CLI flags on this script (`--corpus-sizes`, "
+        "`--concurrency`) already accept larger values, so the natural "
+        "extension point is to widen the matrix when Phase 2 is unblocked — "
+        "no script rewrite needed."
     )
     lines.append("")
     return "\n".join(lines)

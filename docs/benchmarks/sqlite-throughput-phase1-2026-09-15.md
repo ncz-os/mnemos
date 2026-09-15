@@ -10,7 +10,7 @@ artifact is the committed JSON, not this document.
 The matrix was run end-to-end against a fresh temp SQLite file per cell
 (no shared or persistent DB, no real data path pollution), then the
 resulting JSON + markdown summary were committed to
-`docs/proof/bench-sqlite-phase1-20260915T175740Z.{json,md}`.
+`docs/proof/bench-sqlite-phase1-20260915T180442Z.{json,md}`.
 
 This document discharges the Phase 1 shipping criterion:
 
@@ -30,22 +30,22 @@ This document discharges the Phase 1 shipping criterion:
 | Warmup      | 64 inserts per cell (excluded from timed measurement) |
 | Read-back   | 1 `gather_stats()` call per cell (sanity, not headline) |
 | Cells       | 2 × 3 = 6 |
-| Total wall  | ~29 s on the dev host (Asahi aarch64, python 3.14.6) |
+| Total wall  | ~28 s on the dev host (Asahi aarch64, python 3.14.6) |
 | DB path     | Fresh tempfile per cell, removed before the cell returns |
 
 Total 6-cell runtime is well under the 30-minute budget; the script
 has headroom for Phase 2 once the operator decision lands.
 
-## Headline numbers (committed artifact: `bench-sqlite-phase1-20260915T175740Z.md`)
+## Headline numbers (committed artifact: `bench-sqlite-phase1-20260915T180442Z.md`)
 
 | corpus_size | concurrency | throughput (ops/s) | p50 (ms) | p95 (ms) | p99 (ms) | insert wall (s) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1000   | 1  | 1296.34 | 0.716 | 1.152 | 1.510 | 0.78 |
-| 1000   | 5  | 1197.11 | 4.569 | 6.129 | 6.856 | 0.84 |
-| 1000   | 10 | 1540.32 | 5.644 | 9.451 | 10.143 | 0.66 |
-| 10000  | 1  | 1219.35 | 0.855 | 1.331 | 1.671 | 8.28 |
-| 10000  | 5  | 1262.73 | 4.165 | 5.803 | 6.991 | 7.98 |
-| 10000  | 10 | 1316.96 | 7.272 | 11.127 | 13.169 | 7.65 |
+| 1000   | 1  | 1407.48 | 0.604 | 1.089 | 1.402 | 0.71 |
+| 1000   | 5  | 1202.03 | 4.467 | 5.919 | 6.677 | 0.83 |
+| 1000   | 10 | 1307.57 | 7.317 | 10.719 | 11.898 | 0.76 |
+| 10000  | 1  | 1393.40 | 0.608 | 1.188 | 1.503 | 7.18 |
+| 10000  | 5  | 1259.26 | 4.342 | 5.798 | 6.794 | 7.94 |
+| 10000  | 10 | 1267.71 | 8.712 | 11.073 | 13.625 | 7.89 |
 
 (Values are from one run on the dev host; the JSON artifact is the
 source of truth. Throughput should be read as a single-host ballpark
@@ -75,11 +75,11 @@ That means **all writes serialize through one path**, regardless of
 how many concurrent writer tasks the bench dispatches. The numbers
 above show this clearly:
 
-- Throughput plateaus at roughly 1.2-1.5k ops/s across concurrency
+- Throughput plateaus at roughly 1.2-1.4k ops/s across concurrency
   levels 1, 5, and 10 — adding more tasks queues them at the lock,
   it does not parallelize SQLite writes.
-- Per-insert latency scales up with concurrency (p50 ~0.85 ms at c=1
-  vs ~7.3 ms at c=10 on the 10k corpus) — the extra tasks are
+- Per-insert latency scales up with concurrency (p50 ~0.6 ms at c=1
+  vs ~8.7 ms at c=10 on the 10k corpus) — the extra tasks are
   paying for time spent waiting on the lock, not for additional
   work done in parallel.
 
@@ -135,16 +135,17 @@ UTC run timestamp.
 
 Required environment:
 
-- Python 3.11+ (the bench uses `match`-style type hints, `asyncio.Queue`,
-  and `tempfile.mkdtemp`).
+- Python 3.13+ (the bench uses `asyncio.Queue`, `tempfile.mkdtemp`,
+  and `SimpleNamespace`, all standard on 3.13+). Note that
+  `pyproject.toml`'s `requires-python = ">=3.13"` applies project-wide.
 - `mnemos` importable on `sys.path`. The bench inserts the repo root
   onto `sys.path` itself (`scripts/bench_sqlite_throughput_phase1.py`
-  line ~46), so a bare `python scripts/...` from the repo root works
+  line ~70), so a bare `python scripts/...` from the repo root works
   without an editable install — matching the convention used by the
   other bench scripts in this repo.
 
 Expected timing on the dev host (Asahi aarch64, python 3.14.6):
-~29 seconds for the full 6-cell matrix. Will be slower on
+~28 seconds for the full 6-cell matrix. Will be slower on
 architectures with weaker single-thread SQLite performance; faster
 on NVMe-backed desktop builds. None of these changes the
 architectural observation in the section above — the lock-queueing
