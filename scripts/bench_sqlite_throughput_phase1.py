@@ -40,11 +40,16 @@ Output:
 - docs/proof/bench-sqlite-phase1-{ts}.json   provenance-tagged artifact
 - docs/proof/bench-sqlite-phase1-{ts}.md     summary table
 
-Usage:
+Usage (commit artifacts to docs/proof/):
     python scripts/bench_sqlite_throughput_phase1.py \\
         --corpus-sizes 1000,10000 \\
         --concurrency 1,5,10 \\
         --output-dir docs/proof
+
+Usage (validate the bench, no artifacts committed — what the automated
+check command uses so a CI pass does not pollute docs/proof/ with a
+fresh artifact pair on every run):
+    python scripts/bench_sqlite_throughput_phase1.py --dry-run
 """
 
 from __future__ import annotations
@@ -367,9 +372,21 @@ def _render_markdown(payload: dict[str, Any]) -> str:
 
 
 async def _async_main(args: argparse.Namespace) -> int:
-    out_dir = Path(args.output_dir)
-    if not out_dir.is_absolute():
-        out_dir = (REPO / out_dir).resolve()
+    if args.dry_run:
+        # Validation mode: run the full Phase 1 matrix, write the artifacts
+        # to a fresh tempdir, then discard. This is what the automated
+        # check command uses so the bench can be validated without
+        # polluting docs/proof/ on every CI pass — committing an artifact
+        # pair to docs/proof/ is an explicit operator action, gated by
+        # passing --output-dir explicitly (the default of "docs/proof" is
+        # suppressed when --dry-run is set).
+        out_dir = Path(tempfile.mkdtemp(prefix="mnemos-bench-sqlite-p1-dryrun-"))
+        cleanup_out_dir_on_exit = True
+    else:
+        out_dir = Path(args.output_dir)
+        if not out_dir.is_absolute():
+            out_dir = (REPO / out_dir).resolve()
+        cleanup_out_dir_on_exit = False
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -430,6 +447,18 @@ async def _async_main(args: argparse.Namespace) -> int:
     print(f"[bench-sqlite-phase1] wrote {json_path}")
     print(f"[bench-sqlite-phase1] wrote {md_path}")
     print(f"[bench-sqlite-phase1] total wall: {total_wall:.2f}s")
+
+    if args.dry_run:
+        # Best-effort cleanup. A leftover tempdir is harmless; the point
+        # is that nothing under docs/proof/ is touched in dry-run mode.
+        print(f"[bench-sqlite-phase1] dry-run: discarding artifacts under {out_dir}")
+        if cleanup_out_dir_on_exit:
+            try:
+                for child in out_dir.iterdir():
+                    child.unlink(missing_ok=True)
+                out_dir.rmdir()
+            except OSError as exc:
+                print(f"[bench-sqlite-phase1] dry-run cleanup best-effort: {exc}")
     return 0
 
 
@@ -468,7 +497,16 @@ def main() -> int:
     p.add_argument(
         "--output-dir",
         default="docs/proof",
-        help="Output directory for the JSON+md artifacts (default docs/proof).",
+        help="Output directory for the JSON+md artifacts (default docs/proof). "
+             "Ignored when --dry-run is set; in --dry-run mode artifacts are written "
+             "to a fresh tempfile.mkdtemp() and discarded after the run.",
+    )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run the full Phase 1 matrix but write artifacts to a tempdir and discard. "
+             "This is what the automated check command uses so the bench can be "
+             "validated without polluting docs/proof/ on every CI pass.",
     )
     args = p.parse_args()
 
