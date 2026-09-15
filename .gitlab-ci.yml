@@ -149,6 +149,62 @@ test:unit:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
 
+# Critical-path coverage gate for the required-audit write path
+# (mnemos/audit/route_helper.py and mnemos/audit/writer.py). This is a
+# SCOPED gate -- NOT a global coverage threshold -- and its only job is
+# to fail the build if a future regression removes or skips a test that
+# exercises one of the audit-write branches. The whole point is that a
+# regression on THIS file specifically fails the build even when
+# overall coverage is not tracked anywhere else.
+#
+# Test selection: every test that exercises code in mnemos/audit/ --
+# the named files are the complete audit-module test surface (route
+# helper, writer, crypto, merkle proof, repo methods, sealer, endpoints,
+# health, token startup warning, universal chain, plus the required-
+# mutation regressions). The verification command
+# ``pytest tests/test_audit_route_helper.py tests/test_required_audit_mutations.py``
+# is the minimum must-pass subset and is a strict subset of this list.
+#
+# Threshold: 100% (with branch coverage). Branches that cannot be hit
+# from these tests carry an inline ``# pragma: no cover`` comment in
+# the source with a one-line explanation of WHY that exact branch is
+# unreachable from this scope (dialect dispatch for backends this job
+# doesn't run against, Python-version-specific stdlib fallbacks, etc.).
+# Do not silently lower the threshold -- if a new unreachable branch
+# appears, add a pragma with a justification in the same place.
+test:audit-coverage-gate:
+  stage: test
+  tags: [argos, ncz-os]
+  script:
+    # Tests that exercise code in mnemos/audit/. Ordered so the two
+    # named must-pass files (test_audit_route_helper.py + the required
+    # mutation regression set) run first; the rest is the broader
+    # audit-module test surface that this gate's 100% coverage target
+    # depends on for crypto.py / merkle_* / etc.
+    - pytest
+        tests/test_audit_route_helper.py
+        tests/test_required_audit_mutations.py
+        tests/test_audit_writer.py
+        tests/test_audit_crypto.py
+        tests/test_audit_merkle_proof.py
+        tests/test_audit_repo_methods.py
+        tests/test_audit_sealer.py
+        tests/test_audit_endpoints.py
+        tests/test_audit_health.py
+        tests/test_audit_token_startup_warning.py
+        tests/test_universal_audit_chain.py
+        --tb=short
+        --cov=mnemos/audit
+        --cov-branch
+        --cov-fail-under=100
+        -q
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+  # REQUIRED: a future regression on mnemos/audit/route_helper.py or
+  # writer.py must fail the build even when overall coverage is not
+  # tracked anywhere else. Do NOT add allow_failure: true.
+
 test:integration:
   stage: test
   tags: [argos, ncz-os]

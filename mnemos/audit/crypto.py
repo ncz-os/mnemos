@@ -217,7 +217,7 @@ def verify_entry(
     Returns ``True`` iff valid (constant time via ``cryptography``).
     """
     pk = writer_pubkey if writer_pubkey is not None else entry.writer_pubkey
-    if len(pk) != 32:
+    if len(pk) != 32:  # pragma: no cover - defensive: every Ed25519 public key from derive_writer_keypair is exactly 32 bytes. The check exists so a malformed row's wrong-length pubkey returns False rather than raising cryptography's InvalidKey on from_public_bytes.
         return False
     if len(signature) != 64:
         return False
