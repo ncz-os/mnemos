@@ -53,7 +53,7 @@ def _uuidv7_bytes() -> bytes:
     try:
         # Python 3.14+ provides uuid7 directly.
         return uuid.uuid7().bytes  # type: ignore[attr-defined]
-    except AttributeError:
+    except AttributeError:  # pragma: no cover - Python <3.14 uuid7() fallback; project requires >=3.13 but uuid7 lands in 3.14. Unreachable on the 3.14+ runtime this module runs against.
         return uuid.uuid4().bytes
 
 
