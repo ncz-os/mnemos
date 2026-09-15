@@ -220,7 +220,7 @@ def test_no_stale_tracks_mnemos_server_marker():
     version. Codex round-4 of #193 caught two of these."""
     version = _current_version()
     pattern = re.compile(
-        r"Tracks MNEMOS server v(?P<v>\d+(?:\.\d+)*(?:[a-zA-Z]+\d+)?)"
+        r"Tracks MNEMOS server v(?P<v>\d+(?:\.\d+)*(?:[a-zA-Z]+\d+|\.(?:dev|a|b|rc|post)\d+)?)"
     )
     bad: list[str] = []
     docs_dir = REPO / "docs"
@@ -256,7 +256,7 @@ def test_no_stale_as_of_version_anywhere():
     """
     version = _current_version()
     pattern = re.compile(
-        r"\b[Aa]s of v(?P<v>\d+(?:\.\d+)*(?:[a-zA-Z]+\d+)?)"
+        r"\b[Aa]s of v(?P<v>\d+(?:\.\d+)*(?:[a-zA-Z]+\d+|\.(?:dev|a|b|rc|post)\d+)?)"
     )
     bad: list[str] = []
     docs_dir = REPO / "docs"
@@ -337,11 +337,14 @@ _SKIP_DIRS = frozenset({
 # CHANGELOG is a release-by-release record; every entry names its own version.
 _SKIP_FILES = frozenset({"CHANGELOG.md"})
 
-# A version-shaped token: 6.1, 6.1.7, 4.2.0a14.
-_VER = r"v?(\d+\.\d+(?:\.\d+)?(?:[a-zA-Z]+\d+)?)"
+# A version-shaped token: 6.1, 6.1.7, 4.2.0a14, 7.0.0.dev0. The
+# ".(dev|a|b|rc|post)N" alternative covers PEP 440 pre/dev/post
+# releases that use a dot before the qualifier -- v7.0.0.dev0 was
+# the first such version this repo pinned as current.
+_VER = r"v?(\d+\.\d+(?:\.\d+)?(?:[a-zA-Z]+\d+|\.(?:dev|a|b|rc|post)\d+)?)"
 # Same, but the leading "v" is required. Used where a bare number would
 # otherwise match a numbered markdown heading such as "### 7.1 Current state".
-_VVER = r"v(\d+\.\d+(?:\.\d+)?(?:[a-zA-Z]+\d+)?)"
+_VVER = r"v(\d+\.\d+(?:\.\d+)?(?:[a-zA-Z]+\d+|\.(?:dev|a|b|rc|post)\d+)?)"
 
 # Phrasings that assert a version is the *live* one. Historical statements
 # ("shipped in v5.0.0", "as of v3.2.4", "v2.4 ships in v3") deliberately do

@@ -272,7 +272,7 @@ fleet without bloating the install.
 ### 5.4 Hot-path expansion
 
 The compression read paths preferring compressed variants over raw
-content is incremental. As of v6.4.1:
+content is incremental. As of v7.0.0.dev0:
 
 * `/v1/memories/search` honors `include_compressed` to swap
   variants into the response.
@@ -614,4 +614,4 @@ round-trip on the native subset.
 
 ---
 
-*v1.0 — 2026-05-08. Tracks MNEMOS server v6.4.1*
+*v1.0 — 2026-05-08. Tracks MNEMOS server v7.0.0.dev0*

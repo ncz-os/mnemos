@@ -1,6 +1,6 @@
 # MNEMOS Operations — Multi-Node Deployment & Maintenance
 
-**Status:** Canonical (v6.4.1 production line)
+**Status:** Canonical (v7.0.0.dev0 production line)
 **Audience:** Operators, SREs, release engineers
 **Scope:** Continuous operation and maintenance of MNEMOS production + staging + test clusters
 
@@ -474,7 +474,7 @@ Response (JSON):
 ```json
 {
   "status": "healthy",
-  "version": "6.4.1",
+  "version": "7.0.0.dev0",
   "profile": "server",
   "database_connected": true,
   "distillation_worker": "healthy"
