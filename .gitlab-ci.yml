@@ -484,3 +484,41 @@ test:oracle-smoke:
   # smoke only runs when explicitly enabled with a live Oracle in reach.
   rules:
     - if: $RUN_ORACLE_SMOKE == "true"
+
+
+# Portable SQL journals must run against real engines on every branch.
+# SaaS Docker runners supply these disposable services, independently of fleet DBs.
+test:journal-sql:
+  stage: test
+  image: python:3.13-slim
+  services:
+    - name: $JOURNAL_DATABASE_IMAGE
+      alias: journal-db
+  parallel:
+    matrix:
+      - JOURNAL_DATABASE_IMAGE: ["mysql:9.1"]
+        JOURNAL_DIALECT: ["mysql"]
+      - JOURNAL_DATABASE_IMAGE: ["mariadb:12.3"]
+        JOURNAL_DIALECT: ["mariadb"]
+  variables:
+    MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+    MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: "yes"
+    MNEMOS_EMBEDDING_DIM: "3"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential cmake
+    - python -m pip install --quiet -e ".[dev,sqlite,mysql]"
+    - |
+      if [ "$JOURNAL_DIALECT" = mysql ]; then
+        export MNEMOS_TEST_MYSQL_DSN="mysql://root@journal-db:3306/mysql"
+      else
+        export MNEMOS_TEST_MARIADB_DSN="mariadb://root@journal-db:3306/mysql"
+      fi
+  script:
+    - python -m pytest tests/test_federation_journal.py tests/test_morpheus_backend_live.py tests/test_mysql_trigger_splitter.py -k "$JOURNAL_DIALECT or splitter" --tb=short -q --junitxml=journal-sql.xml
+  artifacts:
+    when: always
+    reports:
+      junit: journal-sql.xml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH

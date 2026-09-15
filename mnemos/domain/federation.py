@@ -833,10 +833,9 @@ async def _store_memories(
         existing = existing_markers.get(local_id)
         if journal_enabled:
             # Refresh after the durable fence, including other events in this batch.
-            existing = await repo.fetch_federated_memory_marker(tx, local_id)
-            if existing is not None and mem.get("federation_sequence") is not None:
+            if mem.get("federation_sequence") is not None:
                 await journal.prepare_versioned_update(tx, peer_name, remote_id)
-                existing = {"federation_remote_updated": None}
+            existing = await repo.fetch_federated_memory_marker(tx, local_id)
         mutation_applied = False
         source_audit_provenance: dict[str, Any] = {}
         primary_eid = mem.get("audit_latest_entry_id")

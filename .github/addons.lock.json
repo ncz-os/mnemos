@@ -11,8 +11,8 @@
     "open a PR. Tagging vX.Y.Z then publishes wheels built from exactly",
     "the SHA recorded here -- the resulting image label is reproducible."
   ],
-  "pantheon": "2ee5bd9cb79e614eebb3535562acdee4c3dcdd03",
-  "knemon": "3adbce5e4788353191ad9518c93889f9a6be2e06",
-  "graeae": "55296e2555c6376ed977e03135909f23d3b89bac",
-  "charon": "8304a24af1555bdc05f87334f968617f967c9a5d"
+  "pantheon": "19a8f97b51972ddcc80c31861b7c26100858fff4",
+  "knemon": "83fefcd77d44847b9bab3c109ae05b93eb76bf2e",
+  "graeae": "785291abe7e28607d6501c631c203ef8bbf0587d",
+  "charon": "9159825f4258bc11ce965ee9cbaf8c0d9511faa0"
 }

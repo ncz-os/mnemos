@@ -459,6 +459,8 @@ def _split_mysql_statements(sql: str) -> list[str]:
     literals, line/block comments, or already-open nested BEGIN blocks do not
     affect the open/close counter.  Composite END tokens (``END IF``, ``END
     LOOP``, ``END CASE``, ``END WHILE``, ``END REPEAT``) never close a body.
+    CASE expressions and statements have their own depth so their bare END
+    cannot prematurely terminate a surrounding trigger body.
     """
     statements: list[str] = []
     buffer: list[str] = []
@@ -467,6 +469,7 @@ def _split_mysql_statements(sql: str) -> list[str]:
     in_single = False
     in_double = False
     begin_depth = 0
+    case_depth = 0
     i = 0
     length = len(sql)
     composite_enders = ("IF", "LOOP", "CASE", "WHILE", "REPEAT")
@@ -543,6 +546,11 @@ def _split_mysql_statements(sql: str) -> list[str]:
 
         # Inside an open BEGIN block: track depth, ignore outer semicolons.
         if begin_depth > 0:
+            if _match_word(i, "CASE"):
+                case_depth += 1
+                buffer.append(sql[i : i + 4])
+                i += 4
+                continue
             if _match_word(i, "BEGIN"):
                 begin_depth += 1
                 buffer.append("BEGIN")
@@ -558,12 +566,19 @@ def _split_mysql_statements(sql: str) -> list[str]:
                 for kw in composite_enders:
                     if _match_word(tail_idx, kw):
                         # Copy the full ``END <kw>`` token verbatim and step past.
+                        if kw == "CASE":
+                            case_depth -= 1
                         kw_end = tail_idx + len(kw)
                         buffer.append(sql[i:kw_end])
                         i = kw_end
                         is_composite = True
                         break
                 if is_composite:
+                    continue
+                if case_depth:
+                    case_depth -= 1
+                    buffer.append(sql[i : i + 3])
+                    i += 3
                     continue
                 begin_depth -= 1
                 buffer.append("END")
@@ -1349,10 +1364,14 @@ _INIT_DDLS = [
 ]
 
 
-async def _ensure_mysql_federation_journal(conn: Any) -> None:
+async def _ensure_mysql_federation_journal(conn: Any, *, separate_embeddings: bool = False) -> None:
     directory = Path(__file__).resolve().parents[1] / "db_migrations" / "migrations_mysql"
+    sql = (directory / "0062_federation_journal.sql").read_text()
+    if separate_embeddings:
+        sql = sql.replace(" OR NOT (OLD.embedding <=> NEW.embedding)", "")
+        sql += (directory.parent / "mariadb_helpers" / "federation_journal_mariadb_embeddings.sql").read_text()
     async with conn.cursor() as cursor:
-        for statement in _split_mysql_statements((directory / "0062_federation_journal.sql").read_text()):
+        for statement in _split_mysql_statements(sql):
             try:
                 await cursor.execute(statement)
             except Exception as exc:
@@ -3828,13 +3847,13 @@ class MysqlMorpheusRepository(MorpheusRepository):
                 await cursor.execute(
                     """
                     INSERT INTO deletion_log (
-                        memory_id, content_hash, owner_id, namespace,
+                        id, memory_id, content_hash, owner_id, namespace,
                         requested_by, requested_at, request_kind, reason, source
                     )
-                    SELECT id,
+                    SELECT UUID(), id,
                            SHA2(COALESCE(content, ''), 256),
                            owner_id, namespace,
-                           %s, CURRENT_TIMESTAMP, 'admin_purge', %s, %s
+                           %s, CURRENT_TIMESTAMP, 'admin_purge', %s, JSON_OBJECT('operation', 'morpheus.rollback', 'run_id', %s)
                       FROM memories
                      WHERE id = %s
                        AND provenance = 'morpheus_local'
@@ -3843,7 +3862,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
                     (
                         str(requested_by),
                         f"MORPHEUS rollback {run_id}",
-                        f"morpheus.rollback,{run_id}",
+                        run_id,
                         mid,
                     ),
                 )
@@ -6553,6 +6572,9 @@ class MysqlConsultationAuditRepository(ConsultationAuditRepository):
 
 
 class MysqlFederationRepository(FederationRepository):
+    _journal_embedding_sql = "FROM_VECTOR(m.embedding)"
+    _journal_embedding_join = ""
+
     #: How a JSON-typed column is bound in an INSERT/UPDATE.
     #:
     #: MySQL has a real JSON type and wants the explicit cast. MariaDB does
@@ -7295,11 +7317,12 @@ class MysqlFederationRepository(FederationRepository):
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
                 """
-                UPDATE memories
-                   SET consolidated_into = %s,
-                       consolidated_at = COALESCE(%s, CURRENT_TIMESTAMP(6)),
-                       permission_mode = 400,
-                       metadata = JSON_SET(
+                UPDATE memories AS target
+                  JOIN memories AS canonical ON canonical.id = %s AND canonical.deleted_at IS NULL
+                   SET target.consolidated_into = %s,
+                       target.consolidated_at = COALESCE(%s, CURRENT_TIMESTAMP(6)),
+                       target.permission_mode = 400,
+                       target.metadata = JSON_SET(
                            {json_metadata},
                            '$.federation_consolidation',
                            JSON_OBJECT(
@@ -7308,22 +7331,18 @@ class MysqlFederationRepository(FederationRepository):
                                'peer', %s
                            )
                        )
-                 WHERE id = %s
-                   AND deleted_at IS NULL
-                   AND (consolidated_into IS NULL OR consolidated_into <> %s)
-                   AND EXISTS (
-                       SELECT 1 FROM memories
-                        WHERE id = %s AND deleted_at IS NULL
-                   )
-                """.format(json_metadata=self._JSON_METADATA_EXPR),
+                 WHERE target.id = %s
+                   AND target.deleted_at IS NULL
+                   AND (target.consolidated_into IS NULL OR target.consolidated_into <> %s)
+                """.format(json_metadata=self._JSON_METADATA_EXPR.replace("metadata", "target.metadata")),
                 (
+                    local_canonical_id,
                     local_canonical_id,
                     consolidated_at,
                     remote_id,
                     canonical_remote_id,
                     peer_name,
                     local_id,
-                    local_canonical_id,
                     local_canonical_id,
                 ),
             )
@@ -7334,8 +7353,7 @@ class MysqlFederationRepository(FederationRepository):
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
                 """
-                UPDATE memories
-                   SET deleted_at = CURRENT_TIMESTAMP(6)
+                DELETE FROM memories
                  WHERE id IN (%s, %s)
                    AND federation_source = %s
                    AND deleted_at IS NULL

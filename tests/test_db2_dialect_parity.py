@@ -2800,7 +2800,7 @@ async def test_db2_federation_apply_consolidation_tombstone_native_tokens() -> N
 
 @pytest.mark.asyncio
 async def test_db2_federation_delete_federated_memory_native_tokens() -> None:
-    """Db2 delete_federated_memory emits ? binds + CURRENT TIMESTAMP."""
+    """Db2 delete_federated_memory hard-deletes only the matching peer using native binds."""
     from mnemos.persistence.db2 import Db2FederationRepository
 
     calls: list[dict[str, Any]] = []
@@ -2822,10 +2822,10 @@ async def test_db2_federation_delete_federated_memory_native_tokens() -> None:
     repo = Db2FederationRepository()
     await repo.delete_federated_memory(tx, "peer-x", "mem-1")
     sql = calls[0]["sql"].upper() if calls else ""
-    assert "UPDATE MEMORIES" in sql
-    assert "SET DELETED_AT = CURRENT TIMESTAMP" in sql
+    assert "DELETE FROM MEMORIES" in sql
     assert "SYSTIMESTAMP" not in sql
-    assert "WHERE ID = ?" in sql
+    assert "WHERE ID IN (?, ?)" in sql
+    assert calls[0]["params"] == ("mem-1", "fed:peer-x:mem-1", "peer-x")
     assert "AND FEDERATION_SOURCE = ?" in sql
     assert ":ID" not in sql
     assert ":PEER" not in sql

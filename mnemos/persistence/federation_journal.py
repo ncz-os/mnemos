@@ -49,7 +49,8 @@ async def prepare_versioned_update(tx, peer_name, remote_id):
     This handles source clocks moving backwards and changes sharing a timestamp.
     """
     await _ops(tx).execute(
-        "UPDATE memories SET federation_remote_updated = NULL WHERE id = ? AND federation_source = ?",
+        "UPDATE memories SET federation_remote_updated = NULL, deleted_at = NULL, "
+        "consolidated_into = NULL, consolidated_at = NULL WHERE id = ? AND federation_source = ?",
         f"fed:{peer_name}:{remote_id}",
         peer_name,
     )
@@ -95,7 +96,7 @@ async def _publish(ops: _Ops, memory_id=None):
     value = int(await ops.scalar("SELECT value FROM federation_change_clock WHERE id = 1"))
     ids = [int(row["event_id"]) for row in pending]
     cases = " ".join(f"WHEN ? THEN {index}" for index, _ in enumerate(ids, 1))
-    integer_type = "NUMBER(19)" if ops.dialect == "oracle" else "BIGINT"
+    integer_type = {"oracle": "NUMBER(19)", "mysql": "SIGNED"}.get(ops.dialect, "BIGINT")
     await ops.execute(
         f"UPDATE federation_changes SET seq = CAST(? AS {integer_type}) + CASE event_id {cases} END "
         f"WHERE event_id IN ({','.join('?' for _ in ids)}) AND seq IS NULL",
@@ -106,7 +107,7 @@ async def _publish(ops: _Ops, memory_id=None):
     await ops.execute("UPDATE federation_change_clock SET value = ? WHERE id = 1", value + len(ids))
 
 
-async def _current_states(ops, ids, prefer_compressed=False):
+async def _current_states(ops, ids, prefer_compressed=False, *, repo=None, include_embedding=False):
     if not ids:
         return {}
     placeholders = ",".join("?" for _ in ids)
@@ -115,12 +116,48 @@ async def _current_states(ops, ids, prefer_compressed=False):
     # older sequence (or old data with a newer one) during concurrent writes.
     compressed_column = ", v.compressed_content AS journal_compressed" if prefer_compressed else ""
     compressed_join = " LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id" if prefer_compressed else ""
+    embedding_column = ", m.embedding" if include_embedding else ""
+    embedding_join = ""
+    if include_embedding and getattr(repo, "_journal_embedding_sql", None):
+        embedding_column = ", " + repo._journal_embedding_sql + " AS journal_embedding_value"
+        embedding_join = repo._journal_embedding_join
+    # Do not fetch multi-kilobyte vectors when the peer did not request them.
+    memory_columns = ", ".join(
+        "m." + name
+        for name in (
+            "id",
+            "content",
+            "category",
+            "subcategory",
+            "metadata",
+            "quality_rating",
+            "verbatim_content",
+            "source_model",
+            "source_provider",
+            "source_session",
+            "source_agent",
+            "owner_id",
+            "namespace",
+            "permission_mode",
+            "federation_source",
+            "deleted_at",
+            "archived_at",
+            "consolidated_into",
+            "consolidated_at",
+            "created",
+            "updated",
+        )
+    )
     rows = await ops.fetchall(
         "SELECT e.memory_id AS journal_memory_id, e.seq AS journal_sequence, "
-        "e.changed_at AS journal_updated, m.*" + compressed_column + " FROM federation_changes e "
+        "e.changed_at AS journal_updated, "
+        + memory_columns
+        + compressed_column
+        + embedding_column
+        + " FROM federation_changes e "
         "JOIN (SELECT memory_id, MAX(seq) AS latest_seq FROM federation_changes "
         f"WHERE memory_id IN ({placeholders}) GROUP BY memory_id) latest "
-        "ON e.seq = latest.latest_seq LEFT JOIN memories m ON m.id = e.memory_id" + compressed_join,
+        "ON e.seq = latest.latest_seq LEFT JOIN memories m ON m.id = e.memory_id" + compressed_join + embedding_join,
         *ids,
     )
     return {row["journal_memory_id"]: row for row in rows}
@@ -143,6 +180,8 @@ def _authorized(row, namespaces, categories):
 async def _resolve(event, current, namespaces, categories, include_embedding=False):
     if _authorized(current, namespaces, categories):
         result = dict(current)
+        if "journal_embedding_value" in result:
+            result["embedding"] = result.pop("journal_embedding_value")
         # Oracle LOBs must be consumed before the connection leaves its tx.
         from mnemos.persistence.worker_lifecycle import _await
 
@@ -177,6 +216,7 @@ async def _resolve(event, current, namespaces, categories, include_embedding=Fal
         and current.get("namespace") != "vault"
         and current.get("deleted_at") is None
         and current.get("archived_at") is None
+        and (federation_feed_include_private() or int(current.get("permission_mode") or 0) % 10 >= 4)
         and (not namespaces or current.get("namespace") in namespaces)
         and (not categories or current.get("category") in categories)
     ):
@@ -221,7 +261,13 @@ async def feed_query(
         sequence,
         *params,
     )
-    current = await _current_states(ops, list(dict.fromkeys(e["memory_id"] for e in events)), prefer_compressed)
+    current = await _current_states(
+        ops,
+        list(dict.fromkeys(e["memory_id"] for e in events)),
+        prefer_compressed,
+        repo=repo,
+        include_embedding=include_embedding,
+    )
     rows = [
         await _resolve(event, current[event["memory_id"]], namespaces, categories, include_embedding)
         for event in events
