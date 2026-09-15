@@ -171,9 +171,7 @@ _MYSQL_PY_COSINE_MAX_ROWS_ENV = "MNEMOS_MYSQL_PY_COSINE_MAX_ROWS"
 
 def _mysql_py_cosine_max_rows() -> int:
     """Return the configured per-corpus size threshold (rows)."""
-    return _env_int(
-        _MYSQL_PY_COSINE_MAX_ROWS_ENV, _DEFAULT_MYSQL_PY_COSINE_MAX_ROWS
-    )
+    return _env_int(_MYSQL_PY_COSINE_MAX_ROWS_ENV, _DEFAULT_MYSQL_PY_COSINE_MAX_ROWS)
 
 
 # Per-process flag: the warning is informational, not actionable per
@@ -461,6 +459,8 @@ def _split_mysql_statements(sql: str) -> list[str]:
     literals, line/block comments, or already-open nested BEGIN blocks do not
     affect the open/close counter.  Composite END tokens (``END IF``, ``END
     LOOP``, ``END CASE``, ``END WHILE``, ``END REPEAT``) never close a body.
+    CASE expressions and statements have their own depth so their bare END
+    cannot prematurely terminate a surrounding trigger body.
     """
     statements: list[str] = []
     buffer: list[str] = []
@@ -469,6 +469,7 @@ def _split_mysql_statements(sql: str) -> list[str]:
     in_single = False
     in_double = False
     begin_depth = 0
+    case_depth = 0
     i = 0
     length = len(sql)
     composite_enders = ("IF", "LOOP", "CASE", "WHILE", "REPEAT")
@@ -545,6 +546,11 @@ def _split_mysql_statements(sql: str) -> list[str]:
 
         # Inside an open BEGIN block: track depth, ignore outer semicolons.
         if begin_depth > 0:
+            if _match_word(i, "CASE"):
+                case_depth += 1
+                buffer.append(sql[i : i + 4])
+                i += 4
+                continue
             if _match_word(i, "BEGIN"):
                 begin_depth += 1
                 buffer.append("BEGIN")
@@ -560,12 +566,19 @@ def _split_mysql_statements(sql: str) -> list[str]:
                 for kw in composite_enders:
                     if _match_word(tail_idx, kw):
                         # Copy the full ``END <kw>`` token verbatim and step past.
+                        if kw == "CASE":
+                            case_depth -= 1
                         kw_end = tail_idx + len(kw)
                         buffer.append(sql[i:kw_end])
                         i = kw_end
                         is_composite = True
                         break
                 if is_composite:
+                    continue
+                if case_depth:
+                    case_depth -= 1
+                    buffer.append(sql[i : i + 3])
+                    i += 3
                     continue
                 begin_depth -= 1
                 buffer.append("END")
@@ -1351,6 +1364,22 @@ _INIT_DDLS = [
 ]
 
 
+async def _ensure_mysql_federation_journal(conn: Any, *, separate_embeddings: bool = False) -> None:
+    directory = Path(__file__).resolve().parents[1] / "db_migrations" / "migrations_mysql"
+    sql = (directory / "0062_federation_journal.sql").read_text()
+    if separate_embeddings:
+        sql = sql.replace(" OR NOT (OLD.embedding <=> NEW.embedding)", "")
+        sql += (directory.parent / "mariadb_helpers" / "federation_journal_mariadb_embeddings.sql").read_text()
+    async with conn.cursor() as cursor:
+        for statement in _split_mysql_statements(sql):
+            try:
+                await cursor.execute(statement)
+            except Exception as exc:
+                if getattr(exc, "args", (None,))[0] == 1061 and "CREATE INDEX" in statement.upper():
+                    continue
+                raise
+
+
 async def _ensure_mysql_oauth_schema(conn: Any) -> None:
     """Provision OAuth tables on the node's existing MySQL-family connection."""
     directory = Path(__file__).resolve().parents[1] / "db_migrations" / "migrations_mysql"
@@ -1707,9 +1736,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
                     where.append(clause)
                     params.extend(vis_params)
             await cursor.execute(
-                "SELECT m.id FROM memories m WHERE "
-                + " AND ".join(where)
-                + " FOR UPDATE",
+                "SELECT m.id FROM memories m WHERE " + " AND ".join(where) + " FOR UPDATE",
                 tuple(params),
             )
             if await cursor.fetchone() is None:
@@ -1732,8 +1759,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         placeholders = ", ".join(["%s"] * len(memory_ids))
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
-                "SELECT memory_id, tag FROM memory_tags "
-                f"WHERE memory_id IN ({placeholders}) ORDER BY memory_id, tag",
+                f"SELECT memory_id, tag FROM memory_tags WHERE memory_id IN ({placeholders}) ORDER BY memory_id, tag",
                 list(memory_ids),
             )
             rows = await _fetch_all_dicts(cursor)
@@ -1815,8 +1841,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         if tags:
             placeholders = ", ".join(["%s"] * len(tags))
             where.append(
-                "EXISTS (SELECT 1 FROM memory_tags mt "
-                f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
             )
             params.extend(tags)
         where_sql = " AND ".join(where)
@@ -2099,8 +2124,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         if tags:
             placeholders = ", ".join(["%s"] * len(tags))
             where.append(
-                "EXISTS (SELECT 1 FROM memory_tags mt "
-                f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
             )
             params.extend(tags)
 
@@ -2169,119 +2193,78 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         boost_recency: bool,
         recency_weight: float,
     ) -> list[Row]:
-        """Fallback semantic search using Python-side cosine when MySQL lacks
-        built-in VEC_DISTANCE functions (Community Edition).
+        """Exact fallback with keyset pages and a bounded top-K accumulator.
 
-        Bounding + offload contract (mirrors the scale-limited fallback
-        precedent at ``sqlite._resolve_embedding_dim`` and the F15
-        CPU-offload pattern from ``InProcessEmbedder._run_serial_sync``):
-
-        1. **Count-based eligibility probe.** Before materializing the
-           eligible corpus, run a cheap ``SELECT COUNT(*)`` against the
-           same WHERE clause. If the eligible corpus exceeds
-           ``MNEMOS_MYSQL_PY_COSINE_MAX_ROWS`` (default 10_000), emit a
-           single loud ``logger.warning`` identifying the slow fallback
-           path. The warning is deduped per-process via a flag so a busy
-           server doesn't spam logs once per request. Results are still
-           correct (slow-but-correct beats silently-truncated-results)
-           but operators see clearly when they're running without native
-           vector support and can migrate to a backend that ships it
-           (MariaDB Community, MySQL Enterprise / HeatWave).
-        2. **Offload the cosine work off the event loop.** The heavy
-           Python-side ranking (``_cosine_rank_rows`` + sort + slice)
-           runs through ``loop.run_in_executor(None, ...)`` — the
-           codebase's standard "CPU-bound sync function off the event
-           loop" pattern (used by F15 for embedder backends and by
-           ``mnemos/domain/compression/judge.py:527``). Concurrent
-           searches are NOT serialized; each one runs on its own
-           default-pool thread so a slow fallback search doesn't stall
-           other concurrent request handling on the same worker.
-        3. **Small corpora are unchanged** — under the threshold, no
-           warning fires and no executor offload runs (the overhead of
-           the extra COUNT round-trip is bounded and matches what
-           callers already pay for visibility). The fallback returns
-           the same rows it did before this fix.
+        Native vectors remain preferable. This path still does O(N*D)
+        work, but only one 500-row page plus K results resides in Python.
+        Ranking runs off the event loop. The historical MAX_ROWS setting
+        is a warning threshold, not permission to truncate recall.
         """
+        import heapq
+
         query_vec = json.loads(vec_literal)
         conn = tx.conn
-
         threshold = _mysql_py_cosine_max_rows()
-        eligible_count = 0
-        do_count_probe = threshold > 0  # 0 disables both probe + warn
-        if do_count_probe:
-            async with conn.cursor() as cursor:
-                await cursor.execute(
-                    f"SELECT COUNT(*) FROM memories m WHERE {' AND '.join(where)}",
-                    params,
-                )
-                rows = await _fetch_all_dicts(cursor)
-            if rows:
-                # The COUNT(*) probe always returns exactly one row with
-                # one column. ``_fetch_all_dicts`` keys it by the cursor's
-                # column-0 description (typically ``count(*)``), so just
-                # take the first value of the first row.
-                first_row = next(iter(rows[0].values()))
-                eligible_count = int(first_row or 0)
-                if eligible_count > threshold:
-                    _warn_python_cosine_scale_once(
-                        eligible_count=eligible_count,
-                        threshold=threshold,
-                    )
-
-        # Fetch the full eligible corpus. The COUNT probe above already
-        # established how many rows we're about to pull; the loop below
-        # is therefore a bounded one-shot read rather than an
-        # unbounded cursor drain.
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                f"""
-                SELECT m.id, m.content, m.category, m.subcategory, m.metadata,
-                       m.quality_rating, m.compressed_content, m.verbatim_content,
-                       m.owner_id, m.namespace, m.permission_mode, m.source_model,
-                       m.source_provider, m.source_session, m.source_agent,
-                       m.group_id, m.created, m.updated, m.archived_at,
-                       m.recall_count, m.last_recalled_at, m.consolidated_into,
-                       FROM_VECTOR(m.embedding) AS embedding_json
-                  FROM memories m
-                 WHERE {" AND ".join(where)}
-                """,
-                params,
-            )
-            raw_rows = await _fetch_all_dicts(cursor)
-
+        total = 0
+        after: str | None = None
+        best: list[Row] = []
         today = datetime.now(timezone.utc).date()
-        w = float(recency_weight)
-
-        # Offload the CPU-bound cosine ranking + sort + slice off the
-        # event loop. The result is fully self-contained (no async
-        # dependencies, no DB conn, no shared state) so a plain
-        # run_in_executor with no shield is safe — if the awaiting
-        # coroutine is cancelled the executor task continues and the
-        # result is discarded, which matches the codebase's "search
-        # request can be cancelled without side effects" posture.
+        weight = float(recency_weight)
         loop = asyncio.get_running_loop()
 
-        def _rank_and_slice() -> list[Row]:
+        def rank_page(rows: list[Row], previous: list[Row]) -> list[Row]:
             distances = self._cosine_rank_rows(
                 query_vec,
-                raw_rows,
+                rows,
                 "embedding_json",
                 extract_embedding=lambda value: json.loads(value) if value else None,
             )
-            for row, dist in zip(raw_rows, distances):
+            for row, distance in zip(rows, distances):
                 row.pop("embedding_json", None)
-                row["rank_score"] = dist
-            if boost_recency:
-                raw_rows.sort(
-                    key=lambda row: _boosted_rank_supersession_sort_key(
-                        row, today=today, recency_weight=w
-                    )
-                )
-            else:
-                raw_rows.sort(key=_rank_score_sort_key)
-            return raw_rows[:limit]
+                row["rank_score"] = distance
+            key = (
+                (lambda row: _boosted_rank_supersession_sort_key(row, today=today, recency_weight=weight))
+                if boost_recency
+                else _rank_score_sort_key
+            )
+            return heapq.nsmallest(limit, [*previous, *rows], key=key)
 
-        return await loop.run_in_executor(None, _rank_and_slice)
+        while True:
+            page_where = [*where]
+            page_params = list(params)
+            if after is not None:
+                page_where.append("m.id > %s")
+                page_params.append(after)
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"""
+                    SELECT m.id, m.content, m.category, m.subcategory, m.metadata,
+                           m.quality_rating, m.compressed_content, m.verbatim_content,
+                           m.owner_id, m.namespace, m.permission_mode, m.source_model,
+                           m.source_provider, m.source_session, m.source_agent,
+                           m.group_id, m.created, m.updated, m.archived_at,
+                           m.recall_count, m.last_recalled_at, m.consolidated_into,
+                           FROM_VECTOR(m.embedding) AS embedding_json
+                      FROM memories m
+                     WHERE {" AND ".join(page_where)}
+                     ORDER BY m.id ASC LIMIT 500
+                    """,
+                    page_params,
+                )
+                rows = await _fetch_all_dicts(cursor)
+            if not rows:
+                break
+            next_id = str(rows[-1]["id"])
+            if after is not None and next_id == after:
+                raise RuntimeError("MySQL vector fallback page did not advance")
+            after = next_id
+            total += len(rows)
+            if threshold > 0 and total > threshold:
+                _warn_python_cosine_scale_once(eligible_count=total, threshold=threshold)
+            best = await loop.run_in_executor(None, rank_page, rows, best)
+            if len(rows) < 500:
+                break
+        return best
 
     async def fts_search(
         self,
@@ -2325,8 +2308,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         if tags:
             placeholders = ", ".join(["%s"] * len(tags))
             where.append(
-                "EXISTS (SELECT 1 FROM memory_tags mt "
-                f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
             )
             params.extend(tags)
 
@@ -3865,13 +3847,13 @@ class MysqlMorpheusRepository(MorpheusRepository):
                 await cursor.execute(
                     """
                     INSERT INTO deletion_log (
-                        memory_id, content_hash, owner_id, namespace,
+                        id, memory_id, content_hash, owner_id, namespace,
                         requested_by, requested_at, request_kind, reason, source
                     )
-                    SELECT id,
+                    SELECT UUID(), id,
                            SHA2(COALESCE(content, ''), 256),
                            owner_id, namespace,
-                           %s, CURRENT_TIMESTAMP, 'admin_purge', %s, %s
+                           %s, CURRENT_TIMESTAMP, 'admin_purge', %s, JSON_OBJECT('operation', 'morpheus.rollback', 'run_id', %s)
                       FROM memories
                      WHERE id = %s
                        AND provenance = 'morpheus_local'
@@ -3880,7 +3862,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
                     (
                         str(requested_by),
                         f"MORPHEUS rollback {run_id}",
-                        f"morpheus.rollback,{run_id}",
+                        run_id,
                         mid,
                     ),
                 )
@@ -4033,7 +4015,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
                  WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
                    AND NOT (m.provenance <=> 'morpheus_local')
                    AND m.morpheus_run_id IS NULL
-                   AND {_eligibility.eligible_for_morpheus('m')}
+                   AND {_eligibility.eligible_for_morpheus("m")}
                    AND (r.namespace IS NULL OR m.namespace = r.namespace)
                 """,
                 (run_id,),
@@ -4118,6 +4100,9 @@ class MysqlMorpheusRepository(MorpheusRepository):
         except (json.JSONDecodeError, TypeError):
             config = {}
         clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        from mnemos.persistence.morpheus_isolation import partition_consolidation_clusters
+
+        clusters = await partition_consolidation_clusters(tx, clusters, dialect="mysql")
         min_size = int(run_row[1])
         namespace = run_row[2]
         eligibility_clause = _eligibility.eligible_for_morpheus("")
@@ -6587,6 +6572,9 @@ class MysqlConsultationAuditRepository(ConsultationAuditRepository):
 
 
 class MysqlFederationRepository(FederationRepository):
+    _journal_embedding_sql = "FROM_VECTOR(m.embedding)"
+    _journal_embedding_join = ""
+
     #: How a JSON-typed column is bound in an INSERT/UPDATE.
     #:
     #: MySQL has a real JSON type and wants the explicit cast. MariaDB does
@@ -6784,7 +6772,12 @@ class MysqlFederationRepository(FederationRepository):
             )
             return await _fetch_all_dicts(cursor)
 
-    async def feed_query(
+    async def feed_query(self, tx, **kwargs):
+        from mnemos.persistence.federation_journal import feed_query
+
+        return await feed_query(self, tx, **kwargs)
+
+    async def _legacy_feed_query(
         self,
         tx: Transaction,
         *,
@@ -6972,7 +6965,12 @@ class MysqlFederationRepository(FederationRepository):
             )
             return await _fetch_all_dicts(cursor)
 
-    async def get_feed_memory(
+    async def get_feed_memory(self, tx, memory_id, *, namespaces, categories):
+        from mnemos.persistence.federation_journal import get_feed_memory
+
+        return await get_feed_memory(self, tx, memory_id, namespaces=namespaces, categories=categories)
+
+    async def _legacy_get_feed_memory(
         self,
         tx: Transaction,
         memory_id: str,
@@ -7319,11 +7317,12 @@ class MysqlFederationRepository(FederationRepository):
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
                 """
-                UPDATE memories
-                   SET consolidated_into = %s,
-                       consolidated_at = COALESCE(%s, CURRENT_TIMESTAMP(6)),
-                       permission_mode = 400,
-                       metadata = JSON_SET(
+                UPDATE memories AS target
+                  JOIN memories AS canonical ON canonical.id = %s AND canonical.deleted_at IS NULL
+                   SET target.consolidated_into = %s,
+                       target.consolidated_at = COALESCE(%s, CURRENT_TIMESTAMP(6)),
+                       target.permission_mode = 400,
+                       target.metadata = JSON_SET(
                            {json_metadata},
                            '$.federation_consolidation',
                            JSON_OBJECT(
@@ -7332,22 +7331,18 @@ class MysqlFederationRepository(FederationRepository):
                                'peer', %s
                            )
                        )
-                 WHERE id = %s
-                   AND deleted_at IS NULL
-                   AND (consolidated_into IS NULL OR consolidated_into <> %s)
-                   AND EXISTS (
-                       SELECT 1 FROM memories
-                        WHERE id = %s AND deleted_at IS NULL
-                   )
-                """.format(json_metadata=self._JSON_METADATA_EXPR),
+                 WHERE target.id = %s
+                   AND target.deleted_at IS NULL
+                   AND (target.consolidated_into IS NULL OR target.consolidated_into <> %s)
+                """.format(json_metadata=self._JSON_METADATA_EXPR.replace("metadata", "target.metadata")),
                 (
+                    local_canonical_id,
                     local_canonical_id,
                     consolidated_at,
                     remote_id,
                     canonical_remote_id,
                     peer_name,
                     local_id,
-                    local_canonical_id,
                     local_canonical_id,
                 ),
             )
@@ -7358,8 +7353,7 @@ class MysqlFederationRepository(FederationRepository):
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
                 """
-                UPDATE memories
-                   SET deleted_at = CURRENT_TIMESTAMP(6)
+                DELETE FROM memories
                  WHERE id IN (%s, %s)
                    AND federation_source = %s
                    AND deleted_at IS NULL
@@ -8117,6 +8111,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                         await cursor.execute(ddl)
                 await _ensure_mysql_oauth_schema(conn)
                 await _ensure_mysql_webhook_schema(conn)
+                await _ensure_mysql_federation_journal(conn)
                 await _ensure_mysql_columns(
                     conn,
                     "memories",

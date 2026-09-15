@@ -253,6 +253,7 @@ def _translate_sql_cached(sql: str) -> tuple[str, tuple[str, ...]]:
     adapted = masked_sql
     for oracle_tok, db2_tok in _ORA_TO_DB2_PAIRS:
         adapted = adapted.replace(oracle_tok, db2_tok)
+    adapted = re.sub(r"\bFROM\s+DUAL\b", "FROM SYSIBM.SYSDUMMY1", adapted, flags=re.IGNORECASE)
     adapted = _TO_VECTOR_RE.sub("VECTOR", adapted)
     names = tuple(_BIND_RE.findall(adapted))
     adapted = _BIND_RE.sub("?", adapted)
@@ -869,15 +870,10 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 clause, vis_params = _render_visibility(visibility, table_alias="m")
                 if clause:
                     where.append(_BIND_RE.sub("?", clause))
-                    params.extend(
-                        vis_params[match.group(1)]
-                        for match in _BIND_RE.finditer(clause)
-                    )
+                    params.extend(vis_params[match.group(1)] for match in _BIND_RE.finditer(clause))
             await _call(
                 cursor.execute,
-                "SELECT m.id FROM memories m WHERE "
-                + " AND ".join(where)
-                + " FOR UPDATE",
+                "SELECT m.id FROM memories m WHERE " + " AND ".join(where) + " FOR UPDATE",
                 tuple(params),
             )
             if await _call(cursor.fetchone) is None:
@@ -975,8 +971,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             if tags:
                 placeholders = ", ".join("?" for _ in tags)
                 where.append(
-                    "EXISTS (SELECT 1 FROM memory_tags mt "
-                    f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                    f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
                 )
                 where_params.extend(tags)
 
@@ -1382,8 +1377,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             if tags:
                 placeholders = ", ".join("?" for _ in tags)
                 where.append(
-                    "EXISTS (SELECT 1 FROM memory_tags mt "
-                    f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                    f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
                 )
                 params_list.extend(tags)
             where_sql = " AND ".join(where)
@@ -1625,8 +1619,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             if tags:
                 placeholders = ", ".join("?" for _ in tags)
                 where.append(
-                    "EXISTS (SELECT 1 FROM memory_tags mt "
-                    f"WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
+                    f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
                 )
                 params_list.extend(tags)
             params_list.append(limit)
@@ -2831,8 +2824,7 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
             try:
                 await _call(
                     cursor.execute,
-                    f"UPDATE memories SET triples_extracted_at = NULL "
-                    f"WHERE id IN ({placeholders})",
+                    f"UPDATE memories SET triples_extracted_at = NULL WHERE id IN ({placeholders})",
                     tuple(affected_ids),
                 )
             finally:
@@ -2894,19 +2886,13 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
                 n_restored += int(getattr(cursor, "rowcount", 0) or 0)
             finally:
                 await _call(cursor.close)
-        # Step 5: audit log. Db2 has STANDARD_HASH... actually Db2 12.1
-        # does not have STANDARD_HASH; use HEX(HASH256(c)) if the
-        # build supports it, otherwise fall back to SHA-256 done in
-        # Python — but the deletion_log schema on Db2 (migration 0050)
-        # stores content_hash as VARCHAR(64), so any 64-char lowercase
-        # hex digest works. HASH256 is a Db2 built-in; if the build
-        # doesn't have it we leave content_hash NULL on Db2.
+        # Step 5: audit the complete content before deletion.
         cursor = await _call(conn.cursor)
         try:
             await _call(
                 cursor.execute,
                 """
-                SELECT id FROM memories
+                SELECT id, content FROM memories
                  WHERE morpheus_run_id = ?
                    AND provenance = 'morpheus_local'
                    AND deleted_at IS NULL
@@ -2920,14 +2906,7 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
             mid = row[0]
             cursor = await _call(conn.cursor)
             try:
-                # Db2 built-in HASH256() returns a 32-byte binary; we
-                # cast to VARCHAR(64) for the lowercase hex form via
-                # HEX(). The migration's content_hash column is
-                # VARCHAR(64). Some Db2 12.1 Fix Packs expose HEX as
-                # HEX(int) only; fall back to HEX(BIGINT) of a single
-                # hash row if HEX(CLOB) raises. Operators running
-                # older Fix Packs may need to upgrade — same caveat as
-                # the compression queue migration.
+                # Hash the complete content using the same portable digest as writes.
                 await _call(
                     cursor.execute,
                     """
@@ -2936,7 +2915,7 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
                         requested_by, requested_at, request_kind, reason, source
                     )
                     SELECT id,
-                           HEX(HASH256(COALESCE(content, ''))),
+                           ?,
                            owner_id, namespace,
                            ?, CURRENT TIMESTAMP, 'admin_purge', ?, ?
                       FROM memories
@@ -2945,9 +2924,10 @@ class Db2MorpheusRepository(_Db2OraCompatMixin, OracleMorpheusRepository):
                        AND deleted_at IS NULL
                     """,
                     (
+                        _content_hash(str(row[1] or "")),
                         str(requested_by),
                         f"MORPHEUS rollback {run_id}",
-                        f"morpheus.rollback,{run_id}",
+                        json.dumps({"operation": "morpheus.rollback", "run_id": run_id}),
                         mid,
                     ),
                 )
@@ -3417,8 +3397,7 @@ class Db2WebhookRepository(_Db2OraCompatMixin, OracleWebhookRepository):
             # unavailable (or stale) once the cursor is closed below.
             cols = [c[0].lower() for c in cursor.description]
             result = [
-                _oracle_webhook_claim(dict(zip(cols, r)), lease_token=lease_token, claim_now=claim_now)
-                for r in rows
+                _oracle_webhook_claim(dict(zip(cols, r)), lease_token=lease_token, claim_now=claim_now) for r in rows
             ]
         finally:
             await _call(cursor.close)
@@ -3864,7 +3843,6 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                     local_canonical_id,
                     canonical_remote_id,
                     consolidated_at,
-                    consolidated_at,
                     peer_name,
                     remote_id,
                     local_id,
@@ -3898,13 +3876,12 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
             await _call(
                 cursor.execute,
                 """
-                UPDATE memories
-                   SET deleted_at = CURRENT TIMESTAMP
-                 WHERE id = ?
+                DELETE FROM memories
+                 WHERE id IN (?, ?)
                    AND federation_source = ?
                    AND deleted_at IS NULL
                 """,
-                (memory_id, peer_name),
+                (memory_id, f"fed:{peer_name}:{memory_id}", peer_name),
             )
             return int(getattr(cursor, "rowcount", 0) or 0)
         finally:
@@ -4154,7 +4131,12 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
 
     # ── feed queries ─────────────────────────────────────────────────────
 
-    async def feed_query(
+    async def feed_query(self, tx, **kwargs):
+        from mnemos.persistence.federation_journal import feed_query
+
+        return await feed_query(self, tx, **kwargs)
+
+    async def _legacy_feed_query(
         self,
         tx: Any,
         *,
@@ -4269,7 +4251,12 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         finally:
             await _call(cursor.close)
 
-    async def get_feed_memory(
+    async def get_feed_memory(self, tx, memory_id, *, namespaces, categories):
+        from mnemos.persistence.federation_journal import get_feed_memory
+
+        return await get_feed_memory(self, tx, memory_id, namespaces=namespaces, categories=categories)
+
+    async def _legacy_get_feed_memory(
         self,
         tx: Any,
         memory_id: str,
@@ -4503,7 +4490,6 @@ class Db2OAuthRepository(OracleOAuthRepository):
         # Native Db2 uses question-mark binds; never rely on Oracle translation.
         return sql, params
 
-
     async def register_oauth_token(
         self,
         tx: Any,
@@ -4653,9 +4639,7 @@ class Db2OAuthRepository(OracleOAuthRepository):
     # ``migrations_db2/0003_api_keys.sql`` and ``0006_oauth_sessions.sql``
     # is what allows the same SQL shape with positional binds.
 
-    async def lookup_api_key(
-        self, tx: Any, key_hash: str
-    ) -> Row | None:
+    async def lookup_api_key(self, tx: Any, key_hash: str) -> Row | None:
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
             await _call(
@@ -4692,15 +4676,12 @@ class Db2OAuthRepository(OracleOAuthRepository):
         finally:
             await _call(cursor.close)
 
-    async def resolve_active_session(
-        self, tx: Any, session_id: str, *, now: Any
-    ) -> Row | None:
+    async def resolve_active_session(self, tx: Any, session_id: str, *, now: Any) -> Row | None:
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
             await _call(
                 cursor.execute,
-                "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions "
-                "WHERE session_id = ?",
+                "SELECT user_id, identity_id, revoked, expires_at FROM oauth_sessions WHERE session_id = ?",
                 (session_id,),
             )
             row = await _row_to_dict(cursor, await _call(cursor.fetchone))
@@ -4713,8 +4694,7 @@ class Db2OAuthRepository(OracleOAuthRepository):
                 return None
             await _call(
                 cursor.execute,
-                "UPDATE oauth_sessions SET last_used_at = CURRENT TIMESTAMP "
-                "WHERE session_id = ?",
+                "UPDATE oauth_sessions SET last_used_at = CURRENT TIMESTAMP WHERE session_id = ?",
                 (session_id,),
             )
             return row
@@ -5025,6 +5005,8 @@ class Db2Backend(OracleBackend):
     the app-path ``semantic_search`` override silently degrades to
     exact scan even when ``MNEMOS_DB2_VECTOR_INDEX=approx`` is set.
     """
+
+    _LIVENESS_PROBE_SQL = "SELECT 1 FROM SYSIBM.SYSDUMMY1"
 
     supports_listen_notify = False
     supports_advisory_locks = False
@@ -5586,14 +5568,64 @@ class Db2Backend(OracleBackend):
         return (self._db2_vector_indexing_value or "").upper() == "YES"
 
 
+class _Db2MorpheusTransaction:
+    """Keep the caller's physical transaction while adapting inherited SQL."""
+
+    def __init__(self, tx):
+        self._tx = tx
+        self.conn = _Db2AsyncConnection(tx.conn._conn)
+
+    def __getattr__(self, name):
+        return getattr(self._tx, name)
+
+
+def _morpheus_native_bridge(method):
+    from functools import wraps
+
+    @wraps(method)
+    async def call(self, tx, *args, **kwargs):
+        if isinstance(tx.conn, _Db2NativeAsyncConnection):
+            tx = _Db2MorpheusTransaction(tx)
+        return await method(self, tx, *args, **kwargs)
+
+    return call
+
+
+class Db2MorpheusNativeBridge(Db2MorpheusRepository):
+    """Explicit compatibility island for MORPHEUS's inherited Oracle statements.
+
+    This does not open a second connection, commit, or change database mode.
+    All other repositories retain the strict native cursor. Removing this bridge
+    requires porting and testing the full MORPHEUS SQL surface, rather than
+    claiming inheritance has already made that surface native.
+    """
+
+    begin_run = _morpheus_native_bridge(Db2MorpheusRepository.begin_run)
+    set_phase = _morpheus_native_bridge(Db2MorpheusRepository.set_phase)
+    update_counters = _morpheus_native_bridge(Db2MorpheusRepository.update_counters)
+    increment_extract_counters = _morpheus_native_bridge(Db2MorpheusRepository.increment_extract_counters)
+    finish_run = _morpheus_native_bridge(Db2MorpheusRepository.finish_run)
+    fail_run = _morpheus_native_bridge(Db2MorpheusRepository.fail_run)
+    sweep_orphan_runs = _morpheus_native_bridge(Db2MorpheusRepository.sweep_orphan_runs)
+    rollback_run = _morpheus_native_bridge(Db2MorpheusRepository.rollback_run)
+    fetch_cluster_candidates = _morpheus_native_bridge(Db2MorpheusRepository.fetch_cluster_candidates)
+    replay_scan_count = _morpheus_native_bridge(Db2MorpheusRepository.replay_scan_count)
+    merge_run_config = _morpheus_native_bridge(Db2MorpheusRepository.merge_run_config)
+    phase_consolidate = _morpheus_native_bridge(Db2MorpheusRepository.phase_consolidate)
+    phase_synthesise_load = _morpheus_native_bridge(Db2MorpheusRepository.phase_synthesise_load)
+    phase_synthesise_store = _morpheus_native_bridge(Db2MorpheusRepository.phase_synthesise_store)
+    phase_extract_load = _morpheus_native_bridge(Db2MorpheusRepository.phase_extract_load)
+    phase_extract_failure = _morpheus_native_bridge(Db2MorpheusRepository.phase_extract_failure)
+    phase_extract_store = _morpheus_native_bridge(Db2MorpheusRepository.phase_extract_store)
+
+
 class Db2BackendNative(Db2Backend):
     """Db2 backend with native-cursor pass-through (no Oracle→Db2 token translation).
 
     Suitable for deployments where every repository method emits Db2-native
     SQL natively (i.e. uses ``?`` positional binds, ``CURRENT TIMESTAMP``,
-    ``FROM SYSIBM.SYSDUMMY1``, etc.). MNEMOS as of PR #9c has every
-    persistence repository natively overridden, so this is the production
-    posture going forward.
+    ``FROM SYSIBM.SYSDUMMY1``, etc.). MORPHEUS is an explicit exception: its
+    inherited SQL uses Db2MorpheusNativeBridge on the same transaction.
 
     Operators on older versions OR ones who have customized repositories
     with Oracle-shape SQL should stay on :class:`Db2Backend` (the compat
@@ -5617,6 +5649,7 @@ class Db2BackendNative(Db2Backend):
         # settings, _closed, vector-indexing probe — inherits from
         # Db2Backend unchanged.
         super().__init__(pool, settings)
+        self._morpheus_repo = Db2MorpheusNativeBridge()
 
 
 __all__ = [

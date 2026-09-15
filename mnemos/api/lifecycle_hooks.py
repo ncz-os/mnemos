@@ -17,6 +17,17 @@ logger = logging.getLogger(__name__)
 _registered = False
 
 
+def _morpheus_queue_worker(_pool: Any):
+    if not is_extra_installed("morpheus"):
+        return None
+    from mnemos.domain.morpheus.jobs import morpheus_job_worker
+
+    backend = lifecycle.get_persistence_backend()
+    if getattr(backend, "_pool", None) is None:
+        return None  # The current MORPHEUS HTTP surface is PostgreSQL-only.
+    return morpheus_job_worker(backend)
+
+
 async def _reload_provider_manifest(pool: Any) -> None:
     if not is_extra_installed("graeae"):
         return
@@ -401,6 +412,7 @@ def register_lifespan_hooks() -> None:
         honor_worker_enabled=True,
     )
     lifecycle.register_lifespan_worker("persephone archival worker", _persephone_archival_worker)
+    lifecycle.register_lifespan_worker("morpheus queued runs", _morpheus_queue_worker)
     lifecycle.register_lifespan_worker("webhook retry repair worker", _webhook_repair_worker)
     lifecycle.register_lifespan_worker("webhook delivery recovery worker", _webhook_delivery_worker)
     lifecycle.register_lifespan_worker("federation sync worker", _federation_sync_worker)

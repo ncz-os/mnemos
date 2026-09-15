@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import json
+import math
+import struct
 from datetime import timezone
 from typing import Any, Literal
 
@@ -34,6 +37,120 @@ AuditOp = Literal["create", "update", "delete", "archive", "replicate"]
 
 class AuditChainContinuityError(ValueError):
     """Raised when a caller requires a specific prior chain head."""
+
+
+def normalize_embedding(value: Any) -> bytes | None:
+    """Canonical little-endian float32 encoding across driver representations."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, str):
+        value = json.loads(value)
+    numbers = [float(v) for v in value]
+    if not all(math.isfinite(v) for v in numbers):
+        raise ValueError("audit embedding contains non-finite values")
+    return struct.pack(f"<{len(numbers)}f", *numbers)
+
+
+async def fetch_audit_snapshot(tx, memory_id_str):
+    """Read and lock the fields signed by an imminent destructive mutation."""
+    from mnemos.persistence.worker_lifecycle import _Ops, transaction_dialect
+
+    ops = _Ops(tx, transaction_dialect(tx))
+    return await ops.fetchone(
+        "SELECT content, category, subcategory, metadata, embedding FROM memories WHERE id = ?"
+        + ("" if ops.dialect == "sqlite" else " FOR UPDATE"),
+        memory_id_str,
+    )
+
+
+async def write_transaction_audit(tx, *, op, memory_id_str, snapshot, writer_id):
+    """Audit repository/lifecycle mutations without consulting global app state."""
+    from mnemos.core.config import audit_chain_enabled_flag as audit_chain_enabled
+
+    if not audit_chain_enabled():
+        return
+    from types import SimpleNamespace
+    from mnemos.persistence.worker_lifecycle import transaction_dialect
+
+    dialect = transaction_dialect(tx)
+    if dialect == "sqlite":
+        from mnemos.persistence.sqlite import SqliteAuditChainRepository
+
+        repo = SqliteAuditChainRepository()
+    elif dialect == "postgres":
+        from mnemos.persistence.postgres import PostgresAuditChainRepository
+
+        repo = PostgresAuditChainRepository()
+    elif dialect == "oracle":
+        from mnemos.persistence.oracle import OracleAuditChainRepository
+
+        repo = OracleAuditChainRepository()
+    elif dialect == "db2":
+        from mnemos.persistence.db2 import Db2AuditChainRepository
+
+        repo = Db2AuditChainRepository()
+    else:
+        repo = None
+    await write_configured_audit_entry(
+        SimpleNamespace(audit_chain=repo),
+        tx,
+        op=op,
+        memory_id_str=memory_id_str,
+        snapshot=snapshot,
+        writer_id=writer_id,
+    )
+
+
+async def write_configured_audit_entry(backend, tx, *, op, memory_id_str, snapshot, writer_id):
+    """Apply deployment policy to a real mutation snapshot in the caller's tx.
+
+    `on` retains best-effort compatibility. `required` propagates failures so
+    the data write and any durable federation cursor roll back together.
+    """
+    from mnemos.core.config import audit_chain_required_flag, get_settings
+    from mnemos.core.config import audit_chain_enabled_flag as audit_chain_enabled
+
+    if not audit_chain_enabled():
+        return
+    required = audit_chain_required_flag()
+    try:
+        secret = (getattr(get_settings().server, "session_secret", "") or "").encode("utf-8")
+        if not secret:
+            raise AuditChainContinuityError("audit signing requires a session secret")
+        if snapshot is None:
+            raise AuditChainContinuityError("audit mutation snapshot is missing")
+        values = dict(snapshot)
+        from mnemos.persistence.worker_lifecycle import _await
+
+        for name in ("content", "metadata", "embedding"):
+            value = values.get(name)
+            if hasattr(value, "read"):
+                values[name] = await _await(value.read())
+        metadata = values.get("metadata")
+        if isinstance(metadata, str):
+            metadata = json.loads(metadata)
+        await write_audit_entry(
+            backend,
+            tx,
+            op=op,
+            memory_id_str=memory_id_str,
+            content=values.get("content") or "",
+            category=values.get("category") or "",
+            subcategory=values.get("subcategory"),
+            metadata=metadata,
+            embedding=values.get("embedding"),
+            writer_id=writer_id,
+            session_secret=secret,
+            required=required,
+        )
+    except Exception as exc:
+        if required:
+            if isinstance(exc, AuditChainContinuityError):
+                raise
+            raise AuditChainContinuityError("required mutation audit failed") from exc
+        logger.exception("[AUDIT] best-effort mutation audit failed op=%s", op)
 
 
 def memory_id_to_audit_bytes(memory_id_str: str) -> bytes:
@@ -86,6 +203,11 @@ async def write_audit_entry(
     audit row missed" silent drift documented at
     ``docs/AUDIT_CHAIN.md`` failure-mode table.
     """
+    from mnemos.core.config import audit_chain_required_flag
+
+    required = required or audit_chain_required_flag()
+    if required and not session_secret:
+        raise AuditChainContinuityError("required audit signing requires a session secret")
     if backend.audit_chain is None:
         if required:
             raise AuditChainContinuityError(
@@ -95,6 +217,19 @@ async def write_audit_entry(
             )
         return  # backend hasn't shipped audit_chain; silently no-op
 
+    savepoint_ops = None
+    if not required and not enforce_continuity:
+        from mnemos.persistence.worker_lifecycle import _Ops, transaction_dialect
+
+        try:
+            dialect = transaction_dialect(tx)
+        except TypeError:
+            dialect = None
+        if dialect is not None:
+            savepoint_ops = _Ops(tx, dialect)
+            await savepoint_ops.execute(
+                "SAVEPOINT mnemos_audit_append" + (" ON ROLLBACK RETAIN CURSORS" if dialect == "db2" else "")
+            )
     try:
         memory_id_bytes = memory_id_to_audit_bytes(memory_id_str)
         prev_row = await backend.audit_chain.get_latest_audit_entry(tx, memory_id_bytes)
@@ -108,13 +243,9 @@ async def write_audit_entry(
             # replica is extending. Do not install a nonzero peer-supplied head
             # unless it exactly matches the local chain head for this memory.
             if prev_entry_id is None or prev_entry_hash is None:
-                raise AuditChainContinuityError(
-                    "expected prev head supplied but local audit chain has no predecessor"
-                )
+                raise AuditChainContinuityError("expected prev head supplied but local audit chain has no predecessor")
             if override_prev != (prev_entry_id, prev_entry_hash):
-                raise AuditChainContinuityError(
-                    "expected prev head does not match local audit chain head"
-                )
+                raise AuditChainContinuityError("expected prev head does not match local audit chain head")
 
         payload_hash = canonical_payload_hash(
             memory_id=memory_id_str,
@@ -122,7 +253,7 @@ async def write_audit_entry(
             category=category,
             subcategory=subcategory,
             metadata=metadata,
-            embedding=embedding,
+            embedding=normalize_embedding(embedding),
         )
         entry, signature = build_entry(
             op=op,
@@ -153,6 +284,12 @@ async def write_audit_entry(
             entry.entry_id.hex()[:16],
         )
     except Exception as exc:  # noqa: BLE001 - audit must not block writes unless requested
+        if savepoint_ops is not None:
+            await savepoint_ops.execute(
+                "ROLLBACK TO SAVEPOINT mnemos_audit_append"
+                if savepoint_ops.dialect != "oracle"
+                else "ROLLBACK TO mnemos_audit_append"
+            )
         logger.exception(
             "[AUDIT] write_audit_entry failed for op=%s memory=%s required=%s",
             op,
@@ -170,6 +307,9 @@ async def write_audit_entry(
             raise AuditChainContinuityError(
                 f"required audit write failed for op={op} memory={memory_id_str!r}"
             ) from exc
+    finally:
+        if savepoint_ops is not None and savepoint_ops.dialect != "oracle":
+            await savepoint_ops.execute("RELEASE SAVEPOINT mnemos_audit_append")
 
 
 def _audit_prev_head(prev_row: Any | None) -> tuple[bytes | None, bytes | None]:
@@ -256,9 +396,7 @@ def _decode_expected_prev_head(
     if expected_entry_id is None and expected_entry_hash is None:
         return None
     if expected_entry_id is None or expected_entry_hash is None:
-        raise AuditChainContinuityError(
-            "expected prev entry id/hash must both be supplied or both be empty"
-        )
+        raise AuditChainContinuityError("expected prev entry id/hash must both be supplied or both be empty")
     return expected_entry_id, expected_entry_hash
 
 

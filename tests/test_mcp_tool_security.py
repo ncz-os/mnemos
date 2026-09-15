@@ -79,7 +79,17 @@ def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
 def test_mcp_registry_user_callable_surface_is_exact():
     from mnemos.mcp.tools import TOOL_REGISTRY
 
-    assert list(TOOL_REGISTRY) == EXPECTED_USER_TOOLS
+    from mnemos.core.extras import is_extra_installed
+
+    expected = list(EXPECTED_USER_TOOLS)
+    insert_at = expected.index("list_deletions")
+    optional = []
+    if is_extra_installed("pantheon"):
+        optional.extend(["pantheon_list_models", "pantheon_route_explain"])
+    if is_extra_installed("graeae"):
+        optional.extend(["graeae_consult", "graeae_get_consultation"])
+    expected[insert_at:insert_at] = optional
+    assert list(TOOL_REGISTRY) == expected
 
 
 def test_array_typed_tool_parameters_have_explicit_caps():
@@ -332,15 +342,16 @@ async def test_execute_tool_rate_limit_denial_emits_outcome_denied(monkeypatch):
 
     captured = []
 
-    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
-                      error_class=None):
-        captured.append({
-            "caller_id": caller_id,
-            "role": role,
-            "tool_name": tool_name,
-            "outcome": outcome,
-            "error_class": error_class,
-        })
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome, error_class=None):
+        captured.append(
+            {
+                "caller_id": caller_id,
+                "role": role,
+                "tool_name": tool_name,
+                "outcome": outcome,
+                "error_class": error_class,
+            }
+        )
 
     async def _rate_limited(*, tool_name, user_id, kind):
         raise PermissionError(f"rate limit exceeded for {tool_name}")
@@ -369,8 +380,7 @@ async def test_execute_tool_non_rate_limit_permission_error_remains_error(monkey
 
     captured = []
 
-    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
-                      error_class=None):
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome, error_class=None):
         captured.append({"outcome": outcome, "error_class": error_class})
 
     async def _denied(*, tool_name, user_id, kind):
@@ -403,15 +413,12 @@ async def test_execute_tool_context_mismatch_emits_outcome_denied(monkeypatch):
 
     captured = []
 
-    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
-                      error_class=None):
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome, error_class=None):
         captured.append({"outcome": outcome, "error_class": error_class})
 
     monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
     # Force a stale backend caller_id != user.user_id mismatch.
-    monkeypatch.setattr(
-        mcp_tools, "current_mcp_backend_user_id", lambda: "stale-bob"
-    )
+    monkeypatch.setattr(mcp_tools, "current_mcp_backend_user_id", lambda: "stale-bob")
 
     result = await mcp_tools.execute_tool(
         "get_memory",
@@ -420,9 +427,7 @@ async def test_execute_tool_context_mismatch_emits_outcome_denied(monkeypatch):
     )
 
     assert result == {"success": False, "error": "MCP caller context mismatch"}
-    assert captured == [
-        {"outcome": "denied", "error_class": "ContextMismatch"}
-    ]
+    assert captured == [{"outcome": "denied", "error_class": "ContextMismatch"}]
 
 
 @pytest.mark.asyncio
@@ -433,8 +438,7 @@ async def test_execute_tool_role_mismatch_emits_outcome_denied(monkeypatch):
 
     captured = []
 
-    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
-                      error_class=None):
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome, error_class=None):
         captured.append({"outcome": outcome, "error_class": error_class})
 
     monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
@@ -449,9 +453,7 @@ async def test_execute_tool_role_mismatch_emits_outcome_denied(monkeypatch):
     )
 
     assert result == {"success": False, "error": "MCP caller context mismatch"}
-    assert captured == [
-        {"outcome": "denied", "error_class": "ContextMismatch"}
-    ]
+    assert captured == [{"outcome": "denied", "error_class": "ContextMismatch"}]
 
 
 @pytest.mark.asyncio
@@ -463,16 +465,13 @@ async def test_execute_tool_namespace_mismatch_emits_outcome_denied(monkeypatch)
 
     captured = []
 
-    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
-                      error_class=None):
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome, error_class=None):
         captured.append({"outcome": outcome, "error_class": error_class})
 
     monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
     monkeypatch.setattr(mcp_tools, "current_mcp_backend_user_id", lambda: None)
     monkeypatch.setattr(mcp_tools, "current_mcp_backend_role", lambda: None)
-    monkeypatch.setattr(
-        mcp_tools, "current_mcp_backend_namespace", lambda: "wrong-namespace"
-    )
+    monkeypatch.setattr(mcp_tools, "current_mcp_backend_namespace", lambda: "wrong-namespace")
 
     result = await mcp_tools.execute_tool(
         "get_memory",
@@ -481,9 +480,7 @@ async def test_execute_tool_namespace_mismatch_emits_outcome_denied(monkeypatch)
     )
 
     assert result == {"success": False, "error": "MCP caller context mismatch"}
-    assert captured == [
-        {"outcome": "denied", "error_class": "ContextMismatch"}
-    ]
+    assert captured == [{"outcome": "denied", "error_class": "ContextMismatch"}]
 
 
 @pytest.mark.asyncio
@@ -494,8 +491,7 @@ async def test_execute_tool_rate_limit_match_is_case_insensitive(monkeypatch):
 
     captured = []
 
-    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
-                      error_class=None):
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome, error_class=None):
         captured.append({"outcome": outcome})
 
     async def _rate_limited(*, tool_name, user_id, kind):
@@ -528,8 +524,7 @@ async def test_execute_tool_handler_returning_success_false_emits_outcome_failur
 
     captured = []
 
-    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
-                      error_class=None):
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome, error_class=None):
         captured.append({"outcome": outcome, "error_class": error_class})
 
     async def _failing_handler(**_kwargs):
@@ -549,9 +544,7 @@ async def test_execute_tool_handler_returning_success_false_emits_outcome_failur
     )
 
     assert result == {"success": False, "error": "tool said no"}
-    assert captured == [
-        {"outcome": "failure", "error_class": "ToolError"}
-    ]
+    assert captured == [{"outcome": "failure", "error_class": "ToolError"}]
 
 
 @pytest.mark.asyncio
@@ -562,8 +555,7 @@ async def test_execute_tool_handler_raising_emits_outcome_error(monkeypatch):
 
     captured = []
 
-    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
-                      error_class=None):
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome, error_class=None):
         captured.append({"outcome": outcome, "error_class": error_class})
 
     async def _raising_handler(**_kwargs):
@@ -583,9 +575,7 @@ async def test_execute_tool_handler_raising_emits_outcome_error(monkeypatch):
     )
 
     assert result == {"success": False, "error": "Tool execution failed"}
-    assert captured == [
-        {"outcome": "error", "error_class": "RuntimeError"}
-    ]
+    assert captured == [{"outcome": "error", "error_class": "RuntimeError"}]
 
 
 @pytest.mark.asyncio
@@ -598,8 +588,7 @@ async def test_execute_tool_handler_returning_success_emits_outcome_success(
 
     captured = []
 
-    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
-                      error_class=None):
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome, error_class=None):
         captured.append({"outcome": outcome, "error_class": error_class})
 
     async def _ok_handler(**_kwargs):
@@ -619,9 +608,7 @@ async def test_execute_tool_handler_returning_success_emits_outcome_success(
     )
 
     assert result == {"success": True, "data": "ok"}
-    assert captured == [
-        {"outcome": "success", "error_class": None}
-    ]
+    assert captured == [{"outcome": "success", "error_class": None}]
 
 
 @pytest.mark.asyncio

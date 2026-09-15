@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import array as _array
 import json
+import tempfile
 import uuid
 from collections.abc import Callable, Iterable, Sequence
 from datetime import date, datetime, timezone
@@ -466,6 +467,7 @@ def export_bundle(
     *,
     redact_vault: bool = True,
     validate: bool = True,
+    stream_manifest: bool = False,
 ) -> dict[str, Any]:
     """Write `memories` as a MIF bundle under `out_dir`. Returns the manifest.
 
@@ -477,37 +479,54 @@ def export_bundle(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     entries: list[dict[str, Any]] = []
-    for memory in memories:
-        concept = mif.memory_to_concept(memory, redact_vault=redact_vault)
-        if validate:
-            errors = mif.validate_concept(concept)
-            if errors:
-                raise ValueError(
-                    f"memory {memory.get('id')!r} produced a non-conformant MIF concept: " + "; ".join(errors)
-                )
-        uuid = _concept_uuid(concept)
-        ctype = concept["conceptType"]
-        rel = f"{ctype}/{uuid}.md"
-        path = out / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(mif.concept_to_markdown(concept), encoding="utf-8")
-        entries.append(
-            {
+    count = 0
+    # Disk-spooled index is opt-in; default return shape remains unchanged.
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", dir=out) as index:
+        for memory in memories:
+            concept = mif.memory_to_concept(memory, redact_vault=redact_vault)
+            if validate:
+                errors = mif.validate_concept(concept)
+                if errors:
+                    raise ValueError(
+                        f"memory {memory.get('id')!r} produced a non-conformant MIF concept: " + "; ".join(errors)
+                    )
+            uuid = _concept_uuid(concept)
+            ctype = concept["conceptType"]
+            rel = f"{ctype}/{uuid}.md"
+            path = out / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(mif.concept_to_markdown(concept), encoding="utf-8")
+            entry = {
                 "@id": concept["@id"],
                 "conceptType": ctype,
                 "path": rel,
                 "mnemos_id": (concept.get("properties") or {}).get("mnemos:id"),
             }
-        )
-    manifest = {
-        "mif_version": MIF_VERSION,
-        "schema": MIF_SCHEMA_ID,
-        "context": mif.MIF_CONTEXT_URI,
-        "generator": "mnemos-charon",
-        "count": len(entries),
-        "concepts": entries,
-    }
-    (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+            count += 1
+            if stream_manifest:
+                index.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            else:
+                entries.append(entry)
+        manifest = {
+            "mif_version": MIF_VERSION,
+            "schema": MIF_SCHEMA_ID,
+            "context": mif.MIF_CONTEXT_URI,
+            "generator": "mnemos-charon",
+            "count": count,
+        }
+        if stream_manifest:
+            # Keep the on-disk schema identical without constructing concepts[].
+            index.seek(0)
+            with (out / MANIFEST_NAME).open("w", encoding="utf-8") as target:
+                target.write(json.dumps(manifest, ensure_ascii=False)[:-1] + ',"concepts":[')
+                separator = ""
+                for entry in index:
+                    target.write(separator + entry.rstrip("\n"))
+                    separator = ","
+                target.write("]}\n")
+        else:
+            manifest["concepts"] = entries
+            (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     return manifest
 
 
