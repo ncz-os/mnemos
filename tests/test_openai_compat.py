@@ -676,8 +676,27 @@ class _RecorderConcurrency:
         self.released.append(name)
 
 
+def _isolate_transport_accounting(monkeypatch):
+    # These tests use fake HTTP clients with no persistence. Exercise the
+    # supported unbudgeted mode explicitly; reservation enforcement has its
+    # own database-backed regressions in KNEMON and GRAEAE.
+    from mnemos.core import lifecycle
+    from mnemos.domain.knemon import attempts, budget
+
+    settings = SimpleNamespace(
+        knemon=SimpleNamespace(
+            weekly_budget_cap_usd=0.0,
+            parsed_provider_budget_caps_usd=lambda: {},
+        )
+    )
+    monkeypatch.setattr(lifecycle, "_persistence_backend", None)
+    monkeypatch.setattr(attempts, "get_settings", lambda: settings)
+    monkeypatch.setattr(budget, "get_settings", lambda: settings)
+
+
 def _engine_with_client(monkeypatch, data):
     engine_module = pytest.importorskip("mnemos.domain.graeae.engine")
+    _isolate_transport_accounting(monkeypatch)
 
     engine = engine_module.GraeaeEngine()
     client = _Client(data)
@@ -692,6 +711,7 @@ def _engine_with_client(monkeypatch, data):
 
 def _stream_engine_gateway(monkeypatch, lines):
     engine_module = pytest.importorskip("mnemos.domain.graeae.engine")
+    _isolate_transport_accounting(monkeypatch)
 
     engine = engine_module.GraeaeEngine()
     engine.providers = {

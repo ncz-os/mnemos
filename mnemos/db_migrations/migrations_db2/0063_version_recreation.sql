@@ -1,0 +1,7 @@
+-- PostgreSQL-only version-trigger correction; intentional parity no-op.
+-- This backend has no mnemos_version_snapshot INSERT trigger allocating
+-- version_num = 1. Federation inserts write memories only; explicit version
+-- repository imports retain their caller-supplied version numbers. Therefore
+-- deleting and recreating a federated memory cannot collide through the
+-- PostgreSQL trigger corrected by migration 0063. This is not a claim of
+-- automatic snapshot/version-history parity with PostgreSQL.

@@ -82,7 +82,9 @@ def test_every_backend_visibility_render_subtracts_exclude_namespaces() -> None:
 
 
 @pytest.mark.asyncio
-async def test_db2_feed_queries_require_public_readable_and_exclude_vault(monkeypatch: pytest.MonkeyPatch, ) -> None:
+async def test_db2_feed_queries_require_public_readable_and_exclude_vault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Db2 feed SQL must match the public-readable gate used by PG/MySQL."""
     # Offsite posture: the world-read gate applies only when
     # MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0. Declare it rather than relying
@@ -115,7 +117,7 @@ async def test_db2_feed_queries_require_public_readable_and_exclude_vault(monkey
     tx = SimpleNamespace(conn=_FakeConn())
     repo = Db2FederationRepository()
 
-    await repo.feed_query(
+    await repo._legacy_feed_query(
         tx,
         since_updated=None,
         since_id=None,
@@ -124,7 +126,7 @@ async def test_db2_feed_queries_require_public_readable_and_exclude_vault(monkey
         limit=25,
         prefer_compressed=False,
     )
-    await repo.get_feed_memory(tx, "mem-1", namespaces=[], categories=[])
+    await repo._legacy_get_feed_memory(tx, "mem-1", namespaces=[], categories=[])
 
     feed_sql = calls[0]["sql"].upper()
     feed_params = calls[0]["params"]
@@ -390,10 +392,7 @@ def _assert_withdrawal_federation_gates(sql: str, vault_token: str) -> None:
     # mariadb use a bare 'withdrawal' AS TYPE literal. After _normalized_sql
     # (upper-cases everything), both forms collapse to "SELECT ... 'WITHDRAWAL' AS TYPE"
     # OR "'WITHDRAWAL'::TEXT AS TYPE" — accept either.
-    assert (
-        "'WITHDRAWAL' AS TYPE" in sql
-        or "'WITHDRAWAL'::TEXT AS TYPE" in sql
-    ), (
+    assert "'WITHDRAWAL' AS TYPE" in sql or "'WITHDRAWAL'::TEXT AS TYPE" in sql, (
         "withdrawal branch must emit literal 'withdrawal' as the `type` "
         "column so the receiver classifies it as a FederationWithdrawalEvent"
     )
@@ -408,7 +407,8 @@ def _assert_withdrawal_federation_gates(sql: str, vault_token: str) -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend,module_name,repo_name,tx_factory,dialect_tokens", FEDERATION_GATE_CASES)
-async def test_every_backend_feed_and_by_id_apply_canonical_federation_gates(monkeypatch: pytest.MonkeyPatch,
+async def test_every_backend_feed_and_by_id_apply_canonical_federation_gates(
+    monkeypatch: pytest.MonkeyPatch,
     backend: str,
     module_name: str,
     repo_name: str,
@@ -429,7 +429,7 @@ async def test_every_backend_feed_and_by_id_apply_canonical_federation_gates(mon
     calls: list[dict[str, Any]] = []
     tx = tx_factory(calls)
 
-    await repo.feed_query(
+    await repo._legacy_feed_query(
         tx,
         since_updated=None,
         since_id=None,
@@ -438,7 +438,7 @@ async def test_every_backend_feed_and_by_id_apply_canonical_federation_gates(mon
         limit=25,
         prefer_compressed=False,
     )
-    await repo.get_feed_memory(tx, "mem-1", namespaces=[], categories=[])
+    await repo._legacy_get_feed_memory(tx, "mem-1", namespaces=[], categories=[])
 
     assert len(calls) >= 2, backend
     live_feed_sql, consolidation_sql, withdrawal_sql = _split_feed_branches(calls[0]["sql"])
@@ -480,7 +480,7 @@ async def test_trusted_feed_scope_drops_world_read_but_keeps_vault_and_loopguard
     calls: list[dict[str, Any]] = []
     tx = tx_factory(calls)
 
-    await repo.feed_query(
+    await repo._legacy_feed_query(
         tx,
         since_updated=None,
         since_id=None,
@@ -489,7 +489,7 @@ async def test_trusted_feed_scope_drops_world_read_but_keeps_vault_and_loopguard
         limit=25,
         prefer_compressed=False,
     )
-    await repo.get_feed_memory(tx, "mem-1", namespaces=[], categories=[])
+    await repo._legacy_get_feed_memory(tx, "mem-1", namespaces=[], categories=[])
 
     assert len(calls) >= 2, backend
     live_feed_sql, consolidation_sql, withdrawal_sql = _split_feed_branches(calls[0]["sql"])
@@ -509,17 +509,13 @@ async def test_trusted_feed_scope_drops_world_read_but_keeps_vault_and_loopguard
     # trigger form `namespace = :vault_ns` or `namespace = 'vault'` IS
     # the vault reference in trusted mode, since the world-read trigger
     # is dropped).
-    assert "M.FEDERATION_SOURCE IS NULL" in withdrawal_sql, (
-        f"{backend}: withdrawal branch must carry the loop-guard"
-    )
+    assert "M.FEDERATION_SOURCE IS NULL" in withdrawal_sql, f"{backend}: withdrawal branch must carry the loop-guard"
     vault_present_w = (
         vault_token in withdrawal_sql
         or "M.NAMESPACE = :VAULT_NS" in withdrawal_sql
         or "M.NAMESPACE = 'VAULT'" in withdrawal_sql
     )
-    assert vault_present_w, (
-        f"{backend}: withdrawal branch must reference the vault namespace"
-    )
+    assert vault_present_w, f"{backend}: withdrawal branch must reference the vault namespace"
     if consolidation_sql is not None:
         assert public_token not in consolidation_sql
         assert "M.FEDERATION_SOURCE IS NULL" in consolidation_sql

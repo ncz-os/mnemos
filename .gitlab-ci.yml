@@ -171,7 +171,7 @@ test:integration:
     RATE_LIMIT_STORAGE_URI: "redis://redis:6379/0"
   before_script:
     - python3 -m venv .venv
-    - .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev]"
+    - .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev,sqlite,nats,persephone]"
     - export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
     # Wait for Postgres to accept connections (pgvector image does not
     # signal readiness; poll until psql connects).
@@ -215,6 +215,9 @@ test:integration:
     # ``ON_ERROR_STOP=1``.
     - python3 scripts/ci_apply_postgres_migrations.py --dsn "$DATABASE_URL"
   script:
+    # These regressions create disposable databases and run actual SQL. They
+    # deliberately fail if the configured PostgreSQL service cannot be reached.
+    - pytest tests/test_postgres_concurrent_migration_race.py tests/test_federation_journal.py tests/test_required_audit_mutations.py tests/test_morpheus_job_queue.py tests/test_morpheus_consolidation_isolation.py --tb=short -q --junitxml=junit-regressions.xml
     - pytest tests/ -m integration --tb=short -q --junitxml=junit-integration.xml || EXIT=$?
     - |
       # If no integration-marked tests exist yet, exit code 5 ("no tests collected")
@@ -481,3 +484,71 @@ test:oracle-smoke:
   # smoke only runs when explicitly enabled with a live Oracle in reach.
   rules:
     - if: $RUN_ORACLE_SMOKE == "true"
+
+
+# Portable SQL journals must run against real engines on every branch.
+# SaaS Docker runners supply these disposable services, independently of fleet DBs.
+test:journal-sql:
+  stage: test
+  image: python:3.13-slim
+  services:
+    - name: $JOURNAL_DATABASE_IMAGE
+      alias: journal-db
+  parallel:
+    matrix:
+      - JOURNAL_DATABASE_IMAGE: ["mysql:9.1"]
+        JOURNAL_DIALECT: ["mysql"]
+      - JOURNAL_DATABASE_IMAGE: ["mariadb:12.3"]
+        JOURNAL_DIALECT: ["mariadb"]
+  variables:
+    MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+    MARIADB_ALLOW_EMPTY_ROOT_PASSWORD: "yes"
+    MNEMOS_EMBEDDING_DIM: "3"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential cmake
+    - python -m pip install --quiet -e ".[dev,sqlite,mysql]"
+    - |
+      if [ "$JOURNAL_DIALECT" = mysql ]; then
+        export MNEMOS_TEST_MYSQL_DSN="mysql://root@journal-db:3306/mysql"
+      else
+        export MNEMOS_TEST_MARIADB_DSN="mariadb://root@journal-db:3306/mysql"
+      fi
+  script:
+    - python -m pytest tests/test_federation_journal.py tests/test_morpheus_backend_live.py tests/test_mysql_trigger_splitter.py -k "$JOURNAL_DIALECT or splitter" --tb=short -q --junitxml=journal-sql.xml
+  artifacts:
+    when: always
+    reports:
+      junit: journal-sql.xml
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+
+# Validate the supported combined install as well as the core-only contract.
+test:composition:
+  stage: test
+  image: python:3.13-slim
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git build-essential cmake
+    - |
+      python - <<'PYTHON'
+      import json
+      import subprocess
+      from pathlib import Path
+      pins = json.loads(Path(".github/addons.lock.json").read_text())
+      for name in ("graeae", "knemon", "pantheon", "charon"):
+          target = "../composition-" + name
+          subprocess.run(["git", "clone", "https://gitlab.com/ncz-os/" + name + ".git", target], check=True)
+          subprocess.run(["git", "-C", target, "checkout", pins[name]], check=True)
+      PYTHON
+    - python -m pip install --quiet -e ".[dev,sqlite,nats,persephone]" -e ../composition-graeae -e ../composition-knemon -e ../composition-pantheon -e ../composition-charon
+  script:
+    - python -m pytest tests/ --ignore=tests/test_live_e2e.py --tb=short -q --junitxml=composition.xml
+  artifacts:
+    when: always
+    reports:
+      junit: composition.xml
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH

@@ -75,6 +75,7 @@ def _get_backend() -> Any:
 
     return _lc.get_persistence_backend()
 
+
 # Optional Rust hot-path accelerator. Loaded lazily so the absence of
 # the wheel on a given build host does NOT break the import - the
 # Python implementation below stays the source of truth.
@@ -449,9 +450,7 @@ async def sweep_orphan_runs(
         # Fall back to attribute access in case a backend returns a
         # tuple-shaped row.
         row_id = row.get("id") if hasattr(row, "get") else row[0]
-        row_started = (
-            row.get("started_at") if hasattr(row, "get") else row[1]
-        )
+        row_started = row.get("started_at") if hasattr(row, "get") else row[1]
         logger.info(
             "[MORPHEUS] orphan timeout sweep marked run %s failed (started_at=%s, max_age_hours=%.2f)",
             row_id,
@@ -755,8 +754,7 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
 
     await update_counters(backend, run_id, summaries_created=n_created)
     logger.info(
-        "[MORPHEUS] run %s synthesised %d summary memor%s (mode=%s, "
-        "isolation=per_owner_namespace, min_size=%d)",
+        "[MORPHEUS] run %s synthesised %d summary memor%s (mode=%s, isolation=per_owner_namespace, min_size=%d)",
         run_id,
         n_created,
         "y" if n_created == 1 else "ies",
@@ -1210,6 +1208,11 @@ async def run_dream(
         config=config,
         namespace=namespace,
     )
+    return await execute_existing_run(pool, run_id, config=config)
+
+
+async def execute_existing_run(pool: asyncpg.Pool, run_id: str, *, config: Optional[dict] = None) -> str:
+    """Execute an already persisted run (also used by the durable queue)."""
     try:
         await set_phase(_get_backend(), run_id, "replay")
         await phase_replay(pool, run_id)

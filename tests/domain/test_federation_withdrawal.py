@@ -176,8 +176,7 @@ async def test_feed_emits_withdrawal_when_row_is_soft_deleted_offsite(tmp_path, 
                 prefer_compressed=False,
             )
         assert [r["id"] for r in rows] == ["f07-pub-1"], (
-            "setup sanity: public 644 row must be in the live feed under "
-            "the offsite posture"
+            "setup sanity: public 644 row must be in the live feed under the offsite posture"
         )
         assert rows[0]["type"] is None  # plain MemoryItem
 
@@ -186,30 +185,31 @@ async def test_feed_emits_withdrawal_when_row_is_soft_deleted_offsite(tmp_path, 
         # is the same end state (deleted_at IS NOT NULL, updated bumped).
         async with backend.transactional() as tx:
             from mnemos.persistence.sqlite import _execute
+
             await _execute(
                 tx.conn,
-                "UPDATE memories SET deleted_at = CURRENT_TIMESTAMP, "
-                "updated = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE memories SET deleted_at = CURRENT_TIMESTAMP, updated = CURRENT_TIMESTAMP WHERE id = ?",
                 ("f07-pub-1",),
             )
 
         # Step 4: next feed call — must surface a withdrawal, NOT just
         # silently drop the row.
         response = await handler.federation_feed(
-            None, None,
-            since=None, namespace=None, category=None, limit=10,
-            prefer_compressed=False, copy_embeddings=False,
+            None,
+            None,
+            since=None,
+            namespace=None,
+            category=None,
+            limit=10,
+            prefer_compressed=False,
+            copy_embeddings=False,
         )
-        event_types = _all_event_types(response.memories)
         ids = [m.id for m in response.memories]
         assert "f07-pub-1" in ids, (
-            "the deleted row's id must still appear, but as a "
-            "FederationWithdrawalEvent — not be silently absent"
+            "the deleted row's id must still appear, but as a FederationWithdrawalEvent — not be silently absent"
         )
         withdrawal = next(
-            m for m in response.memories
-            if m.id == "f07-pub-1"
-            and getattr(m, "type", None) == "withdrawal"
+            m for m in response.memories if m.id == "f07-pub-1" and getattr(m, "type", None) == "withdrawal"
         )
         assert withdrawal.type == "withdrawal"
         assert withdrawal.namespace == "default"
@@ -218,8 +218,7 @@ async def test_feed_emits_withdrawal_when_row_is_soft_deleted_offsite(tmp_path, 
         # Crucial: the deleted row must NOT be emitted as a live MemoryItem.
         # Plain MemoryItem rows have no `.type` attribute → `getattr` is None.
         live_leak_for_deleted_id = [
-            m for m in response.memories
-            if m.id == "f07-pub-1" and getattr(m, "type", None) is None
+            m for m in response.memories if m.id == "f07-pub-1" and getattr(m, "type", None) is None
         ]
         assert live_leak_for_deleted_id == [], (
             "the deleted row must NOT be emitted as a live MemoryItem — "
@@ -266,31 +265,33 @@ async def test_feed_emits_withdrawal_when_permission_mode_narrows_offsite(tmp_pa
         # 600 % 10 == 0, which fails the world-read gate.
         async with backend.transactional() as tx:
             from mnemos.persistence.sqlite import _execute
+
             await _execute(
                 tx.conn,
-                "UPDATE memories SET permission_mode = 600, "
-                "updated = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE memories SET permission_mode = 600, updated = CURRENT_TIMESTAMP WHERE id = ?",
                 ("f07-narrow-1",),
             )
 
         response = await handler.federation_feed(
-            None, None,
-            since=None, namespace=None, category=None, limit=10,
-            prefer_compressed=False, copy_embeddings=False,
+            None,
+            None,
+            since=None,
+            namespace=None,
+            category=None,
+            limit=10,
+            prefer_compressed=False,
+            copy_embeddings=False,
         )
         ids = [m.id for m in response.memories]
         assert "f07-narrow-1" in ids
         withdrawal = next(
-            m for m in response.memories
-            if m.id == "f07-narrow-1"
-            and getattr(m, "type", None) == "withdrawal"
+            m for m in response.memories if m.id == "f07-narrow-1" and getattr(m, "type", None) == "withdrawal"
         )
         assert withdrawal.type == "withdrawal"
         # Crucial: not delivered as a live MemoryItem.
-        assert not any(
-            m.id == "f07-narrow-1" and getattr(m, "type", None) is None
-            for m in response.memories
-        ), "narrowed row must not appear as a live MemoryItem"
+        assert not any(m.id == "f07-narrow-1" and getattr(m, "type", None) is None for m in response.memories), (
+            "narrowed row must not appear as a live MemoryItem"
+        )
 
 
 @pytest.mark.asyncio
@@ -336,34 +337,35 @@ async def test_feed_emits_withdrawal_when_row_is_archived(tmp_path, monkeypatch)
         # archive path: archived_at IS NOT NULL, updated bumped.
         async with backend.transactional() as tx:
             from mnemos.persistence.sqlite import _execute
+
             await _execute(
                 tx.conn,
-                "UPDATE memories SET archived_at = CURRENT_TIMESTAMP, "
-                "updated = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE memories SET archived_at = CURRENT_TIMESTAMP, updated = CURRENT_TIMESTAMP WHERE id = ?",
                 ("f07-archive-1",),
             )
 
         response = await handler.federation_feed(
-            None, None,
-            since=None, namespace=None, category=None, limit=10,
-            prefer_compressed=False, copy_embeddings=False,
+            None,
+            None,
+            since=None,
+            namespace=None,
+            category=None,
+            limit=10,
+            prefer_compressed=False,
+            copy_embeddings=False,
         )
         ids = [m.id for m in response.memories]
         assert "f07-archive-1" in ids, (
-            "the archived row's id must still appear, but as a "
-            "FederationWithdrawalEvent — not be silently absent"
+            "the archived row's id must still appear, but as a FederationWithdrawalEvent — not be silently absent"
         )
         withdrawal = next(
-            m for m in response.memories
-            if m.id == "f07-archive-1"
-            and getattr(m, "type", None) == "withdrawal"
+            m for m in response.memories if m.id == "f07-archive-1" and getattr(m, "type", None) == "withdrawal"
         )
         assert withdrawal.type == "withdrawal"
         # Crucial: not delivered as a live MemoryItem.
-        assert not any(
-            m.id == "f07-archive-1" and getattr(m, "type", None) is None
-            for m in response.memories
-        ), "archived row must not appear as a live MemoryItem"
+        assert not any(m.id == "f07-archive-1" and getattr(m, "type", None) is None for m in response.memories), (
+            "archived row must not appear as a live MemoryItem"
+        )
 
 
 @pytest.mark.asyncio
@@ -403,10 +405,10 @@ async def test_receiver_applies_withdrawal_and_drops_local_copy(tmp_path):
 
         async with backend.transactional() as tx:
             from mnemos.persistence.sqlite import _fetch_all
+
             rows = await _fetch_all(
                 tx.conn,
-                "SELECT id, federation_source FROM memories "
-                "WHERE federation_source = 'peer-a'",
+                "SELECT id, federation_source FROM memories WHERE federation_source = 'peer-a'",
             )
         assert [r["id"] for r in rows] == [f"fed:peer-a:{remote_id}"], (
             "setup sanity: the federated row must exist before withdrawal"
@@ -436,13 +438,13 @@ async def test_receiver_applies_withdrawal_and_drops_local_copy(tmp_path):
         # Step 3: confirm the local federated copy is gone.
         async with backend.transactional() as tx:
             from mnemos.persistence.sqlite import _fetch_all
+
             rows = await _fetch_all(
                 tx.conn,
                 "SELECT id FROM memories WHERE federation_source = 'peer-a'",
             )
         assert rows == [], (
-            "the receiver must drop the federated copy on receipt of the "
-            "withdrawal event — the whole point of F07"
+            "the receiver must drop the federated copy on receipt of the withdrawal event — the whole point of F07"
         )
 
         # Step 4: idempotency. Apply the same withdrawal again — must not
@@ -494,6 +496,7 @@ async def test_http_withdrawal_is_equivalent_to_nats_hard_delete(tmp_path):
         # Pre-state: both rows present.
         async with backend.transactional() as tx:
             from mnemos.persistence.sqlite import _fetch_all
+
             rows = await _fetch_all(tx.conn, "SELECT id FROM memories ORDER BY id")
         assert {r["id"] for r in rows} == {
             "fed:peer-http:parity-1",
@@ -520,14 +523,13 @@ async def test_http_withdrawal_is_equivalent_to_nats_hard_delete(tmp_path):
         # directly — this is exactly what nats_consumer.delete_federated_memory
         # calls on a memory.deleted subject.
         async with backend.transactional() as tx:
-            nats_deleted = await backend.federation.delete_federated_memory(
-                tx, "peer-nats", "parity-1"
-            )
+            nats_deleted = await backend.federation.delete_federated_memory(tx, "peer-nats", "parity-1")
         assert nats_deleted == 1
 
         # End-state: both rows are gone, both transports converge.
         async with backend.transactional() as tx:
             from mnemos.persistence.sqlite import _fetch_all
+
             rows = await _fetch_all(tx.conn, "SELECT id FROM memories")
         assert rows == [], (
             "after both transports have applied their respective signal "

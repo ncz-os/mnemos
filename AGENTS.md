@@ -91,8 +91,10 @@ Given `requested` (a set of module ids) and `backend` (one backend id) and
    - extras = [ modules[m].extra for m in requested if m not in {core,stiphos} and extra ]
             + [ backends[backend].extra if present ]
    - if arch == arm64: ensure 'openvino' is NOT in extras; prefer extra "server", which does not pull openvino.
-   - pip install 'mnemos-core[<comma-joined extras>]'
-   - if "stiphos" in requested: ALSO pip install 'mnemos-stiphos[mcp]' and run it as a separate service.
+   - Install core from the canonical GitLab checkout first: python -m pip install -e .
+   - Install requested add-ons from their GitLab URLs in dependency order (graeae, knemon, pantheon, charon).
+   - Public PyPI names are not published; module extras alone cannot bootstrap these packages.
+   - if "stiphos" in requested: ALSO pip install 'mnemos-stiphos[mcp] @ git+https://gitlab.com/ncz-os/mnemos-stiphos.git' and run it as a separate service.
 ```
 
 ---
@@ -126,14 +128,22 @@ docker run -p 5002:5002 \
 
 # Bare metal / no-container install (any arch) — pip, not a container.
 # kernel + reasoning + routing, arm64-safe (no openvino):
-pip install 'mnemos-core[graeae,knemon,pantheon,charon]'
+git clone https://gitlab.com/ncz-os/mnemos
+cd mnemos
+python -m pip install -e .
+pip install 'git+https://gitlab.com/ncz-os/graeae.git'
+pip install 'git+https://gitlab.com/ncz-os/knemon.git'
+pip install 'git+https://gitlab.com/ncz-os/pantheon.git'
+pip install 'git+https://gitlab.com/ncz-os/charon.git'
 
 # pip: everything + enterprise drivers (any arch except db2, which needs amd64)
-pip install 'mnemos-core[full,enterprise]'
+# After installing core and add-ons above, install architecture-compatible
+# driver extras from the checkout (Db2 requires amd64).
+python -m pip install -e '.[enterprise]'
 
 # Hive service (stiphos) — pip-only, no container image exists. Run
 # alongside a container deployment above or a bare pip install, either way.
-pip install 'mnemos-stiphos[mcp]'
+pip install 'mnemos-stiphos[mcp] @ git+https://gitlab.com/ncz-os/mnemos-stiphos.git'
 ```
 
 ---

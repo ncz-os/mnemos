@@ -32,7 +32,7 @@ SELECT id, content, category, subcategory, metadata, quality_rating,
        source_model, source_provider, source_session, source_agent,
        source_memories, provenance, morpheus_run_id, consolidated_into,
        triples_extracted_at, recall_count, last_recalled_at,
-       created, updated, archived_at
+       created, updated, archived_at, embedding
   FROM memories
  WHERE id = $1
    AND deleted_at IS NULL
@@ -54,8 +54,6 @@ SELECT id
 """
 
 
-
-
 async def is_archived(conn: Any, memory_id: str) -> bool:
     """Return True when the live memory row is an archive stub."""
     archived_at = await conn.fetchval(
@@ -63,6 +61,20 @@ async def is_archived(conn: Any, memory_id: str) -> bool:
         memory_id,
     )
     return archived_at is not None
+
+
+async def _audit_mutation(conn, memory_id, op, snapshot, writer_id):
+    from mnemos.workers.audit_sealer import audit_chain_enabled
+
+    if not audit_chain_enabled():
+        return
+    from mnemos.persistence.postgres import PostgresTransaction
+    from mnemos.audit.route_helper import write_transaction_audit
+
+    # The surrounding runner transaction owns commit/rollback; this adapter
+    # exposes only its connection to the audit repository.
+    tx = PostgresTransaction(conn, None)
+    await write_transaction_audit(tx, op=op, memory_id_str=memory_id, snapshot=snapshot, writer_id=writer_id)
 
 
 async def archive_memory(conn: Any, memory_id: str, archived_by: str | None = None) -> None:
@@ -117,6 +129,7 @@ async def archive_memory(conn: Any, memory_id: str, archived_by: str | None = No
         )
         if result == "UPDATE 0":
             raise RuntimeError(f"memory {memory_id!r} was not archived")
+        await _audit_mutation(conn, memory_id, "archive", row, archived_by)
 
 
 async def restore_memory(
@@ -186,6 +199,11 @@ async def restore_memory(
         if result == "UPDATE 0":
             raise RuntimeError(f"memory {memory_id!r} was not restored")
         await conn.execute("DELETE FROM memory_archive WHERE id = $1", memory_id)
+        from mnemos.workers.audit_sealer import audit_chain_enabled
+
+        if audit_chain_enabled():
+            restored = await conn.fetchrow("SELECT * FROM memories WHERE id = $1", memory_id)
+            await _audit_mutation(conn, memory_id, "update", restored, restored_by)
 
 
 async def sweep_for_archival(

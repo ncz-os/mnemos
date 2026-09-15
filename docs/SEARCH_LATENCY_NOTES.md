@@ -1,170 +1,33 @@
-# Search Latency Notes
+# Search latency notes
 
-> **STALE ARCHITECTURE WARNING.** This document describes `_get_embedding` as
-> an HTTP call to a remote `INFERENCE_EMBED_HOST` server. That is no longer
-> true: per an operator-locked architectural decision (2026-05-21,
-> `mem_1779334716543_f8ebd4`), embedding generation is now ALWAYS IN-PROCESS
-> via `llama-cpp-python` — see `mnemos/runtime/embedder.py` and
-> `mnemos/core/lifecycle.py::_get_embedding`. There is no remote embedding
-> HTTP call, no `httpx.AsyncClient`, no `/v1/embeddings` vs `/api/embeddings`
-> fallback, and `INFERENCE_EMBED_HOST`/`INFERENCE_EMBED_MODEL` do nothing on
-> the search path today. The "embed" phase estimate, the "Likely Hot Path"
-> primary hypothesis, and the `INFERENCE_EMBED_HOST` tuning tip below are all
-> from the PRE-2026-05-21 architecture and do not reflect the current code.
-> The `ann_scan` / index / rerank sections are unaffected by this change and
-> remain accurate. Re-benchmark before trusting the embed-phase numbers for
-> anything operational; F15's embedder concurrency fix (2026-09-14) is also
-> relevant to in-process embedding latency under load and postdates the
-> numbers below.
+The May 2026 figures previously quoted here came from an older deployment.
+They do not establish latency for the current code, backend, model or host.
+Use `STRESS_TEST_HARNESS_DESIGN.md` for the measurement requirements.
 
-Context: live pg-host production `POST /v1/memories/search` latency measured on
-2026-05-04 was p50=1527ms, p95=1913ms, p99=1931ms, mean=1579ms,
-stdev=144ms over a corpus of about 7,500 memories. Image v5.0.7 had
-`mnemos_hot` enabled; the isolated Rust rerank path measured about 66ms.
+`mnemos.core.lifecycle._get_embedding` delegates to the runtime embedder.
+Local OpenVINO/llama.cpp and explicitly selected HTTP embedding are supported.
+The HTTP backend uses a persistent `httpx.AsyncClient`, a concurrency limit,
+timeout and circuit breaker. It does not create a new client for every search.
+Configure it with `MNEMOS_EMBED_BACKEND=http` and the `MNEMOS_EMBED_HTTP_*`
+settings defined in `mnemos/core/config.py`; keep vector dimensions consistent
+with database provisioning. Local models avoid an HTTP request but consume
+per-worker model memory and CPU. Measure embedding and admission wait rather
+than assuming either mode dominates.
 
-## Code Path Read
+The search route validates the request, resolves caller visibility, checks
+its configured response cache, obtains an embedding for semantic search,
+executes the backend repository search and serializes the result. Measure
+cache hits and misses separately. PostgreSQL uses a pgvector HNSW cosine
+index; exact query plans, visibility selectivity and search breadth determine
+latency and recall. Recency reranking adds candidate work. SQLite vec0 uses
+native exact cosine top-K; an incomplete index or restrictive filters can
+require an authoritative fallback scan. MySQL's Python fallback pages rows
+and retains K results, but still scans all eligible embeddings.
 
-Handler: `mnemos/api/routes/memories.py::search_memories`.
-
-Semantic search flow:
-
-1. FastAPI parses `MemorySearchRequest` before handler entry.
-2. Handler computes `request_limit = min(request.limit, 500)` and a Redis cache
-   key. A cache hit returns before embedding or Postgres.
-3. `mnemos.core.lifecycle._get_embedding(request.query)` truncates the query to
-   2000 characters, creates a new `httpx.AsyncClient`, and calls
-   `{INFERENCE_EMBED_HOST}/v1/embeddings` with `INFERENCE_EMBED_MODEL`.
-   It falls back to `{INFERENCE_EMBED_HOST}/api/embeddings` only on HTTP 404.
-4. `PostgresMemoryRepository.semantic_search` builds one pgvector SQL query
-   over `memories`, selecting full memory columns plus similarity and ordering by
-   `embedding <=> $1::vector`.
-5. Optional recency rerank is implemented in `semantic_search` when
-   `boost_recency=True` and more than one row returns. It widens candidates to
-   `max(limit, min(limit * 4, 200))`, selects `embedding::text`, computes a
-   recency boost in SQL, parses returned vectors, then calls `_rerank_composite`.
-   `_rerank_composite` uses `mnemos_hot.rerank_composite` when
-   `MNEMOS_HOT_RS_ENABLED=1` and the wheel imports, otherwise Python fallback.
-6. `row_to_memory` builds Pydantic `MemoryItem` objects. It parses `metadata`
-   only if the DB returned it as a JSON string.
-7. `MemoryListResponse` is returned. FastAPI performs final response encoding
-   after handler return. The handler also calls `response.model_dump_json()` for
-   the 5 minute Redis search cache write when cache is enabled.
-
-No LLM judge prompt is on this request path. The only remote model call in the
-search path is the embedding request.
-
-## Phase Estimates
-
-These estimates are hypotheses from code reading plus the 1527ms p50. The new
-timing logs should replace them with measured per-request deltas.
-
-| Phase | Code boundary | Estimate | Notes |
-| --- | --- | ---: | --- |
-| parse | handler entry and cache key setup | <5ms | FastAPI body parsing occurs before handler entry. Redis cache read is outside this estimate and can short-circuit the path. |
-| embed | `_get_embedding` HTTP call | 600-1200ms hypothesis | Most likely hot path if the embedding server is remote, cold, saturated, or `/v1/embeddings` returns 404 and forces the `/api/embeddings` fallback. |
-| ann_scan | `conn.fetch` in `semantic_search` | 100-700ms hypothesis | One pgvector query fetches full memory rows. Cost depends on index use, filters, visibility predicates, pool wait, and result row size. |
-| rerank | `_rerank_composite` block | 0ms unless recency rerank is enabled; 66ms isolated measurement | The handler passes `boost_recency=bool(request.boost_recency)` into `semantic_search`, so rerank is live whenever the client requests it. |
-| metadata_fetch | after DB transaction | ~0-20ms | No N+1 metadata fetch exists in the Postgres path. Metadata is folded into the ANN/FTS SELECT via `_MEMORY_COLS`. |
-| serialize | response model construction and cache JSON | 5-50ms hypothesis | Scales with `limit`, content size, metadata size, and cache JSON encoding. Final FastAPI response encoding occurs after handler return. |
-
-## Index And K
-
-`mnemos/db_migrations/migrations.sql` creates:
-
-```sql
-CREATE INDEX IF NOT EXISTS idx_memories_embedding
-ON memories USING hnsw (embedding vector_cosine_ops);
-```
-
-The embedding index is **HNSW**, not IVFFlat. `mnemos/persistence/schema.py`
-treats that as an invariant: it rewrites any legacy `USING ivfflat (embedding
-vector_cosine_ops)` definition to the HNSW form, and the installer
-(`mnemos/installer/db.py`) recreates the index as HNSW when it finds another
-access method in place. Tune HNSW, and ignore IVFFlat knobs.
-
-No code path sets `hnsw.ef_search` or another pgvector scan parameter for this
-endpoint, so the index runs at the server default. Query K is the client
-`request.limit`, capped in the handler at 500. If recency rerank is active in
-the repository, candidate K widens up to `min(limit * 4, 200)`.
-
-## Likely Hot Path
-
-Primary hypothesis: embedding latency dominates. `_get_embedding` creates a new
-HTTP client per request and performs a remote embedding call with a default
-`INFERENCE_EMBED_TIMEOUT` of 10 seconds. If the configured host does not serve
-OpenAI-compatible `/v1/embeddings`, every request pays for one failed POST before
-the Ollama-compatible fallback.
-
-Secondary hypothesis: ANN scan dominates if embedding timing is low. The query
-selects full memory rows, including `compressed_content`, then orders by
-`embedding <=> $1::vector` with visibility predicates. Confirm with the new
-`ann_scan` timing plus `EXPLAIN (ANALYZE, BUFFERS)` for the exact generated SQL.
-
-Rerank is not the dominant source if the isolated 66ms measurement holds.
-
-## Tuning Options Without Rebuilding
-
-- Point `INFERENCE_EMBED_HOST` directly at the fastest endpoint shape that
-  returns 200 for `/v1/embeddings` to avoid the 404 fallback. Related env vars:
-  `INFERENCE_EMBED_HOST`, `INFERENCE_EMBED_MODEL`, `INFERENCE_EMBED_TIMEOUT`.
-- Lower client `limit` for broad searches. The current only server guard is the
-  hardcoded `min(request.limit, 500)` in `search_memories`; there is no config key
-  for a lower global max.
-- Keep `boost_recency=false` when rerank is not required. Request controls:
-  `boost_recency`, `recency_weight`. Repository rerank widens candidates and can
-  add vector parsing plus Rust/Python rerank cost when wired.
-- Tune `hnsw.ef_search` at the session or database level if ANN scan is high.
-  This is the knob for the index actually in use; raising it trades latency for
-  recall, lowering it does the reverse. Current code sets no value, so the
-  server default applies. A config key would fit near
-  `PostgresMemoryRepository.semantic_search` before `conn.fetch`.
-  `ivfflat.probes` has no effect on this deployment — the index is HNSW.
-- Check database pool pressure if `ann_scan` includes connection wait. Existing
-  controls: `PG_POOL_MIN`, `PG_POOL_MAX`, and `MNEMOS_POOL_ACQUIRE_TIMEOUT`.
-- Use the existing 5 minute Redis response cache for repeated identical searches.
-  The cache key includes user, namespace, filters, group IDs, semantic/FTS mode,
-  archive flag, and recency fields. TTL is hardcoded as 300 seconds in the
-  handler; no config key exists.
-
-## Where To Add Missing Controls
-
-- Embedding cache: add around `_get_embedding` or immediately before the handler
-  call, keyed by normalized query hash plus `INFERENCE_EMBED_MODEL` and host.
-  No existing embedding-cache env var was found.
-- Search max K: add a settings key in `mnemos/core/config.py` and use it instead
-  of the hardcoded 500 cap in `search_memories`.
-- HNSW search breadth: add a settings key in `mnemos/core/config.py`, then apply
-  `SET LOCAL hnsw.ef_search = ...` inside the Postgres transaction before the
-  ANN `conn.fetch`.
-- Search cache TTL: replace the hardcoded `300` in `search_memories` with a
-  runtime setting if operators need to tune repeat-query behavior.
-
-## Observability Added In v5.0.10
-
-Each search request now gets a short `trace_id` and logs elapsed milliseconds
-since handler start at these boundaries:
-
-- `parse`
-- `embed`
-- `ann_scan`
-- `rerank`
-- `metadata_fetch`
-- `serialize`
-
-Example:
-
-`parse`, `embed`, `metadata_fetch`, and `serialize` are emitted by the route
-handler; `ann_scan` and `rerank` are emitted by
-`PostgresMemoryRepository.semantic_search`, which receives the trace id from the
-handler.
-
-```text
-[search:abc123] parse done in 2ms
-[search:abc123] embed done in 823ms
-[search:abc123] ann_scan done in 1235ms
-[search:abc123] rerank done in 1301ms
-[search:abc123] metadata_fetch done in 1302ms
-[search:abc123] serialize done in 1314ms
-```
-
-Subtract adjacent timestamps with the same trace id to get phase deltas.
+For each corpus and filter distribution record end-to-end percentiles,
+embedding wait/inference, connection acquisition, query/reranking and
+serialization. Existing search trace timestamps are cumulative; subtract
+adjacent boundaries for deltas and do not mix different trace IDs. Capture
+`EXPLAIN (ANALYZE, BUFFERS)` for PostgreSQL and count eligible rows/fallbacks
+for SQLite/MySQL. No current latency or capacity guarantee follows from
+old isolated reranking measurements.

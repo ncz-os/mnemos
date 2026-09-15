@@ -11,8 +11,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from mnemos.audit.route_helper import write_audit_entry
-from mnemos.core.config import get_settings
 from mnemos.core.secret_detection import redact_field_with_stored
 from mnemos.nats.client import get_node_name as _nats_get_node_name
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
@@ -95,23 +93,18 @@ def _root_mutation_visibility(namespace: str | None = None) -> VisibilityFilter:
 
 
 async def _maybe_write_delete_audit(backend: Any, tx: Any, row: Any, memory_id: str) -> None:
-    if not audit_chain_enabled():
-        return
-    session_secret = (getattr(get_settings().server, "session_secret", "") or "").encode("utf-8")
-    if not session_secret:
-        return
-    await write_audit_entry(
+    from mnemos.audit.route_helper import write_configured_audit_entry, fetch_audit_snapshot
+    from mnemos.persistence.federation_journal import supports_journal
+
+    if audit_chain_enabled() and supports_journal(tx):
+        row = await fetch_audit_snapshot(tx, memory_id)
+    await write_configured_audit_entry(
         backend,
         tx,
         op="delete",
         memory_id_str=memory_id,
-        content=_row_get(row, "content", ""),
-        category=_row_get(row, "category"),
-        subcategory=_row_get(row, "subcategory"),
-        metadata=None,
-        embedding=None,
+        snapshot=row,
         writer_id=_DEDUP_USER_ID,
-        session_secret=session_secret,
     )
 
 

@@ -103,41 +103,28 @@ inherited `MariadbBackend` of the same file) returns `None`. No
 `memory_audit_chain` or `memory_audit_roots` migration exists under
 `mnemos/db_migrations/migrations_mysql/` or `migrations_mariadb/`.
 
-**Symptom:** deployments running on MySQL or MariaDB do not get the v6.2
-M-2.2.1 Ed25519-signed per-memory audit chain at all. Routes that
-require the chain (federation replica pulls, `/v1/audit/health`,
-`/v1/audit/inclusion_proof`, `/v1/audit/proof`) return HTTP 503 with
-the documented "no audit_chain on this backend" message. Routes that
-emit best-effort audit writes log a `[AUDIT] write_audit_entry
-failed` line and proceed (the memory row still commits). F16 added
-`required=True` to `mnemos.audit.route_helper.write_audit_entry`
-precisely so callers can opt into a fail-fast mode; once a caller
-passes `required=True` on MySQL/MariaDB, the call raises
-`AuditChainContinuityError` instead of silently no-opping.
+**Symptom:** MySQL/MariaDB have no signed per-memory audit repository.
+`MNEMOS_AUDIT_CHAIN=on` remains best effort; covered mutation paths log an
+append failure and preserve the data operation. `MNEMOS_AUDIT_CHAIN=required`
+makes covered writes fail and roll back their transaction when the repository,
+signing key, or append is unavailable. Federation replication itself does not
+require audit when auditing is disabled. Audit proof/health endpoints that
+require this capability remain unavailable on these backends.
 
-**Recovery:** self-hosted operators who need queryable, signed audit
-history should run the `server` profile on PostgreSQL, Oracle, or Db2
-(the three parity-required backends with full audit-chain coverage).
-Migrating MySQL/MariaDB audit parity requires:
+**Coverage:** required mode covers the ordinary memory CRUD/bulk/import paths,
+document import, deduplication, federation replication, and the archive/restore
+and deletion-worker paths described in [AUDIT_CHAIN.md](docs/AUDIT_CHAIN.md).
+It is not a universal database-write interceptor: MORPHEUS, arbitrary SQL, and
+portability restoration do not all have signed-entry enforcement. The existing
+signed payload also does not attest every ACL or lifecycle field.
 
-1. Adding `memory_audit_chain` + `memory_audit_roots` tables under
-   `mnemos/db_migrations/migrations_mysql/` and `migrations_mariadb/`
-   (porting `migrations_oracle/0029_memory_audit_chain.sql` and
-   `0030_memory_audit_roots.sql`, with MySQL/Db2 type substitutions —
-   the MySQL family does not have `RAW(16)` / `BLOB(16)` so the
-   `memory_id` column becomes `BINARY(16)`).
-2. Implementing `MysqlAuditChainRepository` in
-   `mnemos/persistence/mysql.py` (or sharing one between MysqlBackend
-   and MariadbBackend), wiring `audit_chain` to return it.
-3. Wiring the sealer and `/v1/audit/*` endpoints against the new
-   repository — most of that is already generic over the
-   `AuditChainRepository` protocol and only needs a tiny MySQL-specific
-   cursor/conversion layer.
-
-**Proper fix:** the recipe above is the proper fix. It is large enough
-that this F16 pass documents the gap and adds the `required=True`
-opt-in for callers that want fail-fast semantics, rather than landing
-the full port in one go.
+**Recovery:** use a backend with an audit repository when those covered writes
+must be signed. PostgreSQL and SQLite mutation rollback behavior has live
+integration coverage; Oracle/Db2 definitions require their own live engine
+validation. Completing MySQL/MariaDB parity requires audit entry/root tables,
+an AuditChainRepository implementation, and sealer/proof integration. The
+current required policy refuses unsupported covered writes rather than
+claiming that this missing implementation exists.
 
 ---
 

@@ -62,6 +62,7 @@ async def _await(value: Any) -> Any:
 
 class _Ops:
     def __init__(self, tx: Any, dialect: str) -> None:
+        self.tx = tx
         self.conn = tx.conn
         self.dialect = dialect
 
@@ -196,9 +197,7 @@ def _identity_user_column(dialect: str) -> str:
     return "user_id"
 
 
-async def _hard_delete_identity_rows(
-    ops: _Ops, user_id: str, namespace: str | None
-) -> dict[str, int]:
+async def _hard_delete_identity_rows(ops: _Ops, user_id: str, namespace: str | None) -> dict[str, int]:
     """Revoke / delete every subject-owned credential and identity row.
 
     GDPR erasure must not stop at the memory graph: email, raw OAuth
@@ -235,9 +234,7 @@ async def _hard_delete_identity_rows(
     return counts
 
 
-async def _scope_live_counts_identity(
-    ops: _Ops, user_id: str, namespace: str | None
-) -> dict[str, int]:
+async def _scope_live_counts_identity(ops: _Ops, user_id: str, namespace: str | None) -> dict[str, int]:
     """Count identity-table rows that would still leak subject data if
     we marked the request ``hard_deleted`` now. Must return zero on every
     entry before the request can advance to ``hard_deleted``.
@@ -253,9 +250,7 @@ async def _scope_live_counts_identity(
         counts[table] = int(await ops.scalar(sql, *params) or 0)
     # The user row only counts when the request is an all-namespace one.
     if namespace is None:
-        counts["users"] = int(
-            await ops.scalar("SELECT COUNT(*) FROM users WHERE id = ?", user_id) or 0
-        )
+        counts["users"] = int(await ops.scalar("SELECT COUNT(*) FROM users WHERE id = ?", user_id) or 0)
     return counts
 
 
@@ -289,10 +284,7 @@ async def _claim(ops: _Ops, *, hard: bool) -> dict[str, Any] | None:
         # KEEP UPDATE LOCKS promotes the row lock at read time, so a
         # concurrent worker cannot read the same row and race to the UPDATE;
         # SKIP LOCKED DATA makes the others step over it rather than block.
-        sql = (
-            base_sql + " FETCH FIRST 1 ROWS ONLY"
-            " FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS SKIP LOCKED DATA"
-        )
+        sql = base_sql + " FETCH FIRST 1 ROWS ONLY FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS SKIP LOCKED DATA"
     elif ops.dialect == "oracle":
         # Oracle rejects FOR UPDATE against an inline view carrying ROWNUM /
         # DISTINCT / GROUP BY (ORA-02014). That covers FETCH FIRST, and it
@@ -357,6 +349,7 @@ async def _scope_counts(ops: _Ops, user_id: str, namespace: str | None) -> dict[
 
 async def _soft_delete(ops: _Ops, user_id: str, namespace: str | None, at: datetime) -> dict[str, int]:
     counts: dict[str, int] = {}
+    await _audit_scope(ops, user_id, namespace, "deleted_at IS NULL", "delete")
     for table, owner_col in _OWNER_TABLES:
         counts[table] = await ops.execute(
             f"UPDATE {table} SET deleted_at = ? WHERE {_scope(owner_col)} AND deleted_at IS NULL",
@@ -377,6 +370,34 @@ async def _soft_delete(ops: _Ops, user_id: str, namespace: str | None, at: datet
     return counts
 
 
+async def _audit_scope(ops, user_id, namespace, predicate, op, *extra):
+    from mnemos.core.config import audit_chain_enabled_flag as audit_chain_enabled
+
+    if not audit_chain_enabled():
+        return
+    from mnemos.audit.route_helper import write_transaction_audit
+
+    # Lock rows before signing, so an intervening writer cannot change the
+    # payload between its audit snapshot and the destructive mutation.
+    suffix = "" if ops.dialect == "sqlite" else " FOR UPDATE"
+    rows = await ops.fetchall(
+        f"SELECT id, content, category, subcategory, metadata, embedding FROM memories WHERE {_scope('owner_id')} "
+        f"AND {predicate}" + suffix,
+        user_id,
+        namespace,
+        namespace,
+        *extra,
+    )
+    for row in rows:
+        await write_transaction_audit(
+            ops.tx,
+            op=op,
+            memory_id_str=row["id"],
+            snapshot=row,
+            writer_id="system:deletion-lifecycle",
+        )
+
+
 async def restore_soft_deleted_target(
     tx: Any,
     *,
@@ -387,6 +408,7 @@ async def restore_soft_deleted_target(
     """Restore only rows changed by the matching soft-delete sweep."""
     ops = _Ops(tx, transaction_dialect(tx))
     counts: dict[str, int] = {}
+    await _audit_scope(ops, user_id, namespace, "deleted_at = ?", "update", soft_deleted_at)
     for table, owner_col in _OWNER_TABLES:
         counts[table] = await ops.execute(
             f"UPDATE {table} SET deleted_at = NULL WHERE {_scope(owner_col)} AND deleted_at = ?",
@@ -411,13 +433,13 @@ async def _hard_delete_scope(ops: _Ops, request: dict[str, Any]) -> dict[str, in
     user_id = request["target_user_id"]
     namespace = request.get("target_namespace")
     counts: dict[str, int] = {}
+    await _audit_scope(ops, user_id, namespace, "deleted_at IS NOT NULL", "delete")
     if ops.dialect == "postgres":
         # Match the native Postgres hard-delete path: prevent the version
         # snapshot trigger from preserving rows being irreversibly erased.
         await ops.execute("SET LOCAL mnemos.suppress_version_snapshot = '1'")
     memories = await ops.fetchall(
-        f"SELECT id, content, owner_id, namespace FROM memories WHERE {_scope('owner_id')} "
-        "AND deleted_at IS NOT NULL",
+        f"SELECT id, content, owner_id, namespace FROM memories WHERE {_scope('owner_id')} AND deleted_at IS NOT NULL",
         user_id,
         namespace,
         namespace,
@@ -427,15 +449,18 @@ async def _hard_delete_scope(ops: _Ops, request: dict[str, Any]) -> dict[str, in
         source = request.get("source") or ["deletion_request_worker", str(request["id"])]
         source_value = list(source) if ops.dialect == "postgres" else json.dumps(source)
         values = (
-            memory["id"], content_hash, memory.get("owner_id"), memory.get("namespace"),
+            memory["id"],
+            content_hash,
+            memory.get("owner_id"),
+            memory.get("namespace"),
             request.get("requested_by") or "deletion_request_worker",
             request.get("requested_at") or datetime.now(timezone.utc),
-            request.get("request_kind") or "tombstone_collected", request.get("notes"),
+            request.get("request_kind") or "tombstone_collected",
+            request.get("notes"),
             source_value,
         )
         columns = (
-            "memory_id, content_hash, owner_id, namespace, requested_by, requested_at, "
-            "request_kind, reason, source"
+            "memory_id, content_hash, owner_id, namespace, requested_by, requested_at, request_kind, reason, source"
         )
         if ops.dialect in {"oracle", "db2"}:
             await ops.execute(
@@ -485,7 +510,9 @@ async def hard_delete_target(tx: Any, request: dict[str, Any]) -> dict[str, int]
     return await _hard_delete_scope(_Ops(tx, transaction_dialect(tx)), request)
 
 
-async def process_one_deletion_request(backend: Any, *, verify_attempts: int, restore_days: int) -> dict[str, Any] | None:
+async def process_one_deletion_request(
+    backend: Any, *, verify_attempts: int, restore_days: int
+) -> dict[str, Any] | None:
     dialect = backend_dialect(backend)
     async with backend.transactional() as tx:
         ops = _Ops(tx, dialect)
@@ -574,9 +601,7 @@ async def process_one_hard_deletion_request(backend: Any) -> dict[str, Any] | No
         }
 
 
-async def _resweep_and_verify_scope(
-    ops: _Ops, user_id: str, namespace: str | None
-) -> None:
+async def _resweep_and_verify_scope(ops: _Ops, user_id: str, namespace: str | None) -> None:
     """Re-run the soft-delete sweep on the scope and refuse to advance
     the request if any live rows remain.
 
@@ -708,6 +733,15 @@ async def sweep_for_archival(
             )
             if changed != 1:
                 raise RuntimeError(f"memory {row['id']!r} was not archived")
+            from mnemos.audit.route_helper import write_transaction_audit
+
+            await write_transaction_audit(
+                tx,
+                op="archive",
+                memory_id_str=row["id"],
+                snapshot=row,
+                writer_id=DEFAULT_ARCHIVED_BY,
+            )
             archived += 1
         return archived
 
