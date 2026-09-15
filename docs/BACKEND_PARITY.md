@@ -25,9 +25,10 @@ mariadb, oracle, db2) and answers two questions for every cell:
    `test_<capability>_<backend>*.py`?
 
 Summary: **75/162** cells are fully covered
-(✅ implemented+tested), **44** cells are
-implemented but untested, **34** cells have neither
-implementation nor test.
+(✅ implemented+tested), **44** cells are implemented
+but untested, **9** cells have a test against a
+stub backend implementation, and **34** cells have neither
+implementation nor test. (Categories sum to 162: 75 + 44 + 9 + 34 = 162.)
 
 ## Matrix
 
