@@ -49,10 +49,10 @@ performance require separate workload-qualified measurements.
 
 ## Add-on follow-up
 
-The reviewed add-on lock includes GRAEAE's first-use Oracle/Db2 quota repair.
+The reviewed add-on lock includes GRAEAE's first-use Oracle/Db2/MySQL/MariaDB quota repairs.
 Its live test starts eight simultaneous requests with one unit available and
-requires exactly one admission and seven quota rejections. Oracle and native
-Db2 executed separately against dedicated test schemas/databases. STIPHOS's
+requires exactly one admission and seven quota rejections. Oracle, native
+Db2, MySQL and MariaDB executed against disposable test schemas/databases. STIPHOS's
 separate service now materializes Oracle JSON and description CLOBs before
 returning claims; its canonical-schema test claimed 1,000 jobs across eight
 workers without duplicate or missing claims. KNEMON and CHARON CI now run their
