@@ -135,23 +135,22 @@ async def test_federation_repository_feed_cursor_and_sqlite_compressed_stub(back
         )
         page2 = await backend_case.backend.federation.feed_query(
             tx,
-            since_updated=page1[-1]["updated"],
-            since_id=page1[-1]["id"],
+            since_updated=page1[-1]["cursor_updated"],
+            since_id=page1[-1]["cursor_id"],
             namespaces=[namespace],
             categories=[],
             limit=10,
             prefer_compressed=False,
         )
-        if backend_case.name == "sqlite":
-            with pytest.raises(NotImplementedError):
-                await backend_case.backend.federation.feed_query(
-                    tx,
-                    since_updated=None,
-                    since_id=None,
-                    namespaces=[namespace],
-                    categories=[],
-                    limit=10,
-                    prefer_compressed=True,
-                )
+        compressed = await backend_case.backend.federation.feed_query(
+            tx,
+            since_updated=None,
+            since_id=None,
+            namespaces=[namespace],
+            categories=[],
+            limit=10,
+            prefer_compressed=True,
+        )
+        assert [row["id"] for row in compressed] == ids
 
     assert [row["id"] for row in [*page1, *page2]] == ids

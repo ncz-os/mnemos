@@ -128,6 +128,24 @@ async def test_consumer_fetches_body_from_authorized_feed_before_store():
     assert calls == [(pool.conn, "pythia", fetched)]
 
 
+async def test_delayed_delete_nudge_fetches_current_version_before_store():
+    pool = _FakePool()
+    msg = _FakeMsg("mnemos.memory.deleted.default", {"memory_id": "mem_123"})
+    current = [{"id": "mem_123", "content": "re-shared", "federation_sequence": 20}]
+    calls = []
+
+    async def fetch(peer, memory_id):
+        return current
+
+    async def store(conn, peer_name, memories):
+        calls.append(memories)
+        return 1, 0
+
+    await consumer.handle_message(pool, _peer(), msg, fetch=fetch, store=store)
+    assert calls == [current]
+    assert pool.conn.executed == []
+
+
 async def test_consumer_fetches_memory_by_id_before_store(monkeypatch):
     pool = _FakePool()
     msg = _FakeMsg("mnemos.memory.created.default", {"memory_id": "mem_x"})

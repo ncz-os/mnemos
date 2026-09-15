@@ -209,7 +209,6 @@ async def handle_message(
     fetch: Callable[[FederationNatsPeer, str], Awaitable[list[dict[str, Any]]]] | None = None,
 ) -> None:
     """Apply a single NATS memory event to local federation storage."""
-    delete = delete or delete_federated_memory
     subject = getattr(msg, "subject", "")
     payload = _decode_payload(getattr(msg, "data", b""))
     source_node = payload.get("source_node")
@@ -232,7 +231,10 @@ async def handle_message(
     if not memory_id:
         raise PoisonMessageError("federation nats event missing memory_id")
 
-    if _is_deleted_subject(subject):
+    if _is_deleted_subject(subject) and delete is not None:
+        # Explicit legacy adapter hook. Production treats NATS as a nudge and
+        # resolves the authoritative version over the authenticated HTTP feed:
+        # a delayed delete notification must not remove a re-created memory.
         await delete(pool, peer.name, memory_id)
         return
 
@@ -254,7 +256,7 @@ async def handle_message(
 
     backend = lifecycle.get_persistence_backend()
     async with backend.transactional() as tx:
-        await _store_memories(backend.federation, tx, peer.name, memories)
+        await _store_memories(backend.federation, tx, peer.name, memories, backend=backend)
 
 
 async def _fetch_authorized_memories(

@@ -155,6 +155,7 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "0043_memory_acl.sql",
     "0048_memory_versions_visibility.sql",
     "0054_memory_tags.sql",
+    "0062_federation_journal.sql",
 ]
 
 
@@ -717,8 +718,7 @@ def test_gitlab_ci_no_longer_references_stale_db_top_level_dir():
     # absent from the working tree.
     stale = repo_root / "db"
     assert not stale.exists(), (
-        "Test premise broken: this repo somehow has a top-level db/ "
-        "directory; the F18 fix may not apply"
+        "Test premise broken: this repo somehow has a top-level db/ directory; the F18 fix may not apply"
     )
 
     stale_references: list[tuple[int, str]] = []
@@ -782,9 +782,7 @@ def test_canonical_migration_helper_fails_on_missing_paths():
     import sys
     import tempfile
 
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, prefix="fake_installer_"
-    ) as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="fake_installer_") as f:
         # Reference one definitely-missing path.
         f.write(
             "def run_migrations(config):\n"
@@ -812,8 +810,7 @@ def test_canonical_migration_helper_fails_on_missing_paths():
         )
         assert result.returncode != 0, (
             "F18 regression: ci_apply_postgres_migrations.py must FAIL "
-            "non-zero on missing paths. Got exit 0 with stdout:\n"
-            + result.stdout
+            "non-zero on missing paths. Got exit 0 with stdout:\n" + result.stdout
         )
         combined = result.stdout + result.stderr
         assert "DEFINITELY_MISSING_PATH.sql" in combined, (
@@ -822,9 +819,7 @@ def test_canonical_migration_helper_fails_on_missing_paths():
         )
         assert "9999_nope.sql" in combined, (
             "F18 regression: helper must also catch numbered-series "
-            "migrations under mnemos/db_migrations/migrations/. Got:\n"
-            + combined
+            "migrations under mnemos/db_migrations/migrations/. Got:\n" + combined
         )
     finally:
         Path(fake).unlink()
-

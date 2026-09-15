@@ -441,6 +441,19 @@ async def soft_delete_target(
     *,
     invalidate_cache: bool = True,
 ) -> dict[str, int]:
+    from mnemos.core.config import audit_chain_enabled_flag as audit_chain_enabled
+
+    if audit_chain_enabled():
+        from mnemos.persistence.postgres import PostgresTransaction
+        from mnemos.persistence.worker_lifecycle import _Ops, _audit_scope
+
+        await _audit_scope(
+            _Ops(PostgresTransaction(conn, None), "postgres"),
+            target_user_id,
+            target_namespace,
+            "deleted_at IS NULL",
+            "delete",
+        )
     counts: dict[str, int] = {}
     for label, _table, sql in (*_OWNER_NAMESPACE_SOFT_DELETE_SQL, *_SOFT_DELETE_SQL):
         result = await conn.execute(sql, target_user_id, target_namespace)

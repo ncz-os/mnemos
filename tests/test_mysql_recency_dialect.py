@@ -145,7 +145,7 @@ async def test_mysql_federation_feed_embedding_bind_precedes_filters() -> None:
         patch("mnemos.core.config.embed_http_model_override", return_value="embed-model"),
         patch("mnemos.core.config.get_settings"),
     ):
-        await repo.feed_query(
+        await repo._legacy_feed_query(
             tx,
             since_updated=since,
             since_id="cursor-id",

@@ -33,8 +33,10 @@ On judge failure (HTTP error, parse failure, circuit-open), the
 candidate falls back to its engine self-reported score — the
 contest never fails closed because the judge is down.
 """
+
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -47,6 +49,7 @@ import httpx
 
 from mnemos.core.config import get_settings, hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
+from mnemos.runtime.bounded_cpu import BoundedExecutor
 
 from .gpu_guard import get_guard
 
@@ -163,10 +166,7 @@ def _judge_deterministic_score_python(
         bigram_overlap = len(ref_bigrams & cand_bigrams) / len(union)
 
     max_len = max(len(reference), len(candidate))
-    edit_distance_ratio = (
-        1.0 if max_len == 0
-        else 1.0 - (_levenshtein(reference, candidate) / max_len)
-    )
+    edit_distance_ratio = 1.0 if max_len == 0 else 1.0 - (_levenshtein(reference, candidate) / max_len)
 
     ref_len = len(reference)
     cand_len = len(candidate)
@@ -178,11 +178,7 @@ def _judge_deterministic_score_python(
         length_ratio = min(cand_len / ref_len, ref_len / cand_len)
 
     w_bigram, w_edit, w_length = weights or (0.4, 0.4, 0.2)
-    composite = (
-        w_bigram * bigram_overlap
-        + w_edit * edit_distance_ratio
-        + w_length * length_ratio
-    )
+    composite = w_bigram * bigram_overlap + w_edit * edit_distance_ratio + w_length * length_ratio
     return {
         "bigram_overlap": float(bigram_overlap),
         "edit_distance_ratio": float(edit_distance_ratio),
@@ -212,6 +208,9 @@ def _judge_deterministic_score(
     return _judge_deterministic_score_python(reference, candidate, weights)
 
 
+_DETERMINISTIC_WORKER = BoundedExecutor(workers=1, capacity=4, name="mnemos-judge")
+
+
 class DeterministicJudge(Judge):
     """CPU-only fidelity judge based on deterministic text metrics.
 
@@ -221,6 +220,15 @@ class DeterministicJudge(Judge):
     """
 
     model_id = "deterministic-fast"
+
+    def __init__(
+        self, *, max_edit_cells: int = 1_000_000, max_chars: int = 20_000, executor: BoundedExecutor | None = None
+    ):
+        if max_edit_cells < 1 or max_chars < 1:
+            raise ValueError("judge resource limits must be positive")
+        self.max_edit_cells = max_edit_cells
+        self.max_chars = max_chars
+        self._executor = executor or _DETERMINISTIC_WORKER
 
     async def score(
         self,
@@ -232,7 +240,17 @@ class DeterministicJudge(Judge):
     ) -> Optional[JudgeScore]:
         if not original or not candidate_narrated:
             return None
-        score = _judge_deterministic_score(original, candidate_narrated)
+        if (
+            max(len(original), len(candidate_narrated)) > self.max_chars
+            or len(original) * len(candidate_narrated) > self.max_edit_cells
+        ):
+            logger.warning("Deterministic judge unavailable: input exceeds CPU work budget")
+            return None
+        future = self._executor.submit(_judge_deterministic_score, original, candidate_narrated)
+        if future is None:
+            logger.warning("Deterministic judge unavailable: bounded worker is saturated")
+            return None
+        score = await asyncio.wrap_future(future)
         return JudgeScore(
             fidelity=max(0.0, min(1.0, score["composite"])),
             model_id=self.model_id,
@@ -325,7 +343,9 @@ class LLMJudge(Judge):
             logger.info(
                 "LLMJudge: circuit open for %s (%s); falling back to engine "
                 "self-reported score for candidate engine=%s",
-                self.gpu_url, guard.state.value, candidate_engine_id,
+                self.gpu_url,
+                guard.state.value,
+                candidate_engine_id,
             )
             return None
 
@@ -348,14 +368,12 @@ class LLMJudge(Judge):
             )
             response.raise_for_status()
             payload = response.json()
-            raw = (
-                payload.get("choices", [{}])[0].get("text", "")
-                if isinstance(payload, dict) else ""
-            ).strip()
+            raw = (payload.get("choices", [{}])[0].get("text", "") if isinstance(payload, dict) else "").strip()
         except Exception as exc:
             logger.warning(
                 "LLMJudge: HTTP call failed for candidate engine=%s: %s",
-                candidate_engine_id, exc,
+                candidate_engine_id,
+                exc,
             )
             await guard.record_failure(exc, probe_token=probe_token)
             return None
@@ -368,16 +386,18 @@ class LLMJudge(Judge):
         parsed = _parse_judge_output(raw)
         if parsed is None:
             logger.warning(
-                "LLMJudge: output parse failed for candidate engine=%s; "
-                "raw=%r (first 200 chars)",
-                candidate_engine_id, raw[:200],
+                "LLMJudge: output parse failed for candidate engine=%s; raw=%r (first 200 chars)",
+                candidate_engine_id,
+                raw[:200],
             )
             return None
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         logger.debug(
             "LLMJudge: scored candidate engine=%s fidelity=%.3f in %dms",
-            candidate_engine_id, parsed.fidelity, elapsed_ms,
+            candidate_engine_id,
+            parsed.fidelity,
+            elapsed_ms,
         )
         return JudgeScore(
             fidelity=parsed.fidelity,
@@ -498,13 +518,15 @@ class CrossEncoderJudge(Judge):
         if self._model is not None:
             return self._model
         from sentence_transformers import CrossEncoder
+
         kwargs = {}
         if self._device is not None:
             kwargs["device"] = self._device
         self._model = CrossEncoder(self.model_name, **kwargs)
         logger.info(
             "CrossEncoderJudge loaded model=%r device=%r",
-            self.model_name, getattr(self._model, "device", self._device),
+            self.model_name,
+            getattr(self._model, "device", self._device),
         )
         return self._model
 
@@ -524,6 +546,7 @@ class CrossEncoderJudge(Judge):
             # the default executor so the contest's asyncio.gather doesn't
             # block. Small overhead for the <50ms call is fine.
             import asyncio
+
             raw = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: model.predict(
@@ -535,7 +558,8 @@ class CrossEncoderJudge(Judge):
         except Exception as exc:  # noqa: BLE001 — judge MUST NOT crash the contest
             logger.warning(
                 "CrossEncoderJudge: score failed (%s): %s",
-                type(exc).__name__, exc,
+                type(exc).__name__,
+                exc,
             )
             return None
 
@@ -621,7 +645,8 @@ class EnsembleJudge(Judge):
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "EnsembleJudge: secondary %s raised: %s",
-                    type(sec).__name__, exc,
+                    type(sec).__name__,
+                    exc,
                 )
                 continue
             if s is not None:
@@ -635,14 +660,10 @@ class EnsembleJudge(Judge):
         # Backwards-compatible consumers read the primary reasoning from
         # after the bracket; new consumers parse the prefix.
         if secondary_scores:
-            suffix = ",".join(
-                f"{name}={val:.3f}" for name, val in secondary_scores.items()
-            )
+            suffix = ",".join(f"{name}={val:.3f}" for name, val in secondary_scores.items())
             primary_score = JudgeScore(
                 fidelity=primary_score.fidelity,
                 model_id=primary_score.model_id,
-                reasoning=(
-                    f"[secondaries: {suffix}] {primary_score.reasoning}"
-                ),
+                reasoning=(f"[secondaries: {suffix}] {primary_score.reasoning}"),
             )
         return primary_score

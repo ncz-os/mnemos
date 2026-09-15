@@ -111,6 +111,11 @@ class AdminLifecycleRepository:
         )
         if changed != 1:
             raise RuntimeError(f"memory {memory_id!r} was not archived")
+        from mnemos.audit.route_helper import write_transaction_audit
+
+        await write_transaction_audit(
+            ops.tx, op="archive", memory_id_str=memory_id, snapshot=row, writer_id=archived_by
+        )
 
     async def sweep_for_archival(
         self,
@@ -176,8 +181,7 @@ class AdminLifecycleRepository:
         ops = self._portable_ops(tx)
         if ops is not None:
             return await ops.fetchone(
-                "SELECT id, owner_id, namespace, archived_at FROM memories "
-                "WHERE id = ? AND deleted_at IS NULL",
+                "SELECT id, owner_id, namespace, archived_at FROM memories WHERE id = ? AND deleted_at IS NULL",
                 memory_id,
             )
         return await _conn(tx).fetchrow(
@@ -257,6 +261,15 @@ class AdminLifecycleRepository:
             if changed != 1:
                 raise RuntimeError(f"memory {memory_id!r} was not restored")
             await ops.execute("DELETE FROM memory_archive WHERE id = ?", memory_id)
+            from mnemos.workers.audit_sealer import audit_chain_enabled
+
+            if audit_chain_enabled():
+                from mnemos.audit.route_helper import write_transaction_audit, fetch_audit_snapshot
+
+                restored = await fetch_audit_snapshot(tx, memory_id)
+                await write_transaction_audit(
+                    tx, op="update", memory_id_str=memory_id, snapshot=restored, writer_id=restored_by
+                )
             return
         await restore_memory(
             _conn(tx),
@@ -482,7 +495,11 @@ class AdminLifecycleRepository:
             # sqlite3.IntegrityError. The advisory-lock + SELECT check
             # above makes the race window narrow — any duplicate-key
             # error that escapes is an active duplicate.
-            if "UniqueViolation" in type(exc).__name__ or "IntegrityError" in type(exc).__name__ or "UNIQUE constraint" in str(exc):
+            if (
+                "UniqueViolation" in type(exc).__name__
+                or "IntegrityError" in type(exc).__name__
+                or "UNIQUE constraint" in str(exc)
+            ):
                 raise DeletionRequestActiveDuplicateError from exc
             raise
 

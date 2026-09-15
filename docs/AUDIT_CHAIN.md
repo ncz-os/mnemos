@@ -8,7 +8,7 @@ and `0030_memory_audit_roots.sql` (PostgreSQL, Oracle, Db2), plus
 
 ## What it does
 
-Cryptographically-verifiable append-only audit chain over every memory write. Per-memory linear chain via `prev_entry_hash`; per-window Merkle tree across the global write log, sealed by a periodic worker.
+Cryptographically verifiable signed audit entries for the mutation paths listed below. Per-memory linear chain via `prev_entry_hash`; per-window Merkle tree across the global write log, sealed by a periodic worker.
 
 | Component | Module / file |
 |---|---|
@@ -27,12 +27,22 @@ Cryptographically-verifiable append-only audit chain over every memory write. Pe
 
 ---
 
+## Coverage and transaction policy
+
+`MNEMOS_AUDIT_CHAIN=required` makes an audit append a prerequisite for the covered mutation to commit. Missing signing secrets, missing backend repositories, malformed payloads and append failures roll back the caller transaction. `on` keeps best-effort behavior: errors are logged and audit SQL is isolated with a savepoint so an audit failure does not poison the data transaction. The default is disabled.
+
+Covered paths include API create/update/bulk-create/delete, document import, exact deduplication, PERSEPHONE archive/restore/sweeps, deletion-request soft/hard/restore operations, and federation replica mutations. Lifecycle audit entries use the same transaction as the memory mutation. A source journal event and a receiver cursor also roll back on required-audit failure.
+
+This is not a database-wide write interceptor. Direct SQL, portability restoration and MORPHEUS repository phases are not universally covered by the signed chain. Required mode enforces participating paths; it does not make those other paths audited. PostgreSQL, SQLite, Oracle and Db2 have audit repositories; MySQL/MariaDB do not, so covered writes in required mode fail until an audit repository is implemented. Oracle/Db2 savepoint and signing integration require live engine validation.
+
+The signed payload contains ID, content, category, subcategory, metadata and an embedding hash. It does not currently attest owner, namespace, permission mode or every lifecycle column. Driver JSON/list vectors are normalized to little-endian float32 bytes before hashing. Signed hashes retain no recoverable deleted content, but audit identifiers and signatures remain after deletion.
+
 ## Configuration
 
-Two mandatory env vars when `MNEMOS_AUDIT_CHAIN=on`:
+Enable best-effort signing with `on`, or require covered mutations to be audited with `required`:
 
 ```bash
-export MNEMOS_AUDIT_CHAIN=on
+export MNEMOS_AUDIT_CHAIN=required
 export MNEMOS_AUDIT_ROOT_PRIVKEY="$(python -c 'import os, base64; print(base64.b64encode(os.urandom(32)).decode())')"
 ```
 
@@ -183,7 +193,7 @@ Each entry signs over: `entry_id, memory_id (16-byte SHA-256-of-mem-id-str), pre
 | Symptom | Likely cause | Recovery |
 |---|---|---|
 | Sealer logs `MNEMOS_AUDIT_ROOT_PRIVKEY is unset; required when MNEMOS_AUDIT_CHAIN is on` | Env not loaded into sealer process | Set env + restart; `load_root_keypair` is loud by design |
-| `[AUDIT] write_audit_entry failed for op=create memory=mem_xxx` in api logs | Backend hiccup on insert_audit_entry | Audit row missed; memory row still committed. Sealer will skip the unsealed-history gap; rebuild from `git log`-style memory-table audit if forensics needed |
+| `[AUDIT] write_audit_entry failed for op=create memory=mem_xxx` in api logs | Backend hiccup on insert_audit_entry | In `on` mode the memory commits without that audit entry; in `required` mode the covered mutation rolls back. A sealer cannot reconstruct a missed signed entry from its hash alone. |
 | 422 from `/v1/audit/inclusion_proof` | Sealer hasn't run yet for this entry | Wait one `poll_interval` cycle; entries seal in batches per `window_seconds` cadence |
 | 500 from `/v1/audit/inclusion_proof` saying "computed root drift" | Sealer ↔ proof routine mismatch (bug) | File issue with the entry_id + global_root; bisect against any recent crypto-module commits |
 | Federation replicas with mismatching global_root for same window | Split-brain or compromised peer | The Ed25519 root_signature on `memory_audit_roots` is the source of truth; reject peers whose pubkey doesn't match |
@@ -198,7 +208,7 @@ Each entry signs over: `entry_id, memory_id (16-byte SHA-256-of-mem-id-str), pre
 
 3. **Cross-peer chain validation is passive.** The primary publishes `audit_latest_entry_id` + `audit_latest_entry_hash` per row in `/v1/federation/feed`. Replicas log primary's claimed chain head on inbound but **don't yet actively reject mismatched feeds** — hardening to halt-on-mismatch follows after the chain has been fielded at scale (risk: a transient peer bug could DoS a replica's pull loop if rejection is too aggressive).
 
-4. **Archive audit entries are not atomic with the archive.** `POST /v1/admin/persephone/archive/{memory_id}` emits an `op="archive"` entry after the archive commits, in a separate transaction.
+4. **Coverage is explicit, not universal.** Archive/restore audit appends now share the mutation transaction; `required` rolls both back on append failure. Arbitrary SQL, portability restoration and MORPHEUS phases still require additional signed-entry wiring. See the coverage policy above.
 
 ---
 
