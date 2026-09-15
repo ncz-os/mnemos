@@ -12,7 +12,7 @@ Receivers persist last-seen versions, including withdrawals, separately from mem
 
 Deployment considerations:
 
-- Apply migrations before serving the new feed. SQLite/PostgreSQL migration and mutation behavior have live integration tests. MySQL/MariaDB/Oracle/Db2 definitions require validation on those engines before deployment.
+- Apply migrations before serving the new feed. SQLite/PostgreSQL/MySQL/MariaDB migration and mutation behavior have live integration tests (`test:journal-sql` runs `test_federation_journal.py` against real MySQL 9.1 and MariaDB 12.3 containers on every branch). Oracle/Db2 definitions require their own live engine validation before deployment — no standing CI job covers them yet.
 - Bootstrap covers rows present at migration. Deletions that happened before journaling cannot be reconstructed from missing rows. Rebuild an old replica once if it may already contain historical stale copies.
 - Journal and receiver tombstone retention is deliberately unbounded. Do not prune them without a peer acknowledgement/retention protocol. Monitor journal size and index growth.
 - Treat changes to the private-export posture, peer scope filters, source identity, or restoration of an older source database as replication reconfiguration. Rebuild affected replicas and reset their cursor/version state; ordinary incremental polling is not a safe full-membership reconciliation for these changes.
