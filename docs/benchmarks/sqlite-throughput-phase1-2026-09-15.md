@@ -10,7 +10,7 @@ artifact is the committed JSON, not this document.
 The matrix was run end-to-end against a fresh temp SQLite file per cell
 (no shared or persistent DB, no real data path pollution), then the
 resulting JSON + markdown summary were committed to
-`docs/proof/bench-sqlite-phase1-20260915T181210Z.{json,md}`.
+`docs/proof/bench-sqlite-phase1-20260915T181615Z.{json,md}`.
 
 This document discharges the Phase 1 shipping criterion:
 
@@ -30,22 +30,22 @@ This document discharges the Phase 1 shipping criterion:
 | Warmup      | 64 inserts per cell (excluded from timed measurement) |
 | Read-back   | 1 `gather_stats()` call per cell (sanity, not headline) |
 | Cells       | 2 × 3 = 6 |
-| Total wall  | ~32 s on the dev host (Asahi aarch64, python 3.14.6) |
+| Total wall  | ~37 s on the dev host (Asahi aarch64, python 3.14.6) |
 | DB path     | Fresh tempfile per cell, removed before the cell returns |
 
 Total 6-cell runtime is well under the 30-minute budget; the script
 has headroom for Phase 2 once the operator decision lands.
 
-## Headline numbers (committed artifact: `bench-sqlite-phase1-20260915T181210Z.md`)
+## Headline numbers (committed artifact: `bench-sqlite-phase1-20260915T181615Z.md`)
 
 | corpus_size | concurrency | throughput (ops/s) | p50 (ms) | p95 (ms) | p99 (ms) | insert wall (s) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1000   | 1  | 941.40  | 0.822 | 2.199 | 3.359 | 1.06 |
-| 1000   | 5  | 1703.01 | 2.705 | 3.928 | 5.833 | 0.59 |
-| 1000   | 10 | 1195.07 | 6.900 | 19.228 | 21.110 | 0.84 |
-| 10000  | 1  | 1015.66 | 0.810 | 1.917 | 2.951 | 9.85 |
-| 10000  | 5  | 1182.36 | 3.288 | 8.313 | 10.714 | 8.46 |
-| 10000  | 10 | 1259.98 | 6.563 | 15.999 | 24.489 | 7.94 |
+| 1000   | 1  | 1594.37 | 0.569 | 0.990 | 1.224 | 0.63 |
+| 1000   | 5  |  774.41 | 6.278 | 11.570 | 14.473 | 1.29 |
+| 1000   | 10 |  862.74 | 10.666 | 20.116 | 23.410 | 1.16 |
+| 10000  | 1  | 1002.06 | 0.775 | 2.074 | 3.139 | 9.98 |
+| 10000  | 5  |  930.68 | 4.131 | 10.715 | 13.652 | 10.74 |
+| 10000  | 10 |  931.99 | 9.286 | 19.869 | 23.407 | 10.73 |
 
 (Values are from one run on the dev host; the JSON artifact is the
 source of truth. Throughput should be read as a single-host ballpark
@@ -75,17 +75,17 @@ That means **all writes serialize through one path**, regardless of
 how many concurrent writer tasks the bench dispatches. The numbers
 above show this clearly:
 
-- Throughput plateaus at roughly 0.9-1.7k ops/s across concurrency
+- Throughput plateaus at roughly 0.8-1.6k ops/s across concurrency
   levels 1, 5, and 10 — adding more tasks queues them at the lock,
   it does not parallelize SQLite writes. (Per-cell spread is
   meaningful: a fresh `tempfile.mkdtemp`-backed SQLite, a fresh
   `asyncio.Lock`, and a one-shot migration run means cell-to-cell
   variance is not small. The plateau shape, not the absolute
   throughput, is the load-bearing observation.)
-- Per-insert latency scales up with concurrency (p50 ~0.8 ms at c=1
-  vs ~6.6 ms at c=10 on the 10k corpus) — the extra tasks are
-  paying for time spent waiting on the lock, not for additional
-  work done in parallel.
+- Per-insert latency scales up with concurrency (p50 ~0.6-0.8 ms at
+  c=1 vs ~9-11 ms at c=10) — the extra tasks are paying for time
+  spent waiting on the lock, not for additional work done in
+  parallel.
 
 This is the actual behavior of the SQLite backend in MNEMOS today.
 It is **not a benchmark artifact** and it is **not a bug introduced
@@ -149,7 +149,7 @@ Required environment:
   other bench scripts in this repo.
 
 Expected timing on the dev host (Asahi aarch64, python 3.14.6):
-~32 seconds for the full 6-cell matrix. Will be slower on
+~37 seconds for the full 6-cell matrix. Will be slower on
 architectures with weaker single-thread SQLite performance; faster
 on NVMe-backed desktop builds. None of these changes the
 architectural observation in the section above — the lock-queueing
