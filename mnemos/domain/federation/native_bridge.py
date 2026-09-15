@@ -138,6 +138,7 @@ def _wire_payload(row: Mapping[str, Any]) -> dict[str, Any]:
             "id": row["id"],
             "consolidated_into": row["consolidated_into"],
             "consolidated_at": _iso_value(row["consolidated_at"]) or "",
+            "federation_sequence": row.get("federation_sequence"),
         }
     if row.get("type") == "withdrawal":
         # F07: explicit withdrawal/tombstone signal. Receivers drop the
@@ -150,8 +151,11 @@ def _wire_payload(row: Mapping[str, Any]) -> dict[str, Any]:
             "namespace": namespace_val if namespace_val else None,
             "withdrawn_at": _iso_value(row.get("updated") or row.get("created")) or "",
             "reason": "ineligible",
+            "federation_sequence": row.get("federation_sequence"),
         }
-    return _memory_item_payload(row)
+    result = _memory_item_payload(row)
+    result["federation_sequence"] = row.get("federation_sequence")
+    return result
 
 
 def pure_python_serialize_memory_for_feed(rows: Sequence[Mapping[str, Any]]) -> list[str]:
@@ -178,7 +182,7 @@ def pure_python_serialize_memory_rows(rows: Sequence[Mapping[str, Any]]) -> byte
 
 def serialize_memory_rows(rows: Sequence[Mapping[str, Any]]) -> bytes:
     dict_rows = _redacted_non_vault_rows(rows)
-    if _NATIVE_FEDERATION is not None:
+    if _NATIVE_FEDERATION is not None and not any(r.get("federation_sequence") is not None for r in dict_rows):
         try:
             return bytes(_NATIVE_FEDERATION.serialize_memory_rows(dict_rows))
         except Exception:

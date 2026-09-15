@@ -803,9 +803,7 @@ class PostgresMemoryRepository(MemoryRepository):
                 where.append(clause)
                 params.extend(vis_params)
         locked = await conn.fetchrow(
-            "SELECT m.id FROM memories m WHERE "
-            + " AND ".join(where)
-            + " FOR UPDATE",
+            "SELECT m.id FROM memories m WHERE " + " AND ".join(where) + " FOR UPDATE",
             *params,
         )
         if locked is None:
@@ -826,8 +824,7 @@ class PostgresMemoryRepository(MemoryRepository):
         if not memory_ids:
             return {}
         rows = await _postgres_tx(tx).conn.fetch(
-            "SELECT memory_id, tag FROM memory_tags "
-            "WHERE memory_id = ANY($1::text[]) ORDER BY memory_id, tag",
+            "SELECT memory_id, tag FROM memory_tags WHERE memory_id = ANY($1::text[]) ORDER BY memory_id, tag",
             list(memory_ids),
         )
         result = {memory_id: [] for memory_id in memory_ids}
@@ -4703,7 +4700,12 @@ class PostgresFederationRepository(FederationRepository):
             )
         )
 
-    async def feed_query(
+    async def feed_query(self, tx, **kwargs):
+        from mnemos.persistence.federation_journal import feed_query
+
+        return await feed_query(self, tx, **kwargs)
+
+    async def _legacy_feed_query(
         self,
         tx: Transaction,
         *,
@@ -4741,8 +4743,7 @@ class PostgresFederationRepository(FederationRepository):
                 f"OR (m.consolidated_at = ${since_updated_arg} AND m.id > ${since_id_arg}))"
             )
             withdrawal_query_parts.append(
-                f"(m.updated > ${since_updated_arg} "
-                f"OR (m.updated = ${since_updated_arg} AND m.id > ${since_id_arg}))"
+                f"(m.updated > ${since_updated_arg} OR (m.updated = ${since_updated_arg} AND m.id > ${since_id_arg}))"
             )
         if namespaces:
             args.append(list(namespaces))
@@ -4890,7 +4891,12 @@ class PostgresFederationRepository(FederationRepository):
             )
         )
 
-    async def get_feed_memory(
+    async def get_feed_memory(self, tx, memory_id, *, namespaces, categories):
+        from mnemos.persistence.federation_journal import get_feed_memory
+
+        return await get_feed_memory(self, tx, memory_id, namespaces=namespaces, categories=categories)
+
+    async def _legacy_get_feed_memory(
         self,
         tx: Transaction,
         memory_id: str,
@@ -5135,7 +5141,7 @@ class PostgresFederationRepository(FederationRepository):
         remote_updated: Any,
     ) -> bool:
         try:
-            await _postgres_tx(tx).conn.execute(
+            result = await _postgres_tx(tx).conn.execute(
                 """
                 INSERT INTO memories
                   (id, content, category, subcategory, metadata, verbatim_content,
@@ -5145,6 +5151,7 @@ class PostgresFederationRepository(FederationRepository):
                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, 'federation', $8, 644,
                         $9, $10, $11, $12, $13, $14::timestamptz, NOW(),
                         $14::timestamptz)
+                ON CONFLICT (id) DO NOTHING
                 """,
                 local_id,
                 content,
@@ -5161,9 +5168,10 @@ class PostgresFederationRepository(FederationRepository):
                 peer_name,
                 remote_updated,
             )
-            return True
+            return _pg_result_count(result) > 0
         except asyncpg.UniqueViolationError:
-            return False
+            # A different unique constraint is an actual data-integrity error.
+            raise
 
     async def update_federated_memory_if_newer(
         self,
@@ -5226,9 +5234,9 @@ class PostgresFederationRepository(FederationRepository):
                 metadata = COALESCE(metadata, '{}'::jsonb)
                     || jsonb_build_object(
                         'federation_consolidation', jsonb_build_object(
-                            'remote_id', $4,
-                            'remote_consolidated_into', $5,
-                            'peer', $6
+                            'remote_id', $4::text,
+                            'remote_consolidated_into', $5::text,
+                            'peer', $6::text
                         )
                     )
             WHERE id = $1
@@ -5423,6 +5431,8 @@ class PostgresAuditChainRepository(AuditChainRepository):
         signature: bytes,
         signed_at: Any,
     ) -> None:
+        if isinstance(signed_at, str):
+            signed_at = datetime.fromisoformat(signed_at.replace("Z", "+00:00"))
         await _postgres_tx(tx).conn.execute(
             """
             INSERT INTO memory_audit_chain (
@@ -5643,6 +5653,7 @@ class PostgresMorpheusRepository(MorpheusRepository):
             FROM morpheus_runs
             WHERE status = 'running'
               AND started_at < NOW() - ($1::double precision * INTERVAL '1 hour')
+              AND config->>'durable_queue' IS DISTINCT FROM 'true'
             FOR UPDATE SKIP LOCKED
         )
         UPDATE morpheus_runs r
@@ -5804,6 +5815,11 @@ class PostgresMorpheusRepository(MorpheusRepository):
         transaction.
         """
         conn = _postgres_tx(tx).conn
+        from mnemos.persistence.morpheus_jobs import _EXECUTION_LOCK, MorpheusExecutionActive
+
+        if not await conn.fetchval("SELECT pg_try_advisory_xact_lock($1)", _EXECUTION_LOCK):
+            raise MorpheusExecutionActive("A MORPHEUS worker is executing; retry rollback after it stops")
+
         extract_reset = await conn.execute(
             """
             WITH deleted_extract_triples AS (
@@ -5991,7 +6007,7 @@ class PostgresMorpheusRepository(MorpheusRepository):
              WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
                AND m.provenance IS DISTINCT FROM 'morpheus_local'
                AND m.morpheus_run_id IS NULL
-               AND {_eligibility.eligible_for_morpheus('m')}
+               AND {_eligibility.eligible_for_morpheus("m")}
                AND (r.namespace IS NULL OR m.namespace = r.namespace)
             """,
             run_id,
@@ -6067,6 +6083,9 @@ class PostgresMorpheusRepository(MorpheusRepository):
             except json.JSONDecodeError:
                 config = {}
         clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        from mnemos.persistence.morpheus_isolation import partition_consolidation_clusters
+
+        clusters = await partition_consolidation_clusters(tx, clusters, dialect="postgres")
         min_size = int(run_row["cluster_min_size"])
         namespace = run_row["namespace"]
         memories_consolidated = 0

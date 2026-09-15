@@ -2,6 +2,7 @@
 
 Unit tests run without DB. Integration tests require MNEMOS_TEST_DB.
 """
+
 from __future__ import annotations
 
 import os
@@ -12,6 +13,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def legacy_transaction_adapter(monkeypatch):
+    # These protocol unit tests use pre-journal raw connection adapters.
+    from mnemos.persistence import federation_journal
+
+    monkeypatch.setattr(federation_journal, "supports_journal", lambda tx: False)
+
 
 @pytest.fixture(autouse=True)
 def _offsite_feed_scope(monkeypatch):
@@ -62,9 +72,9 @@ class _FeedConnection:
         if "m.updated > $1" in query:
             since_updated, since_id = args[0], args[1]
             rows = [
-                r for r in rows
-                if r["updated"] > since_updated
-                or (r["updated"] == since_updated and r["id"] > since_id)
+                r
+                for r in rows
+                if r["updated"] > since_updated or (r["updated"] == since_updated and r["id"] > since_id)
             ]
         return rows[:limit]
 
@@ -197,6 +207,10 @@ class _FeedBackend:
 
         self.pool = pool
         self.federation = PostgresFederationRepository()
+        # This fake connection models the v1 SQL contract; journal behavior is
+        # exercised against real engines in test_federation_journal.py.
+        self.federation.feed_query = self.federation._legacy_feed_query
+        self.federation.get_feed_memory = self.federation._legacy_get_feed_memory
 
     @asynccontextmanager
     async def transactional(self):
@@ -218,6 +232,7 @@ def _install_feed_backend(monkeypatch, pool: _FeedPool) -> None:
 class TestFederationWiring:
     def test_federation_module_imports(self):
         from mnemos.domain import federation
+
         for name in (
             "sync_peer",
             "federation_worker_loop",
@@ -242,6 +257,7 @@ class TestFederationWiring:
 
     def test_federation_handler_router(self):
         from mnemos.api.routes import federation as handler
+
         assert hasattr(handler, "router")
         assert handler.router.prefix == "/v1/federation"
 
@@ -249,6 +265,7 @@ class TestFederationWiring:
         from mnemos.domain.models import (
             FederationPeerCreateRequest,
         )
+
         req = FederationPeerCreateRequest(
             name="peer-alpha",
             base_url="https://alpha.example.com",
@@ -325,19 +342,19 @@ class TestFederationWiring:
         from mnemos.domain.models import FederationPeerCreateRequest
 
         invalid_cases = [
-            "ab",           # too short (< 3)
-            "a" * 65,       # too long (> 64)
-            "Peer-Alpha",   # uppercase
-            "peer_alpha",   # underscore not allowed
-            "peer.alpha",   # period not allowed
-            "peer alpha",   # whitespace
+            "ab",  # too short (< 3)
+            "a" * 65,  # too long (> 64)
+            "Peer-Alpha",  # uppercase
+            "peer_alpha",  # underscore not allowed
+            "peer.alpha",  # period not allowed
+            "peer alpha",  # whitespace
             "peer\nalpha",  # newline (log-injection shape)
-            "peer\x00",     # null byte
-            "1peer",        # leading digit
-            "-peer",        # leading dash
-            "peer/alpha",   # slash
-            "メモ",          # non-ASCII
-            "",             # empty
+            "peer\x00",  # null byte
+            "1peer",  # leading digit
+            "-peer",  # leading dash
+            "peer/alpha",  # slash
+            "メモ",  # non-ASCII
+            "",  # empty
         ]
         for invalid in invalid_cases:
             with pytest.raises(ValidationError):
@@ -349,6 +366,7 @@ class TestFederationWiring:
 
     def test_router_registered_in_app(self):
         import mnemos.api.main as api_server
+
         paths = {r.path for r in api_server.app.routes}
         fed_paths = [p for p in paths if p.startswith("/v1/federation")]
         # peers CRUD (5) + sync (1) + log (1) + status (1) + feed (1) = 9 at minimum
@@ -356,11 +374,13 @@ class TestFederationWiring:
 
     def test_feed_route_exists(self):
         import mnemos.api.main as api_server
+
         paths = {r.path for r in api_server.app.routes}
         assert "/v1/federation/feed" in paths
 
     def test_memory_route_exists(self):
         import mnemos.api.main as api_server
+
         paths = {r.path for r in api_server.app.routes}
         assert "/v1/federation/memory/{memory_id}" in paths
 
@@ -371,11 +391,13 @@ class TestFederationWiring:
 class TestFederationIdConvention:
     def test_prefix_constant(self):
         from mnemos.domain.federation import FEDERATION_ID_PREFIX
+
         assert FEDERATION_ID_PREFIX == "fed:"
 
     def test_local_id_format_example(self):
         # Docs promise: fed:{peer_name}:{remote_id}
         from mnemos.domain.federation import FEDERATION_ID_PREFIX
+
         peer = "alpha"
         remote_id = "mem_abc123"
         local = f"{FEDERATION_ID_PREFIX}{peer}:{remote_id}"
@@ -400,9 +422,7 @@ class TestFederationFeedCursor:
         pool = _FeedPool(rows)
         _install_feed_backend(monkeypatch, pool)
 
-        first = await handler.federation_feed(
-            None, None, since=None, namespace=None, category=None, limit=2
-        )
+        first = await handler.federation_feed(None, None, since=None, namespace=None, category=None, limit=2)
         assert [m.id for m in first.memories] == [rows[0]["id"], rows[1]["id"]]
         assert first.has_more is True
         first_cursor = fed._decode_feed_cursor(first.next_cursor)
@@ -429,9 +449,7 @@ class TestFederationFeedCursor:
         pool = _FeedPool(rows)
         _install_feed_backend(monkeypatch, pool)
 
-        first = await handler.federation_feed(
-            None, None, since=None, namespace=None, category=None, limit=2
-        )
+        first = await handler.federation_feed(None, None, since=None, namespace=None, category=None, limit=2)
         second = await handler.federation_feed(
             None, None, since=first.next_cursor, namespace=None, category=None, limit=2
         )
@@ -449,14 +467,14 @@ class TestFederationFeedCursor:
             updated,
             "00000000-0000-0000-0000-000000000009",
         )
-        pool = _FeedPool([
-            _feed_row("00000000-0000-0000-0000-000000000001", updated),
-        ])
+        pool = _FeedPool(
+            [
+                _feed_row("00000000-0000-0000-0000-000000000001", updated),
+            ]
+        )
         _install_feed_backend(monkeypatch, pool)
 
-        response = await handler.federation_feed(
-            None, None, since=cursor, namespace=None, category=None, limit=10
-        )
+        response = await handler.federation_feed(None, None, since=cursor, namespace=None, category=None, limit=10)
 
         assert response.memories == []
         assert response.next_cursor == cursor
@@ -498,9 +516,11 @@ class TestFederationFeedCursor:
         from mnemos.api.routes import federation as handler
 
         updated = datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc)
-        pool = _FeedPool([
-            _feed_row("before-boundary", updated - timedelta(seconds=1)),
-        ])
+        pool = _FeedPool(
+            [
+                _feed_row("before-boundary", updated - timedelta(seconds=1)),
+            ]
+        )
         _install_feed_backend(monkeypatch, pool)
 
         with pytest.raises(HTTPException) as exc:
@@ -599,12 +619,14 @@ class TestPeerNameFormat:
 
     def test_valid_peer_names(self):
         import re
+
         pat = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$")
         for name in ("alpha", "peer-alpha", "peer-1", "a1"):
             assert pat.match(name), f"expected {name} valid"
 
     def test_invalid_peer_names(self):
         import re
+
         pat = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$")
         for name in ("A", "peer_alpha", "peer.alpha", "-alpha", "alpha-", "x"):
             assert not pat.match(name), f"expected {name} invalid"
@@ -622,6 +644,7 @@ class TestFederationIntegration:
     @pytest.mark.asyncio
     async def test_peer_crud(self):
         import asyncpg
+
         conn = await asyncpg.connect(os.environ["MNEMOS_TEST_DB"])
         try:
             row = await conn.fetchrow(
@@ -630,20 +653,21 @@ class TestFederationIntegration:
                 VALUES ($1, $2, $3)
                 RETURNING id, name, enabled, total_pulled
                 """,
-                "peer-test", "https://test.example.invalid", "token",
+                "peer-test",
+                "https://test.example.invalid",
+                "token",
             )
             assert row["name"] == "peer-test"
             assert row["enabled"] is True
             assert row["total_pulled"] == 0
-            await conn.execute(
-                "DELETE FROM federation_peers WHERE id = $1", row["id"]
-            )
+            await conn.execute("DELETE FROM federation_peers WHERE id = $1", row["id"])
         finally:
             await conn.close()
 
     @pytest.mark.asyncio
     async def test_memories_federation_source_column_exists(self):
         import asyncpg
+
         conn = await asyncpg.connect(os.environ["MNEMOS_TEST_DB"])
         try:
             row = await conn.fetchrow(
@@ -672,8 +696,7 @@ class TestStoreMemoriesConcurrency:
     """
 
     @pytest.mark.asyncio
-    async def test_unique_violation_on_insert_falls_through_cleanly(self):
-        import asyncpg
+    async def test_primary_key_conflict_on_insert_falls_through_cleanly(self):
 
         from mnemos.domain.federation import _store_memories
         from mnemos.persistence.postgres import PostgresFederationRepository, PostgresTransaction
@@ -703,25 +726,26 @@ class TestStoreMemoriesConcurrency:
             async def execute(self, sql, *args):
                 executes.append((sql, args))
                 if sql.strip().startswith("INSERT"):
-                    raise asyncpg.UniqueViolationError(
-                        "duplicate key value violates unique constraint memories_pkey"
-                    )
+                    assert "ON CONFLICT (id) DO NOTHING" in sql
+                    return "INSERT 0 0"
                 return "UPDATE 1"
 
         # Real feed rows ship ISO strings; _feed_row uses datetime
         # objects for the feed-pagination tests. Build a payload that
         # matches the on-the-wire format _store_memories actually parses.
-        feed = [{
-            "id": "mem_race",
-            "content": "content mem_race",
-            "category": "facts",
-            "verbatim_content": "content mem_race",
-            "namespace": "default",
-            "metadata": {"source": "test"},
-            "quality_rating": 75,
-            "updated": "2026-05-01T01:00:00Z",
-            "created": "2026-05-01T01:00:00Z",
-        }]
+        feed = [
+            {
+                "id": "mem_race",
+                "content": "content mem_race",
+                "category": "facts",
+                "verbatim_content": "content mem_race",
+                "namespace": "default",
+                "metadata": {"source": "test"},
+                "quality_rating": 75,
+                "updated": "2026-05-01T01:00:00Z",
+                "created": "2026-05-01T01:00:00Z",
+            }
+        ]
 
         tx = PostgresTransaction(_FakeConn(), _NoopRawTx())
         new_n, upd_n = await _store_memories(PostgresFederationRepository(), tx, "pythia", feed)
@@ -760,20 +784,16 @@ class TestStoreMemoriesConcurrency:
 
         class _FakeConn:
             async def fetch(self, sql, *args):
-                return [{
-                    "id": "fed:pythia:mem_race",
-                    "federation_remote_updated": datetime(
-                        2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc
-                    ),
-                }]
+                return [
+                    {
+                        "id": "fed:pythia:mem_race",
+                        "federation_remote_updated": datetime(2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc),
+                    }
+                ]
 
             async def fetchrow(self, sql, *args):
                 # Existing row: T0 baseline (older than both A and B).
-                return {
-                    "federation_remote_updated": datetime(
-                        2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc
-                    )
-                }
+                return {"federation_remote_updated": datetime(2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc)}
 
             async def execute(self, sql, *args):
                 execute_calls.append((sql, args))
@@ -782,17 +802,19 @@ class TestStoreMemoriesConcurrency:
                 return "UPDATE 0"
 
         # Consumer B with the OLDER remote_updated (T1).
-        feed = [{
-            "id": "mem_race",
-            "content": "stale content",
-            "category": "facts",
-            "verbatim_content": "stale content",
-            "namespace": "default",
-            "metadata": {"source": "B"},
-            "quality_rating": 75,
-            "updated": "2026-05-01T01:00:00Z",  # T1
-            "created": "2026-05-01T01:00:00Z",
-        }]
+        feed = [
+            {
+                "id": "mem_race",
+                "content": "stale content",
+                "category": "facts",
+                "verbatim_content": "stale content",
+                "namespace": "default",
+                "metadata": {"source": "B"},
+                "quality_rating": 75,
+                "updated": "2026-05-01T01:00:00Z",  # T1
+                "created": "2026-05-01T01:00:00Z",
+            }
+        ]
 
         tx = PostgresTransaction(_FakeConn(), _NoopRawTx())
         new_n, upd_n = await _store_memories(PostgresFederationRepository(), tx, "pythia", feed)
@@ -847,8 +869,11 @@ class TestFederationFeedPreferCompressed:
         _install_feed_backend(monkeypatch, pool)
 
         resp = await handler.federation_feed(
-            None, None,
-            since=None, namespace=None, category=None,
+            None,
+            None,
+            since=None,
+            namespace=None,
+            category=None,
             limit=10,
             prefer_compressed=True,
         )
@@ -866,13 +891,10 @@ class TestFederationFeedPreferCompressed:
         # the variant being emitted twice (content + compressed_
         # content); the COALESCE handles NULL/empty verbatim rows.
         assert "2 * octet_length(to_json(v.compressed_content)::text)" in seen, (
-            "prefer_compressed gate must double the variant byte "
-            "count to reflect dual emission; got SQL: "
-            f"{seen[:400]}"
+            f"prefer_compressed gate must double the variant byte count to reflect dual emission; got SQL: {seen[:400]}"
         )
         assert "COALESCE(octet_length(to_json(m.verbatim_content)::text), 0)" in seen, (
-            "gate must COALESCE-with-0 verbatim length so NULL/empty "
-            f"rows don't slip through; got SQL: {seen[:400]}"
+            f"gate must COALESCE-with-0 verbatim length so NULL/empty rows don't slip through; got SQL: {seen[:400]}"
         )
 
         # Wire shape verification: the MemoryItem should carry the
@@ -902,8 +924,11 @@ class TestFederationFeedPreferCompressed:
         _install_feed_backend(monkeypatch, pool)
 
         resp = await handler.federation_feed(
-            None, None,
-            since=None, namespace=None, category=None,
+            None,
+            None,
+            since=None,
+            namespace=None,
+            category=None,
             limit=10,
             prefer_compressed=True,
         )
@@ -939,8 +964,11 @@ class TestFederationFeedPreferCompressed:
         _install_feed_backend(monkeypatch, pool)
 
         await handler.federation_feed(
-            None, None,
-            since=None, namespace=None, category=None,
+            None,
+            None,
+            since=None,
+            namespace=None,
+            category=None,
             limit=10,
             prefer_compressed=True,
         )
@@ -989,8 +1017,11 @@ class TestFederationFeedPreferCompressed:
         # module hit the same convention by passing all params
         # explicitly.
         resp = await handler.federation_feed(
-            None, None,
-            since=None, namespace=None, category=None,
+            None,
+            None,
+            since=None,
+            namespace=None,
+            category=None,
             limit=10,
             prefer_compressed=False,
         )

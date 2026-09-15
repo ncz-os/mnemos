@@ -69,11 +69,14 @@ def test_postgres_schema_lock_key_is_stable():
     """
     import hashlib
 
-    expected = int.from_bytes(
-        hashlib.sha256(b"mnemos_schema_migration").digest()[:8],
-        "big",
-        signed=False,
-    ) & 0x7FFFFFFFFFFFFFFF
+    expected = (
+        int.from_bytes(
+            hashlib.sha256(b"mnemos_schema_migration").digest()[:8],
+            "big",
+            signed=False,
+        )
+        & 0x7FFFFFFFFFFFFFFF
+    )
     assert _POSTGRES_SCHEMA_LOCK_KEY == expected
     # And it's a signed-int64 (positive after the &-mask; never negative).
     assert 0 < _POSTGRES_SCHEMA_LOCK_KEY < 2**63
@@ -91,8 +94,7 @@ async def _drop_db(admin_dsn: str, dbname: str) -> None:
         # Postgres refuses ``DROP DATABASE`` against an open connection;
         # force-disconnect any lingering sessions first.
         await conn.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname = $1 AND pid <> pg_backend_pid()",
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
             dbname,
         )
         await conn.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
@@ -232,15 +234,11 @@ async def test_concurrent_ensure_postgres_schema_succeeds_against_fresh_db(
     # index whose existence proves the lock didn't deadlock against
     # the waiter's vxid.
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
-            "ORDER BY tablename"
-        )
+        rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename")
         table_names = {row["tablename"] for row in rows}
 
         concurrently_idx = await conn.fetchval(
-            "SELECT indexname FROM pg_indexes "
-            "WHERE indexname = 'memories_import_chunk_key_uniq'"
+            "SELECT indexname FROM pg_indexes WHERE indexname = 'memories_import_chunk_key_uniq'"
         )
 
     expected_tables = {
@@ -374,9 +372,7 @@ async def test_ensure_postgres_schema_holds_advisory_session_lock_during_run(
         # caller finds the ``memories`` table it expects).
         await real_apply(conn, paths, embedding_dim)
 
-    monkeypatch.setattr(
-        "mnemos.persistence.schema._apply_postgres_migrations", _slow_apply
-    )
+    monkeypatch.setattr("mnemos.persistence.schema._apply_postgres_migrations", _slow_apply)
 
     await ensure_postgres_schema(pool, SimpleNamespace())
 
@@ -399,9 +395,7 @@ async def test_ensure_postgres_schema_holds_advisory_session_lock_during_run(
             "ensure_postgres_schema returned — a failed migration "
             "would deadlock every subsequent worker startup forever."
         )
-        await probe_conn.execute(
-            "SELECT pg_advisory_unlock($1)", _POSTGRES_SCHEMA_LOCK_KEY
-        )
+        await probe_conn.execute("SELECT pg_advisory_unlock($1)", _POSTGRES_SCHEMA_LOCK_KEY)
 
 
 @pytest.mark.asyncio
@@ -415,9 +409,7 @@ async def test_pg_advisory_session_lock_polling_eventually_acquires(
     pool, _dbname = fresh_pg_pool
 
     async with pool.acquire() as holder_conn:
-        await holder_conn.execute(
-            "SELECT pg_advisory_lock($1)", _POSTGRES_SCHEMA_LOCK_KEY
-        )
+        await holder_conn.execute("SELECT pg_advisory_lock($1)", _POSTGRES_SCHEMA_LOCK_KEY)
 
         async with pool.acquire() as waiter_conn:
             # Hold the lock for 1 second from the holder side, then
@@ -425,14 +417,10 @@ async def test_pg_advisory_session_lock_polling_eventually_acquires(
             # the parameter for test speed).
             async def release_after():
                 await asyncio.sleep(1.0)
-                await holder_conn.execute(
-                    "SELECT pg_advisory_unlock($1)", _POSTGRES_SCHEMA_LOCK_KEY
-                )
+                await holder_conn.execute("SELECT pg_advisory_unlock($1)", _POSTGRES_SCHEMA_LOCK_KEY)
 
             release_task = asyncio.create_task(release_after())
-            await _pg_advisory_session_lock_polling(
-                waiter_conn, _POSTGRES_SCHEMA_LOCK_KEY, poll_interval=0.1
-            )
+            await _pg_advisory_session_lock_polling(waiter_conn, _POSTGRES_SCHEMA_LOCK_KEY, poll_interval=0.1)
             await release_task
 
             try:
@@ -452,8 +440,6 @@ async def test_pg_advisory_session_lock_polling_eventually_acquires(
                 # Release the lock before waiter_conn returns to the pool,
                 # otherwise the next acquirer of that pooled connection
                 # would inherit the schema lock.
-                await waiter_conn.execute(
-                    "SELECT pg_advisory_unlock($1)", _POSTGRES_SCHEMA_LOCK_KEY
-                )
+                await waiter_conn.execute("SELECT pg_advisory_unlock($1)", _POSTGRES_SCHEMA_LOCK_KEY)
 
         # Waiter connection's exit releases the conn (lock-free now).

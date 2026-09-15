@@ -171,7 +171,7 @@ test:integration:
     RATE_LIMIT_STORAGE_URI: "redis://redis:6379/0"
   before_script:
     - python3 -m venv .venv
-    - .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev]"
+    - .venv/bin/pip install --cache-dir=.cache/pip -q -e ".[dev,sqlite,nats,persephone]"
     - export PATH="$CI_PROJECT_DIR/.venv/bin:$PATH"
     # Wait for Postgres to accept connections (pgvector image does not
     # signal readiness; poll until psql connects).
@@ -215,6 +215,9 @@ test:integration:
     # ``ON_ERROR_STOP=1``.
     - python3 scripts/ci_apply_postgres_migrations.py --dsn "$DATABASE_URL"
   script:
+    # These regressions create disposable databases and run actual SQL. They
+    # deliberately fail if the configured PostgreSQL service cannot be reached.
+    - pytest tests/test_postgres_concurrent_migration_race.py tests/test_federation_journal.py tests/test_required_audit_mutations.py tests/test_morpheus_job_queue.py tests/test_morpheus_consolidation_isolation.py --tb=short -q --junitxml=junit-regressions.xml
     - pytest tests/ -m integration --tb=short -q --junitxml=junit-integration.xml || EXIT=$?
     - |
       # If no integration-marked tests exist yet, exit code 5 ("no tests collected")

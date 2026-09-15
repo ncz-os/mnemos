@@ -1339,9 +1339,7 @@ class OracleMemoryRepository(MemoryRepository):
                     params.update(vis_params)
             await _call(
                 cursor.execute,
-                "SELECT m.id FROM memories m WHERE "
-                + " AND ".join(where)
-                + " FOR UPDATE",
+                "SELECT m.id FROM memories m WHERE " + " AND ".join(where) + " FOR UPDATE",
                 params,
             )
             if await _call(cursor.fetchone) is None:
@@ -1374,8 +1372,7 @@ class OracleMemoryRepository(MemoryRepository):
         try:
             await _call(
                 cursor.execute,
-                "SELECT memory_id, tag FROM memory_tags "
-                f"WHERE memory_id IN ({placeholders}) ORDER BY memory_id, tag",
+                f"SELECT memory_id, tag FROM memory_tags WHERE memory_id IN ({placeholders}) ORDER BY memory_id, tag",
                 binds,
             )
             rows = await _fetch_all_dicts(cursor)
@@ -3059,7 +3056,7 @@ class OracleMorpheusRepository(MorpheusRepository):
                  WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
                    AND (m.provenance <> 'morpheus_local' OR m.provenance IS NULL)
                    AND m.morpheus_run_id IS NULL
-                   AND {_eligibility.eligible_for_morpheus('m')}
+                   AND {_eligibility.eligible_for_morpheus("m")}
                    AND (r.namespace IS NULL OR m.namespace = r.namespace)
                 """,
                 {"run_id": run_id},
@@ -3166,6 +3163,9 @@ class OracleMorpheusRepository(MorpheusRepository):
         except (json.JSONDecodeError, TypeError):
             config = {}
         clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        from mnemos.persistence.morpheus_isolation import partition_consolidation_clusters
+
+        clusters = await partition_consolidation_clusters(tx, clusters)
         min_size = int(run_row["cluster_min_size"])
         namespace = run_row["namespace"]
         eligible = _eligibility.eligible_for_morpheus("")
@@ -7310,7 +7310,12 @@ class OracleFederationRepository(FederationRepository):
         finally:
             await _call(cursor.close)
 
-    async def feed_query(
+    async def feed_query(self, tx, **kwargs):
+        from mnemos.persistence.federation_journal import feed_query
+
+        return await feed_query(self, tx, **kwargs)
+
+    async def _legacy_feed_query(
         self,
         tx: Transaction,
         *,
@@ -7371,9 +7376,7 @@ class OracleFederationRepository(FederationRepository):
                 upd_var.setvalue(0, since_updated)
                 params["upd"] = upd_var
                 params["since_id"] = since_id
-                withdrawal_where.append(
-                    "(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))"
-                )
+                withdrawal_where.append("(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))")
             if namespaces:
                 ns_ph, ns_params = _in_placeholders(namespaces, "ns")
                 where.append(f"m.namespace IN ({ns_ph})")
@@ -7432,7 +7435,12 @@ class OracleFederationRepository(FederationRepository):
         finally:
             await _call(cursor.close)
 
-    async def get_feed_memory(
+    async def get_feed_memory(self, tx, memory_id, *, namespaces, categories):
+        from mnemos.persistence.federation_journal import get_feed_memory
+
+        return await get_feed_memory(self, tx, memory_id, namespaces=namespaces, categories=categories)
+
+    async def _legacy_get_feed_memory(
         self,
         tx: Transaction,
         memory_id: str,

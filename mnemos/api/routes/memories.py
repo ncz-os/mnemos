@@ -32,7 +32,6 @@ from mnemos.core.lifecycle import (
 )
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
-from mnemos.audit import write_audit_entry
 from mnemos.domain.search import SearchProfile, apply_decay, get_reranker, load_decay_table, resolve_profile
 from mnemos.domain.artemis_dedup import (
     duplicate_content_error_body,
@@ -113,6 +112,7 @@ async def _write_memory_mutation_audit_entry(
     subcategory: str | None,
     metadata: dict | None,
     writer_id: str,
+    embedding=None,
 ) -> None:
     """Append a route-side audit-chain entry for one memory mutation.
 
@@ -122,31 +122,21 @@ async def _write_memory_mutation_audit_entry(
     behavior: when audit is disabled, unsupported by the backend, or missing
     a session secret, the data write still commits.
     """
-    from mnemos.core.config import get_settings as _get_settings
-    from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
+    from mnemos.audit.route_helper import write_configured_audit_entry
 
-    if not _ace():
-        return
-    _settings = _get_settings()
-    _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
-    if not _session_secret:
-        logger.warning(
-            "[%s] MNEMOS_AUDIT_CHAIN=on but session_secret is empty; skipping audit write",
-            op,
-        )
-        return
-    await write_audit_entry(
+    await write_configured_audit_entry(
         backend,
         tx,
         op=op,
         memory_id_str=memory_id,
-        content=content,
-        category=category,
-        subcategory=subcategory,
-        metadata=metadata,
-        embedding=None,
+        snapshot={
+            "content": content,
+            "category": category,
+            "subcategory": subcategory,
+            "metadata": metadata,
+            "embedding": embedding,
+        },
         writer_id=writer_id,
-        session_secret=_session_secret,
     )
 
 
@@ -332,9 +322,7 @@ async def _assert_no_active_deletion(
     from mnemos.persistence.worker_lifecycle import active_deletion_for_scope
 
     try:
-        active = await active_deletion_for_scope(
-            backend, target_user_id=owner_id, target_namespace=namespace
-        )
+        active = await active_deletion_for_scope(backend, target_user_id=owner_id, target_namespace=namespace)
     except Exception:
         # If the fence itself errors (e.g. backend doesn't expose
         # transactional), fall through. The hard-delete resweep+verify
@@ -722,6 +710,10 @@ async def _insert_memory_with_created_webhook(
                 writer_id=audit_writer_id,
             )
         except Exception:
+            from mnemos.core.config import audit_chain_required_flag
+
+            if audit_chain_required_flag():
+                raise
             logger.exception("[ingest/create] audit-chain write failed for memory %s", mem_id)
 
     event_payload = {
@@ -1736,9 +1728,7 @@ async def create_memory(
     # even though the request is recorded as complete. Root bypasses the
     # fence so operators can still inject tombstone / restoration rows.
     if user.role != "root":
-        await _assert_no_active_deletion(
-            backend, owner_id=owner_id, namespace=namespace
-        )
+        await _assert_no_active_deletion(backend, owner_id=owner_id, namespace=namespace)
 
     # Secret-vault persisted-text classification (release-blocking 2026-06-14).
     # Classify every text field that will be stored. Any VAULT-class finding in
@@ -1867,25 +1857,29 @@ async def create_memory(
                 subcategory=request.subcategory,
                 metadata=persisted_metadata,
                 writer_id=user.user_id,
+                embedding=vec,
             )
             # Same-tx outbox enqueue — preserves the v4.0 contract
             # that webhook_deliveries rows commit atomically with
             # the data write.
             if getattr(backend, "supports_webhooks", False):
-                delivery_ids = [intent.delivery_id for intent in await backend.webhooks.dispatch_event(
-                    tx,
-                    "memory.created",
-                    {
-                        "memory_id": mem_id,
-                        "category": request.category,
-                        "subcategory": request.subcategory,
-                        "content": _redacted_for_webhook(request.content, _classified.metadata),
-                        "owner_id": owner_id,
-                        "namespace": namespace,
-                    },
-                    owner_id=owner_id,
-                    namespace=namespace,
-                )]
+                delivery_ids = [
+                    intent.delivery_id
+                    for intent in await backend.webhooks.dispatch_event(
+                        tx,
+                        "memory.created",
+                        {
+                            "memory_id": mem_id,
+                            "category": request.category,
+                            "subcategory": request.subcategory,
+                            "content": _redacted_for_webhook(request.content, _classified.metadata),
+                            "owner_id": owner_id,
+                            "namespace": namespace,
+                        },
+                        owner_id=owner_id,
+                        namespace=namespace,
+                    )
+                ]
             else:
                 delivery_ids = []
             # Re-fetch the row inside the same tx so the response
@@ -2088,22 +2082,26 @@ async def bulk_create_memories(
                             subcategory=mem.subcategory,
                             metadata=item_metadata,
                             writer_id=user.user_id,
+                            embedding=vec,
                         )
                         if getattr(backend, "supports_webhooks", False):
-                            item_delivery_ids = [intent.delivery_id for intent in await backend.webhooks.dispatch_event(
-                                tx,
-                                "memory.created",
-                                {
-                                    "memory_id": mid,
-                                    "category": mem.category,
-                                    "subcategory": mem.subcategory,
-                                    "content": _redacted_for_webhook(mem.content, item_metadata),
-                                    "owner_id": owner_id,
-                                    "namespace": namespace,
-                                },
-                                owner_id=owner_id,
-                                namespace=namespace,
-                            )]
+                            item_delivery_ids = [
+                                intent.delivery_id
+                                for intent in await backend.webhooks.dispatch_event(
+                                    tx,
+                                    "memory.created",
+                                    {
+                                        "memory_id": mid,
+                                        "category": mem.category,
+                                        "subcategory": mem.subcategory,
+                                        "content": _redacted_for_webhook(mem.content, item_metadata),
+                                        "owner_id": owner_id,
+                                        "namespace": namespace,
+                                    },
+                                    owner_id=owner_id,
+                                    namespace=namespace,
+                                )
+                            ]
                         else:
                             item_delivery_ids = []
                 except Exception as e:
@@ -2246,22 +2244,26 @@ async def update_memory(
                     subcategory=row["subcategory"],
                     metadata=_metadata_for_audit(row["metadata"]),
                     writer_id=user.user_id,
+                    embedding=row.get("embedding"),
                 )
             if updates and getattr(backend, "supports_webhooks", False):
-                delivery_ids = [intent.delivery_id for intent in await backend.webhooks.dispatch_event(
-                    tx,
-                    "memory.updated",
-                    {
-                        "memory_id": memory_id,
-                        "category": row["category"],
-                        "subcategory": row["subcategory"],
-                        "content": _redacted_for_webhook(row["content"], row.get("metadata")),
-                        "owner_id": row["owner_id"],
-                        "namespace": row["namespace"],
-                    },
-                    owner_id=row["owner_id"],
-                    namespace=row["namespace"],
-                )]
+                delivery_ids = [
+                    intent.delivery_id
+                    for intent in await backend.webhooks.dispatch_event(
+                        tx,
+                        "memory.updated",
+                        {
+                            "memory_id": memory_id,
+                            "category": row["category"],
+                            "subcategory": row["subcategory"],
+                            "content": _redacted_for_webhook(row["content"], row.get("metadata")),
+                            "owner_id": row["owner_id"],
+                            "namespace": row["namespace"],
+                        },
+                        owner_id=row["owner_id"],
+                        namespace=row["namespace"],
+                    )
+                ]
             else:
                 delivery_ids = []
     except HTTPException:
@@ -2314,6 +2316,10 @@ async def delete_memory(
     try:
         async with backend.transactional() as tx:
             await _maybe_set_pg_rls(tx, user)
+            from mnemos.workers.audit_sealer import audit_chain_enabled
+            from mnemos.audit.route_helper import fetch_audit_snapshot
+
+            audit_snapshot = await fetch_audit_snapshot(tx, memory_id) if audit_chain_enabled() else None
             try:
                 row = await backend.memories.delete_memory(
                     tx,
@@ -2340,24 +2346,28 @@ async def delete_memory(
                 content=row["content"],
                 category=row["category"],
                 subcategory=row["subcategory"],
-                metadata=None,
+                metadata=_metadata_for_audit(audit_snapshot["metadata"]) if audit_snapshot else None,
                 writer_id=user.user_id,
+                embedding=audit_snapshot.get("embedding") if audit_snapshot else None,
             )
             if getattr(backend, "supports_webhooks", False):
-                delivery_ids = [intent.delivery_id for intent in await backend.webhooks.dispatch_event(
-                    tx,
-                    "memory.deleted",
-                    {
-                        "memory_id": row["id"],
-                        "category": row["category"],
-                        "subcategory": row["subcategory"],
-                        "content": _redacted_for_webhook(row["content"], row.get("metadata")),
-                        "owner_id": row["owner_id"],
-                        "namespace": row["namespace"],
-                    },
-                    owner_id=row["owner_id"],
-                    namespace=row["namespace"],
-                )]
+                delivery_ids = [
+                    intent.delivery_id
+                    for intent in await backend.webhooks.dispatch_event(
+                        tx,
+                        "memory.deleted",
+                        {
+                            "memory_id": row["id"],
+                            "category": row["category"],
+                            "subcategory": row["subcategory"],
+                            "content": _redacted_for_webhook(row["content"], row.get("metadata")),
+                            "owner_id": row["owner_id"],
+                            "namespace": row["namespace"],
+                        },
+                        owner_id=row["owner_id"],
+                        namespace=row["namespace"],
+                    )
+                ]
             else:
                 delivery_ids = []
     except HTTPException:

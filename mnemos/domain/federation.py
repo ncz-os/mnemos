@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ def _federation_allow_private() -> bool:
     from mnemos.core.config import get_settings
 
     return get_settings().federation.allow_private
+
 
 # Keep this legacy module import-compatible while allowing additive
 # submodules under mnemos/domain/federation/.
@@ -198,7 +200,9 @@ async def _check_peer_schema(
     # peer URL is misconfigured or compromised and retrying will not help.
     try:
         client, _ = await make_safe_client(
-            url, timeout=10.0, allow_private=_federation_allow_private(),
+            url,
+            timeout=10.0,
+            allow_private=_federation_allow_private(),
         )
     except Exception as e:
         logger.warning("federation: peer %s URL rejected (SSRF/DNS): %s", name, e)
@@ -532,6 +536,20 @@ async def sync_peer(
     total_updated = 0
     cursor_request: Optional[datetime | FederationFeedCursor] = cursor_before
     cursor_persisted = cursor_before
+    from mnemos.persistence import federation_journal as journal
+
+    filter_signature = hashlib.sha256(
+        json.dumps(
+            [peer["base_url"], peer["namespace_filter"], peer["category_filter"]],
+            sort_keys=True,
+            default=str,
+        ).encode()
+    ).hexdigest()
+    async with backend.transactional() as tx:
+        journal_enabled = journal.supports_journal(tx)
+        saved = await journal.load_peer_cursor(tx, peer_id, filter_signature) if journal_enabled else None
+    if saved:
+        cursor_request = _decode_feed_cursor(saved)
     err: Optional[str] = None
 
     # v6.1 F-1: per-peer copy_embeddings flag (added by migration 0028).
@@ -564,10 +582,19 @@ async def sync_peer(
                     copy_embeddings=peer_copy_embeddings,
                     client=feed_client,
                 )
-                if not batch:
+                if not batch and next_cursor is None:
                     break
+                if has_more and (next_cursor is None or next_cursor == cursor_request):
+                    raise RuntimeError("federation peer returned a non-advancing cursor")
                 async with backend.transactional() as tx:
                     new_n, upd_n = await _store_memories(repo, tx, peer["name"], batch, backend=backend)
+                    if journal_enabled and next_cursor is not None:
+                        await journal.save_peer_cursor(
+                            tx,
+                            peer_id,
+                            _encode_feed_cursor(next_cursor.updated, next_cursor.memory_id),
+                            filter_signature,
+                        )
                 total_pulled += len(batch)
                 total_new += new_n
                 total_updated += upd_n
@@ -646,7 +673,9 @@ async def _pull_batch(
     if owns_client:
         try:
             client, _ = await make_safe_client(
-                url, timeout=FEDERATION_HTTP_TIMEOUT, allow_private=_federation_allow_private(),
+                url,
+                timeout=FEDERATION_HTTP_TIMEOUT,
+                allow_private=_federation_allow_private(),
             )
         except Exception as e:
             raise RuntimeError(f"federation URL rejected (SSRF/DNS): {type(e).__name__}: {e}") from e
@@ -688,7 +717,9 @@ async def pull_memory_by_id(
     # F1 (adversarial review 2026-06-28): re-validate + DNS-pin (see _check_peer_schema).
     try:
         client, _ = await make_safe_client(
-            url, timeout=FEDERATION_HTTP_TIMEOUT, allow_private=_federation_allow_private(),
+            url,
+            timeout=FEDERATION_HTTP_TIMEOUT,
+            allow_private=_federation_allow_private(),
         )
     except Exception as e:
         raise RuntimeError(f"federation URL rejected (SSRF/DNS): {type(e).__name__}: {e}") from e
@@ -722,6 +753,9 @@ async def _store_memories(
     repository ``upsert_memory_embedding`` so the join-table /
     direct-column shapes per backend are handled.
     """
+    from mnemos.persistence import federation_journal as journal
+
+    journal_enabled = journal.supports_journal(tx)
     new_n = 0
     upd_n = 0
     local_ids = [
@@ -760,6 +794,16 @@ async def _store_memories(
         remote_id = mem.get("id")
         if not remote_id or not isinstance(remote_id, str):
             continue
+        if journal_enabled and mem.get("type") != "withdrawal":
+            if not await journal.accept_event(
+                tx,
+                peer_name,
+                remote_id,
+                sequence=mem.get("federation_sequence"),
+                remote_updated=mem.get("updated") or mem.get("consolidated_at") or mem.get("created"),
+                withdrawn=False,
+            ):
+                continue
         if mem.get("type") == "consolidation":
             upd_n += await _apply_consolidation_tombstone(repo, tx, peer_name, mem)
             continue
@@ -787,6 +831,12 @@ async def _store_memories(
 
         # Check existing
         existing = existing_markers.get(local_id)
+        if journal_enabled:
+            # Refresh after the durable fence, including other events in this batch.
+            existing = await repo.fetch_federated_memory_marker(tx, local_id)
+            if existing is not None and mem.get("federation_sequence") is not None:
+                await journal.prepare_versioned_update(tx, peer_name, remote_id)
+                existing = {"federation_remote_updated": None}
         mutation_applied = False
         source_audit_provenance: dict[str, Any] = {}
         primary_eid = mem.get("audit_latest_entry_id")
@@ -1003,6 +1053,16 @@ async def _store_memories(
         # predecessor for this local `fed:<peer>:<remote>` replica chain.
         # Enforced audit writes make the first pull seed a local replica chain
         # and make later pulls fail closed if the local predecessor is corrupt.
+        from mnemos.core.config import audit_chain_required_flag
+
+        if mutation_applied and audit_chain_required_flag():
+            from mnemos.audit.route_helper import fetch_audit_snapshot, write_transaction_audit
+
+            snapshot = await fetch_audit_snapshot(tx, local_id)
+            await write_transaction_audit(
+                tx, op="replicate", memory_id_str=local_id, snapshot=snapshot, writer_id=f"fed:{peer_name}"
+            )
+            continue
         if mutation_applied and backend is not None and backend.audit_chain is not None:
             from mnemos.workers.audit_sealer import audit_chain_enabled
 
@@ -1070,6 +1130,33 @@ async def _apply_consolidation_tombstone(
         canonical_remote_id=canonical_remote_id,
         peer_name=peer_name,
     )
+    if not updated and event.get("federation_sequence") is not None:
+        canonical = await repo.fetch_federated_memory_marker(tx, local_canonical_id)
+        if canonical is None:
+            # A bootstrap page may contain the loser before the canonical.
+            # Retire the loser now; the canonical arrives through its own event.
+            # The source sequence was already fenced by _store_memories.
+            return await _apply_withdrawal(
+                repo,
+                tx,
+                peer_name,
+                {
+                    "id": remote_id,
+                    "withdrawn_at": raw_consolidated_at,
+                    "federation_sequence": event["federation_sequence"],
+                },
+                accepted=True,
+            )
+    if updated:
+        from mnemos.workers.audit_sealer import audit_chain_enabled
+
+        if audit_chain_enabled():
+            from mnemos.audit.route_helper import fetch_audit_snapshot, write_transaction_audit
+
+            snapshot = await fetch_audit_snapshot(tx, local_id)
+            await write_transaction_audit(
+                tx, op="update", memory_id_str=local_id, snapshot=snapshot, writer_id=f"fed:{peer_name}"
+            )
     return 1 if updated else 0
 
 
@@ -1078,6 +1165,8 @@ async def _apply_withdrawal(
     tx: Transaction,
     peer_name: str,
     event: Dict[str, Any],
+    *,
+    accepted: bool = False,
 ) -> int:
     """F07: drop a federated row on receipt of an explicit HTTP-feed withdrawal.
 
@@ -1093,7 +1182,36 @@ async def _apply_withdrawal(
     remote_id = event.get("id")
     if not isinstance(remote_id, str) or not remote_id:
         return 0
+    from mnemos.persistence import federation_journal as journal
+
+    if journal.supports_journal(tx) and not accepted:
+        # Migration from legacy replicas: compare their existing timestamp before
+        # installing the first unsequenced withdrawal tombstone.
+        if event.get("federation_sequence") is None:
+            existing = await repo.fetch_federated_memory_marker(tx, f"fed:{peer_name}:{remote_id}")
+            prior = _coerce_datetime(existing["federation_remote_updated"]) if existing else None
+            incoming = _coerce_datetime(event.get("withdrawn_at"))
+            if prior is not None and (incoming is None or incoming < prior):
+                return 0
+        if not await journal.accept_event(
+            tx,
+            peer_name,
+            remote_id,
+            sequence=event.get("federation_sequence"),
+            remote_updated=event.get("withdrawn_at"),
+            withdrawn=True,
+        ):
+            return 0
+    from mnemos.workers.audit_sealer import audit_chain_enabled
+    from mnemos.audit.route_helper import fetch_audit_snapshot, write_transaction_audit
+
+    local_id = f"fed:{peer_name}:{remote_id}"
+    snapshot = await fetch_audit_snapshot(tx, local_id) if audit_chain_enabled() else None
     deleted = await repo.delete_federated_memory(tx, peer_name, remote_id)
+    if deleted:
+        await write_transaction_audit(
+            tx, op="delete", memory_id_str=local_id, snapshot=snapshot, writer_id=f"fed:{peer_name}"
+        )
     return int(deleted or 0)
 
 

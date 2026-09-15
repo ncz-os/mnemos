@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+
 @pytest.fixture(autouse=True)
 def _offsite_feed_scope(monkeypatch):
     """These tests pin the SQL shape of the OFFSITE feed scope.
@@ -22,7 +23,6 @@ def _offsite_feed_scope(monkeypatch):
     trusted-LAN full-corpus scope, so declare the posture explicitly.
     """
     monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "0")
-
 
 
 class _DeterministicUUID:
@@ -60,7 +60,9 @@ class _FixedDatetime:
 class _FakeSyncCursor:
     rowcount = 0
 
-    def __init__(self, subscriptions: list[tuple[str, str | None, str | None, str]], calls: list[dict[str, Any]]) -> None:
+    def __init__(
+        self, subscriptions: list[tuple[str, str | None, str | None, str]], calls: list[dict[str, Any]]
+    ) -> None:
         self._subscriptions = subscriptions
         self._calls = calls
         self.description: tuple[tuple[str], ...] | None = None
@@ -80,13 +82,11 @@ class _FakeSyncCursor:
             self.description = (("id",), ("url",), ("owner_id",), ("namespace",))
             if "COALESCE" in sql.upper():
                 self._rows = [
-                    (sid, url, owner or "default", ns or "default")
-                    for sid, owner, ns, url in self._subscriptions
+                    (sid, url, owner or "default", ns or "default") for sid, owner, ns, url in self._subscriptions
                 ]
             else:
                 self._rows = [
-                    (sid, url, owner or "default", ns or "default")
-                    for sid, owner, ns, url in self._subscriptions
+                    (sid, url, owner or "default", ns or "default") for sid, owner, ns, url in self._subscriptions
                 ]
         else:
             self.description = None
@@ -103,7 +103,9 @@ class _FakeSyncCursor:
 
 
 class _FakeConn:
-    def __init__(self, subscriptions: list[tuple[str, str | None, str | None, str]], calls: list[dict[str, Any]]) -> None:
+    def __init__(
+        self, subscriptions: list[tuple[str, str | None, str | None, str]], calls: list[dict[str, Any]]
+    ) -> None:
         self._subscriptions = subscriptions
         self._calls = calls
 
@@ -3199,7 +3201,7 @@ async def test_db2_federation_feed_query_native_tokens() -> None:
 
     tx = SimpleNamespace(conn=_FakeConn())
     repo = Db2FederationRepository()
-    await repo.feed_query(
+    await repo._legacy_feed_query(
         tx,
         since_updated="2026-01-01",
         since_id="mem-0",
@@ -3261,7 +3263,7 @@ async def test_db2_federation_feed_query_no_filters_native_tokens() -> None:
 
     tx = SimpleNamespace(conn=_FakeConn())
     repo = Db2FederationRepository()
-    await repo.feed_query(
+    await repo._legacy_feed_query(
         tx,
         since_updated=None,
         since_id=None,
@@ -3317,7 +3319,7 @@ async def test_db2_federation_get_feed_memory_native_tokens() -> None:
 
     tx = SimpleNamespace(conn=_FakeConn())
     repo = Db2FederationRepository()
-    await repo.get_feed_memory(
+    await repo._legacy_get_feed_memory(
         tx,
         "mem-1",
         namespaces=["ns-a"],
@@ -3366,7 +3368,7 @@ async def test_db2_federation_get_feed_memory_no_filters_native_tokens() -> None
 
     tx = SimpleNamespace(conn=_FakeConn())
     repo = Db2FederationRepository()
-    await repo.get_feed_memory(tx, "mem-1", namespaces=[], categories=[])
+    await repo._legacy_get_feed_memory(tx, "mem-1", namespaces=[], categories=[])
     sql = calls[0]["sql"].upper() if calls else ""
     params_tuple = calls[0]["params"] if calls else ()
     assert "M.ID = ?" in sql
