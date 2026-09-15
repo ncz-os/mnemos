@@ -1,0 +1,136 @@
+# Backend parity matrix
+
+> ⚙️ **Machine-generated. Do not edit by hand.**
+>
+> Re-run with `python scripts/generate_backend_parity_matrix.py`. The companion CI job
+> (`.github/workflows/docs-backend-parity.yml`) re-runs this
+> command and fails on any drift via
+> `git diff --exit-code docs/BACKEND_PARITY.md`. To refresh
+> after a backend change: re-run the generator and commit the
+> regenerated matrix alongside the code change.
+
+This matrix enumerates the cross-cutting capability surface of
+MNEMOS's six SQL persistence backends (sqlite, postgres, mysql,
+mariadb, oracle, db2) and answers two questions for every cell:
+
+1. **implemented** — does the backend's facade class actually wire
+   up the capability, or does the property unconditionally raise
+   `BackendCapabilityMissing` / return `None` / raise
+   `NotImplementedError`?
+2. **tested** — does at least one test in `tests/` exercise the
+   (capability, backend) pair, either via a `@pytest.mark.parametrize`
+   over the backend name or via a file named
+   `test_<capability>_<backend>*.py`?
+
+Summary: **62/162** cells are fully covered
+(✅ implemented+tested), **49** cells are
+implemented but untested, **43** cells have neither
+implementation nor test.
+
+## Matrix
+
+| Capability | sqlite | postgres | mysql | mariadb | oracle | db2 |
+|---|---|---|---|---|---|---|
+| memory_crud (MemoryRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| vector_search (semantic_search) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
+| fts_search (FTS5 / native FTS) | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
+| kg (KGRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| versions (VersionRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| branches (BranchRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| compression (CompressionRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| compression_queue (CompressionQueueRepository) | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test |
+| morpheus (MorpheusRepository) | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test |
+| webhooks (end-to-end delivery) | ⚠️ test exists, stub impl | ✅ implemented+tested | ⚠️ test exists, stub impl | ❌ neither | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl |
+| nats_dispatch_log (idempotency dedupe) | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test |
+| consultations_audit (model recommendation) | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| oauth (OAuthRepository) | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| sessions (SessionsRepository) | ⚠️ implemented, no test | ⚠️ implemented, no test | ❌ neither | ❌ neither | ✅ implemented+tested | ✅ implemented+tested |
+| consultations (ConsultationsRepository) | ⚠️ implemented, no test | ⚠️ implemented, no test | ❌ neither | ❌ neither | ✅ implemented+tested | ✅ implemented+tested |
+| federation (FederationRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
+| state (StateRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
+| audit_chain (AuditChainRepository) | ✅ implemented+tested | ✅ implemented+tested | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl | ✅ implemented+tested | ✅ implemented+tested |
+| acl (AclRepository) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ⚠️ implemented, no test | ⚠️ implemented, no test |
+| journal (KNEMON journal entries) | ❌ neither | ❌ neither | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
+| ledger (KNEMON usage_ledger) | ⚠️ test exists, stub impl | ❌ neither | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
+| row_level_security (Postgres RLS) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
+| listen_notify (Postgres LISTEN/NOTIFY) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
+| advisory_locks (Postgres advisory locks) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
+| federation_journal (distinct journal table) | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test |
+| morpheus HTTP-trigger (POST /admin/morpheus/runs) | ⚠️ test exists, stub impl | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
+| kronos routes (POSTGRES-only) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
+
+
+## Legend
+
+Cell legend:
+
+| Symbol | Meaning |
+|---|---|
+| ✅ implemented+tested | The backend exposes the capability *and* at least one test exercises it. |
+| ⚠️ implemented, no test | The backend exposes the capability but no test covers it. |
+| ⚠️ test exists, stub impl | A test exists for the (capability, backend) cell but the backend's implementation is a stub / raises / returns None. |
+| ❌ neither | No implementation and no test for the (capability, backend) cell. |
+
+
+## How cells are decided
+
+### implemented (AST scan)
+
+For each backend we load `mnemos/persistence/<backend>.py`, find the
+facade class (`SqliteBackend`, `PostgresBackend`, `MysqlBackend`,
+`MariadbBackend`, `OracleBackend`, `Db2Backend`), and inspect every
+`@property` on the class (including inherited ones via the AST MRO
+walk). A property counts as implemented only when its body does
+*not*:
+
+* raise `BackendCapabilityMissing(...)`,
+* raise `NotImplementedError(...)`,
+* unconditionally `return None` (the audit-chain contract — see
+  `mnemos/persistence/base.py::AuditPersistence.audit_chain`).
+
+Backend-only class attributes (`supports_pgvector`,
+`supports_listen_notify`, `supports_row_level_security`,
+`supports_advisory_locks`) are detected as `True` literals on the
+class body.
+
+The `federation_journal` capability is detected by the presence of
+`mnemos.persistence.federation_journal.feed_query` *and* an explicit
+`_ensure_<backend>_federation_journal(...)` call in `open()`. The
+HTTP-trigger `morpheus_http_trigger` and `kronos_routes` rows are
+Postgres-only by construction (see
+`mnemos/api/routes/morpheus.py` and
+`mnemos/api/routes/kronos.py`, which both call
+`require_postgres_pool_or_503`); the matrix records that rule.
+
+### tested (test scan)
+
+For each `(capability, backend)` pair we scan every `test_*.py` in
+`tests/` for either:
+
+* a `@pytest.mark.parametrize(...)` whose argument ids mention the
+  backend name (literal strings, `ids=[...]` lists, or nested
+  constants), or
+* a filename that encodes both the capability and the backend
+  (e.g. `test_db2_dialect_parity.py`, `test_oracle_live.py`,
+  `test_kronos_backends.py`, `test_mysql_recency_dialect.py`,
+  `test_backend_audit_chain_attribute.py`).
+
+Heuristics were calibrated against these existing tests; if you add
+a new test, follow the same naming convention and the matrix will
+pick it up automatically.
+
+## Why this matrix exists
+
+The `morpheus_local` parity migrations (0061c), the v6.2 audit-chain
+rollback on MariaDB, and the `audit_chain` `AttributeError` bug
+(`MariadbBackend` raised when federation's `is not None` guard ran)
+are all examples of features that *claimed* cross-backend support
+in code while being silently absent from one of the six SQL
+backends. This matrix is the machine-readable form of the answer
+to "does this thing actually work on this backend, and do we have
+a test that proves it?".
+
+The narrow federation-SQL parity test
+(`tests/test_federation_backend_parity_static.py`) is left
+untouched and complementary — it covers one specific SQL shape; this
+matrix covers the wider capability surface.
