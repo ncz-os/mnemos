@@ -1,0 +1,89 @@
+name: docs-backend-parity
+
+# REQUIRED CI gate for the backend parity matrix.
+#
+# This job enforces that ``docs/BACKEND_PARITY.md`` exactly matches what
+# ``scripts/generate_backend_parity_matrix.py`` would produce against the
+# current tree. Any drift — manual edit, forgotten regeneration, or a
+# capability change that wasn't reflected in the matrix — fails the build.
+#
+# The matrix itself is a docs-truth drift detector: every backend
+# capability that was ever "claimed in code, absent at runtime" (e.g. the
+# 2026-09 audit_chain AttributeError on MariadbBackend, the federation
+# journal table that's optional on MySQL/MariaDB, the morpheus_local
+# 0061c migrations) is exposed as a cell. This job keeps that exposure
+# honest: if a backend gains or loses a capability without regenerating
+# the matrix, the diff has to land alongside the code change.
+#
+# To refresh the matrix after editing mnemos/persistence/*.py:
+#
+#     python scripts/generate_backend_parity_matrix.py
+#     git add docs/BACKEND_PARITY.md
+#     git commit
+
+on:
+  pull_request:
+    paths:
+      - "mnemos/persistence/**"
+      - "mnemos/api/routes/**"
+      - "tests/**"
+      - "scripts/generate_backend_parity_matrix.py"
+      - "docs/BACKEND_PARITY.md"
+      - ".github/workflows/docs-backend-parity.yml"
+  push:
+    branches: [master, main, v3.5-dev]
+    paths:
+      - "mnemos/persistence/**"
+      - "mnemos/api/routes/**"
+      - "tests/**"
+      - "scripts/generate_backend_parity_matrix.py"
+      - "docs/BACKEND_PARITY.md"
+      - ".github/workflows/docs-backend-parity.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  backend-parity:
+    name: regenerate matrix and fail on drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      # The generator uses only the Python standard library (ast, re,
+      # subprocess) so a bare CPython install is enough. uv-managed
+      # Python keeps the environment consistent with the rest of the CI.
+      - name: Set up Python
+        run: uv python install 3.11
+
+      # Run the generator. The script will regenerate
+      # ``docs/BACKEND_PARITY.md`` in place — its diff against the
+      # committed copy is the signal this job emits.
+      - name: Regenerate docs/BACKEND_PARITY.md
+        run: |
+          uv run --python 3.11 --no-project -- python scripts/generate_backend_parity_matrix.py
+
+      # Fail the build if regeneration changed the matrix. This is the
+      # exact same command the task description specifies for local
+      # validation:
+      #
+      #     python scripts/generate_backend_parity_matrix.py \
+      #         && git diff --exit-code docs/BACKEND_PARITY.md
+      #
+      # We split them into separate ``run`` steps so that the failure
+      # log shows BOTH the regeneration output and the diff, which is
+      # much easier to debug than a single ``&&`` chain.
+      - name: Verify matrix has not drifted
+        run: git diff --exit-code docs/BACKEND_PARITY.md
+
+      # Print the committed matrix on success — the matrix is the
+      # artifact reviewers should look at first when a backend PR
+      # lands, and surfacing it here makes the change easy to skim.
+      - name: Show updated matrix
+        if: success()
+        run: cat docs/BACKEND_PARITY.md
