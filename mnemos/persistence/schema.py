@@ -6,6 +6,8 @@ instead of the host-only installer ``sudo -u postgres psql`` path.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import inspect
 import logging
 import os
@@ -19,6 +21,31 @@ _LOG = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DB_DIR = _REPO_ROOT / "mnemos" / "db_migrations"
 _POSTGRES_OAUTH_MIGRATION = _DB_DIR / "migrations_v5_4_0_mcp_oauth.sql"
+
+
+# Stable signed-int64 advisory lock key for the schema-migration critical
+# section. Every worker process that boots MNEMOS against a Postgres
+# backend races on this same fixed key -- a hash of the well-known
+# string ``"mnemos_schema_migration"`` -- so only one worker actually
+# applies migrations at a time; the others block until the lock is
+# released, then either see the schema already at the target state
+# (most DDL is idempotent via IF NOT EXISTS + the benign-replay guard)
+# or safely re-run (the statements ARE safe to run sequentially -- just
+# not concurrently; see round-97 P1 migration race).
+#
+# Lock scope: SESSION-scoped (``pg_advisory_lock`` / ``pg_advisory_unlock``)
+# -- NOT transaction-scoped (``pg_advisory_xact_lock``). Several
+# migrations in the runtime set use ``CREATE INDEX CONCURRENTLY`` and
+# ``DROP INDEX CONCURRENTLY``, which Postgres refuses to run inside a
+# transaction block (mnemos/db_migrations/
+# migrations_v4_2_deletion_requests_soft_delete_columns.sql:56,
+# mnemos/db_migrations/migrations_v4_2_document_import_chunk_idempotency.sql).
+# The runner also tracks its own per-statement BEGIN/COMMIT/ROLLBACK
+# state so the migrations cannot be wrapped in one outer transaction
+# either.
+_POSTGRES_SCHEMA_LOCK_KEY: int = int.from_bytes(
+    hashlib.sha256(b"mnemos_schema_migration").digest()[:8], "big", signed=False
+) & 0x7FFFFFFFFFFFFFFF
 
 _POSTGRES_LEGACY_MIGRATIONS: tuple[Path, ...] = (
     _DB_DIR / "migrations.sql",
@@ -207,25 +234,169 @@ def split_db2_statements(sql: str) -> list[str]:
     return _split_semicolon_statements(sql)
 
 
+async def _pg_advisory_session_lock(conn: Any, key: int) -> None:
+    """Acquire a session-scoped advisory lock, blocking until free.
+
+    Round-97 P1: ``CREATE INDEX CONCURRENTLY`` cannot run inside a
+    transaction, so this MUST be the SESSION-scoped variant, not the
+    transaction-scoped ``pg_advisory_xact_lock``. Pair every acquire
+    with a matching ``_pg_advisory_session_unlock`` in a try/finally so
+    a failed migration attempt doesn't leave the lock permanently held
+    and deadlock every subsequent worker startup forever (a worker that
+    dies holding a session lock releases it automatically when its
+    backend connection is closed by the pool, but we don't want to
+    rely on that -- an explicit unlock is the contract).
+
+    NOTE: prefer ``_pg_advisory_session_lock_polling`` for the schema-
+    migration lock; see that helper for why.
+    """
+    await conn.execute("SELECT pg_advisory_lock($1)", key)
+
+
+async def _pg_advisory_session_unlock(conn: Any, key: int) -> None:
+    """Release a session-scoped advisory lock acquired via ``_pg_advisory_session_lock``."""
+    await conn.execute("SELECT pg_advisory_unlock($1)", key)
+
+
+async def _pg_advisory_session_lock_polling(
+    conn: Any, key: int, *, poll_interval: float = 0.5, max_wait: float = 600.0
+) -> None:
+    """Acquire a session-scoped advisory lock WITHOUT blocking the caller.
+
+    Round-97 P1: ``pg_advisory_lock`` blocks at the server side until
+    the lock is free. While a connection is blocked at
+    ``pg_advisory_lock`` it still holds an open virtual transaction id
+    (vxid) -- that backend's connection cannot be reused until the lock
+    is granted or the call is cancelled.
+
+    For schema migrations, this creates a second-order deadlock with
+    ``CREATE INDEX CONCURRENTLY``: the migration runner holding the
+    lock calls ``CREATE INDEX CONCURRENTLY`` on a table (e.g.
+    ``memories``), which deliberately waits for every other backend
+    with an open vxid to finish before each of its table scans; the
+    other workers' connections, blocked at ``pg_advisory_lock``, have
+    exactly that open vxid -- so the holder's CONCURRENTLY deadlocks
+    against the waiters' lock attempts. Verified on a real cluster
+    with N>=2 concurrent workers against a fresh DB; the deadlock
+    detector eventually catches the cycle and kills one of the
+    participants, but the error is opaque and the migrations abort
+    partway through.
+
+    The fix is to NOT block at ``pg_advisory_lock``. Instead, retry
+    ``pg_try_advisory_lock`` with a small sleep between attempts. Each
+    ``pg_try_advisory_lock`` runs in its own auto-commit transaction,
+    so between retries the connection has no open vxid -- and the
+    holder's CONCURRENTLY sees no live vxids to wait on. The polling
+    cost (a few-ms query every 500 ms) is irrelevant against a cold-
+    start migration that takes seconds-to-minutes.
+
+    Raises ``TimeoutError`` after ``max_wait`` seconds; the caller
+    should treat that as a hard error (a worker has held the lock for
+    10 minutes, something is genuinely wrong).
+    """
+    deadline = asyncio.get_running_loop().time() + max_wait
+    while True:
+        got = await conn.fetchval("SELECT pg_try_advisory_lock($1)", key)
+        if got:
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError(
+                f"timed out after {max_wait}s waiting for Postgres schema "
+                f"migration advisory lock (key={key}); another worker is "
+                f"still running migrations or has crashed while holding "
+                f"the lock. Investigate the holder before retrying."
+            )
+        await asyncio.sleep(poll_interval)
+
+
+async def _with_postgres_schema_lock(pool: Any, body):
+    """Run ``body(conn)`` inside the schema-migration advisory lock.
+
+    Round-97 P1 design:
+
+    * Lock is SESSION-scoped (``pg_advisory_lock`` /
+      ``pg_advisory_unlock``), NOT transaction-scoped -- because
+      ``CREATE INDEX CONCURRENTLY`` cannot run inside a transaction
+      (mnemos/db_migrations/migrations_v4_2_deletion_requests_soft_
+      delete_columns.sql:56 and others).
+    * Acquired via ``_pg_advisory_session_lock_polling`` (the
+      non-blocking polling variant) NOT the synchronous
+      ``_pg_advisory_session_lock`` -- a worker blocked at
+      ``pg_advisory_lock`` keeps its connection's virtual transaction
+      id open, which ``CREATE INDEX CONCURRENTLY`` then waits for,
+      which can deadlock the lock-holder's CONCURRENTLY against the
+      waiters' lock attempts (verified on a real cluster with N>=2
+      concurrent workers against a fresh DB; the deadlock detector
+      eventually catches the cycle but the migrations abort mid-run
+      and the next startup re-runs the whole stack from scratch).
+      The polling variant keeps the waiter between attempts with no
+      open vxid, so CONCURRENTLY's per-scan wait completes
+      immediately.
+    * Released in the finally clause -- a failed migration attempt
+      must not leave the lock permanently held and deadlock every
+      subsequent worker startup forever.
+    """
+    async with pool.acquire() as conn:
+        await _pg_advisory_session_lock_polling(conn, _POSTGRES_SCHEMA_LOCK_KEY)
+        try:
+            await body(conn)
+        finally:
+            await _pg_advisory_session_unlock(conn, _POSTGRES_SCHEMA_LOCK_KEY)
+
+
 async def ensure_postgres_schema(pool: Any, settings: Any | None = None) -> None:
-    """Apply the full Postgres schema on the configured asyncpg pool."""
+    """Apply the full Postgres schema on the configured asyncpg pool.
+
+    Round-97 P1: when ``mnemos serve --workers N`` boots against a
+    genuinely fresh Postgres database (N processes, one shared empty
+    schema, no coordination), every worker independently decides "the
+    schema isn't established yet, let me establish it" and races the
+    others into the migration runner. ``CREATE OR REPLACE VIEW`` /
+    ``CREATE OR REPLACE FUNCTION`` (and similar "create-if-not-then-
+    replace" DDL) are safe to run repeatedly IN SEQUENCE but not
+    concurrently -- two sessions racing to create the same catalog
+    entry can both attempt the underlying ``pg_type`` insert and one
+    loses to ``duplicate key value violates unique constraint
+    "pg_type_typname_nsp_index"``.
+
+    The fix is a session-scoped advisory lock around the whole
+    migration run -- see ``_POSTGRES_SCHEMA_LOCK_KEY`` and
+    ``_with_postgres_schema_lock`` for the rationale on session (not
+    transaction) scope, the fixed-key hash, and the polling variant
+    (which is required to keep ``CREATE INDEX CONCURRENTLY`` from
+    deadlocking against the lock-waiters' open vxids).
+    """
     embedding_dim = resolve_embedding_dim(settings)
     if not 1 <= embedding_dim <= 2000:
         raise RuntimeError(
             f"MNEMOS_EMBEDDING_DIM={embedding_dim} is outside the supported pgvector HNSW vector index range [1, 2000]."
         )
 
-    async with pool.acquire() as conn:
+    async def _apply(conn: Any) -> None:
         await _apply_postgres_migrations(conn, postgres_migration_paths(), embedding_dim)
         await _ensure_postgres_embedding_shape(conn, embedding_dim)
 
+    await _with_postgres_schema_lock(pool, _apply)
+
 
 async def ensure_postgres_oauth_schema(pool: Any) -> None:
-    """Provision only the tables required by a dedicated OAuth database."""
-    async with pool.acquire() as conn:
+    """Provision only the tables required by a dedicated OAuth database.
+
+    Round-97 P1: same race exposure as ``ensure_postgres_schema`` -- if
+    an operator runs a multi-worker OAuth service against a fresh
+    dedicated OAuth Postgres database, every worker would race on the
+    same ``CREATE OR REPLACE`` DDL and one would lose to a
+    ``pg_type_typname_nsp_index`` unique-key collision. Uses the same
+    session-scoped advisory lock so the two callers share one critical
+    section.
+    """
+
+    async def _apply(conn: Any) -> None:
         # This migration has no vector placeholders; keep the dedicated OAuth
         # database independent of core embedding configuration and pgvector.
         await _apply_postgres_migrations(conn, [_POSTGRES_OAUTH_MIGRATION], embedding_dim=1)
+
+    await _with_postgres_schema_lock(pool, _apply)
 
 
 async def _apply_postgres_migrations(conn: Any, paths: list[Path], embedding_dim: int) -> None:
