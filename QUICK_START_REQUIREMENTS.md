@@ -149,9 +149,9 @@ OPENAI_API_KEY=xxx                   # etc.
 
 **Optional**:
 ```bash
-GPU_PROVIDER_HOST=http://localhost:8000  # For local LLM
-REDIS_URL=redis://localhost:6379         # For caching
-RATE_LIMIT_ENABLED=true                  # For rate limiting
+GPU_PROVIDER_HOST=http://localhost:8000        # For local LLM
+RATE_LIMIT_STORAGE_URI=redis://localhost:6379/1  # Shared rate-limit/circuit-breaker state (multi-worker only)
+RATE_LIMIT_ENABLED=true                        # For rate limiting
 ```
 
 ---
