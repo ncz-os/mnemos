@@ -301,6 +301,20 @@ async def restore_soft_deleted_target(
     *,
     invalidate_cache: bool = True,
 ) -> dict[str, int]:
+    from mnemos.workers.audit_sealer import audit_chain_enabled
+
+    if audit_chain_enabled():
+        from mnemos.persistence.postgres import PostgresTransaction
+        from mnemos.persistence.worker_lifecycle import _Ops, _audit_scope
+
+        await _audit_scope(
+            _Ops(PostgresTransaction(conn, None), "postgres"),
+            target_user_id,
+            target_namespace,
+            "deleted_at = ?",
+            "update",
+            soft_deleted_at,
+        )
     counts: dict[str, int] = {}
     for label, _table, sql in _RESTORE_OWNER_NAMESPACE_SQL:
         result = await conn.execute(sql, target_user_id, target_namespace, soft_deleted_at)
@@ -322,6 +336,19 @@ async def hard_delete_target(
     source: list[str] | tuple[str, ...] | None = None,
     invalidate_cache: bool = True,
 ) -> dict[str, int]:
+    from mnemos.workers.audit_sealer import audit_chain_enabled
+
+    if audit_chain_enabled():
+        from mnemos.persistence.postgres import PostgresTransaction
+        from mnemos.persistence.worker_lifecycle import _Ops, _audit_scope
+
+        await _audit_scope(
+            _Ops(PostgresTransaction(conn, None), "postgres"),
+            target_user_id,
+            target_namespace,
+            "deleted_at IS NOT NULL",
+            "delete",
+        )
     counts: dict[str, int] = {}
     await conn.execute("SET LOCAL mnemos.suppress_version_snapshot = '1'")
     await log_target_memory_deletions(

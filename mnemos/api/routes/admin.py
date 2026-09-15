@@ -612,52 +612,13 @@ async def persephone_archive_memory(
     _require_persephone_enabled()
     backend = backend_or_503()
 
+    from mnemos.audit.route_helper import AuditChainContinuityError
+
     try:
         async with backend.transactional() as tx:
-            archive_row_snapshot = await _admin_lifecycle_repo.fetch_memory_archive_snapshot(tx, memory_id)
             await _admin_lifecycle_repo.archive_memory(tx, memory_id, user.user_id)
-            try:
-                from mnemos.audit import write_audit_entry
-                from mnemos.core.config import get_settings as _get_settings
-                from mnemos.workers.audit_sealer import audit_chain_enabled as _ace
-
-                if _ace() and archive_row_snapshot is not None and backend.audit_chain is not None:
-                    _settings = _get_settings()
-                    _session_secret = (getattr(_settings.server, "session_secret", "") or "").encode("utf-8")
-                    if _session_secret:
-                        import json as _json
-
-                        raw_meta = archive_row_snapshot["metadata"]
-                        parsed_meta = (
-                            _json.loads(raw_meta)
-                            if isinstance(raw_meta, str)
-                            else (dict(raw_meta) if raw_meta else None)
-                        )
-                        # F16: pass the actual embedding bytes from the
-                        # archive snapshot so payload_hash covers it.
-                        # Pre-fix this was hardcoded None, silently
-                        # shifting the audit signature from the real
-                        # archive payload.
-                        raw_emb = archive_row_snapshot.get("embedding")
-                        embedding_bytes = raw_emb if isinstance(raw_emb, (bytes, bytearray, memoryview)) else None
-                        await write_audit_entry(
-                            backend,
-                            tx,
-                            op="archive",
-                            memory_id_str=memory_id,
-                            content=archive_row_snapshot["content"],
-                            category=archive_row_snapshot["category"],
-                            subcategory=archive_row_snapshot["subcategory"],
-                            metadata=parsed_meta,
-                            embedding=embedding_bytes,
-                            writer_id=user.user_id,
-                            session_secret=_session_secret,
-                        )
-            except Exception:
-                logger.exception(
-                    "[archive] audit-chain write failed for memory %s; archive still committed",
-                    memory_id,
-                )
+    except AuditChainContinuityError as exc:
+        raise HTTPException(status_code=503, detail="required audit write unavailable") from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     await _invalidate_memory_read_caches()

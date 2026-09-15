@@ -1339,9 +1339,7 @@ class OracleMemoryRepository(MemoryRepository):
                     params.update(vis_params)
             await _call(
                 cursor.execute,
-                "SELECT m.id FROM memories m WHERE "
-                + " AND ".join(where)
-                + " FOR UPDATE",
+                "SELECT m.id FROM memories m WHERE " + " AND ".join(where) + " FOR UPDATE",
                 params,
             )
             if await _call(cursor.fetchone) is None:
@@ -1374,8 +1372,7 @@ class OracleMemoryRepository(MemoryRepository):
         try:
             await _call(
                 cursor.execute,
-                "SELECT memory_id, tag FROM memory_tags "
-                f"WHERE memory_id IN ({placeholders}) ORDER BY memory_id, tag",
+                f"SELECT memory_id, tag FROM memory_tags WHERE memory_id IN ({placeholders}) ORDER BY memory_id, tag",
                 binds,
             )
             rows = await _fetch_all_dicts(cursor)
@@ -2825,7 +2822,7 @@ class OracleMorpheusRepository(MorpheusRepository):
             await _call(
                 cursor.execute,
                 """
-                SELECT id, owner_id, namespace
+                SELECT id, owner_id, namespace, content
                   FROM memories
                  WHERE morpheus_run_id = :rid
                    AND provenance = 'morpheus_local'
@@ -2840,17 +2837,7 @@ class OracleMorpheusRepository(MorpheusRepository):
             mid, _owner_id, _namespace = row[0], row[1], row[2]
             cursor = await _call(conn.cursor)
             try:
-                # STANDARD_HASH rejects a CLOB argument outright
-                # (ORA-00902) on this Oracle version — confirmed live,
-                # not just an assumption; a pre-existing, unrelated
-                # occurrence of the same bug (backfill_missing_content_hashes)
-                # has the identical defect and is out of this item's
-                # scope to fix. DBMS_LOB.SUBSTR materializes a VARCHAR2
-                # prefix (capped at Oracle's 4000-byte VARCHAR2 limit)
-                # that STANDARD_HASH accepts; the audit hash is a
-                # first-4000-bytes fingerprint rather than a full-content
-                # hash for memories longer than that, which is an
-                # acceptable admin-audit-trail tradeoff.
+                digest = _content_hash(str(await _materialize_value(row[3]) or ""))
                 await _call(
                     cursor.execute,
                     """
@@ -2859,9 +2846,7 @@ class OracleMorpheusRepository(MorpheusRepository):
                         requested_by, requested_at, request_kind, reason, source
                     )
                     SELECT id,
-                           LOWER(RAWTOHEX(STANDARD_HASH(
-                               DBMS_LOB.SUBSTR(content, 4000, 1), 'SHA256'
-                           ))),
+                           :content_digest,
                            owner_id, namespace,
                            :req_by, SYSTIMESTAMP, 'admin_purge', :reason, :source
                       FROM memories
@@ -2870,9 +2855,10 @@ class OracleMorpheusRepository(MorpheusRepository):
                        AND deleted_at IS NULL
                     """,
                     {
+                        "content_digest": digest,
                         "req_by": str(requested_by),
                         "reason": f"MORPHEUS rollback {run_id}",
-                        "source": f"morpheus.rollback,{run_id}",
+                        "source": json.dumps({"operation": "morpheus.rollback", "run_id": run_id}),
                         "mid": mid,
                     },
                 )
@@ -2933,7 +2919,7 @@ class OracleMorpheusRepository(MorpheusRepository):
         trivially becomes a ``list[float]`` via ``list(...)``.
 
         ``IS DISTINCT FROM`` is not portable to Oracle — we use
-        ``NOT (provenance = 'morpheus_local' OR provenance IS NULL)``
+        ``(provenance <> 'morpheus_local' OR provenance IS NULL)``
         which is the canonical Oracle null-safe equality form.
 
         Db2 inherits this whole method via ``_Db2OraCompatMixin``
@@ -2961,7 +2947,7 @@ class OracleMorpheusRepository(MorpheusRepository):
                 SELECT id, embedding
                   FROM memories
                  WHERE created BETWEEN :window_start AND :window_end
-                   AND NOT (provenance = 'morpheus_local' OR provenance IS NULL)
+                   AND (provenance <> 'morpheus_local' OR provenance IS NULL)
                    AND morpheus_run_id IS NULL
                    AND embedding IS NOT NULL
                    AND {eligibility_clause}
@@ -3059,7 +3045,7 @@ class OracleMorpheusRepository(MorpheusRepository):
                  WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
                    AND (m.provenance <> 'morpheus_local' OR m.provenance IS NULL)
                    AND m.morpheus_run_id IS NULL
-                   AND {_eligibility.eligible_for_morpheus('m')}
+                   AND {_eligibility.eligible_for_morpheus("m")}
                    AND (r.namespace IS NULL OR m.namespace = r.namespace)
                 """,
                 {"run_id": run_id},
@@ -3162,10 +3148,13 @@ class OracleMorpheusRepository(MorpheusRepository):
         if run_row is None:
             return None
         try:
-            config = json.loads(run_row["config"] or "{}")
+            config = _json_value(run_row["config"], {})
         except (json.JSONDecodeError, TypeError):
             config = {}
         clusters = config.get("clusters", []) if isinstance(config, dict) else []
+        from mnemos.persistence.morpheus_isolation import partition_consolidation_clusters
+
+        clusters = await partition_consolidation_clusters(tx, clusters)
         min_size = int(run_row["cluster_min_size"])
         namespace = run_row["namespace"]
         eligible = _eligibility.eligible_for_morpheus("")
@@ -3224,7 +3213,7 @@ class OracleMorpheusRepository(MorpheusRepository):
                 if member_id == canonical_id:
                     continue
                 try:
-                    metadata = json.loads(row["metadata"] or "{}")
+                    metadata = _json_value(row["metadata"], {})
                 except (json.JSONDecodeError, TypeError):
                     metadata = {}
                 if not isinstance(metadata, dict):
@@ -3237,7 +3226,7 @@ class OracleMorpheusRepository(MorpheusRepository):
                         cursor.execute,
                         """
                         UPDATE memories SET consolidated_into = :canonical,
-                            consolidated_at = SYSTIMESTAMP, permission_mode = :mode,
+                            consolidated_at = SYSTIMESTAMP, permission_mode = :permission_mode_value,
                             morpheus_run_id = :run_id, metadata = :metadata
                         WHERE id = :id AND deleted_at IS NULL AND archived_at IS NULL
                           AND consolidated_into IS NULL AND morpheus_run_id IS NULL
@@ -3245,7 +3234,7 @@ class OracleMorpheusRepository(MorpheusRepository):
                         """,
                         {
                             "canonical": canonical_id,
-                            "mode": int(consolidated_permission_mode),
+                            "permission_mode_value": int(consolidated_permission_mode),
                             "run_id": run_id,
                             "metadata": json.dumps(metadata),
                             "id": member_id,
@@ -3296,7 +3285,7 @@ class OracleMorpheusRepository(MorpheusRepository):
             return None
         cluster_min_size = int(row["cluster_min_size"])
         try:
-            config = json.loads(row["config"] or "{}")
+            config = _json_value(row["config"], {})
         except (json.JSONDecodeError, TypeError):
             config = {}
         clusters = config.get("clusters", []) if isinstance(config, dict) else []
@@ -3395,7 +3384,7 @@ class OracleMorpheusRepository(MorpheusRepository):
         if run_row is None:
             return None
         try:
-            config = json.loads(run_row["config"] or "{}")
+            config = _json_value(run_row["config"], {})
         except (json.JSONDecodeError, TypeError):
             config = {}
         if not isinstance(config, dict):
@@ -3519,8 +3508,8 @@ class OracleMorpheusRepository(MorpheusRepository):
                 MERGE INTO morpheus_extract_run_memories target
                 USING (SELECT :run_id AS run_id, :memory_id AS memory_id FROM dual) source
                 ON (target.run_id = source.run_id AND target.memory_id = source.memory_id)
-                WHEN MATCHED THEN UPDATE SET processed_at = SYSTIMESTAMP
-                WHEN NOT MATCHED THEN INSERT (run_id, memory_id, processed_at)
+                WHEN MATCHED THEN UPDATE SET extracted_at = SYSTIMESTAMP
+                WHEN NOT MATCHED THEN INSERT (run_id, memory_id, extracted_at)
                 VALUES (source.run_id, source.memory_id, SYSTIMESTAMP)
                 """,
                 {"run_id": run_id, "memory_id": candidate.id},
@@ -7298,19 +7287,23 @@ class OracleFederationRepository(FederationRepository):
             await _call(
                 cursor.execute,
                 """
-                UPDATE memories
-                   SET deleted_at = SYSTIMESTAMP
-                 WHERE id = :id
+                DELETE FROM memories
+                 WHERE id IN (:id, :local_id)
                    AND federation_source = :peer
                    AND deleted_at IS NULL
                 """,
-                {"id": memory_id, "peer": peer_name},
+                {"id": memory_id, "local_id": f"fed:{peer_name}:{memory_id}", "peer": peer_name},
             )
             return int(getattr(cursor, "rowcount", 0) or 0)
         finally:
             await _call(cursor.close)
 
-    async def feed_query(
+    async def feed_query(self, tx, **kwargs):
+        from mnemos.persistence.federation_journal import feed_query
+
+        return await feed_query(self, tx, **kwargs)
+
+    async def _legacy_feed_query(
         self,
         tx: Transaction,
         *,
@@ -7371,9 +7364,7 @@ class OracleFederationRepository(FederationRepository):
                 upd_var.setvalue(0, since_updated)
                 params["upd"] = upd_var
                 params["since_id"] = since_id
-                withdrawal_where.append(
-                    "(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))"
-                )
+                withdrawal_where.append("(m.updated > :upd OR (m.updated = :upd AND m.id > :since_id))")
             if namespaces:
                 ns_ph, ns_params = _in_placeholders(namespaces, "ns")
                 where.append(f"m.namespace IN ({ns_ph})")
@@ -7432,7 +7423,12 @@ class OracleFederationRepository(FederationRepository):
         finally:
             await _call(cursor.close)
 
-    async def get_feed_memory(
+    async def get_feed_memory(self, tx, memory_id, *, namespaces, categories):
+        from mnemos.persistence.federation_journal import get_feed_memory
+
+        return await get_feed_memory(self, tx, memory_id, namespaces=namespaces, categories=categories)
+
+    async def _legacy_get_feed_memory(
         self,
         tx: Transaction,
         memory_id: str,

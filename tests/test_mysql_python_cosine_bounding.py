@@ -3,8 +3,7 @@
 The fallback exists because MySQL Community Edition (verified absent of
 ``VEC_DISTANCE_COSINE`` through 9.3) lacks a native vector distance
 function; when ``semantic_search`` catches the ``1305 / VEC_DISTANCE``
-error it routes to ``_python_cosine_search`` which materializes the
-entire eligible corpus and ranks it in Python.
+error it routes to ``_python_cosine_search`` which reads bounded pages and retains the best K rows in Python.
 
 The pre-fix behavior scaled memory, CPU, and async-event-loop
 occupancy proportional to corpus size. This file pins down the
@@ -113,6 +112,7 @@ class _FakeCursor:
     def __init__(self, corpus: list[tuple]) -> None:
         self._corpus = corpus
         self._last_sql = ""
+        self._params = []
         self.description = tuple((col,) for col in _FALLBACK_COLUMNS)
 
     async def __aenter__(self) -> "_FakeCursor":
@@ -123,11 +123,15 @@ class _FakeCursor:
 
     async def execute(self, sql: str, _params) -> None:
         self._last_sql = sql
+        self._params = _params
 
     async def fetchall(self) -> list[tuple]:
         if "COUNT(*)" in self._last_sql:
             return [(len(self._corpus),)]
-        return list(self._corpus)
+        rows = sorted(self._corpus, key=lambda row: row[0])
+        if "m.id > %s" in self._last_sql:
+            rows = [row for row in rows if row[0] > self._params[-1]]
+        return rows[:500]
 
     async def fetchone(self) -> tuple | None:
         if "COUNT(*)" in self._last_sql:
@@ -165,9 +169,7 @@ def _reset_scale_warning_flag():
 
 
 @pytest.mark.asyncio
-async def test_small_corpus_returns_correct_ranking_without_warning(
-    monkeypatch, caplog
-):
+async def test_small_corpus_returns_correct_ranking_without_warning(monkeypatch, caplog):
     """Under the threshold the fallback returns identical rows and
     emits no slow-path warning — invisible for normal-sized
     deployments, as the task spec requires."""
@@ -192,12 +194,9 @@ async def test_small_corpus_returns_correct_ranking_without_warning(
     )
 
     assert [row["id"] for row in out] == ["weak"]
-    slow_path_warnings = [
-        record for record in caplog.records if "[PY-COSINE]" in record.message
-    ]
+    slow_path_warnings = [record for record in caplog.records if "[PY-COSINE]" in record.message]
     assert slow_path_warnings == [], (
-        "small corpus must not emit the slow-path warning; got: "
-        f"{[r.message for r in slow_path_warnings]}"
+        f"small corpus must not emit the slow-path warning; got: {[r.message for r in slow_path_warnings]}"
     )
 
 
@@ -232,25 +231,18 @@ async def test_large_corpus_emits_single_loud_warning(caplog):
     assert len(out) == 5
     assert all(row["rank_score"] is not None for row in out)
 
-    slow_path_warnings = [
-        record for record in caplog.records if "[PY-COSINE]" in record.message
-    ]
+    slow_path_warnings = [record for record in caplog.records if "[PY-COSINE]" in record.message]
     assert len(slow_path_warnings) == 1, (
-        "exactly one warning should fire on the first qualifying call; "
-        f"got {len(slow_path_warnings)}"
+        f"exactly one warning should fire on the first qualifying call; got {len(slow_path_warnings)}"
     )
     msg = slow_path_warnings[0].message
     assert "200" in msg, f"warning must report observed eligible count: {msg}"
     assert "100" in msg, f"warning must report the configured threshold: {msg}"
-    assert "MariaDB" in msg or "Enterprise" in msg, (
-        f"warning must point at remediation: {msg}"
-    )
+    assert "MariaDB" in msg or "Enterprise" in msg, f"warning must point at remediation: {msg}"
 
 
 @pytest.mark.asyncio
-async def test_large_corpus_warning_fires_only_once_per_process(
-    monkeypatch, caplog
-):
+async def test_large_corpus_warning_fires_only_once_per_process(monkeypatch, caplog):
     """A busy server with a 100k-row corpus shouldn't spam the log once
     per request — the warning is informational and dedupes after the
     first fire."""
@@ -273,13 +265,8 @@ async def test_large_corpus_warning_fires_only_once_per_process(
             recency_weight=0.15,
         )
 
-    slow_path_warnings = [
-        record for record in caplog.records if "[PY-COSINE]" in record.message
-    ]
-    assert len(slow_path_warnings) == 1, (
-        "warning must fire at most once per process; "
-        f"got {len(slow_path_warnings)}"
-    )
+    slow_path_warnings = [record for record in caplog.records if "[PY-COSINE]" in record.message]
+    assert len(slow_path_warnings) == 1, f"warning must fire at most once per process; got {len(slow_path_warnings)}"
 
 
 @pytest.mark.asyncio
@@ -384,3 +371,29 @@ def test_warning_flag_starts_false_by_default():
     # The autouse fixture in this file resets the flag for each test,
     # so by the time we reach here the flag has been reset to False.
     assert _PY_COSINE_SCALE_WARNED is False
+
+
+@pytest.mark.asyncio
+async def test_best_match_on_later_page_is_not_truncated(monkeypatch):
+    corpus = [_row(f"id-{i:05}", [0, 1, 0]) for i in range(1200)]
+    corpus.append(_row("last-winner", [1, 0, 0]))
+    repo = MysqlMemoryRepository()
+    original = repo._cosine_rank_rows
+    page_sizes = []
+
+    def measure_page(query, rows, *args, **kwargs):
+        page_sizes.append(len(rows))
+        return original(query, rows, *args, **kwargs)
+
+    monkeypatch.setattr(repo, "_cosine_rank_rows", measure_page)
+    out = await repo._python_cosine_search(
+        SimpleNamespace(conn=_FakeConn(corpus)),
+        vec_literal="[1,0,0]",
+        where=["1=1"],
+        params=[],
+        limit=1,
+        boost_recency=False,
+        recency_weight=0.15,
+    )
+    assert [row["id"] for row in out] == ["last-winner"]
+    assert page_sizes == [500, 500, 201]

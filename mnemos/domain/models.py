@@ -140,6 +140,7 @@ class MemoryItem(BaseModel):
     # latest local audit head as provenance. Receivers must not treat this
     # as their local predecessor because replicas write under
     # `fed:<peer>:<remote_id>` chains.
+    federation_sequence: Optional[int] = None
     audit_latest_entry_id: Optional[str] = None  # hex(16-byte entry_id)
     audit_latest_entry_hash: Optional[str] = None  # hex(32-byte sha256)
     # Semantic relevance score (UAT 2026-06-13). Normalized cosine
@@ -166,6 +167,7 @@ class FederationConsolidationEvent(BaseModel):
     id: str
     consolidated_into: str
     consolidated_at: str
+    federation_sequence: Optional[int] = None
 
 
 class FederationWithdrawalEvent(BaseModel):
@@ -200,6 +202,7 @@ class FederationWithdrawalEvent(BaseModel):
     id: str
     namespace: Optional[str] = None
     withdrawn_at: str
+    federation_sequence: Optional[int] = None
     reason: str = "ineligible"
 
 
@@ -351,8 +354,7 @@ def _significant_tokens(text):
     return out
 
 
-def is_ood_result_set(query, rows, margin_floor=DEFAULT_SEMANTIC_MARGIN_FLOOR,
-                      anchor_topn=SEMANTIC_ANCHOR_TOPN):
+def is_ood_result_set(query, rows, margin_floor=DEFAULT_SEMANTIC_MARGIN_FLOOR, anchor_topn=SEMANTIC_ANCHOR_TOPN):
     """GRAEAE margin + lexical-anchor gate. Given the ALREADY-FLOORED semantic
     rows (each carrying a normalized cosine score under SEMANTIC_SCORE_KEY),
     decide whether the result set is out-of-distribution (nonsense / no real
@@ -503,8 +505,9 @@ def normalize_similarity(row) -> Optional[float]:
     return sim
 
 
-def row_to_memory(row, include_compressed: bool = False, redact_secrets: bool = False,
-                  frame_data: bool = False) -> MemoryItem:
+def row_to_memory(
+    row, include_compressed: bool = False, redact_secrets: bool = False, frame_data: bool = False
+) -> MemoryItem:
     """Build a MemoryItem from a backend row.
 
     ``redact_secrets`` (release-blocking 2026-06-13) is the
@@ -1044,6 +1047,8 @@ class ConsultationResponse(BaseModel):
     quorum_reached: Optional[bool] = None
     quorum_threshold: Optional[float] = None
     similarity_pairs: Optional[Dict[str, float]] = None
+    agreement_metric: Optional[str] = None
+    contradiction_pairs: Optional[Dict[str, bool]] = None
 
 
 class ConsultationArtifact(BaseModel):

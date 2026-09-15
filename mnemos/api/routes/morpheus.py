@@ -3,9 +3,8 @@
   GET    /v1/morpheus/runs                — list dream runs (newest first)
   GET    /v1/morpheus/runs/{run_id}        — single run details
   POST   /admin/morpheus/runs              — manually trigger a dream
-                                             (root only — runs synchronously
-                                             so the caller sees the final
-                                             state)
+                                             (root only — returns a durable
+                                             queued run; poll for completion)
   DELETE /admin/morpheus/runs/{run_id}     — roll back a run by deleting
                                              run-created rows and restoring
                                              tagged in-place mutations
@@ -18,6 +17,7 @@ Slice 4 adds optional EXTRACT.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import List, Optional
 
@@ -65,7 +65,7 @@ class MorpheusTriggerRequest(BaseModel):
     cluster_min_size: int = Field(3, ge=2, le=100)
     consolidate: bool = Field(
         False,
-        description=("Enable the optional CONSOLIDATE phase between CLUSTER and " "SYNTHESISE for this run."),
+        description=("Enable the optional CONSOLIDATE phase between CLUSTER and SYNTHESISE for this run."),
     )
     extract: bool = Field(
         False,
@@ -135,7 +135,7 @@ def _row_to_run(r) -> MorpheusRun:
             r["memories_processed_for_extraction"] if "memories_processed_for_extraction" in keys else 0
         ),
         error=r["error"],
-        config=dict(r["config"]) if isinstance(r["config"], dict) else {},
+        config=(json.loads(r["config"]) if isinstance(r["config"], str) else dict(r["config"] or {})),
         namespace=r["namespace"] if "namespace" in keys else None,
     )
 
@@ -273,22 +273,20 @@ async def list_clusters(run_id: str, _: UserContext = Depends(require_root)):
     return MorpheusClusterList(run_id=run_id, count=len(out), clusters=out)
 
 
-@router.post("/admin/morpheus/runs", response_model=MorpheusRun, status_code=201)
+@router.post("/admin/morpheus/runs", response_model=MorpheusRun, status_code=202)
 async def trigger_run(
     request: MorpheusTriggerRequest,
     _: UserContext = Depends(require_root),
 ):
     """Manually trigger a MORPHEUS run.
 
-    Runs synchronously so the caller sees the final state. For long
-    windows (e.g. 7-day = 168h) the LLM pass in slice 2 may take
-    minutes — at which point the trigger should move to a background
-    task with the caller polling /v1/morpheus/runs/{id}. Slice 1's
-    runner is a no-op so this returns near-instantly.
+    Persist the run and return immediately. Poll its URL for phase/status.
+    Admission permits one outstanding run per namespace (an all-namespace
+    run conflicts with every namespace), at most 16 queued/active runs.
     """
     _require_morpheus_installed()
     pg_backend = _require_postgres_backend()
-    from mnemos.domain.morpheus.runner import run_dream
+    from mnemos.persistence.morpheus_jobs import MorpheusQueueFull, MorpheusQueueUnavailable, PostgresMorpheusJobs
 
     run_config = dict(request.config)
     if request.consolidate:
@@ -303,14 +301,17 @@ async def trigger_run(
         run_config["extract_verify"] = True
     else:
         run_config.setdefault("extract_verify", False)
-    run_id = await run_dream(
-        pg_backend._pool,
-        triggered_by="api",
-        window_hours=request.window_hours,
-        cluster_min_size=request.cluster_min_size,
-        config=run_config,
-        namespace=request.namespace,
-    )
+    try:
+        run_id = await PostgresMorpheusJobs(pg_backend).enqueue(
+            window_hours=request.window_hours,
+            cluster_min_size=request.cluster_min_size,
+            config=run_config,
+            namespace=request.namespace,
+        )
+    except MorpheusQueueUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except MorpheusQueueFull as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "30"}) from exc
     pool_handle = pg_backend._pool
     async with pool_handle.acquire() as conn:
         row = await conn.fetchrow(
@@ -349,6 +350,8 @@ async def rollback(
         )
     if existing is None:
         raise HTTPException(status_code=404, detail=f"morpheus run {run_id} not found")
+    from mnemos.persistence.morpheus_jobs import MorpheusExecutionActive
+
     try:
         from mnemos.domain.morpheus.runner import rollback_run
 
@@ -364,6 +367,8 @@ async def rollback(
             run_id,
             requested_by=user.user_id,
         )
+    except MorpheusExecutionActive as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return MorpheusRollbackResponse(run_id=run_id, memories_deleted=n_deleted)
