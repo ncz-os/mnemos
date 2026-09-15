@@ -1634,6 +1634,27 @@ def embed_http_timeout_env() -> float:
     return float(runtime_env_value("MNEMOS_EMBED_HTTP_TIMEOUT", "30.0"))
 
 
+def embed_http_concurrency_env() -> int:
+    """Max concurrent in-flight HTTP embedding calls across all callers.
+
+    The HTTP backend is fully reentrant on the asyncio side (a plain httpx
+    async call — no thread, no in-process state), so we don't need a
+    mutex to serialize calls the way the non-reentrant llama-cpp / openvino
+    / cix-npu backends do. But we still need a BOUNDED cap — an unbounded
+    thundering herd to a remote GPU host (e.g. the operator's llama.cpp
+    Vulkan endpoint) is its own outage mode. Default 10 mirrors the
+    operator's typical concurrent-request ceiling on that host.
+
+    Set via MNEMOS_EMBED_HTTP_CONCURRENCY. Minimum 1.
+    """
+    raw = runtime_env_value("MNEMOS_EMBED_HTTP_CONCURRENCY", "10")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 10
+    return max(1, n)
+
+
 def embed_max_chars_env() -> int:
     return int(runtime_env_value("MNEMOS_EMBED_MAX_CHARS", "8000"))
 
