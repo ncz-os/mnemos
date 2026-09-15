@@ -37,7 +37,7 @@ What is in the box:
 > KNEMON, CHARON) and the standalone STIPHOS hive service. The published
 > container image is `ghcr.io/ncz-os/mnemos-enterprise` — a single multi-arch
 > (amd64 + arm64) manifest with every backend driver (Oracle, MySQL, MariaDB)
-> except Db2, which is amd64-only. Pin the minor line (`:6.3`) to keep a fleet
+> except Db2, which is amd64-only. Pin the minor line (`:6.4`) to keep a fleet
 > on identical code. Install and DSN/driver setup for each backend are in
 > [docs/INSTALL.md](docs/INSTALL.md); the agent-facing contract is in
 > [AGENTS.md](AGENTS.md).
