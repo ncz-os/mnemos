@@ -352,7 +352,20 @@ test:multi-worker:
             retries: 30
 
         mnemos:
-          command: ["mnemos", "serve", "--host", "0.0.0.0", "--workers", "2"]
+          # The shipped image never installs the optional `redis` extra
+          # (pyproject.toml keeps it opt-in — most single-worker deployments
+          # don't need it). This job's whole point is multi-worker mode,
+          # which docs/SCALING.md documents as requiring Redis-backed rate
+          # limiting, so RATE_LIMIT_STORAGE_URI below is redis:// on
+          # purpose. Without the package, mnemos crashes at import time
+          # constructing the rate limiter: "'redis' prerequisite not
+          # available" (reproduced 2026-09-14 on the real ARGOS runner).
+          # Install it before serving rather than rebuilding the shipped
+          # image with a permanently-larger default footprint.
+          command:
+            - /bin/sh
+            - -c
+            - "pip install --no-cache-dir 'redis>=5.0.0' && exec mnemos serve --host 0.0.0.0 --workers 2"
           # Same host-port collision as postgres above: the base compose
           # publishes 0.0.0.0:5002, so concurrent pipelines on the shared
           # runner collide ("Bind for 0.0.0.0:5002 failed: port is already
@@ -365,6 +378,16 @@ test:multi-worker:
             WEBHOOK_ALLOW_PRIVATE_HOSTS: "true"
             PG_POOL_MIN: "1"
             PG_POOL_MAX: "8"
+            # This compose override predates mnemos/core/network_guard.py's
+            # bind-refusal check (mnemos serve refuses to bind 0.0.0.0
+            # without auth configured). Without this, the mnemos container
+            # crash-loops on every restart — reproduced 2026-09-14 on the
+            # real ARGOS runner: "mnemos serve refuses to bind 0.0.0.0 with
+            # authentication disabled". This service is reachable only on
+            # the compose-internal network (ports: !reset [], no host
+            # publish), not the internet — exactly the guard's own
+            # documented escape-hatch case.
+            MNEMOS_ALLOW_UNAUTHENTICATED_NETWORK_BIND: "1"
           depends_on:
             redis:
               condition: service_healthy
