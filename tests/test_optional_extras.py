@@ -5,6 +5,7 @@ import importlib
 import logging
 import sys
 from types import ModuleType
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -27,9 +28,16 @@ def _restore_modules(removed: dict[str, ModuleType]) -> None:
         sys.modules.setdefault(name, module)
 
 
-def test_is_extra_installed_known_no_dep_and_unknown() -> None:
+@pytest.mark.parametrize("installed", [False, True])
+def test_is_extra_installed_known_no_dep_and_unknown(monkeypatch, installed) -> None:
+    def probe(name):
+        if not installed:
+            raise ModuleNotFoundError(name)
+        return ModuleType(name)
+
+    monkeypatch.setattr(extras, "import_module", probe)
     assert extras.is_extra_installed("knossos") is True
-    assert extras.is_extra_installed("pantheon") is False
+    assert extras.is_extra_installed("pantheon") is installed
     assert extras.is_extra_installed("definitely-not-a-mnemos-extra") is False
 
 
@@ -42,9 +50,10 @@ def test_require_extra_raises_with_install_hint() -> None:
     assert "pip install mnemos-core[definitely-not-a-mnemos-extra]" in message
 
 
-def test_extracted_subsystem_leaf_import_missing_in_core() -> None:
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("mnemos.domain.pantheon.catalog")
+def test_extracted_subsystem_is_not_vendored_in_core() -> None:
+    # Add-ons may be installed beside core; their presence must not make a
+    # packaging-boundary test fail or permit re-vendoring their implementation.
+    assert not (Path(__file__).parents[1] / "mnemos/domain/pantheon").exists()
 
 
 def test_optional_subsystem_import_raises_when_dependency_missing(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -80,9 +89,10 @@ def test_mcp_tool_filter_hides_missing_extra_tools(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(tools, "is_extra_installed", lambda name: name != "kronos")
 
-    assert tools._filter_unavailable_tools(
-        ["search_memories", "kronos_anomalies", "pantheon_list_models"]
-    ) == ["search_memories", "pantheon_list_models"]
+    assert tools._filter_unavailable_tools(["search_memories", "kronos_anomalies", "pantheon_list_models"]) == [
+        "search_memories",
+        "pantheon_list_models",
+    ]
 
 
 def test_worker_noops_when_extra_missing(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
