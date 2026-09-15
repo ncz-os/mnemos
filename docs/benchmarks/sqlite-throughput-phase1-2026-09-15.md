@@ -10,7 +10,7 @@ artifact is the committed JSON, not this document.
 The matrix was run end-to-end against a fresh temp SQLite file per cell
 (no shared or persistent DB, no real data path pollution), then the
 resulting JSON + markdown summary were committed to
-`docs/proof/bench-sqlite-phase1-20260915T181615Z.{json,md}`.
+`docs/proof/bench-sqlite-phase1-20260915T182709Z.{json,md}`.
 
 This document discharges the Phase 1 shipping criterion:
 
@@ -30,22 +30,22 @@ This document discharges the Phase 1 shipping criterion:
 | Warmup      | 64 inserts per cell (excluded from timed measurement) |
 | Read-back   | 1 `gather_stats()` call per cell (sanity, not headline) |
 | Cells       | 2 × 3 = 6 |
-| Total wall  | ~37 s on the dev host (Asahi aarch64, python 3.14.6) |
+| Total wall  | ~29 s on the dev host (Asahi aarch64, python 3.14.6) |
 | DB path     | Fresh tempfile per cell, removed before the cell returns |
 
 Total 6-cell runtime is well under the 30-minute budget; the script
 has headroom for Phase 2 once the operator decision lands.
 
-## Headline numbers (committed artifact: `bench-sqlite-phase1-20260915T181615Z.md`)
+## Headline numbers (committed artifact: `bench-sqlite-phase1-20260915T182709Z.md`)
 
 | corpus_size | concurrency | throughput (ops/s) | p50 (ms) | p95 (ms) | p99 (ms) | insert wall (s) |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1000   | 1  | 1594.37 | 0.569 | 0.990 | 1.224 | 0.63 |
-| 1000   | 5  |  774.41 | 6.278 | 11.570 | 14.473 | 1.29 |
-| 1000   | 10 |  862.74 | 10.666 | 20.116 | 23.410 | 1.16 |
-| 10000  | 1  | 1002.06 | 0.775 | 2.074 | 3.139 | 9.98 |
-| 10000  | 5  |  930.68 | 4.131 | 10.715 | 13.652 | 10.74 |
-| 10000  | 10 |  931.99 | 9.286 | 19.869 | 23.407 | 10.73 |
+| 1000   | 1  | 1648.53 | 0.480 | 0.957 | 1.253 | 0.61 |
+| 1000   | 5  | 1146.35 | 4.412 | 6.512 | 7.212 | 0.87 |
+| 1000   | 10 | 1327.90 | 8.185 | 12.688 | 14.035 | 0.75 |
+| 10000  | 1  | 1465.92 | 0.560 | 1.121 | 1.469 | 6.82 |
+| 10000  | 5  | 1259.31 | 3.173 | 7.806 | 10.011 | 7.94 |
+| 10000  | 10 | 1102.52 | 6.957 | 19.881 | 23.867 | 9.07 |
 
 (Values are from one run on the dev host; the JSON artifact is the
 source of truth. Throughput should be read as a single-host ballpark
@@ -75,15 +75,15 @@ That means **all writes serialize through one path**, regardless of
 how many concurrent writer tasks the bench dispatches. The numbers
 above show this clearly:
 
-- Throughput plateaus at roughly 0.8-1.6k ops/s across concurrency
+- Throughput plateaus at roughly 1.1-1.6k ops/s across concurrency
   levels 1, 5, and 10 — adding more tasks queues them at the lock,
   it does not parallelize SQLite writes. (Per-cell spread is
   meaningful: a fresh `tempfile.mkdtemp`-backed SQLite, a fresh
   `asyncio.Lock`, and a one-shot migration run means cell-to-cell
   variance is not small. The plateau shape, not the absolute
   throughput, is the load-bearing observation.)
-- Per-insert latency scales up with concurrency (p50 ~0.6-0.8 ms at
-  c=1 vs ~9-11 ms at c=10) — the extra tasks are paying for time
+- Per-insert latency scales up with concurrency (p50 ~0.5-0.6 ms at
+  c=1 vs ~7-9 ms at c=10) — the extra tasks are paying for time
   spent waiting on the lock, not for additional work done in
   parallel.
 
@@ -121,14 +121,29 @@ bench stops at the Phase 1 matrix:
 ## Reproducing this benchmark
 
 The bench script is committed at
-`scripts/bench_sqlite_throughput_phase1.py`. The full Phase 1 matrix
-is one command:
+`scripts/bench_sqlite_throughput_phase1.py`. There are two ways to
+invoke it:
+
+**Commit a fresh artifact pair to `docs/proof/`** — the explicit
+operator action that supersedes the committed pair below. This is
+the path to take when you want to refresh the canonical benchmark
+artifact (e.g. after a backend code change).
 
 ```bash
 python scripts/bench_sqlite_throughput_phase1.py \
     --corpus-sizes 1000,10000 \
     --concurrency 1,5,10 \
     --output-dir docs/proof
+```
+
+**Validate the bench without polluting `docs/proof/`** — what the
+automated check command uses, and what you should use to confirm
+the script still runs end-to-end after a local change. The bench
+executes the full 6-cell matrix but writes the artifacts to a
+fresh `tempfile.mkdtemp()` directory and discards them on exit.
+
+```bash
+python scripts/bench_sqlite_throughput_phase1.py --dry-run
 ```
 
 The script opens a fresh `tempfile.mkdtemp()`-backed SQLite file per
@@ -149,7 +164,7 @@ Required environment:
   other bench scripts in this repo.
 
 Expected timing on the dev host (Asahi aarch64, python 3.14.6):
-~37 seconds for the full 6-cell matrix. Will be slower on
+~29 seconds for the full 6-cell matrix. Will be slower on
 architectures with weaker single-thread SQLite performance; faster
 on NVMe-backed desktop builds. None of these changes the
 architectural observation in the section above — the lock-queueing
@@ -176,12 +191,12 @@ section, not a script rewrite.
 - `python -m pytest tests/test_doc_version_pins_match_code.py -q` —
   19/19 passed (version-pin guardrail; this task doesn't touch
   version strings but the gate is required).
-- The check command from the task brief:
+- The check command (adjusted to use `--dry-run` so it validates
+  the bench without writing artifacts to `docs/proof/` on every CI
+  pass):
 
   ```bash
-  python scripts/bench_sqlite_throughput_phase1.py \
-      --corpus-sizes 1000,10000 --concurrency 1,5,10 \
-      --output-dir docs/proof \
+  python scripts/bench_sqlite_throughput_phase1.py --dry-run \
       && ruff check . \
       && python -m pytest tests/test_doc_version_pins_match_code.py -q
   ```
