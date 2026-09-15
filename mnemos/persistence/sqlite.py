@@ -496,6 +496,40 @@ if _HOT_RS_ENABLED:
     _HOT_RS = load_hot_rs(logger, "SQLite cosine UDF")
 
 
+async def _sqlite_vec_aux_columns(conn: Any, table_name: str) -> list[str]:
+    """Return the named auxiliary columns declared on a vec0 virtual table.
+
+    sqlite-vec auxiliary columns come back from ``PRAGMA table_info`` as
+    ordinary columns (the index column is still the implicit ``rowid``).
+    Used by the SQLite semantic-search candidate path to confirm that a
+    legacy ``memory_embedding_vec`` (created before the aux column was
+    added) has been migrated to the new shape that exposes ``memory_id``.
+    """
+    rows = await _fetch_all(conn, f"PRAGMA table_info({table_name})")
+    cols: list[str] = []
+    for row in rows:
+        name = row.get("name") if isinstance(row, dict) else row[1]
+        # Skip the implicit rowid pseudo-column reported at index 0.
+        if name and name != "rowid":
+            cols.append(str(name))
+    return cols
+
+
+async def _vec_candidate_path_enabled(conn: Any) -> bool:
+    """Return True iff vec0 is reachable on this connection AND the
+    ``memory_embedding_vec`` table is at the post-fix schema.
+
+    Cheap probe (``PRAGMA table_info`` is O(1) on sqlite-vec virtual
+    tables). Returns False on the missing-table OperationalError so a
+    connection without the vec0 module never sees a hard failure.
+    """
+    try:
+        aux = await _sqlite_vec_aux_columns(conn, "memory_embedding_vec")
+    except sqlite3.OperationalError:
+        return False
+    return "memory_id" in aux
+
+
 def _cosine_similarity(left: Any, right: Any) -> float:
     if _HOT_RS is not None:
         # Rust path: ~12× faster on 384-dim batches per
@@ -1092,6 +1126,77 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             "  updated_at = strftime('%s', 'now')",
             (memory_id, embedding_json),
         )
+        # Sync the vec0 KNN index so the candidate-path semantic_search
+        # sees the row immediately on the next call. vec0 virtual tables
+        # have no per-column unique constraint on auxiliary columns, so
+        # the idempotent upsert dance is DELETE WHERE memory_id = ? +
+        # INSERT. Wrapped in a best-effort try/except so a transient
+        # sqlite-vec outage can't poison the canonical
+        # memory_embeddings write — semantic_search will fall back to
+        # the UDF scan until the next upsert or boot-time backfill
+        # recovers parity. The OperationalError branch also covers the
+        # "no vec0 module loaded" deployment so a bare sqlite-vec-less
+        # build keeps the legacy fallback path active.
+        try:
+            await _execute(
+                conn,
+                "DELETE FROM memory_embedding_vec WHERE memory_id = ?",
+                (memory_id,),
+            )
+            await _execute(
+                conn,
+                "INSERT INTO memory_embedding_vec(embedding, memory_id) VALUES (?, ?)",
+                (embedding_json, memory_id),
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug(
+                "sqlite-vec sync skipped on upsert_memory_embedding memory_id=%s: %s",
+                memory_id,
+                exc,
+            )
+
+    async def _sqlite_vec_candidate_ids(
+        self,
+        conn: Any,
+        embedding_json: str,
+        *,
+        k: int,
+    ) -> list[str]:
+        """Return up to ``k`` memory_ids ordered by vec0 KNN distance.
+
+        Module-level helper: the candidate-path semantic_search passes a
+        parameterised embedding JSON tuple + ``k``. Empty list means
+        vec0 isn't reachable on this connection (sqlite-vec missing or
+        memory_embedding_vec at legacy schema) — callers fall back to
+        the UDF scan in that case.
+        """
+        if not await _vec_candidate_path_enabled(conn):
+            return []
+        try:
+            rows = await _fetch_all(
+                conn,
+                "SELECT memory_id FROM memory_embedding_vec "
+                "WHERE embedding MATCH ? AND k = ? "
+                "ORDER BY distance",
+                (embedding_json, k),
+            )
+        except sqlite3.OperationalError as exc:
+            # vec0 may report the table as present but fail the MATCH
+            # (e.g. mismatched dim, sqlite-vec extension not loaded on
+            # the current connection thread). Degrade silently to the
+            # UDF scan — the candidate-path finding asks for this not
+            # to leak, not for this to be a hard failure.
+            logger.debug(
+                "sqlite-vec candidate query failed; falling back to UDF scan: %s",
+                exc,
+            )
+            return []
+        out: list[str] = []
+        for row in rows:
+            mid = row.get("memory_id") if isinstance(row, dict) else row[0]
+            if mid:
+                out.append(str(mid))
+        return out
 
     async def semantic_search(
         self,
@@ -1134,12 +1239,20 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             )
 
         embedding_json = json.dumps([float(value) for value in embedding])
-        conditions: list[str] = ["me.embedding IS NOT NULL"]
+        conn = self._conn(tx)
+
+        # Build the authoritative-row filter conditions shared by both
+        # the candidate-path and the UDF-fallback paths. The vec0 KNN
+        # result only delivers a candidate pool; visibility / ACL
+        # filtering happens against the JOIN with ``memories`` so an
+        # unauthorized row that scores well in vec0 cannot leak into
+        # the final result. This is the correctness-critical split:
+        # vec0 knows vectors, NOT row-level access control.
+        filter_conditions: list[str] = ["me.embedding IS NOT NULL"]
         if not include_archived:
-            conditions.append("m.archived_at IS NULL")
+            filter_conditions.append("m.archived_at IS NULL")
         if exclude_superseded:
-            conditions.append("m.consolidated_into IS NULL")
-        params: list[Any] = [embedding_json]
+            filter_conditions.append("m.consolidated_into IS NULL")
         for col, val in (
             ("category", category),
             ("subcategory", subcategory),
@@ -1148,36 +1261,153 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             ("source_agent", source_agent),
         ):
             if val is not None:
-                conditions.append(f"m.{col} = ?")
-                params.append(val)
+                filter_conditions.append(f"m.{col} = ?")
         if tags:
-            tag_condition = _in_clause("mt.tag", list(tags), params)
-            conditions.append(
+            tag_condition = _in_clause("mt.tag", list(tags), tag_params)
+            filter_conditions.append(
                 "EXISTS (SELECT 1 FROM memory_tags mt "
                 f"WHERE mt.memory_id = m.id AND {tag_condition})"
             )
-        vis_clause = _render_sqlite_visibility(visibility, params, table_alias="m")
+        # Visibility rendering — render once so the candidate-path and
+        # the UDF fallback share the exact same WHERE clause.
+        vis_params: list[Any] = []
+        tag_params: list[Any] = []
+        vis_clause = _render_sqlite_visibility(visibility, vis_params, table_alias="m")
         if vis_clause:
-            conditions.append(vis_clause)
-        # Bounded approximation matching PostgresMemoryRepository: recency
-        # reranks only within this native similarity candidate window.
-        candidate_limit = max(limit, min(limit * 4, 200)) if boost_recency else limit
-        params.append(candidate_limit)
-        # SELECT ``_MEMORY_COLS`` (with the ``m.`` alias) so the row
-        # shape matches what the handler's ``row_to_memory`` consumes —
-        # parity with PostgresMemoryRepository.semantic_search.
+            filter_conditions.append(vis_clause)
+
         select_cols = _sqlite_memory_cols("m")
-        rows = await _fetch_all(
-            self._conn(tx),
+        base_select = (
             f"SELECT {select_cols}, "
             "replace(datetime(m.last_recalled_at), ' ', 'T') AS last_recalled_at, "
             "mnemos_cosine_similarity(me.embedding, ?) AS similarity "
             "FROM memory_embeddings me "
-            "JOIN memories m ON m.id = me.memory_id "
-            f"WHERE {' AND '.join(conditions)} "
-            "ORDER BY similarity DESC, m.updated DESC LIMIT ?",
-            params,
+            "JOIN memories m ON m.id = me.memory_id"
         )
+
+        async def _fetch_authorized_rows(memory_ids: list[str]) -> list[Row]:
+            """Run the authoritative-row fetch + cosine re-rank.
+
+            Returns the ``memory_embeddings`` JSON + ``memories`` row
+            plus ``similarity`` for each surviving row after the shared
+            filter passes. Empty when ``memory_ids`` is empty.
+            """
+            if not memory_ids:
+                return []
+            # Use a slightly relaxed cap here (``limit * 2``) so the
+            # final Python ``rows = rows[:limit]`` below can preserve
+            # the natural cosine ordering without losing legitimate
+            # hits to an over-tight candidate cap.
+            bound = max(limit, min(limit * 2, 200))
+            query_params: list[Any] = [embedding_json]
+            id_placeholders: list[Any] = []
+            id_condition = _in_clause("m.id", list(memory_ids), id_placeholders)
+            where_sql = " AND ".join([id_condition, *filter_conditions])
+            query_params.extend(id_placeholders)
+            query_params.extend(tag_params)
+            query_params.extend(vis_params)
+            query_params.append(bound)
+            sql = (
+                f"{base_select} WHERE {where_sql} "
+                "ORDER BY similarity DESC, m.updated DESC LIMIT ?"
+            )
+            try:
+                return await _fetch_all(conn, sql, query_params)
+            except sqlite3.OperationalError as exc:
+                # Should never happen for non-dim reasons, but a
+                # poisoned memory_embeddings row (NULL embedding /
+                # wrong-dim / malformed JSON) would surface here. Drop
+                # the candidate pool and fall back to the UDF scan
+                # below — better to log + retry slowly than to 500.
+                logger.debug(
+                    "sqlite candidate-path fetch failed; falling back to UDF scan: %s",
+                    exc,
+                )
+                return []
+
+        # ---------- Candidate-path (the cheap, native ANN) ----------
+        #
+        # Probe vec0 availability per call: a fresh transaction uses a
+        # new sqlite connection, so a backend that does or does not
+        # have the vec0 module loaded is decided on the spot. The probe
+        # costs one cheap ``PRAGMA table_info`` call when sqlite-vec is
+        # present and ``memory_embedding_vec`` exists, and a no-op
+        # ``OperationalError`` when it doesn't — both fast. The actual
+        # KNN query is what fails loud on dim errors / missing module,
+        # at which point we drop to the UDF fallback below.
+        rows: list[Row] = []
+        used_candidate_path = False
+        vec0_available = await _vec_candidate_path_enabled(conn)
+
+        if vec0_available:
+            # Initial candidate window: 10x the requested ``limit`` with
+            # an absolute floor so a small ``limit`` still sees enough
+            # candidates for visibility filtering to have something to
+            # select from. The hard cap protects against pathological
+            # small ``limit`` on huge corpora — bounding the read
+            # regardless of operator config keeps one slow query from
+            # pinning a worker.
+            multiplier = getattr(self, "_vec_candidate_multiplier", 10)
+            floor = getattr(self, "_vec_candidate_floor", 100)
+            cap = getattr(self, "_vec_candidate_cap", 2000)
+            base_window = max(limit * multiplier, floor)
+            candidate_k = min(base_window, cap)
+            candidate_ids = await self._sqlite_vec_candidate_ids(
+                conn, embedding_json, k=candidate_k
+            )
+            if candidate_ids:
+                rows = await _fetch_authorized_rows(candidate_ids)
+                used_candidate_path = True
+                # If too few rows survived visibility / ACL filtering
+                # (e.g. the candidate pool is dominated by rows in
+                # other namespaces / owned by other users), retry once
+                # with a larger window — visibility might be reachable
+                # just outside the original k. Hard-bounded by the
+                # _CAP so we don't unboundedly chase a full ``limit``
+                # that visibility rules render impossible.
+                target = min(limit, 50)
+                if 0 < len(rows) < target and candidate_k < cap:
+                    grown_k = min(candidate_k * 4, cap)
+                    if grown_k > candidate_k:
+                        grown_ids = await self._sqlite_vec_candidate_ids(
+                            conn, embedding_json, k=grown_k
+                        )
+                        if grown_ids:
+                            rows = await _fetch_authorized_rows(grown_ids)
+                            candidate_k = grown_k
+
+        # ---------- UDF fallback -----------------------------------------
+        # Engaged when vec0 isn't available (sqlite-vec wheel missing /
+        # legacy DB before the aux-column migration) OR the
+        # candidate-path threw unexpectedly above. Semantically the
+        # pre-fix behaviour: linear cosine scan over
+        # ``memory_embeddings`` with the full filter set, ordered and
+        # limited in SQL. Slow but correct.
+        if not rows and not used_candidate_path:
+            conditions = list(filter_conditions)
+            params: list[Any] = [embedding_json]
+            for col, val in (
+                ("category", category),
+                ("subcategory", subcategory),
+                ("source_provider", source_provider),
+                ("source_model", source_model),
+                ("source_agent", source_agent),
+            ):
+                if val is not None:
+                    params.append(val)
+            params.extend(tag_params)
+            params.extend(vis_params)
+            # Bounded approximation matching PostgresMemoryRepository: recency
+            # reranks only within this native similarity candidate window.
+            candidate_limit = max(limit, min(limit * 4, 200)) if boost_recency else limit
+            params.append(candidate_limit)
+            rows = await _fetch_all(
+                conn,
+                f"{base_select} WHERE {' AND '.join(conditions)} "
+                "ORDER BY similarity DESC, m.updated DESC LIMIT ?",
+                params,
+            )
+
         if boost_recency and rows:
             today = datetime.now(timezone.utc).date()
 
@@ -1204,6 +1434,12 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                     -_recency_score(row),
                 )
             )
+            rows = rows[:limit]
+        # Cap the final return to ``limit`` regardless of which path
+        # produced the rows. The candidate-path query already bounded
+        # to ``limit * 2`` for boost-recency headroom, but callers
+        # asked for ``limit`` and any extra rows are leak risk.
+        if not boost_recency:
             rows = rows[:limit]
         return rows
 
@@ -6610,6 +6846,16 @@ class SqliteBackend:
         # endpoint after open() could poison the table or silently degrade
         # search until the next restart.
         self._memories._expected_embedding_dim = self._resolve_embedding_dim()
+        # Mirror the vec0 candidate-path tuning onto the repo so
+        # ``semantic_search`` (called from the repo) can size the KNN
+        # K without reaching back into the backend. The values are
+        # constants on the class, but copying them here keeps the repo
+        # testable in isolation (SqliteMemoryRepository() can be
+        # constructed without a backend and still see consistent
+        # tuning).
+        self._memories._vec_candidate_multiplier = self._SQLITE_VEC_CANDIDATE_MULTIPLIER
+        self._memories._vec_candidate_floor = self._SQLITE_VEC_CANDIDATE_FLOOR
+        self._memories._vec_candidate_cap = self._SQLITE_VEC_CANDIDATE_CAP
         await _commit(conn)
 
     async def _check_sqlite_version(self, conn: Any) -> None:
@@ -6640,7 +6886,16 @@ class SqliteBackend:
             import sqlite_vec
 
             raw_conn = getattr(conn, "_conn", conn)
-            sqlite_vec.load(raw_conn)
+            # The Python wheel calls ``conn.load_extension(...)`` itself,
+            # which requires load-extension auth to still be on. The
+            # ``enable_load_extension(False)`` in the ``finally`` above
+            # turned auth back off, so re-enable it for the duration of
+            # the python-loader attempt only.
+            await _call(raw_conn.enable_load_extension, True)
+            try:
+                sqlite_vec.load(raw_conn)
+            finally:
+                await _call(raw_conn.enable_load_extension, False)
             self._vec_loaded = True
         except Exception as exc:  # pragma: no cover - optional path.
             logger.debug("sqlite-vec Python loader unavailable; using cosine UDF fallback: %s", exc)
@@ -6854,6 +7109,14 @@ class SqliteBackend:
             if column not in existing:
                 await _execute(conn, f"ALTER TABLE {table} ADD COLUMN {definition}")
 
+    # SQLite vec0 ANN candidate-path tuning (constants are class-scope
+    # so a test that wires up a backend without ``open()`` still sees
+    # the published tuning values). Multiplier / floor / cap together
+    # define the bounded re-query budget used by ``semantic_search``.
+    _SQLITE_VEC_CANDIDATE_MULTIPLIER = 10
+    _SQLITE_VEC_CANDIDATE_FLOOR = 100
+    _SQLITE_VEC_CANDIDATE_CAP = 2000
+
     async def _create_vec_virtual_table(self, conn: Any) -> None:
         dim = self._resolve_embedding_dim()
         # Guard 1: if the vec0 virtual table already exists at a different dim,
@@ -6872,6 +7135,27 @@ class SqliteBackend:
                 f"recreate the table at the new dim and re-embed all memories. "
                 f"Refusing to start to prevent silent search degradation."
             )
+        # Guard 1b: legacy vec0 deployments (created by SQLite backend
+        # revisions before the candidate-path search landed) do not carry
+        # the ``memory_id`` auxiliary column that the new KNN candidate
+        # generator relies on to map rowid -> memory_id without a re-scan.
+        # Detect legacy schema, drop the empty vec0 body, and let the
+        # DDL below recreate it with the right shape. The next
+        # embedding write per row repopulates the index. Operators on a
+        # deployed production SQLite see this happen exactly once on
+        # first restart after the upgrade.
+        if existing_vec_dim is not None and self._vec_loaded:
+            aux = await _sqlite_vec_aux_columns(conn, "memory_embedding_vec")
+            if "memory_id" not in aux:
+                logger.warning(
+                    "sqlite vec0 table is at legacy schema (missing memory_id "
+                    "aux column); recreating and dropping the vec0 vector "
+                    "backup. The next embedding write per row will repopulate "
+                    "it; until then, semantic_search will fall back to the "
+                    "memory_embeddings Python cosine scan."
+                )
+                await _execute(conn, "DROP TABLE memory_embedding_vec")
+                existing_vec_dim = None
         # Guard 2: scan ALL fallback memory_embeddings rows. Stale-dim rows
         # would silently score 0.0 in cosine similarity against new-dim
         # queries — search degrades to "rank by recency" with no warning.
@@ -6897,11 +7181,78 @@ class SqliteBackend:
         try:
             await _execute(
                 conn,
-                f"CREATE VIRTUAL TABLE IF NOT EXISTS memory_embedding_vec USING vec0(embedding float[{dim}])",
+                # Auxiliary column ``memory_id TEXT`` maps each vec0 row to
+                # its authoritative ``memories.id`` so the candidate-path
+                # search can do a single targeted JOIN against
+                # ``memory_embeddings`` / ``memories`` for visibility
+                # filtering + cosine re-rank instead of a full corpus scan.
+                # No PRIMARY KEY on the aux column (vec0 virtual tables
+                # don't support it); the write path uses DELETE WHERE
+                # memory_id = ? + INSERT to make upserts idempotent.
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS memory_embedding_vec "
+                f"USING vec0(embedding float[{dim}], memory_id TEXT)",
             )
+            # Best-effort backfill of any existing memory_embeddings rows
+            # into the vector table on first start after upgrade. Cheap on a
+            # production deployment (~9k rows), and critical so the very
+            # first semantic search sees a populated KNN index rather than
+            # silently degrading to the legacy UDF scan until each row is
+            # re-embedded organically.
+            await self._backfill_vec_table(conn)
         except Exception as exc:
             self._vec_loaded = False
             logger.debug("sqlite-vec virtual table creation failed; using fallback memory_embeddings table: %s", exc)
+
+    async def _backfill_vec_table(self, conn: Any) -> None:
+        """Push every fallback ``memory_embeddings`` row into vec0 on first start.
+
+        sqlite-vec has no incremental "sync from json shadow table"
+        trigger, so the first deployment that upgrades to the candidate-path
+        search needs an explicit one-shot backfill. After this the
+        ``upsert_memory_embedding`` write path keeps vec0 in sync per row.
+        Backfill is best-effort and IDEMPOTENT — already-present rows are
+        re-inserted (vec0 supports ``DELETE WHERE memory_id = ?`` so the
+        DELETE+INSERT dance we run per row handles dedup). Failures are
+        logged and the candidate-path search then continues to behave
+        correctly as rows land organically via ``upsert_memory_embedding``.
+        """
+        try:
+            rows = await _fetch_all(
+                conn,
+                "SELECT memory_id, embedding FROM memory_embeddings",
+            )
+        except sqlite3.OperationalError:
+            # memory_embeddings not yet created (very early boot) — skip.
+            return
+        synced = 0
+        for row in rows:
+            memory_id = row.get("memory_id") if isinstance(row, dict) else row[0]
+            embedding = row.get("embedding") if isinstance(row, dict) else row[1]
+            if not memory_id or embedding is None:
+                continue
+            try:
+                await _execute(
+                    conn,
+                    "DELETE FROM memory_embedding_vec WHERE memory_id = ?",
+                    (memory_id,),
+                )
+                await _execute(
+                    conn,
+                    "INSERT INTO memory_embedding_vec(embedding, memory_id) VALUES (?, ?)",
+                    (embedding, memory_id),
+                )
+                synced += 1
+            except sqlite3.OperationalError as exc:
+                logger.debug(
+                    "sqlite-vec backfill: skipped memory_id=%s (%s)",
+                    memory_id,
+                    exc,
+                )
+        if synced:
+            logger.debug(
+                "sqlite-vec backfill complete: synced=%d rows into memory_embedding_vec",
+                synced,
+            )
 
     async def _existing_vec_table_dim(self, conn: Any) -> Optional[int]:
         """Return the embedded float[N] dim of memory_embedding_vec if it exists.
