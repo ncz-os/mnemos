@@ -429,30 +429,13 @@ async def test_mpf_import_writes_create_audit_entry(sqlite_backend, monkeypatch)
     from mnemos.audit import canonical_payload_hash, memory_id_to_audit_bytes, verify_entry
     from mnemos.domain.portability.schemas import MEMORY_PAYLOAD_VERSION, MPFEnvelope, MPFRecord
 
-    async def _sqlite_insert_memory(_conn, **kwargs):
-        await sqlite_backend.memories.insert_memory(
-            active_tx,
-            memory_id=kwargs["memory_id"],
-            content=kwargs["content"],
-            category=kwargs["category"],
-            subcategory=kwargs["subcategory"],
-            metadata_json=kwargs["metadata_json"],
-            quality_rating=kwargs["quality_rating"],
-            owner_id=kwargs["owner_id"],
-            namespace=kwargs["namespace"],
-            permission_mode=kwargs["permission_mode"],
-            source_model=kwargs["source_model"],
-            source_provider=kwargs["source_provider"],
-            source_session=kwargs["source_session"],
-            source_agent=kwargs["source_agent"],
-            verbatim_content=kwargs["verbatim_content"],
-            embedding=None,
-            created=kwargs["created"],
-            updated=kwargs["updated"],
-        )
-        return "INSERT 0 1"
-
-    monkeypatch.setattr(import_mod.repo, "insert_memory", _sqlite_insert_memory)
+    # No shim any more. This test used to monkeypatch CHARON's module-level
+    # `repo.insert_memory` to redirect a Postgres-only import at the SQLite
+    # backend, and to hand the importer a `_FakePgConn()` stand-in, because
+    # the MPF import path spoke raw asyncpg and could not reach any other
+    # backend. It now takes a persistence backend + transaction, so the real
+    # SQLite backend is passed straight through -- which makes this a genuine
+    # cross-backend proof of the import path rather than a test of the shim.
     envelope = MPFEnvelope(
         records=[
             MPFRecord(
@@ -473,14 +456,12 @@ async def test_mpf_import_writes_create_audit_entry(sqlite_backend, monkeypatch)
     )
 
     async with sqlite_backend.transactional() as tx:
-        active_tx = tx
         stats = await import_mod.import_memories(
-            _FakePgConn(),
+            sqlite_backend,
+            tx,
             envelope=envelope,
             preserve_owner=True,
             user=_Root(),
-            backend=sqlite_backend,
-            tx=tx,
         )
         row = await sqlite_backend.audit_chain.get_latest_audit_entry(
             tx,

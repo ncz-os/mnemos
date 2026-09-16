@@ -65,6 +65,7 @@ from pathlib import Path
 from time import time
 from typing import Any
 
+from mnemos.persistence.base import is_duplicate_memory_error
 from mnemos.portability import mif
 
 MANIFEST_NAME = "mif-manifest.json"
@@ -1228,20 +1229,7 @@ async def import_bundle_to_backend(
     }
 
 
-def _is_duplicate_memory_error(exc: BaseException) -> bool:
-    """Best-effort detection of "row already exists" across backends.
-
-    The SQLite impl raises :class:`mnemos.persistence.base.DuplicateMemoryError`;
-    Postgres raises its own (different) exception. Some backends surface it
-    as an IntegrityError with a known message. We keep this narrow on
-    purpose — anything else propagates so the caller learns about real
-    failures.
-    """
-    name = type(exc).__name__
-    if name == "DuplicateMemoryError":
-        return True
-    if name in {"IntegrityError", "UniqueViolation", "DuplicateKeyError"}:
-        msg = str(exc).lower()
-        if "unique" in msg or "duplicate" in msg or "primary key" in msg:
-            return True
-    return False
+# Single source of truth lives on the persistence contract, next to
+# DuplicateMemoryError itself; this alias keeps the historical private name
+# working for existing call sites in this module.
+_is_duplicate_memory_error = is_duplicate_memory_error
