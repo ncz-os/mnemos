@@ -1,6 +1,6 @@
 # MNEMOS Deployment & Configuration Guide
 
-**Status**: v7.0.0.dev0 current.
+**Status**: v7.0.0 current.
 
 ---
 
