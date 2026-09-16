@@ -45,6 +45,14 @@ The review was performed directly against the canonical GitLab source.
    streaming implementation. Follow-up pin commits bind CI and release composition
    to the reviewed sources. No moving branch references are used for dependencies.
 
+8. **Composition-only layer violations.** Core shutdown imported the GRAEAE
+   domain directly and could construct an engine just to close it. GRAEAE now
+   registers its own optional cleanup when its singleton is created. The MCP
+   tool also imported pure helpers from an API route; those six helpers moved
+   unchanged into the GRAEAE domain and remain re-exported for compatibility.
+   All seven import contracts now pass with every add-on installed; composition
+   CI enforces that check so the core-only installation cannot hide this again.
+
 ## Verification boundaries
 
 The SQLite harness measures overlapping tasks queued at one backend lock, not
@@ -68,10 +76,10 @@ suite results, commit IDs, and CI status are recorded in the completed handoff.
 ## Local validation (2026-09-16)
 
 - Core plus pinned add-ons: 3,745 passed, 476 skipped.
-- Core only: 3,722 passed, 495 skipped; seven import contracts kept.
+- Core only: 3,722 passed, 495 skipped; all seven import contracts also pass in composition.
 - Audit gate: 156 passed, 35 skipped; 100% statements and branches without exclusions.
 - CHARON with disposable PostgreSQL 17: 320 passed, 4 skipped.
-- GRAEAE: 148 passed, 4 skipped; KNEMON with PostgreSQL: 227 passed, 1 skipped;
+- GRAEAE: 150 passed, 4 skipped; KNEMON with PostgreSQL: 227 passed, 1 skipped;
   PANTHEON: 376 passed.
 - Oracle structural move check: nine symbols passed. Migration inventory: 62 with parity.
 - Full dependency resolution and installed-package compatibility check passed.
