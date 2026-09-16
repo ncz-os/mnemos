@@ -60,6 +60,7 @@ from mnemos.persistence.base import (
     ConsultationsRepository,
     FederationRepository,
     FULL_STORAGE_CAPABILITY_DETAILS,
+    IsolationLevel,
     KGRepository,
     MemoryRepository,
     MorpheusConsolidationResult,
@@ -648,6 +649,7 @@ class _OracleTransaction:
     def __init__(self, conn: Any):
         self._conn = conn
         self._closed = False
+        self._savepoint_seq = 0
 
     @property
     def closed(self) -> bool:
@@ -672,6 +674,37 @@ class _OracleTransaction:
         if inspect.isawaitable(result):
             await result
         self._closed = True
+
+    @asynccontextmanager
+    async def savepoint(self) -> AsyncIterator["_OracleTransaction"]:
+        """Nested savepoint scope.
+
+        Oracle has SAVEPOINT and ROLLBACK TO SAVEPOINT but NO
+        ``RELEASE SAVEPOINT`` -- there is nothing to release, a savepoint
+        simply becomes unreachable when the transaction ends. The success
+        path is therefore a no-op, which is correct rather than a shortcut:
+        leaving the marker in place changes nothing about what commits.
+
+        Db2 in Oracle-compat mode inherits this and behaves the same way.
+        """
+        if self._closed:
+            raise RuntimeError("cannot open a savepoint on a closed transaction")
+        self._savepoint_seq += 1
+        name = f"mnemos_sp_{self._savepoint_seq}"
+        cursor = await _call(self._conn.cursor)
+        try:
+            await _call(cursor.execute, f"SAVEPOINT {name}")
+        finally:
+            await _call(cursor.close)
+        try:
+            yield self
+        except BaseException:
+            cursor = await _call(self._conn.cursor)
+            try:
+                await _call(cursor.execute, f"ROLLBACK TO SAVEPOINT {name}")
+            finally:
+                await _call(cursor.close)
+            raise
 
 
 def _stub_method(method_name: str):
@@ -787,12 +820,16 @@ class OracleKGRepository(KGRepository):
         effective_ns: str | None,
         include_unattached: bool,
         hard_limit: int,
+        include_secrets: bool = False,
     ) -> list[Row]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
             where: list[str] = ["deleted_at IS NULL"]
             params: dict[str, Any] = {}
+            if not include_secrets:
+                where.append("(namespace IS NULL OR namespace <> :vault_ns)")
+                params["vault_ns"] = VAULT_NAMESPACE
             if memory_ids:
                 placeholders, mid_params = _in_placeholders(memory_ids, "mid")
                 if include_unattached:
@@ -958,6 +995,7 @@ class OracleVersionRepository(VersionRepository):
         effective_owner: str | None,
         effective_ns: str | None,
         hard_limit: int,
+        include_secrets: bool = False,
     ) -> list[Row]:
         if not memory_ids:
             return []
@@ -966,6 +1004,9 @@ class OracleVersionRepository(VersionRepository):
         try:
             placeholders, params = _in_placeholders(memory_ids, "mid")
             where = ["deleted_at IS NULL", f"memory_id IN ({placeholders})"]
+            if not include_secrets:
+                where.append("(namespace IS NULL OR namespace <> :vault_ns)")
+                params["vault_ns"] = VAULT_NAMESPACE
             if effective_owner:
                 where.append("owner_id = :owner_id")
                 params["owner_id"] = effective_owner
@@ -1806,12 +1847,17 @@ class OracleMemoryRepository(MemoryRepository):
         category: str | None,
         limit: int,
         offset: int,
+        include_secrets: bool = False,
+        record_cursor: tuple[Any, str] | None = None,
     ) -> list[Row]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
             where = ["deleted_at IS NULL"]
             params: dict[str, Any] = {"limit": limit, "offset": offset}
+            if not include_secrets:
+                where.append("(namespace IS NULL OR namespace <> :vault_ns)")
+                params["vault_ns"] = VAULT_NAMESPACE
             if effective_owner:
                 where.append("owner_id = :owner_id")
                 params["owner_id"] = effective_owner
@@ -1821,6 +1867,17 @@ class OracleMemoryRepository(MemoryRepository):
             if category:
                 where.append("category = :cat")
                 params["cat"] = category
+            if record_cursor is not None:
+                # Oracle supports row-value comparison only in restricted
+                # forms, so the keyset is expressed as its expanded
+                # lexicographic equivalent.
+                where.append(
+                    "(created > :cur_created "
+                    "OR (created = :cur_created_eq AND id > :cur_id))"
+                )
+                params["cur_created"] = record_cursor[0]
+                params["cur_created_eq"] = record_cursor[0]
+                params["cur_id"] = record_cursor[1]
             sql = (
                 "SELECT id, content, category, subcategory, created, updated, "
                 "owner_id, group_id, namespace, permission_mode, quality_rating, "
@@ -1829,6 +1886,96 @@ class OracleMemoryRepository(MemoryRepository):
                 "FROM memories WHERE " + " AND ".join(where) + " "
                 "ORDER BY created ASC, id ASC "
                 "OFFSET :offset ROWS FETCH NEXT :limit ROWS ONLY"
+            )
+            await _call(cursor.execute, sql, params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_visible_export_memory_ids(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        include_secrets: bool = False,
+    ) -> set[str]:
+        if not memory_ids:
+            return set()
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders, params = _in_placeholders(memory_ids, "vis")
+            where = [f"id IN ({placeholders})", "deleted_at IS NULL"]
+            if effective_owner:
+                where.append("owner_id = :owner_id")
+                params["owner_id"] = effective_owner
+            if effective_ns:
+                where.append("namespace = :ns")
+                params["ns"] = effective_ns
+            if not include_secrets:
+                where.append("(namespace IS NULL OR namespace <> :vault_ns)")
+                params["vault_ns"] = VAULT_NAMESPACE
+            sql = "SELECT id FROM memories WHERE " + " AND ".join(where)
+            await _call(cursor.execute, sql, params)
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        return {row["id"] for row in rows}
+
+    async def fetch_deletion_log_for_export(
+        self,
+        tx: Transaction,
+        *,
+        effective_owner: str | None,
+        effective_ns: str | None,
+        hard_limit: int,
+        from_executed_at: Any = None,
+        to_executed_at: Any = None,
+        cursor_executed_at: Any = None,
+        cursor_id: str | None = None,
+        export_as_of: Any = None,
+        include_secrets: bool = False,
+    ) -> list[Row]:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where: list[str] = []
+            params: dict[str, Any] = {}
+            if not include_secrets:
+                where.append("(namespace IS NULL OR namespace <> :vault_ns)")
+                params["vault_ns"] = VAULT_NAMESPACE
+            if effective_owner:
+                where.append("owner_id = :owner_id")
+                params["owner_id"] = effective_owner
+            if effective_ns:
+                where.append("namespace = :ns")
+                params["ns"] = effective_ns
+            if from_executed_at:
+                where.append("executed_at >= :dl_from")
+                params["dl_from"] = from_executed_at
+            if to_executed_at:
+                where.append("executed_at <= :dl_to")
+                params["dl_to"] = to_executed_at
+            if cursor_executed_at and cursor_id:
+                where.append(
+                    "(executed_at > :cur_exec "
+                    "OR (executed_at = :cur_exec_eq AND id > :cur_id))"
+                )
+                params["cur_exec"] = cursor_executed_at
+                params["cur_exec_eq"] = cursor_executed_at
+                params["cur_id"] = cursor_id
+            if export_as_of:
+                where.append("executed_at <= :as_of")
+                params["as_of"] = export_as_of
+            clause = ("WHERE " + " AND ".join(where)) if where else ""
+            sql = (
+                "SELECT id, memory_id, content_hash, owner_id, namespace, "
+                "requested_by, requested_at, executed_at, request_kind, reason, source "
+                f"FROM deletion_log {clause} "
+                "ORDER BY executed_at ASC, id ASC "
+                f"FETCH FIRST {int(hard_limit) + 1} ROWS ONLY"
             )
             await _call(cursor.execute, sql, params)
             return await _fetch_all_dicts(cursor)
@@ -7848,8 +7995,52 @@ class OracleBackend(OracleAuditJournalMixin):
         return set(FULL_STORAGE_CAPABILITY_DETAILS)
 
     @asynccontextmanager
-    async def transactional(self) -> AsyncIterator[Transaction]:
+    async def transactional(
+        self,
+        *,
+        isolation: IsolationLevel | None = None,
+        readonly: bool = False,
+    ) -> AsyncIterator[Transaction]:
+        """Open a transaction, optionally pinning isolation and read-only mode.
+
+        Oracle's isolation vocabulary is deliberately narrower than the SQL
+        standard's: it offers READ COMMITTED and SERIALIZABLE, and has no
+        REPEATABLE READ keyword at all. What it *does* have is
+        ``SET TRANSACTION READ ONLY``, which pins every statement in the
+        transaction to one SCN -- statement-set read consistency, which is
+        precisely the guarantee REPEATABLE READ names on the other backends.
+
+        So ``repeatable_read`` maps to READ ONLY when the caller asked for
+        read-only (the export's case) and to SERIALIZABLE otherwise, since a
+        read-write transaction needing repeatable reads on Oracle must use
+        SERIALIZABLE. Neither is a downgrade.
+
+        ``SET TRANSACTION`` must be the FIRST statement of the transaction,
+        so it is issued before anything else touches the connection.
+        """
         async with self._pool.acquire() as conn:
+            if isolation is not None or readonly:
+                if isolation == "read_committed":
+                    stmt = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+                elif isolation == "serializable":
+                    stmt = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+                elif isolation == "repeatable_read":
+                    stmt = (
+                        "SET TRANSACTION READ ONLY"
+                        if readonly
+                        else "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+                    )
+                elif isolation is None:
+                    stmt = "SET TRANSACTION READ ONLY"
+                else:
+                    raise ValueError(
+                        f"unsupported isolation level for Oracle: {isolation!r}"
+                    )
+                cursor = await _call(conn.cursor)
+                try:
+                    await _call(cursor.execute, stmt)
+                finally:
+                    await _call(cursor.close)
             tx = _OracleTransaction(conn)
             try:
                 yield tx
@@ -7860,6 +8051,32 @@ class OracleBackend(OracleAuditJournalMixin):
             else:
                 if not tx.closed:
                     await tx.commit()
+
+    async def fetch_server_now(self, tx: Transaction) -> datetime:
+        # SYSTIMESTAMP is the DB host's clock WITH a timezone offset;
+        # CURRENT_TIMESTAMP would be the session timezone and SYSDATE has no
+        # sub-second precision. Normalise to UTC so the anchor is comparable
+        # regardless of where the database sits.
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(cursor.execute, "SELECT SYSTIMESTAMP FROM dual")
+            row = await _call(cursor.fetchone)
+        finally:
+            await _call(cursor.close)
+        raw = row[0] if row else None
+        if isinstance(raw, datetime):
+            return (
+                raw.astimezone(timezone.utc)
+                if raw.tzinfo
+                else raw.replace(tzinfo=timezone.utc)
+            )
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return (
+            parsed.astimezone(timezone.utc)
+            if parsed.tzinfo
+            else parsed.replace(tzinfo=timezone.utc)
+        )
 
     async def insert_pantheon_routing_audit(
         self,

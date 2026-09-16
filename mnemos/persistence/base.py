@@ -190,6 +190,21 @@ class WebhookFinalizationResult:
     successor_delivery_id: str | None = None
 
 
+IsolationLevel: TypeAlias = Literal["read_committed", "repeatable_read", "serializable"]
+"""Backend-neutral transaction isolation levels.
+
+Only the three levels MNEMOS actually asks for are modelled. ``read_uncommitted``
+is deliberately absent: no MNEMOS caller wants dirty reads, and two of the six
+backends (Postgres, Oracle) silently promote it to ``read_committed`` anyway, so
+offering it would advertise a guarantee that varies by backend.
+
+The critical consumer is the MPF export path, which requires ``repeatable_read``
++ ``readonly`` so every page, sidecar and tombstone read in one export observes
+a single snapshot. See :meth:`PersistenceCapabilityBase.transactional` for the
+per-backend mapping, including the SQLite caveat.
+"""
+
+
 @runtime_checkable
 class Transaction(Protocol):
     """Backend-neutral transaction handle.
@@ -205,6 +220,49 @@ class Transaction(Protocol):
 
     async def rollback(self) -> None:
         """Rollback the transaction."""
+        ...
+
+
+@runtime_checkable
+class NestableTransaction(Transaction, Protocol):
+    """A :class:`Transaction` that can also open nested savepoint scopes.
+
+    Deliberately a SEPARATE protocol rather than two more lines on
+    :class:`Transaction`, for two reasons:
+
+    1. ``Transaction`` is ``runtime_checkable`` and is the handle every test
+       double and fake backend fabricates. ``isinstance(x, Transaction)``
+       checks member PRESENCE, so widening ``Transaction`` would retroactively
+       invalidate every stub that only implements commit/rollback — including
+       fakes in downstream repositories this package cannot see.
+    2. Savepoints are a capability, and this codebase already models optional
+       capabilities separately (see :class:`BackendCapabilityMissing`) rather
+       than forcing every implementation to carry every method.
+
+    All six shipped backends DO implement this; the split is about not
+    breaking doubles, not about expected coverage.
+
+    Why it exists at all: the MPF import path needs per-entry failure
+    isolation — one malformed sidecar row must not abort a whole import.
+    Postgres got that implicitly, because asyncpg turns a nested
+    ``conn.transaction()`` into a SAVEPOINT; no other driver replicates that.
+    Making it explicit is what lets one piece of import code run on all six.
+    """
+
+    def savepoint(self) -> AsyncContextManager["Transaction"]:
+        """Open a nested savepoint scope inside this transaction.
+
+        Yields a handle for the nested scope (in practice ``self`` — a
+        savepoint is a rollback marker within one transaction, not a separate
+        session). On clean exit the savepoint is released; on any exception it
+        is rolled back to and the exception propagates, leaving the *outer*
+        transaction alive and usable.
+
+        Implementations must NOT reuse one savepoint name within a
+        transaction: ``ROLLBACK TO <name>`` targets the most recent savepoint
+        of that name, so a shared name lets an inner scope's failure silently
+        unwind an outer one.
+        """
         ...
 
 
@@ -262,7 +320,102 @@ class MemoryRepository(ABC):
         category: str | None,
         limit: int,
         offset: int,
-    ) -> list[Row]: ...
+        include_secrets: bool = False,
+        record_cursor: tuple[Any, str] | None = None,
+    ) -> list[Row]:
+        """Return one page of exportable memory rows in ``(created, id)`` order.
+
+        ``include_secrets`` is the root-only backup escape hatch. When ``False``
+        (the default, and the only value a non-root caller can reach) rows in
+        the vault namespace are excluded outright. Implementations MUST apply
+        this as a SQL predicate, not a post-filter, or a page of vault rows
+        would silently shrink the page below ``limit`` and make the caller
+        believe the walk had finished.
+
+        ``record_cursor`` is a ``(created, id)`` keyset position; when supplied
+        the page resumes strictly after it. ``(created, id)`` is a TOTAL order
+        because ``id`` is the primary key, so keyset resumption is gap-free and
+        overlap-free. Callers combine ``offset`` (first page only) with the
+        cursor for subsequent pages — re-applying ``offset`` after a cursor
+        would skip rows a second time.
+        """
+        ...
+
+    @abstractmethod
+    async def fetch_visible_export_memory_ids(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        include_secrets: bool = False,
+    ) -> set[str]:
+        """Return the subset of ``memory_ids`` the export scope may reference.
+
+        Used to resolve MPF v0.2 PROV-DM ``wasInfluencedBy`` targets that point
+        at memories outside the current page. A reference to another tenant's
+        memory must not survive into the envelope, and a reference to a row
+        that is merely on a different page must not be dropped — so visibility
+        is resolved against the whole snapshot rather than against the page.
+
+        The predicate is deliberately a strict SUPERSET of
+        :meth:`fetch_memory_export`'s: ``deleted_at IS NULL`` + owner +
+        namespace + vault exclusion, but NO ``category`` filter. Any row on the
+        current page is therefore visible by construction, which is what makes
+        it safe to seed the in-scope set from the page and query only the
+        remainder.
+
+        Returns a set of ids, not rows: callers only ever test membership.
+        """
+        ...
+
+    @abstractmethod
+    async def fetch_deletion_log_for_export(
+        self,
+        tx: Transaction,
+        *,
+        effective_owner: str | None,
+        effective_ns: str | None,
+        hard_limit: int,
+        from_executed_at: Any = None,
+        to_executed_at: Any = None,
+        cursor_executed_at: Any = None,
+        cursor_id: str | None = None,
+        export_as_of: Any = None,
+        include_secrets: bool = False,
+    ) -> list[Row]:
+        """Return deletion_log (tombstone) rows for an MPF v0.2 export.
+
+        Lives on ``MemoryRepository`` rather than a repository of its own
+        because deletion_log is the tombstone half of the memory lifecycle: its
+        rows are memories, just deleted ones. It is the ONLY export surface not
+        bound to a set of live memory ids — binding it to live rows would defeat
+        its entire purpose — so it scopes by owner/namespace alone.
+
+        Pagination has two independent, combinable shapes:
+
+        * ``from_executed_at`` / ``to_executed_at`` — inclusive time window.
+        * ``cursor_executed_at`` + ``cursor_id`` — keyset over the composite
+          ``(executed_at, id)``, strict-greater. Required for the bulk-wipe
+          case where thousands of tombstones share one ``executed_at`` and a
+          time window alone cannot split them.
+
+        ``export_as_of`` caps ``executed_at`` so rows committed after the export
+        began cannot bleed into a later page. It is a best-effort anchor, NOT a
+        true cross-call snapshot — a transaction that stamped ``executed_at`` at
+        BEGIN but committed after page 1 can sort below the keyset and be
+        skipped. That caveat is inherited from the shape of the data, not from
+        any backend, and is documented at the charon export entry point.
+
+        Order is ``executed_at ASC, id ASC`` on every backend — the cursor is
+        only stable if the sort is.
+
+        Implementations MUST return ``hard_limit + 1`` rows at most, so the
+        caller can detect overflow and mint a next-page cursor rather than
+        truncating silently.
+        """
+        ...
 
     @abstractmethod
     async def fetch_referenced_memory_allowlist(
@@ -593,7 +746,17 @@ class KGRepository(ABC):
         effective_ns: str | None,
         include_unattached: bool,
         hard_limit: int,
-    ) -> list[Row]: ...
+        include_secrets: bool = False,
+    ) -> list[Row]:
+        """Return kg_triples attached to ``memory_ids`` (plus, optionally,
+        unattached ones) for an MPF export.
+
+        ``include_secrets=False`` excludes vault-namespace triples, matching
+        :meth:`MemoryRepository.fetch_memory_export`. A triple's namespace is
+        independent of its memory's, so this filter is needed here in its own
+        right — it is not implied by the records page already being filtered.
+        """
+        ...
 
     @abstractmethod
     async def insert_kg_triple(
@@ -631,7 +794,16 @@ class VersionRepository(ABC):
         effective_owner: str | None,
         effective_ns: str | None,
         hard_limit: int,
-    ) -> list[Row]: ...
+        include_secrets: bool = False,
+    ) -> list[Row]:
+        """Return version history rows for ``memory_ids`` for an MPF export.
+
+        ``include_secrets=False`` excludes vault-namespace versions. A version
+        row carries its own namespace, so a memory can be non-vault while an
+        older version of it is vaulted; filtering only the parent would leak
+        that version's plaintext.
+        """
+        ...
 
     @abstractmethod
     async def fetch_memory_versions_by_ids(self, tx: Transaction, version_ids: Sequence[str]) -> list[Row]: ...
@@ -2888,8 +3060,75 @@ class BackendCapabilityMissing(HTTPException):
 class PersistenceCapabilityBase(Protocol):
     """Common facade shape shared by every persistence capability."""
 
-    def transactional(self) -> AsyncContextManager[Transaction]:
-        """Open a backend-neutral transaction context."""
+    def transactional(
+        self,
+        *,
+        isolation: IsolationLevel | None = None,
+        readonly: bool = False,
+    ) -> AsyncContextManager[Transaction]:
+        """Open a backend-neutral transaction context.
+
+        ``isolation=None`` keeps each backend's existing default, so every
+        pre-existing call site is unchanged. A non-None value is a REAL
+        request that the backend must honor or refuse — never silently ignore.
+
+        Per-backend mapping of ``isolation="repeatable_read", readonly=True``
+        (the MPF export's requirement — one snapshot for every read in the
+        export, and no writes):
+
+        ===========  =====================================================
+        Postgres     ``BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY``.
+                     True MVCC snapshot taken at first statement.
+        MySQL /      ``SET TRANSACTION ISOLATION LEVEL REPEATABLE READ``
+        MariaDB      then ``START TRANSACTION READ ONLY``. InnoDB takes a
+                     consistent read view at the first read.
+        Oracle       ``SET TRANSACTION READ ONLY``. Oracle has no
+                     REPEATABLE READ keyword; read-only transactions give
+                     statement-set read consistency from a single SCN,
+                     which is the guarantee REPEATABLE READ names
+                     elsewhere. SERIALIZABLE maps to
+                     ``ISOLATION LEVEL SERIALIZABLE``.
+        Db2          ``SET CURRENT ISOLATION = RR`` (Repeatable Read is
+                     Db2's literal name for it) before BEGIN.
+        SQLite       **Different mechanism, equivalent guarantee — see
+                     below.** This is the one row that is NOT the same
+                     thing under a different name.
+        ===========  =====================================================
+
+        SQLite, honestly stated
+        -----------------------
+        SQLite has no ``READ COMMITTED`` / ``REPEATABLE READ`` vocabulary at
+        all; it has ``DEFERRED`` / ``IMMEDIATE`` / ``EXCLUSIVE`` *locking*
+        modes. Mapping our level names onto those names would be a lie.
+
+        What SQLite genuinely provides, and what this implementation uses, is:
+        in **WAL mode** (which MNEMOS enables — ``PRAGMA journal_mode=WAL``),
+        a read transaction takes a snapshot of the database as of its first
+        read and sees NOTHING committed by any writer afterwards, until it
+        ends. That is precisely the consistency property ``repeatable_read``
+        is being asked for here — a stable snapshot for the duration of the
+        export — arrived at by a different mechanism.
+
+        Two real caveats, not papered over:
+
+        1. A ``BEGIN DEFERRED`` does not acquire the read snapshot until the
+           first actual read. This implementation therefore issues a trivial
+           ``SELECT`` immediately after BEGIN so the snapshot is pinned at
+           ``transactional()`` entry, matching the other five backends. Without
+           that, rows committed between BEGIN and the first real query would be
+           visible and the guarantee would be silently weaker.
+        2. ``readonly=True`` is enforced by SQLite only to the extent that a
+           deferred transaction that never writes never escalates to a write
+           lock. There is no ``START TRANSACTION READ ONLY`` equivalent, so a
+           write issued on a ``readonly=True`` SQLite transaction would still
+           succeed rather than raise. Callers must not rely on SQLite to
+           *reject* writes; ``readonly`` is a snapshot/locking hint there, and
+           a genuine server-enforced prohibition on the other five.
+
+        Raises ``ValueError`` for an isolation level the backend cannot honor,
+        rather than downgrading — a silently downgraded export snapshot is the
+        exact failure this parameter exists to prevent.
+        """
         ...
 
     @property
@@ -2907,6 +3146,30 @@ class CorePersistence(PersistenceCapabilityBase, Protocol):
     """Core memory/category/search persistence surface."""
 
     _supports_core_persistence: Literal[True]
+
+    async def fetch_server_now(self, tx: Transaction) -> datetime:
+        """Return the DATABASE server's current timestamp, timezone-aware.
+
+        Lives on the backend facade rather than a repository because it is a
+        property of the session, not of any table.
+
+        Why the app clock is not acceptable here: the MPF export stamps an
+        ``export_as_of`` anchor into its pagination cursor, and every later
+        page filters ``executed_at <= export_as_of``. That comparison happens
+        in the database, against values the database wrote. If the anchor came
+        from the app's clock, any skew between app host and DB host would
+        either admit rows that committed after the export began (clock ahead)
+        or silently drop rows that committed before it (clock behind). Both are
+        wrong, and both are invisible in testing on a single host where the two
+        clocks agree.
+
+        Implementations return an aware ``datetime`` in UTC. Backends whose
+        native "now" is naive or session-local (Db2's ``CURRENT TIMESTAMP``,
+        SQLite's ``CURRENT_TIMESTAMP``) MUST attach UTC explicitly rather than
+        handing back a naive value — a naive anchor compared against a
+        timestamptz column is exactly the skew bug this method exists to avoid.
+        """
+        raise NotImplementedError("fetch_server_now is not implemented")
 
     async def record_usage_ledger(
         self,
