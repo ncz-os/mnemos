@@ -94,6 +94,27 @@ lint:ruff:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
 
+lint:backend-parity:
+  stage: lint
+  tags: [argos, ncz-os]
+  script:
+    - python3 scripts/generate_backend_parity_matrix.py
+    - git diff --exit-code -- docs/BACKEND_PARITY.md
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+lint:oracle-method-move:
+  stage: lint
+  tags: [argos, ncz-os]
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - python3 tools/verify_method_move.py --report
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
 lint:import-linter:
   stage: lint
   tags: [argos, ncz-os]
@@ -165,13 +186,9 @@ test:unit:
 # ``pytest tests/test_audit_route_helper.py tests/test_required_audit_mutations.py``
 # is the minimum must-pass subset and is a strict subset of this list.
 #
-# Threshold: 100% (with branch coverage). Branches that cannot be hit
-# from these tests carry an inline ``# pragma: no cover`` comment in
-# the source with a one-line explanation of WHY that exact branch is
-# unreachable from this scope (dialect dispatch for backends this job
-# doesn't run against, Python-version-specific stdlib fallbacks, etc.).
-# Do not silently lower the threshold -- if a new unreachable branch
-# appears, add a pragma with a justification in the same place.
+# Threshold: 100% statement and branch coverage, without audit exclusions.
+# Driver dispatch is tested with real repository constructors and an isolated
+# writer spy; this does not replace live backend persistence qualification.
 test:audit-coverage-gate:
   stage: test
   tags: [argos, ncz-os]

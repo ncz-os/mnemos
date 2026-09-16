@@ -28,7 +28,7 @@ import json
 from typing import Any
 
 from mnemos.persistence.base import AuditChainRepository, Transaction
-from mnemos.persistence.oracle import _call, _conn_from_tx, _fetch_all_dicts, _row_to_dict
+from mnemos.persistence.oracle_helpers import _call, _conn_from_tx, _fetch_all_dicts, _row_to_dict
 from mnemos.persistence.types import Row
 
 

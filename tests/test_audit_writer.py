@@ -245,3 +245,15 @@ class TestLatestHash:
         h2 = latest_hash(*entries[1])
         assert entries[1][0].prev_entry_hash == h1
         assert entries[2][0].prev_entry_hash == h2
+
+
+def test_uuid_generation_on_both_supported_stdlib_paths(monkeypatch):
+    from mnemos.audit.writer import _uuidv7_bytes
+    import uuid
+
+    fixed = uuid.UUID(int=42)
+    monkeypatch.setattr(uuid, "uuid7", lambda: fixed, raising=False)
+    assert _uuidv7_bytes() == fixed.bytes
+    monkeypatch.delattr(uuid, "uuid7")
+    monkeypatch.setattr(uuid, "uuid4", lambda: fixed)
+    assert _uuidv7_bytes() == fixed.bytes

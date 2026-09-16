@@ -4,8 +4,8 @@
 Confirms that a class or method moved from ``mnemos/persistence/oracle.py``
 into ``mnemos/persistence/oracle_audit.py`` is byte-identical modulo
 location. The comparison uses ``ast.dump`` on the function/class node, so
-indentation differences from re-nesting are tolerated but any real
-behavioral change (different statements, arguments, decorators, default
+indentation differences from re-nesting are tolerated but any syntactic
+change (different statements, arguments, decorators, default
 values, etc.) is caught.
 
 Why AST and not raw bytes?
@@ -24,15 +24,18 @@ Usage (single symbol)::
         --after-file mnemos/persistence/oracle_audit.py \
         --symbol OracleAuditChainRepository
 
-Usage (summary across all 4 split symbols)::
+Usage (summary across the split symbols and shared helpers)::
 
     python tools/verify_method_move.py --report
+
+This is a structural guard, not a proof of runtime equivalence: dynamic imports,
+transitive dependency changes, monkeypatching, and metaclass behavior need tests.
 
 Exit code is 0 if every check passes and nonzero if any real behavioral
 diff is detected (or if a symbol cannot be located in either the BEFORE
 or AFTER tree, which would itself be a bug).
 
-The default ``--before`` is ``HEAD~1`` (the parent of the split commit).
+The default ``--before`` is ``106671e^`` (the parent of the split commit).
 For diffing against an older ref, pass ``--before <ref>`` explicitly. If
 the split is uncommitted in your working tree, pass ``--before HEAD`` so
 the BEFORE tree is the last committed snapshot rather than the split
@@ -44,6 +47,8 @@ from __future__ import annotations
 import argparse
 import ast
 import subprocess
+import builtins
+import symtable
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,10 +97,17 @@ DEFAULT_SYMBOLS: tuple[dict, ...] = (
 )
 
 
-# Path of the *post-split* oracle.py — used to confirm that the moved symbol
-# no longer exists at its old location. The split is mechanical, so the
-# symbol must be ABSENT from the new oracle.py at the BEFORE location.
-POST_SPLIT_ORACLE_FILE = "mnemos/persistence/oracle.py"
+# Shared driver helpers were also extracted to break the module import cycle.
+DEFAULT_SYMBOLS += tuple(
+    {
+        "symbol": name,
+        "before_file": "mnemos/persistence/oracle.py",
+        "after_file": "mnemos/persistence/oracle_helpers.py",
+        "before_class": None,
+        "after_class": None,
+    }
+    for name in ("_call", "_conn_from_tx", "_materialize_value", "_row_to_dict", "_fetch_all_dicts")
+)
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +155,7 @@ def _find_class(tree: ast.Module, name: str) -> ast.ClassDef:
 
 def _find_top_level(tree: ast.Module, name: str) -> ast.ClassDef | ast.FunctionDef:
     for node in tree.body:
-        if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name == name:
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return node
     raise LookupError(f"top-level {name!r} not found")
 
@@ -203,6 +215,69 @@ def _dump(node: ast.AST) -> str:
     of their position in the file or their indentation level.
     """
     return ast.dump(node, annotate_fields=True, indent=2)
+
+
+def _global_names(node):
+    table = symtable.symtable(ast.unparse(node), "<moved>", "exec")
+    names = set()
+
+    def walk(scope):
+        for symbol in scope.get_symbols():
+            if symbol.is_referenced() and symbol.is_global():
+                names.add(symbol.get_name())
+        for child in scope.get_children():
+            walk(child)
+
+    walk(table)
+    return names - {getattr(node, "name", "")}
+
+
+def _binding(name, tree, file, ref, seen=()):
+    """Resolve local import re-exports without importing application code."""
+    key = (file, name)
+    if key in seen:
+        return ("cycle", name)
+    for stmt in reversed(tree.body):
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and stmt.name == name:
+            return ("definition", _dump(stmt))
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+                return ("value", _dump(stmt.value) if stmt.value else "None")
+        if isinstance(stmt, ast.Import):
+            for alias in stmt.names:
+                if (alias.asname or alias.name.split(".")[0]) == name:
+                    return ("module", alias.name)
+        if isinstance(stmt, ast.ImportFrom):
+            for alias in stmt.names:
+                if (alias.asname or alias.name) != name:
+                    continue
+                module = stmt.module or ""
+                if stmt.level:
+                    parts = Path(file).parent.parts
+                    module = ".".join((*parts[: len(parts) - stmt.level + 1], module))
+                local = module.replace(".", "/") + ".py"
+                try:
+                    source = _read_git_file(ref, local) if ref else (REPO_ROOT / local).read_text()
+                except (subprocess.CalledProcessError, OSError):
+                    return ("import", module, alias.name)
+                return _binding(alias.name, ast.parse(source), local, ref, (*seen, key))
+    if name in vars(builtins):
+        return ("builtin", name)
+    return ("unresolved", name)
+
+
+def _binding_differences(node, before_tree, after_tree, before_file, after_file, before_ref):
+    differences = []
+    for name in sorted(_global_names(node)):
+        before = _binding(name, before_tree, before_file, before_ref)
+        after = _binding(name, after_tree, after_file, None)
+        if before != after or before[0] == "unresolved":
+            differences.append(name)
+    # Zero-argument super and __class__ depend on the enclosing class cell.
+    if "super" in _global_names(node) or any(isinstance(n, ast.Name) and n.id == "__class__" for n in ast.walk(node)):
+        differences.append("class closure requires runtime verification")
+    return differences
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +370,16 @@ def check_symbol(
             detail=f"AST bodies differ; first divergence: {diff_hint}",
         )
 
+    changed_bindings = _binding_differences(before_node, before_tree, after_tree, before_file, after_file, before_ref)
+    if changed_bindings:
+        return CheckResult(
+            symbol,
+            before_loc,
+            after_loc,
+            False,
+            "changed or unresolved global bindings: " + ", ".join(changed_bindings),
+        )
+
     # Stronger guarantee for the mechanical split: the moved symbol must
     # also be ABSENT from its OLD location in the post-split ``oracle.py``.
     # If a reviewer accidentally reintroduces it (e.g. a half-applied
@@ -307,7 +392,7 @@ def check_symbol(
         # pass since we just resolved the symbol at this exact location).
         absence_detail = "absence-from-source check skipped (before==after file)"
     else:
-        post_split_path = REPO_ROOT / POST_SPLIT_ORACLE_FILE
+        post_split_path = REPO_ROOT / before_file
         post_split_tree = _parse(post_split_path)
         try:
             _find_in_tree(
@@ -317,8 +402,7 @@ def check_symbol(
             )
         except LookupError:
             absence_detail = (
-                f"and symbol correctly absent from post-split {POST_SPLIT_ORACLE_FILE} "
-                f"at {before_class or 'top level'}"
+                f"and symbol correctly absent from post-split {before_file} at {before_class or 'top level'}"
             )
         else:
             return CheckResult(
@@ -328,7 +412,7 @@ def check_symbol(
                 passed=False,
                 detail=(
                     f"moved symbol still present at its OLD location in "
-                    f"{POST_SPLIT_ORACLE_FILE} ({before_class or 'top level'}.{symbol}); "
+                    f"{before_file} ({before_class or 'top level'}.{symbol}); "
                     f"a mechanical move requires the symbol to be REMOVED from the source."
                 ),
             )
@@ -338,7 +422,7 @@ def check_symbol(
         before_loc=before_loc,
         after_loc=after_loc,
         passed=True,
-        detail="AST bodies match exactly; " + absence_detail,
+        detail="AST and direct global bindings match; runtime behavior still requires tests; " + absence_detail,
     )
 
 
@@ -392,9 +476,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--before",
-        default="HEAD~1",
+        default="106671e^",
         help=(
-            "Git ref for the BEFORE tree (default: HEAD~1, i.e. the parent "
+            "Git ref for the BEFORE tree (default: 106671e^, i.e. the parent "
             "of the split commit). The verifier is designed to compare the "
             "post-split source (read from disk / index) against the "
             "pre-split source pulled from git history. HEAD itself is the "

@@ -278,3 +278,10 @@ def test_constant_time_eq() -> None:
     assert constant_time_eq(b"abc", b"abc")
     assert not constant_time_eq(b"abc", b"abd")
     assert not constant_time_eq(b"abc", b"abcd")
+
+
+@pytest.mark.parametrize("key", [b"", b"x" * 31, b"x" * 33])
+def test_verify_rejects_malformed_persisted_public_key(key):
+    from types import SimpleNamespace
+
+    assert verify_entry(SimpleNamespace(writer_pubkey=key), b"x" * 64) is False

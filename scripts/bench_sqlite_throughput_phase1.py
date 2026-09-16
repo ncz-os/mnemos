@@ -19,7 +19,7 @@ Architectural note (not a benchmark artifact):
 
 ``SqliteBackend.transactional()`` (line ~7401 of
 ``mnemos/persistence/sqlite.py``) acquires a single ``asyncio.Lock``
-and opens one connection that runs ``BEGIN IMMEDIATE`` per
+around its shared connection and runs ``BEGIN IMMEDIATE`` per
 transaction. All writes therefore serialize through one path regardless
 of how many concurrent writer tasks the bench dispatches. We report the
 per-task latency distribution and aggregate wall time honestly — the
@@ -154,153 +154,174 @@ async def _run_one(
     temp directory that is cleaned up before this function returns, so we
     cannot pollute any real data path.
     """
-    from mnemos.persistence.sqlite import SqliteBackend
+    from mnemos.persistence.sqlite import SqliteBackend, aiosqlite
+
+    if aiosqlite is None:
+        raise RuntimeError("Concurrency measurements require the sqlite extra (aiosqlite)")
 
     # SqliteBackend only needs `settings.database.embedding_dim` (see
     # `_resolve_embedding_dim()` at line ~7380 of
     # ``mnemos/persistence/sqlite.py``). We use SimpleNamespace to expose the
     # one attribute it reads — matching the convention in the existing
     # test-suite fixtures (e.g. ``tests/test_boost_recency_supersession.py``).
+    cell_started = time.perf_counter()
     settings = SimpleNamespace(database=SimpleNamespace(embedding_dim=embedding_dim))
 
     workdir = Path(tempfile.mkdtemp(prefix=f"mnemos-bench-sqlite-p1-{corpus_size}-{concurrency}-"))
     db_path = workdir / "bench.db"
     rid = uuid.uuid4().hex[:12]
     backend = SqliteBackend(db_path, settings)
-    await backend.open()
-
-    # Deterministic per-corpus seed: corpus_size itself is enough to keep
-    # the mock vector stream stable across runs of the same cell, mirroring
-    # the random.Random(0) seeding convention already in this repo.
-    rng = random.Random(corpus_size)
-    records: list[dict[str, Any]] = []
-    for i in range(corpus_size):
-        records.append(
-            {
-                "memory_id": f"b_{rid}_{i:08d}",
-                "content": f"bench memory {i} for corpus={corpus_size}",
-                "category": "bench",
-                "subcategory": "phase1",
-                "embedding": _mock_embedding(rng, embedding_dim),
-            }
-        )
-
-    now = datetime.datetime.now(datetime.timezone.utc)
-    insert_kwargs = {
-        "category": "bench",
-        "subcategory": "phase1",
-        "metadata_json": json.dumps({"bench": "phase1", "corpus_size": corpus_size, "concurrency": concurrency}),
-        "quality_rating": 50,
-        "owner_id": "bench",
-        "namespace": "phase1",
-        "permission_mode": 1,
-        "source_model": "mock-bench",
-        "source_provider": "mock-bench",
-        "source_session": rid,
-        "source_agent": "bench_sqlite_throughput_phase1",
-        "verbatim_content": None,
-        "created": now,
-        "updated": now,
-    }
-
-    # Warmup: small synchronous insertion under one transaction to flush any
-    # one-time open() / migration / sqlite-vec costs. Insert warmup rows with
-    # one task so they don't skew the concurrency measurement. Cap at
-    # corpus_size so a tiny cell doesn't try to warm up with more rows than
-    # it actually has.
-    warmup_n = min(warmup, corpus_size)
-    if warmup_n > 0:
-        warm_records = [
-            {**r, "memory_id": f"warm_{rid}_{i:08d}", "content": f"warmup {i}"}
-            for i, r in enumerate(records[:warmup_n])
-        ]
-        async with backend.transactional() as tx:
-            for r in warm_records:
-                await backend.memories.insert_memory(tx, memory_id=r["memory_id"], content=r["content"], **insert_kwargs, embedding=r["embedding"])
-
-    queue: asyncio.Queue[int] = asyncio.Queue()
-    for idx in range(corpus_size):
-        queue.put_nowait(idx)
-
-    # asyncio is single-threaded; concurrent appends are safe without a
-    # lock. We keep a list of per-task latencies to compute p50/p95/p99
-    # after gather() finishes — one float per insert.
-    latencies: list[float] = []
-    started_at = time.perf_counter()
-
-    async def worker() -> None:
-        while True:
-            try:
-                rec_idx = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            try:
-                r = records[rec_idx]
-                t0 = time.perf_counter()
-                async with backend.transactional() as tx:
-                    await backend.memories.insert_memory(
-                        tx,
-                        memory_id=r["memory_id"],
-                        content=r["content"],
-                        **insert_kwargs,
-                        embedding=r["embedding"],
-                    )
-                dt = time.perf_counter() - t0
-            finally:
-                queue.task_done()
-            latencies.append(dt)
-
-    workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
-    await asyncio.gather(*workers)
-    insert_wall = time.perf_counter() - started_at
-
-    # Optional small read-back pass: how long does a single gather_stats on
-    # the freshly-loaded corpus take? This isn't the headline metric for
-    # Phase 1 — the brief is insert throughput/latency — but it's cheap and
-    # surfaces pathological cases (e.g. missing index) without costing the
-    # 30-minute budget.
-    readback_wall = 0.0
-    readback_count_actual = 0
-    if readback_count > 0:
-        # gather_stats is the cheapest aggregate; it returns total/federated/etc.
-        t0 = time.perf_counter()
-        async with backend.transactional() as tx:
-            stats = await backend.memories.gather_stats(tx)
-        readback_wall = time.perf_counter() - t0
-        readback_count_actual = int(stats.total_memories)
-
-    total_wall = time.perf_counter() - started_at
-
-    throughput_ops_s = round(corpus_size / insert_wall, 2) if insert_wall > 0 else None
-
-    await backend.close()
-
-    # Clean up the temp DB and its directory before returning so we cannot
-    # pollute any real data path. Best-effort: a leftover temp dir is fine.
     try:
-        db_path.unlink(missing_ok=True)
-        workdir.rmdir()
-    except OSError:
-        pass
+        await backend.open()
 
-    summary = _summarize(latencies)
-    return {
-        "corpus_size": corpus_size,
-        "concurrency": concurrency,
-        "wall_seconds": round(total_wall, 4),
-        "insert_wall_seconds": round(insert_wall, 4),
-        "readback_wall_seconds": round(readback_wall, 4),
-        "readback_total_memories": readback_count_actual,
-        "throughput_ops_per_sec": throughput_ops_s,
-        "latency": summary,
-        "embedding_dim": embedding_dim,
-        "warmup_inserts": warmup,
-        "schema_note": (
-            "SqliteBackend.transactional() acquires a single asyncio.Lock + BEGIN IMMEDIATE "
-            "connection, so all writes serialize through one path. Concurrency > 1 measures "
-            "how many tasks queue at the lock, not parallel SQLite writes."
-        ),
-    }
+        # Deterministic per-corpus seed: corpus_size itself is enough to keep
+        # the mock vector stream stable across runs of the same cell, mirroring
+        # the random.Random(0) seeding convention already in this repo.
+        rng = random.Random(corpus_size)
+        records: list[dict[str, Any]] = []
+        for i in range(corpus_size):
+            records.append(
+                {
+                    "memory_id": f"b_{rid}_{i:08d}",
+                    "content": f"bench memory {i} for corpus={corpus_size}",
+                    "category": "bench",
+                    "subcategory": "phase1",
+                    "embedding": _mock_embedding(rng, embedding_dim),
+                }
+            )
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        insert_kwargs = {
+            "category": "bench",
+            "subcategory": "phase1",
+            "metadata_json": json.dumps({"bench": "phase1", "corpus_size": corpus_size, "concurrency": concurrency}),
+            "quality_rating": 50,
+            "owner_id": "bench",
+            "namespace": "phase1",
+            "permission_mode": 1,
+            "source_model": "mock-bench",
+            "source_provider": "mock-bench",
+            "source_session": rid,
+            "source_agent": "bench_sqlite_throughput_phase1",
+            "verbatim_content": None,
+            "created": now,
+            "updated": now,
+        }
+
+        # Warmup: small synchronous insertion under one transaction to flush any
+        # one-time open() / migration / sqlite-vec costs. Insert warmup rows with
+        # one task so they don't skew the concurrency measurement. Cap at
+        # corpus_size so a tiny cell doesn't try to warm up with more rows than
+        # it actually has.
+        warmup_n = min(warmup, corpus_size)
+        if warmup_n > 0:
+            warm_records = [
+                {**r, "memory_id": f"warm_{rid}_{i:08d}", "content": f"warmup {i}"}
+                for i, r in enumerate(records[:warmup_n])
+            ]
+            async with backend.transactional() as tx:
+                for r in warm_records:
+                    await backend.memories.insert_memory(
+                        tx, memory_id=r["memory_id"], content=r["content"], **insert_kwargs, embedding=r["embedding"]
+                    )
+
+        queue: asyncio.Queue[int] = asyncio.Queue()
+        for idx in range(corpus_size):
+            queue.put_nowait(idx)
+
+        # asyncio is single-threaded; concurrent appends are safe without a
+        # lock. We keep a list of per-task latencies to compute p50/p95/p99
+        # after gather() finishes — one float per insert.
+        latencies: list[float] = []
+        started_at = time.perf_counter()
+        active = 0
+        peak_active = 0
+
+        async def worker() -> None:
+            nonlocal active, peak_active
+            while True:
+                try:
+                    rec_idx = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    r = records[rec_idx]
+                    t0 = time.perf_counter()
+                    active += 1
+                    peak_active = max(peak_active, active)
+                    async with backend.transactional() as tx:
+                        await backend.memories.insert_memory(
+                            tx,
+                            memory_id=r["memory_id"],
+                            content=r["content"],
+                            **insert_kwargs,
+                            embedding=r["embedding"],
+                        )
+                    dt = time.perf_counter() - t0
+                finally:
+                    active -= 1
+                    queue.task_done()
+                latencies.append(dt)
+
+        workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for task in workers:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+        insert_wall = time.perf_counter() - started_at
+
+        # Optional small read-back pass: how long does a single gather_stats on
+        # the freshly-loaded corpus take? This isn't the headline metric for
+        # Phase 1 — the brief is insert throughput/latency — but it's cheap and
+        # surfaces pathological cases (e.g. missing index) without costing the
+        # 30-minute budget.
+        readback_wall = 0.0
+        readback_count_actual = 0
+        if readback_count > 0:
+            # gather_stats is the cheapest aggregate; it returns total/federated/etc.
+            t0 = time.perf_counter()
+            async with backend.transactional() as tx:
+                stats = await backend.memories.gather_stats(tx)
+            readback_wall = time.perf_counter() - t0
+            readback_count_actual = int(stats.total_memories)
+            if readback_count_actual != corpus_size + warmup_n:
+                raise RuntimeError("read-back count does not match successful insert count")
+
+        throughput_ops_s = round(corpus_size / insert_wall, 2) if insert_wall > 0 else None
+
+        summary = _summarize(latencies)
+        result = {
+            "corpus_size": corpus_size,
+            "concurrency": concurrency,
+            "insert_wall_seconds": round(insert_wall, 4),
+            "readback_wall_seconds": round(readback_wall, 4),
+            "readback_total_memories": readback_count_actual,
+            "throughput_ops_per_sec": throughput_ops_s,
+            "latency": summary,
+            "embedding_dim": embedding_dim,
+            "warmup_inserts": warmup_n,
+            "peak_in_flight_inserts": peak_active,
+            "driver": "aiosqlite",
+            "connection_model": "single shared connection with backend write lock",
+            "schema_note": (
+                "SqliteBackend.transactional() acquires a single asyncio.Lock + BEGIN IMMEDIATE "
+                "connection, so all writes serialize through one path. Concurrency > 1 measures "
+                "how many tasks queue at the lock, not parallel SQLite writes."
+            ),
+        }
+
+    finally:
+        try:
+            await backend.close()
+        finally:
+            import shutil
+
+            shutil.rmtree(workdir)
+    result["wall_seconds"] = round(time.perf_counter() - cell_started, 4)
+    return result
 
 
 # ── artifact writers ─────────────────────────────────────────────────────────
@@ -498,15 +519,15 @@ def main() -> int:
         "--output-dir",
         default="docs/proof",
         help="Output directory for the JSON+md artifacts (default docs/proof). "
-             "Ignored when --dry-run is set; in --dry-run mode artifacts are written "
-             "to a fresh tempfile.mkdtemp() and discarded after the run.",
+        "Ignored when --dry-run is set; in --dry-run mode artifacts are written "
+        "to a fresh tempfile.mkdtemp() and discarded after the run.",
     )
     p.add_argument(
         "--dry-run",
         action="store_true",
         help="Run the full Phase 1 matrix but write artifacts to a tempdir and discard. "
-             "This is what the automated check command uses so the bench can be "
-             "validated without polluting docs/proof/ on every CI pass.",
+        "This is what the automated check command uses so the bench can be "
+        "validated without polluting docs/proof/ on every CI pass.",
     )
     args = p.parse_args()
 

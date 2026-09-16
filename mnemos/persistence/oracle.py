@@ -20,6 +20,15 @@ from __future__ import annotations
 
 import hashlib
 
+from mnemos.persistence.oracle_helpers import (
+    _call,
+    _conn_from_tx,
+    _materialize_value,
+    _row_to_dict,
+    _fetch_all_dicts,
+)
+from mnemos.persistence.oracle_audit import OracleAuditChainRepository, OracleAuditJournalMixin
+
 from mnemos.core import audit_chain
 import inspect
 import json
@@ -321,13 +330,6 @@ def _is_unique_violation(exc: BaseException) -> bool:
     return False
 
 
-def _conn_from_tx(tx: Any) -> Any:
-    """Resolve an oracledb connection from a backend-neutral tx handle."""
-    if tx is None:
-        return None
-    return getattr(tx, "conn", tx)
-
-
 def _uuid_to_raw(value: str | bytes | uuid.UUID | None) -> bytes | None:
     if value is None:
         return None
@@ -405,38 +407,6 @@ def _ts_for_oracle(value: Any) -> Any:
         return datetime.fromisoformat(text)
     except ValueError:
         return value
-
-
-async def _call(value: Any, *args: Any, **kwargs: Any) -> Any:
-    result = value(*args, **kwargs) if callable(value) else value
-    return await result if inspect.isawaitable(result) else result
-
-
-async def _materialize_value(value: Any) -> Any:
-    """Resolve oracledb async LOBs into plain strings/bytes.
-
-    The python-oracledb async driver returns CLOB / BLOB columns as
-    :class:`AsyncLOB` whose ``read()`` is a coroutine. The sync driver
-    returns LOB objects whose ``read()`` is synchronous. This helper
-    handles both shapes so callers always see a materialized value.
-    """
-    read = getattr(value, "read", None)
-    if not callable(read):
-        return value
-    result = read()
-    if inspect.isawaitable(result):
-        return await result
-    return result
-
-
-async def _row_to_dict(cursor: Any, row: Any) -> dict[str, Any] | None:
-    if row is None:
-        return None
-    names = [col[0].lower() for col in cursor.description]
-    out: dict[str, Any] = {}
-    for name, value in zip(names, row):
-        out[name] = await _materialize_value(value)
-    return out
 
 
 def _parse_oracle_dsn(dsn: str) -> dict[str, Any]:
@@ -1171,29 +1141,6 @@ class OracleBranchRepository(BranchRepository):
             }
         finally:
             await _call(cursor.close)
-
-
-async def _fetch_all_dicts(cursor: Any) -> list[dict[str, Any]]:
-    rows = await _call(cursor.fetchall)
-    out: list[dict[str, Any]] = []
-    for raw in rows or []:
-        d = await _row_to_dict(cursor, raw)
-        if d is not None:
-            out.append(d)
-    return out
-
-
-# v7 Feature 3/5 split: OracleAuditChainRepository and the
-# OracleAuditJournalMixin live in ``oracle_audit`` so ``oracle.py`` stays
-# under the v7 split target. The import is placed AFTER all module-level
-# helpers above so the circular reference (``oracle_audit`` imports
-# ``_call``/``_conn_from_tx``/``_row_to_dict``/``_fetch_all_dicts`` from
-# this module) resolves cleanly: at the time Python executes the import
-# below, every name ``oracle_audit`` needs is already bound here.
-from mnemos.persistence.oracle_audit import (
-    OracleAuditChainRepository,
-    OracleAuditJournalMixin,
-)
 
 
 def _in_placeholders(ids: Sequence[str], prefix: str = "id") -> tuple[str, dict[str, Any]]:
