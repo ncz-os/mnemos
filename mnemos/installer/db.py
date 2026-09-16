@@ -646,6 +646,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0043_memory_acl.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0048_memory_versions_visibility.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0054_memory_tags.sql",
+        repo_path / "mnemos" / "db_migrations" / "migrations" / "0065_api_keys_key_prefix.sql",
     ]
 
     if selected_components:
@@ -856,8 +857,74 @@ def _ensure_postgres_embedding_hnsw_index(config: Config) -> bool:
         return False
 
 
+def _create_api_key_sqlite(config: Config, raw_key: str, key_hash: str, key_prefix: str) -> str | None:
+    """Mint the installer's API key on a SQLite (edge/dev profile) install.
+
+    Goes through the same ``OAuthRepository.create_api_key`` the admin
+    route uses rather than hand-rolling a third INSERT, so there is one
+    definition of the api_keys write per backend. The SQLite backend is
+    opened exactly the way ``setup_sqlite_database`` opens it, which also
+    replays the migration list -- that is what guarantees the 'default'
+    root user row exists (migrations_v7_0_default_user_seed_sqlite.sql)
+    for api_keys.user_id to join against.
+
+    Before this existed, ``create_api_key`` had four driver paths and all
+    four were Postgres-only, so `mnemos install` on an edge profile
+    printed four connection failures and returned None -- the operator
+    finished the install with no usable credential.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    from mnemos.persistence.sqlite import SqliteBackend
+
+    db_path = Path(config.sqlite_path).expanduser()
+    settings_shim = SimpleNamespace(database=SimpleNamespace(embedding_dim=getattr(config, "embedding_dim", 768)))
+
+    async def _create() -> None:
+        backend = SqliteBackend(db_path, settings_shim)
+        try:
+            await backend.open()
+            async with backend.transactional() as tx:
+                await backend.oauth.create_api_key(
+                    tx,
+                    user_id="default",
+                    key_hash=key_hash,
+                    key_prefix=key_prefix,
+                    label="installer-generated",
+                )
+        finally:
+            await backend.close()
+
+    try:
+        asyncio.run(_create())
+    except Exception as exc:
+        print(f"[db] SQLite create_api_key failed: {exc}", file=sys.stderr)
+        return None
+    print("[db] API key created via the SQLite backend.")
+    return raw_key
+
+
 def create_api_key(config: Config) -> str | None:
     """Create an initial API key. Returns the raw key string, or None on failure.
+
+    SQLite (edge/dev) profiles are served by ``_create_api_key_sqlite``
+    above, through the backend-neutral OAuth repository.
+
+    The Postgres paths below keep their own driver-fallback chain rather
+    than routing through the repository: the installer runs before the
+    application's lifecycle exists, so there is no PostgresBackend or
+    asyncpg pool to borrow, and the fallbacks (psycopg / psycopg2 / psql)
+    exist precisely to cope with hosts where the default driver is
+    unavailable.
+
+    NOTE (enterprise-backend gap): the installer's Config models only
+    sqlite vs postgres -- Oracle, MySQL, MariaDB and Db2 are not
+    represented in its profile model at all, so `mnemos install` cannot
+    provision a key on them. Those backends now have a working
+    ``create_api_key`` in the repository layer and can mint keys through
+    POST /admin/users/{user_id}/apikeys once the server is up; teaching
+    the installer about them is separate work.
 
     Connection-driver preference order (codex round-2 finding,
     2026-05-01):
@@ -881,6 +948,10 @@ def create_api_key(config: Config) -> str | None:
     import hashlib
 
     key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    key_prefix = raw_key[:8]
+
+    if _profile_uses_sqlite(config.profile):
+        return _create_api_key_sqlite(config, raw_key, key_hash, key_prefix)
 
     # 1. asyncpg path (default; works against any Postgres + auth)
     try:

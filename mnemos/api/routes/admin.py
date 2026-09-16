@@ -11,7 +11,11 @@ from pydantic import BaseModel, Field
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user, require_root
-from mnemos.api.persistence_helpers import backend_or_503, require_postgres_pool_or_503
+from mnemos.api.persistence_helpers import (
+    backend_or_503,
+    require_oauth_backend,
+    require_postgres_pool_or_503,
+)
 from mnemos.core.config import get_settings
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.security import is_root
@@ -108,43 +112,53 @@ async def create_api_key(
     request: ApiKeyCreateRequest,
     _: UserContext = Depends(require_root),
 ):
-    """Generate a new API key for user_id. Raw key is returned once and never stored."""
-    require_postgres_pool_or_503(route_label="POST /admin/users/{user_id}/apikeys")
+    """Generate a new API key for user_id. Raw key is returned once and never stored.
 
-    async with _lc.get_pool_manager().acquire() as conn:
-        user = await conn.fetchrow("SELECT id FROM users WHERE id=$1", user_id)
-        if not user:
+    Writes through ``OAuthRepository.create_api_key`` rather than raw
+    asyncpg. Until v7.0.1 this route hand-rolled a Postgres INSERT and
+    sat behind ``require_postgres_pool_or_503``, so key CREATION 503'd
+    on every non-Postgres backend even though key LOOKUP
+    (``lookup_api_key``) had been backend-neutral since v6.3 — an
+    operator on the SQLite edge profile could authenticate with a key
+    but could never mint one.
+
+    The secret is generated here, not in the repository: the plaintext
+    key must never reach the persistence layer, matching the existing
+    split where ``lookup_api_key`` takes a hash rather than a raw key.
+    """
+    backend = require_oauth_backend()
+    oauth = backend.oauth
+
+    raw_key = secrets.token_hex(32)  # 64 hex chars = 256 bits
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+    key_prefix = raw_key[:8]  # shown in listings for identification
+
+    async with backend.transactional() as tx:
+        if not await oauth.user_exists(tx, user_id):
             raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
 
-        key_count = await conn.fetchval("SELECT COUNT(*) FROM api_keys WHERE user_id=$1 AND NOT revoked", user_id)
-        if key_count >= 10:
+        if await oauth.count_active_api_keys(tx, user_id) >= 10:
             raise HTTPException(
                 status_code=422,
                 detail="Maximum of 10 active API keys per user",
             )
 
-        raw_key = secrets.token_hex(32)  # 64 hex chars = 256 bits
-        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-        key_prefix = raw_key[:8]  # shown in listings for identification
-
-        row = await conn.fetchrow(
-            "INSERT INTO api_keys (user_id, key_hash, key_prefix, label) "
-            "VALUES ($1, $2, $3, $4) "
-            "RETURNING id, user_id, key_prefix, label, created_at, last_used, revoked",
-            user_id,
-            key_hash,
-            key_prefix,
-            request.label,
+        row = await oauth.create_api_key(
+            tx,
+            user_id=user_id,
+            key_hash=key_hash,
+            key_prefix=key_prefix,
+            label=request.label,
         )
 
     logger.info(f"[ADMIN] Created API key prefix={key_prefix} for user={user_id}")
     return ApiKeyResponse(
-        id=str(row["id"]),
+        id=row["id"],
         user_id=row["user_id"],
         key_prefix=row["key_prefix"],
         label=row["label"],
-        created_at=row["created_at"].isoformat(),
-        last_used=row["last_used"].isoformat() if row["last_used"] else None,
+        created_at=row["created_at"],
+        last_used=row["last_used"],
         revoked=row["revoked"],
         raw_key=raw_key,  # only returned here; never stored, never returned again
     )
@@ -155,25 +169,26 @@ async def list_api_keys(
     user_id: str,
     _: UserContext = Depends(require_root),
 ):
-    """List API keys for user_id (no raw key in response)."""
-    require_postgres_pool_or_503(route_label="GET /admin/users/{user_id}/apikeys")
-    async with _lc.get_pool_manager().acquire() as conn:
-        user = await conn.fetchrow("SELECT id FROM users WHERE id=$1", user_id)
-        if not user:
+    """List API keys for user_id (no raw key in response).
+
+    Backend-neutral counterpart to the create route above; see its
+    docstring for why these three api_keys endpoints no longer take the
+    Postgres-pool gate.
+    """
+    backend = require_oauth_backend()
+    oauth = backend.oauth
+    async with backend.transactional() as tx:
+        if not await oauth.user_exists(tx, user_id):
             raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
-        rows = await conn.fetch(
-            "SELECT id, user_id, key_prefix, label, created_at, last_used, revoked "
-            "FROM api_keys WHERE user_id=$1 ORDER BY created_at",
-            user_id,
-        )
+        rows = await oauth.list_api_keys(tx, user_id)
     return [
         ApiKeyResponse(
-            id=str(r["id"]),
+            id=r["id"],
             user_id=r["user_id"],
             key_prefix=r["key_prefix"],
             label=r["label"],
-            created_at=r["created_at"].isoformat(),
-            last_used=r["last_used"].isoformat() if r["last_used"] else None,
+            created_at=r["created_at"],
+            last_used=r["last_used"],
             revoked=r["revoked"],
         )
         for r in rows
@@ -185,14 +200,17 @@ async def revoke_api_key(
     key_id: str,
     _: UserContext = Depends(require_root),
 ):
-    """Revoke an API key by ID (soft-delete: sets revoked=true)."""
-    require_postgres_pool_or_503(route_label="DELETE /admin/apikeys/{key_id}")
-    async with _lc.get_pool_manager().acquire() as conn:
-        result = await conn.execute(
-            "UPDATE api_keys SET revoked=true WHERE id=$1::uuid AND NOT revoked",
-            key_id,
-        )
-    if result == "UPDATE 0":
+    """Revoke an API key by ID (soft-delete: sets revoked=true).
+
+    Backend-neutral counterpart to the create route above. Revocation is
+    a flag on Postgres/SQLite/MySQL and a ``revoked_at`` timestamp on
+    Oracle/Db2; the repository owns that difference and returns a plain
+    "did a row change" boolean.
+    """
+    backend = require_oauth_backend()
+    async with backend.transactional() as tx:
+        revoked = await backend.oauth.revoke_api_key(tx, key_id)
+    if not revoked:
         raise HTTPException(status_code=404, detail="API key not found or already revoked")
     logger.info(f"[ADMIN] Revoked API key id={key_id}")
 
