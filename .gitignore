@@ -110,3 +110,8 @@ uv.lock
 .venv-ci/
 mnemos_os.egg-info/
 .docs-audit-ledger.json
+
+# Local audit coverage reports
+.coverage
+.coverage.*
+htmlcov/

@@ -7,13 +7,10 @@ name: docs-backend-parity
 # current tree. Any drift — manual edit, forgotten regeneration, or a
 # capability change that wasn't reflected in the matrix — fails the build.
 #
-# The matrix itself is a docs-truth drift detector: every backend
-# capability that was ever "claimed in code, absent at runtime" (e.g. the
-# 2026-09 audit_chain AttributeError on MariadbBackend, the federation
-# journal table that's optional on MySQL/MariaDB, the morpheus_local
-# 0061c migrations) is exposed as a cell. This job keeps that exposure
-# honest: if a backend gains or loses a capability without regenerating
-# the matrix, the diff has to land alongside the code change.
+# This is a static inventory drift check, not behavioral parity evidence.
+# Facade wiring and test-name candidates can still mask skipped, mocked,
+# negative, or incomplete backend implementations; live suites remain required.
+# The canonical GitLab CI also runs this check.
 #
 # The generator's rendered markdown carries NO wall-clock timestamp and
 # NO HEAD SHA — both would re-render to a different string each run,

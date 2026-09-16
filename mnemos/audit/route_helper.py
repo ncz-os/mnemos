@@ -79,19 +79,19 @@ async def write_transaction_audit(tx, *, op, memory_id_str, snapshot, writer_id)
         from mnemos.persistence.sqlite import SqliteAuditChainRepository
 
         repo = SqliteAuditChainRepository()
-    elif dialect == "postgres":  # pragma: no cover - postgres dialect dispatch; this CI gate runs against SQLite only. The PostgresAuditChainRepository itself is exercised in tests/test_db2_dialect_parity.py / test_federation_journal.py against live Postgres in the test:integration job, not here.
+    elif dialect == "postgres":
         from mnemos.persistence.postgres import PostgresAuditChainRepository
 
         repo = PostgresAuditChainRepository()
-    elif dialect == "oracle":  # pragma: no cover - oracle dialect dispatch; covered by test:oracle-smoke against a live Oracle (not this SQLite-only audit-coverage gate).
+    elif dialect == "oracle":
         from mnemos.persistence.oracle import OracleAuditChainRepository
 
         repo = OracleAuditChainRepository()
-    elif dialect == "db2":  # pragma: no cover - db2 dialect dispatch; covered by tests/test_db2_*.py against live Db2 in test:integration (Db2 has no arm64 Linux wheel and is excluded from this gate by design).
+    elif dialect == "db2":
         from mnemos.persistence.db2 import Db2AuditChainRepository
 
         repo = Db2AuditChainRepository()
-    else:  # pragma: no cover - defensive default for unrecognized dialects; not reachable from any production backend (sqlite/postgres/oracle/db2/mysql/mariadb all map to a branch above). Kept so a future backend cannot silently fall through to repo=None.
+    else:
         repo = None
     await write_configured_audit_entry(
         SimpleNamespace(audit_chain=repo),
@@ -351,7 +351,7 @@ def _signed_at_candidates(value: Any) -> tuple[str, ...]:
                 add(value.replace(tzinfo=timezone.utc).isoformat())
             else:
                 add(value.astimezone(timezone.utc).isoformat())
-        except Exception:  # pragma: no cover - defensive: an exotic tz-aware datetime whose astimezone(UTC) raises. No production datetime hits this; the catch exists so the candidate list still gets a usable format even on a bad datetime.
+        except Exception:
             pass
     if isinstance(value, str):
         text = value.strip()
