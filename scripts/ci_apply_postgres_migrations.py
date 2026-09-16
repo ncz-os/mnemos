@@ -151,7 +151,18 @@ def main() -> int:
     # Apply. ON_ERROR_STOP=1 + non-zero exit on the first failure so a
     # bad migration aborts the whole apply sequence rather than
     # silently skipping the rest.
-    psql_env = {**os.environ, "PGOPTIONS": "-c ON_ERROR_STOP=1"}
+    #
+    # ON_ERROR_STOP is a psql CLIENT variable and is passed as `-v` below.
+    # It must NOT also be pushed through PGOPTIONS: PGOPTIONS is forwarded to
+    # the SERVER as startup options, and a PostgreSQL 17 server rejects the
+    # unknown GUC outright --
+    #
+    #   FATAL: unrecognized configuration parameter "ON_ERROR_STOP"
+    #
+    # which fails the connection before a single migration runs. Inherit the
+    # ambient environment unchanged instead.
+    psql_env = {**os.environ}
+    psql_env.pop("PGOPTIONS", None)
     print(f"[migrate] applying {len(paths)} migration(s) from {installer}")
     for p in paths:
         rel = p.relative_to(REPO)
