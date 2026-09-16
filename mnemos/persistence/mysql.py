@@ -65,6 +65,7 @@ from urllib.parse import unquote, urlparse
 from mnemos.core.auth_context import UserContext
 from mnemos.core import eligibility as _eligibility
 from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.base import (
     BackendCapabilityMissing,
     BranchRepository,
@@ -78,6 +79,7 @@ from mnemos.persistence.base import (
     ConsultationAuditRepository,
     FederationRepository,
     KG_CAPABILITY,
+    IsolationLevel,
     KGRepository,
     MemoryRepository,
     MorpheusConsolidationResult,
@@ -1554,6 +1556,13 @@ async def create_mysql_pool(
 # ── Transaction ───────────────────────────────────────────────────────────────
 
 
+_MYSQL_ISOLATION_SQL: dict[str, str] = {
+    "read_committed": "READ COMMITTED",
+    "repeatable_read": "REPEATABLE READ",
+    "serializable": "SERIALIZABLE",
+}
+
+
 class _MysqlTransaction:
     """Backend-neutral transaction wrapping an aiomysql connection."""
 
@@ -1561,6 +1570,7 @@ class _MysqlTransaction:
         self._conn = conn
         self._closed = False
         self._named_locks: set[str] = set()
+        self._savepoint_seq = 0
 
     @property
     def closed(self) -> bool:
@@ -1601,6 +1611,35 @@ class _MysqlTransaction:
         finally:
             await self._release_named_locks()
             self._closed = True
+
+    @asynccontextmanager
+    async def savepoint(self) -> AsyncIterator["_MysqlTransaction"]:
+        """Nested savepoint scope. InnoDB supports SAVEPOINT natively.
+
+        Names are sequenced rather than reused: MySQL's ``ROLLBACK TO
+        SAVEPOINT`` targets the most recent savepoint of a given name and
+        silently drops every savepoint created after it, so a shared name
+        would let an inner failure unwind an outer scope.
+
+        Note ``RELEASE SAVEPOINT`` is NOT a commit -- it only discards the
+        marker. The enclosing transaction still decides the outcome.
+        """
+        if self._closed:
+            raise RuntimeError("cannot open a savepoint on a closed transaction")
+        self._savepoint_seq += 1
+        name = f"mnemos_sp_{self._savepoint_seq}"
+        async with self._conn.cursor() as cursor:
+            await cursor.execute(f"SAVEPOINT {name}")
+        try:
+            yield self
+        except BaseException:
+            async with self._conn.cursor() as cursor:
+                await cursor.execute(f"ROLLBACK TO SAVEPOINT {name}")
+                await cursor.execute(f"RELEASE SAVEPOINT {name}")
+            raise
+        else:
+            async with self._conn.cursor() as cursor:
+                await cursor.execute(f"RELEASE SAVEPOINT {name}")
 
 
 def _mysql_tx(tx: Transaction) -> _MysqlTransaction:
@@ -2479,10 +2518,15 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         category: str | None,
         limit: int,
         offset: int,
+        include_secrets: bool = False,
+        record_cursor: tuple[Any, str] | None = None,
     ) -> list[Row]:
         conn = tx.conn
         where = ["deleted_at IS NULL"]
         params: list[Any] = []
+        if not include_secrets:
+            where.append("(namespace IS NULL OR namespace <> %s)")
+            params.append(VAULT_NAMESPACE)
         if effective_owner:
             where.append("owner_id = %s")
             params.append(effective_owner)
@@ -2492,6 +2536,12 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         if category:
             where.append("category = %s")
             params.append(category)
+        if record_cursor is not None:
+            # MySQL/MariaDB support row-value comparison, but the expanded
+            # form is spelled out so the keyset semantics do not depend on
+            # optimiser support for tuple predicates on either fork.
+            where.append("(created > %s OR (created = %s AND id > %s))")
+            params.extend([record_cursor[0], record_cursor[0], record_cursor[1]])
         sql = (
             "SELECT id, content, category, subcategory, created, updated, "
             "owner_id, group_id, namespace, permission_mode, quality_rating, "
@@ -2503,6 +2553,89 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         params.extend([limit, offset])
         async with conn.cursor() as cursor:
             await cursor.execute(sql, tuple(params))
+            return await _fetch_all_dicts(cursor)
+
+    async def fetch_visible_export_memory_ids(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        include_secrets: bool = False,
+    ) -> set[str]:
+        ids = list(memory_ids)
+        if not ids:
+            return set()
+        conn = tx.conn
+        placeholders = ", ".join(["%s"] * len(ids))
+        conditions = [f"id IN ({placeholders})", "deleted_at IS NULL"]
+        params: list[Any] = list(ids)
+        if effective_owner:
+            conditions.append("owner_id = %s")
+            params.append(effective_owner)
+        if effective_ns:
+            conditions.append("namespace = %s")
+            params.append(effective_ns)
+        if not include_secrets:
+            conditions.append("(namespace IS NULL OR namespace <> %s)")
+            params.append(VAULT_NAMESPACE)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT id FROM memories WHERE " + " AND ".join(conditions),
+                tuple(params),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        return {row["id"] for row in rows}
+
+    async def fetch_deletion_log_for_export(
+        self,
+        tx: Transaction,
+        *,
+        effective_owner: str | None,
+        effective_ns: str | None,
+        hard_limit: int,
+        from_executed_at: Any = None,
+        to_executed_at: Any = None,
+        cursor_executed_at: Any = None,
+        cursor_id: str | None = None,
+        export_as_of: Any = None,
+        include_secrets: bool = False,
+    ) -> list[Row]:
+        conn = tx.conn
+        conditions: list[str] = []
+        params: list[Any] = []
+        if not include_secrets:
+            conditions.append("(namespace IS NULL OR namespace <> %s)")
+            params.append(VAULT_NAMESPACE)
+        if effective_owner:
+            conditions.append("owner_id = %s")
+            params.append(effective_owner)
+        if effective_ns:
+            conditions.append("namespace = %s")
+            params.append(effective_ns)
+        if from_executed_at:
+            conditions.append("executed_at >= %s")
+            params.append(from_executed_at)
+        if to_executed_at:
+            conditions.append("executed_at <= %s")
+            params.append(to_executed_at)
+        if cursor_executed_at and cursor_id:
+            conditions.append("(executed_at > %s OR (executed_at = %s AND id > %s))")
+            params.extend([cursor_executed_at, cursor_executed_at, cursor_id])
+        if export_as_of:
+            conditions.append("executed_at <= %s")
+            params.append(export_as_of)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(int(hard_limit) + 1)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT id, memory_id, content_hash, owner_id, namespace, "
+                "requested_by, requested_at, executed_at, request_kind, reason, source "
+                f"FROM deletion_log {where} "
+                "ORDER BY executed_at ASC, id ASC LIMIT %s",
+                tuple(params),
+            )
             return await _fetch_all_dicts(cursor)
 
     async def fetch_referenced_memory_allowlist(
@@ -2671,9 +2804,13 @@ class MysqlKGRepository(KGRepository):
         effective_ns: str | None,
         include_unattached: bool,
         hard_limit: int,
+        include_secrets: bool = False,
     ) -> list[Row]:
         conditions: list[str] = ["deleted_at IS NULL"]
         params: list[Any] = []
+        if not include_secrets:
+            conditions.append("(namespace IS NULL OR namespace <> %s)")
+            params.append(VAULT_NAMESPACE)
         if memory_ids:
             placeholders = ", ".join(["%s"] * len(memory_ids))
             if include_unattached:
@@ -3037,11 +3174,15 @@ class MysqlVersionRepository(VersionRepository):
         effective_owner: str | None,
         effective_ns: str | None,
         hard_limit: int,
+        include_secrets: bool = False,
     ) -> list[Row]:
         if not memory_ids:
             return []
         conditions = ["deleted_at IS NULL"]
         params: list[Any] = []
+        if not include_secrets:
+            conditions.append("(namespace IS NULL OR namespace <> %s)")
+            params.append(VAULT_NAMESPACE)
         placeholders = ", ".join(["%s"] * len(memory_ids))
         conditions.append(f"memory_id IN ({placeholders})")
         params.extend(memory_ids)
@@ -8012,9 +8153,39 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
             return int(getattr(cursor, "rowcount", 0) or 0) > 0
 
     @asynccontextmanager
-    async def transactional(self) -> AsyncIterator[Transaction]:
+    async def transactional(
+        self,
+        *,
+        isolation: IsolationLevel | None = None,
+        readonly: bool = False,
+    ) -> AsyncIterator[Transaction]:
+        """Open a transaction, optionally pinning isolation and read-only mode.
+
+        MySQL/MariaDB configure both on the NEXT transaction via
+        ``SET TRANSACTION ...``, which must therefore be issued BEFORE the
+        BEGIN -- issuing it after would silently apply to the transaction
+        after this one. aiomysql's ``conn.begin()`` emits a plain BEGIN, so
+        when ``readonly`` is requested we emit ``START TRANSACTION READ ONLY``
+        ourselves (BEGIN has no READ ONLY variant) and drive commit/rollback
+        through the same connection object.
+
+        InnoDB's REPEATABLE READ establishes a consistent read view at the
+        first read and holds it for the transaction -- the same snapshot
+        guarantee Postgres gives. READ ONLY is server-enforced: a write
+        raises ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION.
+        """
         async with self._pool.acquire() as conn:
-            await conn.begin()
+            if isolation is not None:
+                level = _MYSQL_ISOLATION_SQL.get(isolation)
+                if level is None:
+                    raise ValueError(f"unsupported isolation level for MySQL: {isolation!r}")
+                async with conn.cursor() as cursor:
+                    await cursor.execute(f"SET TRANSACTION ISOLATION LEVEL {level}")
+            if readonly:
+                async with conn.cursor() as cursor:
+                    await cursor.execute("START TRANSACTION READ ONLY")
+            else:
+                await conn.begin()
             tx = _MysqlTransaction(conn)
             try:
                 yield tx
@@ -8025,6 +8196,21 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
             else:
                 if not tx.closed:
                     await tx.commit()
+
+    async def fetch_server_now(self, tx: Transaction) -> datetime:
+        # UTC_TIMESTAMP(6) rather than NOW(): NOW() is session-timezone
+        # dependent, so two connections with different time_zone settings
+        # would anchor the export at different instants. Microsecond
+        # precision matters -- a second-resolution anchor would drop every
+        # tombstone written later in the same second.
+        async with _mysql_tx(tx).conn.cursor() as cursor:
+            await cursor.execute("SELECT UTC_TIMESTAMP(6)")
+            row = await cursor.fetchone()
+        raw = row[0] if isinstance(row, (tuple, list)) else list(row.values())[0]
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
     async def insert_pantheon_routing_audit(
         self,

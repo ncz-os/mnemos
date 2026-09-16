@@ -52,6 +52,7 @@ from mnemos.persistence.oracle import (
     OracleStateRepository,
     OracleVersionRepository,
     OracleWebhookRepository,
+    _OracleTransaction,
     _call,
     _conn_from_tx,
     _content_hash,
@@ -69,7 +70,7 @@ from mnemos.persistence.oracle import (
     _uuid_to_raw,
     _validate_and_format_vector,
 )
-from mnemos.persistence.base import Transaction
+from mnemos.persistence.base import IsolationLevel, Transaction
 from mnemos.persistence.schema import ensure_db2_schema
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter
@@ -1529,12 +1530,17 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         category: str | None,
         limit: int,
         offset: int,
+        include_secrets: bool = False,
+        record_cursor: tuple[Any, str] | None = None,
     ) -> list[Row]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
             where = ["deleted_at IS NULL"]
             params_list: list[Any] = []
+            if not include_secrets:
+                where.append("(namespace IS NULL OR namespace <> ?)")
+                params_list.append(VAULT_NAMESPACE)
             for col, val in [
                 ("owner_id", effective_owner),
                 ("namespace", effective_ns),
@@ -1543,6 +1549,11 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 if val is not None:
                     where.append(f"{col} = ?")
                     params_list.append(val)
+            if record_cursor is not None:
+                where.append("(created > ? OR (created = ? AND id > ?))")
+                params_list.extend(
+                    [record_cursor[0], record_cursor[0], record_cursor[1]]
+                )
             params_list.extend([offset, limit])
             sql = (
                 "SELECT id, content, category, subcategory, created, updated, "
@@ -2179,12 +2190,16 @@ class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):
         effective_ns: str | None,
         include_unattached: bool,
         hard_limit: int,
+        include_secrets: bool = False,
     ) -> list[Row]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
             where: list[str] = ["deleted_at IS NULL"]
             params: list[Any] = []
+            if not include_secrets:
+                where.append("(namespace IS NULL OR namespace <> ?)")
+                params.append(VAULT_NAMESPACE)
             if memory_ids:
                 placeholders = ",".join("?" for _ in memory_ids)
                 if include_unattached:
@@ -2359,6 +2374,7 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
         effective_owner: str | None,
         effective_ns: str | None,
         hard_limit: int,
+        include_secrets: bool = False,
     ) -> list[Row]:
         if not memory_ids:
             return []
@@ -2368,6 +2384,9 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
             placeholders = ", ".join("?" for _ in memory_ids)
             params: list[Any] = list(memory_ids)
             where = ["deleted_at IS NULL", f"memory_id IN ({placeholders})"]
+            if not include_secrets:
+                where.append("(namespace IS NULL OR namespace <> ?)")
+                params.append(VAULT_NAMESPACE)
             if effective_owner:
                 where.append("owner_id = ?")
                 params.append(effective_owner)
@@ -5052,6 +5071,15 @@ class Db2AclRepository(OracleAclRepository):
             await _call(cursor.close)
 
 
+_DB2_ISOLATION_CODE: dict[str, str] = {
+    # Db2 names its isolation levels with two-letter codes rather than the
+    # SQL-standard phrases. CS (Cursor Stability) is Db2's READ COMMITTED.
+    "read_committed": "CS",
+    "repeatable_read": "RR",
+    "serializable": "RR",
+}
+
+
 class Db2Backend(OracleBackend):
     """IBM Db2 12.1.x backend via Oracle Compatibility Mode.
 
@@ -5099,6 +5127,94 @@ class Db2Backend(OracleBackend):
             return
         await ensure_db2_schema(self._pool, self._settings)
         self._schema_ensured = True
+
+    @asynccontextmanager
+    async def transactional(
+        self,
+        *,
+        isolation: IsolationLevel | None = None,
+        readonly: bool = False,
+    ) -> AsyncIterator[Transaction]:
+        """Open a transaction with Db2's own isolation syntax.
+
+        This must NOT inherit Oracle's version: Db2 has no
+        ``SET TRANSACTION ISOLATION LEVEL`` / ``SET TRANSACTION READ ONLY``
+        statement, and the Oracle->Db2 token rewriter does not translate
+        those (it handles SYSTIMESTAMP, dual and bind style, not DDL/session
+        verbs). Inheriting would send Oracle DDL to Db2 and fail at runtime.
+
+        Db2 spells the levels as two-letter codes on a session special
+        register, set BEFORE the transaction starts:
+
+            RR = Repeatable Read (Db2's name for it; strictest, range locks)
+            RS = Read Stability
+            CS = Cursor Stability  (Db2's READ COMMITTED analogue)
+            UR = Uncommitted Read
+
+        ``serializable`` maps to RR as well: Db2's RR takes range locks and
+        prevents phantoms, which is the property SERIALIZABLE names here.
+
+        ``readonly`` has no session-register equivalent on Db2. It is
+        therefore accepted and used only as an intent hint -- the snapshot
+        still comes from RR. This is called out rather than silently dropped
+        because, unlike Postgres/MySQL, a stray write inside this scope would
+        NOT be rejected by the server.
+        """
+        level = None
+        if isolation is not None:
+            level = _DB2_ISOLATION_CODE.get(isolation)
+            if level is None:
+                raise ValueError(f"unsupported isolation level for Db2: {isolation!r}")
+        async with self._pool.acquire() as conn:
+            if level is not None:
+                cursor = await _call(conn.cursor)
+                try:
+                    await _call(cursor.execute, f"SET CURRENT ISOLATION = {level}")
+                finally:
+                    await _call(cursor.close)
+            tx = _OracleTransaction(conn)
+            try:
+                yield tx
+            except BaseException:
+                if not tx.closed:
+                    await tx.rollback()
+                raise
+            else:
+                if not tx.closed:
+                    await tx.commit()
+
+    async def fetch_server_now(self, tx: Any) -> datetime:
+        """Db2's ``CURRENT TIMESTAMP`` is SERVER-LOCAL and naive.
+
+        Overridden rather than inherited because Oracle's SYSTIMESTAMP
+        carries an offset while Db2's CURRENT TIMESTAMP does not. Taking the
+        inherited path and stamping UTC onto that naive value would shift the
+        export anchor by the server's UTC offset -- silently, and only on
+        non-UTC servers. ``- CURRENT TIMEZONE`` converts to real UTC first.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT CURRENT TIMESTAMP - CURRENT TIMEZONE FROM SYSIBM.SYSDUMMY1",
+            )
+            row = await _call(cursor.fetchone)
+        finally:
+            await _call(cursor.close)
+        raw = row[0] if row else None
+        if isinstance(raw, datetime):
+            return (
+                raw.astimezone(timezone.utc)
+                if raw.tzinfo
+                else raw.replace(tzinfo=timezone.utc)
+            )
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return (
+            parsed.astimezone(timezone.utc)
+            if parsed.tzinfo
+            else parsed.replace(tzinfo=timezone.utc)
+        )
 
     async def insert_pantheon_routing_audit(
         self,

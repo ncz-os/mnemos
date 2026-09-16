@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from mnemos.core import eligibility as _eligibility
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.base import (
     BackendCapabilityMissing,
     BranchRepository,
@@ -462,6 +463,8 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
         category: str | None,
         limit: int,
         offset: int,
+        include_secrets: bool = False,
+        record_cursor: tuple[Any, str] | None = None,
     ) -> list[Row]:
         # MariaDB stores embeddings in a separate memory_embeddings table (read
         # via VEC_ToText), unlike MySQL's inline memories.embedding column — so the
@@ -470,6 +473,9 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
         conn = tx.conn
         where = ["m.deleted_at IS NULL"]
         params: list[Any] = []
+        if not include_secrets:
+            where.append("(m.namespace IS NULL OR m.namespace <> %s)")
+            params.append(VAULT_NAMESPACE)
         if effective_owner:
             where.append("m.owner_id = %s")
             params.append(effective_owner)
@@ -479,6 +485,9 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
         if category:
             where.append("m.category = %s")
             params.append(category)
+        if record_cursor is not None:
+            where.append("(m.created > %s OR (m.created = %s AND m.id > %s))")
+            params.extend([record_cursor[0], record_cursor[0], record_cursor[1]])
         sql = (
             "SELECT m.id, m.content, m.category, m.subcategory, m.created, m.updated, "
             "m.owner_id, m.group_id, m.namespace, m.permission_mode, m.quality_rating, "
@@ -487,7 +496,14 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
             "VEC_ToText(me.embedding) AS embedding "
             "FROM memories m LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
             "WHERE " + " AND ".join(where) + " "
-            "ORDER BY m.created ASC LIMIT %s OFFSET %s"
+            # `, m.id ASC` is required, not cosmetic: every other backend
+            # orders by (created, id), and without the tiebreaker the sort is
+            # not a TOTAL order. Rows sharing a `created` value could then be
+            # returned in a different relative order on each page, which makes
+            # the keyset predicate above unsound (a row could be skipped or
+            # repeated) and made plain LIMIT/OFFSET paging non-deterministic
+            # even before the cursor existed.
+            "ORDER BY m.created ASC, m.id ASC LIMIT %s OFFSET %s"
         )
         params.extend([limit, offset])
         async with conn.cursor() as cursor:
