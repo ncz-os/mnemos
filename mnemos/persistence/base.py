@@ -34,6 +34,41 @@ class DuplicateMemoryError(ValueError):
     """Raised when an explicit memory id already exists."""
 
 
+def is_duplicate_memory_error(exc: BaseException) -> bool:
+    """Best-effort "this row already exists" detection across backends.
+
+    Necessary because ``insert_memory`` does NOT signal a conflict uniformly:
+    five backends (postgres, mysql, mariadb, oracle, db2) return the string
+    ``"INSERT 0 0"``, while SQLite RAISES :class:`DuplicateMemoryError`. That
+    divergence is deliberate on the SQLite side — ``POST /v1/memories`` maps
+    the exception to a 409 and ``tests/test_sqlite_insert_dup.py`` pins it — so
+    callers that need idempotent inserts must handle BOTH shapes:
+
+        try:
+            result = await backend.memories.insert_memory(tx, ...)
+            conflicted = result == "INSERT 0 0"
+        except Exception as exc:
+            if not is_duplicate_memory_error(exc):
+                raise
+            conflicted = True
+
+    Checking only the return string silently turns a SQLite re-import into a
+    hard failure; checking only the exception silently turns a Postgres
+    re-import into a phantom success.
+
+    Kept deliberately NARROW: anything that is not clearly a
+    uniqueness/duplicate signal propagates, so real failures still surface.
+    """
+    name = type(exc).__name__
+    if name == "DuplicateMemoryError":
+        return True
+    if name in {"IntegrityError", "UniqueViolation", "DuplicateKeyError", "UniqueViolationError"}:
+        msg = str(exc).lower()
+        if "unique" in msg or "duplicate" in msg or "primary key" in msg:
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class MemoryStatsRow:
     """Backend-neutral aggregate snapshot for ``GET /stats``.
