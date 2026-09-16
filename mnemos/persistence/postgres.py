@@ -27,6 +27,7 @@ from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.oauth import _mint_user_id
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.core.recommendation import choose_recommended_model
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.core.visibility import (
     read_visibility_predicate as _core_read_visibility_predicate,
     version_visibility_predicate as _core_version_visibility_predicate,
@@ -46,6 +47,7 @@ from mnemos.persistence.base import (
     ConsultationAuditRepository,
     ConsultationsRepository,
     FederationRepository,
+    IsolationLevel,
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
@@ -281,6 +283,7 @@ async def _fetch_sidecar(
     hard_limit: int,
     null_ok: bool = False,
     order_by: Optional[str] = None,
+    include_secrets: bool = False,
 ):
     if bound_to_memories and not memory_ids and not null_ok:
         return []
@@ -290,6 +293,13 @@ async def _fetch_sidecar(
     idx = 1
     if table in {"kg_triples", "memory_versions"}:
         conditions.append("deleted_at IS NULL")
+    # Vault exclusion applies only to the two sidecars that carry their own
+    # namespace column. memory_compressed_variants has no namespace, so it is
+    # scoped by owner alone and cannot be filtered here.
+    if not include_secrets and table in {"kg_triples", "memory_versions"}:
+        conditions.append(f"(namespace IS NULL OR namespace <> ${idx})")
+        params.append(VAULT_NAMESPACE)
+        idx += 1
     if bound_to_memories:
         if null_ok and memory_ids:
             conditions.append(f"({memory_id_column} IS NULL OR {memory_id_column} = ANY(${idx}::text[]))")
@@ -359,6 +369,26 @@ class PostgresTransaction:
         if self._closed:
             raise RuntimeError("cannot register post-commit callback on a closed transaction")
         self._after_commit.append(callback)
+
+    @asynccontextmanager
+    async def savepoint(self) -> AsyncIterator["PostgresTransaction"]:
+        """Nested savepoint scope. asyncpg models this natively.
+
+        ``conn.transaction()`` inside an already-open transaction issues a
+        SAVEPOINT rather than a BEGIN, so this is a thin pass-through and the
+        historical Postgres behaviour is preserved exactly.
+        """
+        if self._closed:
+            raise RuntimeError("cannot open a savepoint on a closed transaction")
+        nested = self._conn.transaction()
+        await nested.start()
+        try:
+            yield self
+        except BaseException:
+            await nested.rollback()
+            raise
+        else:
+            await nested.commit()
 
 
 def _postgres_tx(tx: Transaction) -> PostgresTransaction:
@@ -650,11 +680,17 @@ class PostgresMemoryRepository(MemoryRepository):
         category: str | None,
         limit: int,
         offset: int,
+        include_secrets: bool = False,
+        record_cursor: tuple[Any, str] | None = None,
     ) -> list[Row]:
         conn = _postgres_tx(tx).conn
         conditions: list[str] = ["deleted_at IS NULL"]
         params: list[Any] = []
         idx = 1
+        if not include_secrets:
+            conditions.append(f"(namespace IS NULL OR namespace <> ${idx})")
+            params.append(VAULT_NAMESPACE)
+            idx += 1
         if effective_owner:
             conditions.append(f"owner_id = ${idx}")
             params.append(effective_owner)
@@ -667,6 +703,13 @@ class PostgresMemoryRepository(MemoryRepository):
             conditions.append(f"category = ${idx}")
             params.append(category)
             idx += 1
+        if record_cursor is not None:
+            # Row-comparison keyset. Postgres compares composite values
+            # lexicographically, so this is the exact "strictly after
+            # (created, id)" predicate the ORDER BY below implies.
+            conditions.append(f"(created, id) > (${idx}, ${idx + 1})")
+            params.extend(record_cursor)
+            idx += 2
 
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         sql = (
@@ -689,6 +732,90 @@ class PostgresMemoryRepository(MemoryRepository):
             f"LIMIT ${idx} OFFSET ${idx + 1}"
         )
         params.extend([limit, offset])
+        return await conn.fetch(sql, *params)
+
+    async def fetch_visible_export_memory_ids(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        include_secrets: bool = False,
+    ) -> set[str]:
+        if not memory_ids:
+            return set()
+        conn = _postgres_tx(tx).conn
+        conditions = ["id = ANY($1::text[])", "deleted_at IS NULL"]
+        params: list[Any] = [list(memory_ids)]
+        for column, value in (("owner_id", effective_owner), ("namespace", effective_ns)):
+            if value:
+                params.append(value)
+                conditions.append(f"{column} = ${len(params)}")
+        if not include_secrets:
+            params.append(VAULT_NAMESPACE)
+            conditions.append(f"(namespace IS NULL OR namespace <> ${len(params)})")
+        rows = await conn.fetch(
+            "SELECT id FROM memories WHERE " + " AND ".join(conditions), *params
+        )
+        return {row["id"] for row in rows}
+
+    async def fetch_deletion_log_for_export(
+        self,
+        tx: Transaction,
+        *,
+        effective_owner: str | None,
+        effective_ns: str | None,
+        hard_limit: int,
+        from_executed_at: Any = None,
+        to_executed_at: Any = None,
+        cursor_executed_at: Any = None,
+        cursor_id: str | None = None,
+        export_as_of: Any = None,
+        include_secrets: bool = False,
+    ) -> list[Row]:
+        conn = _postgres_tx(tx).conn
+        conditions: list[str] = []
+        params: list[Any] = []
+        idx = 1
+        if not include_secrets:
+            conditions.append(f"(namespace IS NULL OR namespace <> ${idx})")
+            params.append(VAULT_NAMESPACE)
+            idx += 1
+        if effective_owner:
+            conditions.append(f"owner_id = ${idx}")
+            params.append(effective_owner)
+            idx += 1
+        if effective_ns:
+            conditions.append(f"namespace = ${idx}")
+            params.append(effective_ns)
+            idx += 1
+        if from_executed_at:
+            conditions.append(f"executed_at >= ${idx}::timestamptz")
+            params.append(from_executed_at)
+            idx += 1
+        if to_executed_at:
+            conditions.append(f"executed_at <= ${idx}::timestamptz")
+            params.append(to_executed_at)
+            idx += 1
+        # Keyset cursor over (executed_at, id). Backed by the composite index
+        # from migrations_v5_3_3_deletion_log_export_index.sql.
+        if cursor_executed_at and cursor_id:
+            conditions.append(f"(executed_at, id) > (${idx}::timestamptz, ${idx + 1}::uuid)")
+            params.append(cursor_executed_at)
+            params.append(cursor_id)
+            idx += 2
+        if export_as_of:
+            conditions.append(f"executed_at <= ${idx}::timestamptz")
+            params.append(export_as_of)
+            idx += 1
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        sql = (
+            "SELECT id::text AS id, memory_id, content_hash, owner_id, namespace, "
+            "requested_by, requested_at, executed_at, request_kind, reason, source "
+            f"FROM deletion_log {where} "
+            f"ORDER BY executed_at ASC, id ASC LIMIT {int(hard_limit) + 1}"
+        )
         return await conn.fetch(sql, *params)
 
     async def fetch_referenced_memory_allowlist(
@@ -855,8 +982,13 @@ class PostgresMemoryRepository(MemoryRepository):
     async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None:
         conn = _postgres_tx(tx).conn
         return await conn.fetchrow(
+            # verbatim_content is part of this projection on mysql/oracle/db2
+            # already; postgres and sqlite were the two that omitted it. Callers
+            # that compare a stored row against an inbound payload (the MPF
+            # importer) need it, and without it they fall back to a second,
+            # driver-specific query.
             "SELECT content, category, subcategory, "
-            "metadata, quality_rating, owner_id, "
+            "metadata, quality_rating, verbatim_content, owner_id, "
             "namespace, permission_mode, "
             "source_model, source_provider, "
             "source_session, source_agent, "
@@ -1668,10 +1800,12 @@ class PostgresKGRepository(KGRepository):
         effective_ns: str | None,
         include_unattached: bool,
         hard_limit: int,
+        include_secrets: bool = False,
     ) -> list[Row]:
         conn = _postgres_tx(tx).conn
         return await _fetch_sidecar(
             conn,
+            include_secrets=include_secrets,
             table="kg_triples",
             columns=(
                 "id, subject, predicate, object, subject_type, "
@@ -1760,6 +1894,7 @@ class PostgresVersionRepository(VersionRepository):
         effective_owner: str | None,
         effective_ns: str | None,
         hard_limit: int,
+        include_secrets: bool = False,
     ) -> list[Row]:
         conn = _postgres_tx(tx).conn
         # ``id`` and ``parent_version_id`` are PG UUID columns; cast to
@@ -1769,6 +1904,7 @@ class PostgresVersionRepository(VersionRepository):
         # ``str(uuid)`` fails.
         return await _fetch_sidecar(
             conn,
+            include_secrets=include_secrets,
             table="memory_versions",
             columns=(
                 "id::text AS id, memory_id, version_num, content, category, "
@@ -6605,9 +6741,22 @@ class PostgresBackend:
         return set(POSTGRES_CAPABILITY_DETAILS)
 
     @asynccontextmanager
-    async def transactional(self) -> AsyncIterator[Transaction]:
+    async def transactional(
+        self,
+        *,
+        isolation: IsolationLevel | None = None,
+        readonly: bool = False,
+    ) -> AsyncIterator[Transaction]:
+        # asyncpg speaks these level names natively and emits
+        # BEGIN ISOLATION LEVEL <level> [READ ONLY], so Postgres needs no
+        # translation layer -- the server enforces both properties.
         async with self._pool.acquire() as conn:
-            raw_tx = conn.transaction()
+            kwargs: dict[str, Any] = {}
+            if isolation is not None:
+                kwargs["isolation"] = isolation
+            if readonly:
+                kwargs["readonly"] = True
+            raw_tx = conn.transaction(**kwargs)
             await raw_tx.start()
             tx = PostgresTransaction(conn, raw_tx)
             try:
@@ -6619,6 +6768,12 @@ class PostgresBackend:
             else:
                 if not tx.closed:
                     await tx.commit()
+
+    async def fetch_server_now(self, tx: Transaction) -> datetime:
+        # now() is transaction-start time under MVCC, which is exactly the
+        # anchor semantics the export cursor wants: every row this snapshot
+        # can see has executed_at <= this value.
+        return await _postgres_tx(tx).conn.fetchval("SELECT now()")
 
     async def insert_pantheon_routing_audit(
         self,

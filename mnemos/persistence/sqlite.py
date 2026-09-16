@@ -33,6 +33,7 @@ from mnemos.core.auth_context import UserContext
 from mnemos.core.config import embed_http_model_override, hot_rs_enabled
 from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.oauth import _mint_user_id
+from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.base import (
     AuditChainRepository,
@@ -47,6 +48,7 @@ from mnemos.persistence.base import (
     ConsultationsRepository,
     DuplicateMemoryError,
     FederationRepository,
+    IsolationLevel,
     FULL_STORAGE_CAPABILITY_DETAILS,
     KGRepository,
     MemoryRepository,
@@ -648,6 +650,7 @@ class SqliteTransaction:
     def __init__(self, conn: Any):
         self._conn = conn
         self._closed = False
+        self._savepoint_seq = 0
 
     @property
     def conn(self) -> Any:
@@ -668,6 +671,31 @@ class SqliteTransaction:
             return
         await _rollback(self._conn)
         self._closed = True
+
+    @asynccontextmanager
+    async def savepoint(self) -> AsyncIterator["SqliteTransaction"]:
+        """Nested savepoint scope. SQLite supports SAVEPOINT natively.
+
+        Names are sequenced per transaction rather than reused, because
+        ``ROLLBACK TO <name>`` targets the MOST RECENT savepoint of that name;
+        with a single shared name, an inner scope's rollback would silently
+        unwind an outer one too.
+        """
+        if self._closed:
+            raise RuntimeError("cannot open a savepoint on a closed transaction")
+        self._savepoint_seq += 1
+        name = f"mnemos_sp_{self._savepoint_seq}"
+        await _execute(self._conn, f"SAVEPOINT {name}")
+        try:
+            yield self
+        except BaseException:
+            # ROLLBACK TO rewinds but leaves the savepoint on the stack;
+            # RELEASE then pops it so the outer transaction stays clean.
+            await _execute(self._conn, f"ROLLBACK TO {name}")
+            await _execute(self._conn, f"RELEASE {name}")
+            raise
+        else:
+            await _execute(self._conn, f"RELEASE {name}")
 
 
 def _sqlite_tx(tx: Transaction) -> SqliteTransaction:
@@ -868,11 +896,16 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         category: str | None,
         limit: int,
         offset: int,
+        include_secrets: bool = False,
+        record_cursor: tuple[Any, str] | None = None,
     ) -> list[Row]:
         # Exclude soft-deleted rows (matches oracle/postgres/db2/mysql and the
         # normal read paths) so export never resurrects tombstoned memories.
         conditions: list[str] = ["deleted_at IS NULL"]
         params: list[Any] = []
+        if not include_secrets:
+            conditions.append("(namespace IS NULL OR namespace <> ?)")
+            params.append(VAULT_NAMESPACE)
         if effective_owner:
             conditions.append("owner_id = ?")
             params.append(effective_owner)
@@ -882,6 +915,13 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         if category:
             conditions.append("category = ?")
             params.append(category)
+        if record_cursor is not None:
+            # Expanded lexicographic form of `(created, id) > (?, ?)`.
+            # SQLite has supported row values since 3.15, but writing the
+            # comparison out keeps the keyset correct on any build and makes
+            # the total ordering explicit rather than implied.
+            conditions.append("(created > ? OR (created = ? AND id > ?))")
+            params.extend([record_cursor[0], record_cursor[0], record_cursor[1]])
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         params.extend([limit, offset])
         return await _fetch_all(
@@ -900,6 +940,89 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             "provenance AS prov_kind, morpheus_run_id, "
             "source_memory_ids, federation_source "
             f"FROM memories {where} ORDER BY created ASC, id ASC LIMIT ? OFFSET ?",
+            params,
+        )
+
+    async def fetch_visible_export_memory_ids(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: Sequence[str],
+        effective_owner: str | None,
+        effective_ns: str | None,
+        include_secrets: bool = False,
+    ) -> set[str]:
+        if not memory_ids:
+            return set()
+        params: list[Any] = []
+        conditions = [_in_clause("id", list(memory_ids), params), "deleted_at IS NULL"]
+        if effective_owner:
+            conditions.append("owner_id = ?")
+            params.append(effective_owner)
+        if effective_ns:
+            conditions.append("namespace = ?")
+            params.append(effective_ns)
+        if not include_secrets:
+            conditions.append("(namespace IS NULL OR namespace <> ?)")
+            params.append(VAULT_NAMESPACE)
+        rows = await _fetch_all(
+            self._conn(tx),
+            "SELECT id FROM memories WHERE " + " AND ".join(conditions),
+            params,
+        )
+        return {row["id"] for row in rows}
+
+    async def fetch_deletion_log_for_export(
+        self,
+        tx: Transaction,
+        *,
+        effective_owner: str | None,
+        effective_ns: str | None,
+        hard_limit: int,
+        from_executed_at: Any = None,
+        to_executed_at: Any = None,
+        cursor_executed_at: Any = None,
+        cursor_id: str | None = None,
+        export_as_of: Any = None,
+        include_secrets: bool = False,
+    ) -> list[Row]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if not include_secrets:
+            conditions.append("(namespace IS NULL OR namespace <> ?)")
+            params.append(VAULT_NAMESPACE)
+        if effective_owner:
+            conditions.append("owner_id = ?")
+            params.append(effective_owner)
+        if effective_ns:
+            conditions.append("namespace = ?")
+            params.append(effective_ns)
+        # SQLite stores timestamps as ISO-8601 TEXT, which sorts and compares
+        # lexicographically in exactly calendar order -- provided every value
+        # is normalized to the same UTC shape. _sqlite_ts does that; comparing
+        # a raw datetime against TEXT would silently match nothing.
+        if from_executed_at:
+            conditions.append("executed_at >= ?")
+            params.append(_isoformat_for_compare(from_executed_at))
+        if to_executed_at:
+            conditions.append("executed_at <= ?")
+            params.append(_isoformat_for_compare(to_executed_at))
+        if cursor_executed_at and cursor_id:
+            conditions.append("(executed_at > ? OR (executed_at = ? AND id > ?))")
+            params.extend(
+                [_isoformat_for_compare(cursor_executed_at), _isoformat_for_compare(cursor_executed_at), cursor_id]
+            )
+        if export_as_of:
+            conditions.append("executed_at <= ?")
+            params.append(_isoformat_for_compare(export_as_of))
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(int(hard_limit) + 1)
+        return await _fetch_all(
+            self._conn(tx),
+            "SELECT id, memory_id, content_hash, owner_id, namespace, "
+            "requested_by, requested_at, executed_at, request_kind, reason, source "
+            f"FROM deletion_log {where} "
+            "ORDER BY executed_at ASC, id ASC LIMIT ?",
             params,
         )
 
@@ -1054,9 +1177,16 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
     async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None:
         return await _fetch_one(
             self._conn(tx),
-            "SELECT content, category, subcategory, metadata, quality_rating, owner_id, "
+            # `verbatim_content` matches the mysql/oracle/db2 projection.
+            # `deleted_at IS NULL` matches all five other backends: without it
+            # this was the only backend that would hand back a soft-deleted
+            # row, so an importer comparing against it would "find" a
+            # tombstoned memory and reject a legitimate insert.
+            "SELECT content, category, subcategory, metadata, quality_rating, "
+            "verbatim_content, owner_id, "
             "namespace, permission_mode, source_model, source_provider, source_session, "
-            "source_agent, created, updated FROM memories WHERE id = ?",
+            "source_agent, created, updated FROM memories "
+            "WHERE id = ? AND deleted_at IS NULL",
             (memory_id,),
         )
 
@@ -1979,9 +2109,13 @@ class SqliteKGRepository(_SqliteRepository, KGRepository):
         effective_ns: str | None,
         include_unattached: bool,
         hard_limit: int,
+        include_secrets: bool = False,
     ) -> list[Row]:
         conditions: list[str] = []
         params: list[Any] = []
+        if not include_secrets:
+            conditions.append("(namespace IS NULL OR namespace <> ?)")
+            params.append(VAULT_NAMESPACE)
         if memory_ids:
             memory_condition = _in_clause("memory_id", list(memory_ids), params)
             if include_unattached:
@@ -2108,9 +2242,15 @@ async def _fetch_sidecar(
     bound_to_memories: bool,
     hard_limit: int,
     order_by: str | None = None,
+    include_secrets: bool = False,
 ) -> list[Row]:
     conditions: list[str] = []
     params: list[Any] = []
+    # Vault exclusion applies only to tables carrying their own namespace
+    # column; memory_compressed_variants has none and is owner-scoped.
+    if not include_secrets and table in {"kg_triples", "memory_versions"}:
+        conditions.append("(namespace IS NULL OR namespace <> ?)")
+        params.append(VAULT_NAMESPACE)
     if bound_to_memories:
         if not memory_ids:
             return []
@@ -2136,9 +2276,11 @@ class SqliteVersionRepository(_SqliteRepository, VersionRepository):
         effective_owner: str | None,
         effective_ns: str | None,
         hard_limit: int,
+        include_secrets: bool = False,
     ) -> list[Row]:
         return await _fetch_sidecar(
             self._conn(tx),
+            include_secrets=include_secrets,
             table="memory_versions",
             columns=(
                 "id, memory_id, version_num, content, category, "
@@ -7480,13 +7622,82 @@ class SqliteBackend:
         return dim
 
     @asynccontextmanager
-    async def transactional(self) -> AsyncIterator[Transaction]:
+    async def transactional(
+        self,
+        *,
+        isolation: IsolationLevel | None = None,
+        readonly: bool = False,
+    ) -> AsyncIterator[Transaction]:
+        """Open a SQLite transaction.
+
+        Isolation, honestly: SQLite has no READ COMMITTED / REPEATABLE READ /
+        SERIALIZABLE vocabulary. It has DEFERRED / IMMEDIATE / EXCLUSIVE
+        *locking* modes. Rather than pretend the names map, this method
+        provides the CONSISTENCY GUARANTEE each level names, using the
+        mechanism SQLite actually has, and refuses anything it cannot honor.
+
+        * Default (``isolation=None``) keeps the historical ``BEGIN IMMEDIATE``
+          -- a write transaction that takes the reserved lock up front. Every
+          existing caller is therefore byte-for-byte unchanged.
+
+        * ``repeatable_read`` / ``serializable`` with ``readonly=True`` uses
+          ``BEGIN DEFERRED`` plus an immediate probe read. In WAL mode (which
+          this backend enables: ``PRAGMA journal_mode=WAL``) a read
+          transaction observes the database as of its first read and sees
+          nothing any writer commits afterwards, for its whole lifetime. That
+          IS a snapshot -- the same consistency property the other five
+          backends give under REPEATABLE READ, reached by a different route.
+
+          The probe read is load-bearing, not decoration. ``BEGIN DEFERRED``
+          acquires nothing until the first statement touches the database, so
+          without it the snapshot would be pinned at the first *real* query
+          and anything committed in between would leak in. ``SELECT 1 FROM
+          sqlite_schema LIMIT 1`` pins it at entry, matching the other
+          backends' behaviour of establishing the snapshot at BEGIN.
+
+          SERIALIZABLE is accepted as an alias here because, for a READ-ONLY
+          transaction, a stable snapshot IS serializable with respect to
+          concurrent writers -- there are no writes of our own to order.
+
+        What this deliberately does NOT claim:
+
+        * ``readonly=True`` is not enforced. SQLite has no ``START
+          TRANSACTION READ ONLY``; a write issued inside this scope would
+          succeed (and escalate to a write lock) rather than raise. On the
+          other five backends the server rejects it. Callers must treat
+          ``readonly`` as a guarantee about what THEY do, and rely on the
+          snapshot -- not on SQLite policing them.
+        * A write-intent transaction at ``repeatable_read`` is refused rather
+          than silently downgraded, because DEFERRED + writes would escalate
+          mid-transaction and could abort with SQLITE_BUSY partway through --
+          strictly worse than telling the caller up front.
+        """
         if self._closed:
             raise RuntimeError("SQLite backend is closed")
+        if isolation is not None and isolation not in (
+            "read_committed",
+            "repeatable_read",
+            "serializable",
+        ):
+            raise ValueError(f"unsupported isolation level for SQLite: {isolation!r}")
+        snapshot_read = readonly and isolation in ("repeatable_read", "serializable")
+        if isolation in ("repeatable_read", "serializable") and not readonly:
+            raise ValueError(
+                f"SQLite can only provide {isolation!r} semantics for a "
+                "read-only transaction (readonly=True). A write transaction "
+                "under BEGIN DEFERRED would escalate its lock mid-flight and "
+                "can fail with SQLITE_BUSY after partial work; use the "
+                "default isolation (BEGIN IMMEDIATE) for writes."
+            )
         async with self._lock:
             await self.open()
             assert self._conn is not None
-            await _execute(self._conn, "BEGIN IMMEDIATE")
+            if snapshot_read:
+                await _execute(self._conn, "BEGIN DEFERRED")
+                # Pin the WAL read snapshot NOW -- see docstring.
+                await _fetch_val(self._conn, "SELECT 1 FROM sqlite_schema LIMIT 1")
+            else:
+                await _execute(self._conn, "BEGIN IMMEDIATE")
             tx = SqliteTransaction(self._conn)
             try:
                 yield tx
@@ -7497,6 +7708,23 @@ class SqliteBackend:
             else:
                 if not tx.closed:
                     await tx.commit()
+
+    async def fetch_server_now(self, tx: Transaction) -> datetime:
+        """SQLite's clock is the same process clock this code runs on.
+
+        There is no separate database server, so "DB time" and "app time" are
+        by definition identical here and the skew this accessor guards against
+        on client/server backends cannot occur. We still route through SQLite
+        (rather than returning ``datetime.now``) so the value is produced the
+        same way the rows' own timestamps are, and we attach UTC explicitly --
+        ``CURRENT_TIMESTAMP`` yields a naive ``'YYYY-MM-DD HH:MM:SS'`` string
+        in UTC, and handing back a naive datetime would defeat the contract.
+        """
+        raw = await _fetch_val(_sqlite_tx(tx).conn, "SELECT CURRENT_TIMESTAMP")
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
     async def insert_pantheon_routing_audit(
         self,
