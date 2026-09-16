@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from mnemos.persistence.base import Transaction
+from mnemos.persistence.base import build_api_key_row
 from mnemos.persistence.mcp_oauth import oauth_utc
 from mnemos.persistence.types import Row
 
@@ -170,6 +171,90 @@ class MysqlBrowserOAuthMixin:
             "UPDATE api_keys SET last_used=? WHERE id=?",
             (self._mcp_timestamp(datetime.now(timezone.utc)), key_id),
         )
+
+    async def user_exists(self, tx: Transaction, user_id: str) -> bool:
+        row = await self._mcp_fetch(tx, "SELECT 1 AS present FROM users WHERE id=?", (user_id,))
+        return row is not None
+
+    async def count_active_api_keys(self, tx: Transaction, user_id: str) -> int:
+        row = await self._mcp_fetch(
+            tx,
+            "SELECT COUNT(*) AS active FROM api_keys WHERE user_id=? AND revoked=0",
+            (user_id,),
+        )
+        return int((row or {}).get("active") or 0)
+
+    async def create_api_key(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        key_hash: str,
+        key_prefix: str,
+        label: str | None,
+    ) -> Row:
+        # migrations_mysql/0065_api_keys_key_prefix.sql (mirrored for
+        # MariaDB) adds key_prefix/label/created_at; the original
+        # 0052_oauth_repository.sql api_keys carried only the columns the
+        # auth lookup needed. The id column has no server-side default on
+        # this backend, so it is generated here.
+        key_id = uuid.uuid4().hex
+        await self._mcp_execute(
+            tx,
+            "INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, revoked, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (
+                key_id,
+                user_id,
+                key_hash,
+                key_prefix,
+                label,
+                self._mcp_timestamp(datetime.now(timezone.utc)),
+            ),
+        )
+        row = await self._mcp_fetch(
+            tx,
+            "SELECT id, user_id, key_prefix, label, created_at, last_used, revoked "
+            "FROM api_keys WHERE id=?",
+            (key_id,),
+        )
+        return build_api_key_row(
+            key_id=row["id"],
+            user_id=row["user_id"],
+            key_prefix=row["key_prefix"],
+            label=row["label"],
+            created_at=row["created_at"],
+            last_used=row["last_used"],
+            revoked=row["revoked"],
+        )
+
+    async def list_api_keys(self, tx: Transaction, user_id: str) -> list[Row]:
+        rows = await self._oauth_fetch_all(
+            tx,
+            "SELECT id, user_id, key_prefix, label, created_at, last_used, revoked "
+            "FROM api_keys WHERE user_id=? ORDER BY created_at",
+            (user_id,),
+        )
+        return [
+            build_api_key_row(
+                key_id=row["id"],
+                user_id=row["user_id"],
+                key_prefix=row["key_prefix"],
+                label=row["label"],
+                created_at=row["created_at"],
+                last_used=row["last_used"],
+                revoked=row["revoked"],
+            )
+            for row in rows
+        ]
+
+    async def revoke_api_key(self, tx: Transaction, key_id: Any) -> bool:
+        changed = await self._mcp_execute(
+            tx,
+            "UPDATE api_keys SET revoked=1 WHERE id=? AND revoked=0",
+            (str(key_id),),
+        )
+        return changed > 0
 
     async def resolve_active_session(self, tx: Transaction, session_id: str, *, now: Any) -> Row | None:
         row = await self._mcp_fetch(

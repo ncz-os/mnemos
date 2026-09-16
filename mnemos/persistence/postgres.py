@@ -35,6 +35,7 @@ from mnemos.core import eligibility as _eligibility
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin
 from mnemos.persistence.base import (
     POSTGRES_CAPABILITY_DETAILS,
+    build_api_key_row,
     AclRepository,
     AuditChainRepository,
     BranchRepository,
@@ -4019,6 +4020,79 @@ class PostgresOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
 
     async def touch_api_key(self, tx: Transaction, key_id: Any) -> None:
         await _postgres_tx(tx).conn.execute("UPDATE api_keys SET last_used=NOW() WHERE id=$1", key_id)
+
+    async def user_exists(self, tx: Transaction, user_id: str) -> bool:
+        row = await _postgres_tx(tx).conn.fetchrow("SELECT 1 FROM users WHERE id=$1", user_id)
+        return row is not None
+
+    async def count_active_api_keys(self, tx: Transaction, user_id: str) -> int:
+        value = await _postgres_tx(tx).conn.fetchval(
+            "SELECT COUNT(*) FROM api_keys WHERE user_id=$1 AND NOT revoked",
+            user_id,
+        )
+        return int(value or 0)
+
+    async def create_api_key(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        key_hash: str,
+        key_prefix: str,
+        label: str | None,
+    ) -> Row:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            "INSERT INTO api_keys (user_id, key_hash, key_prefix, label) "
+            "VALUES ($1, $2, $3, $4) "
+            "RETURNING id::text AS id, user_id, key_prefix, label, created_at, last_used, revoked",
+            user_id,
+            key_hash,
+            key_prefix,
+            label,
+        )
+        return build_api_key_row(
+            key_id=row["id"],
+            user_id=row["user_id"],
+            key_prefix=row["key_prefix"],
+            label=row["label"],
+            created_at=row["created_at"],
+            last_used=row["last_used"],
+            revoked=row["revoked"],
+        )
+
+    async def list_api_keys(self, tx: Transaction, user_id: str) -> list[Row]:
+        rows = await _postgres_tx(tx).conn.fetch(
+            "SELECT id::text AS id, user_id, key_prefix, label, created_at, last_used, revoked "
+            "FROM api_keys WHERE user_id=$1 ORDER BY created_at",
+            user_id,
+        )
+        return [
+            build_api_key_row(
+                key_id=row["id"],
+                user_id=row["user_id"],
+                key_prefix=row["key_prefix"],
+                label=row["label"],
+                created_at=row["created_at"],
+                last_used=row["last_used"],
+                revoked=row["revoked"],
+            )
+            for row in rows
+        ]
+
+    async def revoke_api_key(self, tx: Transaction, key_id: Any) -> bool:
+        # api_keys.id is a UUID column here. A malformed id used to reach
+        # Postgres as `$1::uuid` and surface as a 500 invalid-input error;
+        # rejecting it up front makes an unparseable id simply "not found",
+        # which is what the caller already renders for an unknown key.
+        try:
+            uuid.UUID(str(key_id))
+        except (AttributeError, TypeError, ValueError):
+            return False
+        result = await _postgres_tx(tx).conn.execute(
+            "UPDATE api_keys SET revoked=true WHERE id=$1::uuid AND NOT revoked",
+            str(key_id),
+        )
+        return _pg_result_count(result) > 0
 
     async def resolve_active_session(self, tx: Transaction, session_id: str, *, now: Any) -> Row | None:
         conn = _postgres_tx(tx).conn

@@ -1162,6 +1162,52 @@ class ConsultationAuditRepository(ABC):
         raise NotImplementedError("write_price_history not implemented for this backend")
 
 
+def _api_key_timestamp(value: Any) -> str | None:
+    """Normalise a backend timestamp column to ISO-8601 text.
+
+    The six backends hand the same logical column back in three
+    different shapes: ``datetime`` (asyncpg, oracledb, aiomysql), an
+    ISO ``str`` (SQLite stores TEXT), or ``None``. Pinning the neutral
+    Row to "ISO-8601 string or None" keeps a per-backend
+    ``.isoformat()`` branch out of the route handlers.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    isoformat = getattr(value, "isoformat", None)
+    return isoformat() if callable(isoformat) else str(value)
+
+
+def build_api_key_row(
+    *,
+    key_id: Any,
+    user_id: str,
+    key_prefix: str | None,
+    label: str | None,
+    created_at: Any,
+    last_used: Any,
+    revoked: Any,
+) -> Row:
+    """Assemble the backend-neutral ``api_keys`` Row.
+
+    Every backend's ``create_api_key`` / ``list_api_keys`` funnels
+    through here so six divergent physical schemas surface one shape.
+    Column-name divergence is resolved by the caller before it gets
+    here: Oracle and Db2 store ``owner_id`` / ``name`` / ``revoked_at``
+    where Postgres stores ``user_id`` / ``label`` / ``revoked``.
+    """
+    return {
+        "id": str(key_id),
+        "user_id": user_id,
+        "key_prefix": key_prefix,
+        "label": label,
+        "created_at": _api_key_timestamp(created_at),
+        "last_used": _api_key_timestamp(last_used),
+        "revoked": bool(revoked),
+    }
+
+
 class OAuthRepository(ABC):
     """OAuth provider, identity, and browser-session persistence."""
 
@@ -1252,6 +1298,71 @@ class OAuthRepository(ABC):
     @abstractmethod
     async def touch_api_key(self, tx: Transaction, key_id: Any) -> None:
         """Bump the ``last_used`` timestamp on the given api_keys row."""
+
+    @abstractmethod
+    async def user_exists(self, tx: Transaction, user_id: str) -> bool:
+        """Return True when ``users`` holds a row with this id.
+
+        Backend-neutral existence probe for the admin API-key routes,
+        which must 404 on an unknown user before minting a key. It is
+        deliberately narrower than a full user read: the six ``users``
+        tables do not share a column set (SQLite carries no
+        ``display_name``/``email``, MySQL no ``created_at``), but every
+        one of them has ``id``.
+        """
+
+    @abstractmethod
+    async def count_active_api_keys(self, tx: Transaction, user_id: str) -> int:
+        """Count this user's non-revoked ``api_keys`` rows.
+
+        "Non-revoked" is spelled differently per backend — Postgres,
+        SQLite and MySQL carry a ``revoked`` flag; Oracle and Db2
+        record ``revoked_at IS NULL`` instead — so the predicate lives
+        in the implementations and the caller just compares the count
+        against the per-user cap.
+        """
+
+    @abstractmethod
+    async def create_api_key(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        key_hash: str,
+        key_prefix: str,
+        label: str | None,
+    ) -> Row:
+        """Persist a new API key and return its backend-neutral Row.
+
+        The caller generates the secret, hashes it, and derives the
+        display prefix. That is the same split ``lookup_api_key``
+        already uses — it takes a ``key_hash``, never a raw key — so
+        the plaintext secret never reaches the persistence layer and
+        each backend is responsible only for storage.
+
+        Returns the Row shape built by :func:`build_api_key_row`:
+        ``id`` (str), ``user_id`` (str), ``key_prefix`` (str),
+        ``label`` (str | None), ``created_at`` (ISO-8601 str),
+        ``last_used`` (ISO-8601 str | None), ``revoked`` (bool).
+        """
+
+    @abstractmethod
+    async def list_api_keys(self, tx: Transaction, user_id: str) -> list[Row]:
+        """Return every API key row for ``user_id``, oldest first.
+
+        Same Row shape as :meth:`create_api_key`. Revoked keys are
+        included and flagged rather than filtered, matching the
+        pre-existing Postgres listing behaviour.
+        """
+
+    @abstractmethod
+    async def revoke_api_key(self, tx: Transaction, key_id: Any) -> bool:
+        """Soft-delete an API key; return True when a row changed.
+
+        Returns False both for an unknown id and for an
+        already-revoked key, so the caller can 404 the two identically
+        without a second round-trip.
+        """
 
     @abstractmethod
     async def resolve_active_session(

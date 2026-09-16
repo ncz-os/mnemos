@@ -4676,6 +4676,80 @@ class Db2OAuthRepository(OracleOAuthRepository):
         finally:
             await _call(cursor.close)
 
+    # Same column mapping as the Oracle base class (owner_id / name /
+    # revoked_at), re-implemented with positional binds because
+    # ibm_db_dbi does not accept named parameters.
+
+    async def user_exists(self, tx: Any, user_id: str) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, "SELECT 1 AS present FROM users WHERE id = ?", (user_id,))
+            return await _call(cursor.fetchone) is not None
+        finally:
+            await _call(cursor.close)
+
+    async def count_active_api_keys(self, tx: Any, user_id: str) -> int:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT COUNT(*) AS active FROM api_keys WHERE owner_id = ? AND revoked_at IS NULL",
+                (user_id,),
+            )
+            row = await _call(cursor.fetchone)
+            return int(row[0]) if row else 0
+        finally:
+            await _call(cursor.close)
+
+    async def create_api_key(
+        self,
+        tx: Any,
+        *,
+        user_id: str,
+        key_hash: str,
+        key_prefix: str,
+        label: str | None,
+    ) -> Row:
+        key_id = uuid.uuid4().hex
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO api_keys (id, name, provider, key_hash, key_prefix, owner_id) "
+                "VALUES (?, ?, 'mnemos', ?, ?, ?)",
+                (key_id, label or "api-key", key_hash, key_prefix, user_id),
+            )
+            await _call(cursor.execute, self._API_KEY_SELECT + " WHERE id = ?", (key_id,))
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return self._api_key_row(row)
+        finally:
+            await _call(cursor.close)
+
+    async def list_api_keys(self, tx: Any, user_id: str) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                self._API_KEY_SELECT + " WHERE owner_id = ? ORDER BY created",
+                (user_id,),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return [self._api_key_row(row) for row in rows]
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_api_key(self, tx: Any, key_id: Any) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE api_keys SET revoked_at = CURRENT TIMESTAMP WHERE id = ? AND revoked_at IS NULL",
+                (str(key_id),),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
     async def resolve_active_session(self, tx: Any, session_id: str, *, now: Any) -> Row | None:
         cursor = await _call(_conn_from_tx(tx).cursor)
         try:
