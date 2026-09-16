@@ -1381,12 +1381,25 @@ async def _ensure_mysql_federation_journal(conn: Any, *, separate_embeddings: bo
 
 
 async def _ensure_mysql_oauth_schema(conn: Any) -> None:
-    """Provision OAuth tables on the node's existing MySQL-family connection."""
+    """Provision OAuth tables on the node's existing MySQL-family connection.
+
+    0065 is an ALTER-only upgrade file: MySQL has no
+    ``ADD COLUMN IF NOT EXISTS``, so replaying it on an already-migrated
+    database raises error 1060 (duplicate column). That one code is
+    swallowed; every other error still propagates. Fresh installs get the
+    same columns straight from 0052's CREATE TABLE, so the ALTERs are a
+    no-op there.
+    """
     directory = Path(__file__).resolve().parents[1] / "db_migrations" / "migrations_mysql"
     async with conn.cursor() as cursor:
-        for name in ("0052_oauth_repository.sql", "0053_mcp_oauth.sql"):
+        for name in ("0052_oauth_repository.sql", "0053_mcp_oauth.sql", "0065_api_keys_key_prefix.sql"):
             for statement in split_postgres_statements((directory / name).read_text(encoding="utf-8")):
-                await cursor.execute(statement)
+                try:
+                    await cursor.execute(statement)
+                except Exception as exc:
+                    if getattr(exc, "args", (None,))[0] == 1060:
+                        continue
+                    raise
 
 
 # ── webhook DDL (item 5) ────────────────────────────────────────────────────

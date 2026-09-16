@@ -36,6 +36,7 @@ from mnemos.core.oauth import _mint_user_id
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.base import (
     AuditChainRepository,
+    build_api_key_row,
     BranchRepository,
     BackendCapabilityMissing,
     ClusterCandidateRow,
@@ -155,6 +156,8 @@ SQLITE_MIGRATION_FILES = [
     "0054_memory_tags.sql",
     "0062_federation_journal.sql",
     "0064_federation_journal_dialects.sql",
+    "migrations_v7_0_api_keys_key_prefix_sqlite.sql",
+    "migrations_v7_0_default_user_seed_sqlite.sql",
 ]
 
 
@@ -4710,6 +4713,85 @@ class SqliteOAuthRepository(_SqliteRepository, MCPOAuthRepositoryMixin, OAuthRep
             "UPDATE api_keys SET last_used=CURRENT_TIMESTAMP WHERE id=?",
             (key_id,),
         )
+
+    async def user_exists(self, tx: Transaction, user_id: str) -> bool:
+        value = await _fetch_val(self._conn(tx), "SELECT 1 FROM users WHERE id=?", (user_id,))
+        return value is not None
+
+    async def count_active_api_keys(self, tx: Transaction, user_id: str) -> int:
+        value = await _fetch_val(
+            self._conn(tx),
+            "SELECT COUNT(*) FROM api_keys WHERE user_id=? AND revoked=0",
+            (user_id,),
+        )
+        return int(value or 0)
+
+    async def create_api_key(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        key_hash: str,
+        key_prefix: str,
+        label: str | None,
+    ) -> Row:
+        # ``key_prefix`` arrives via migrations_v7_0_api_keys_key_prefix_sqlite.sql
+        # — the same additive-column pattern the ``last_used`` parity
+        # migration used — so the edge profile returns the identical Row
+        # as Postgres instead of a None the response model would reject.
+        # The id is generated here rather than left to the table default
+        # so the row can be read back without relying on RETURNING.
+        conn = self._conn(tx)
+        key_id = uuid.uuid4().hex
+        await _execute_count(
+            conn,
+            "INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, revoked, created_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (key_id, user_id, key_hash, key_prefix, label, _now_iso()),
+        )
+        row = await _fetch_one(
+            conn,
+            "SELECT id, user_id, key_prefix, label, created_at, last_used, revoked "
+            "FROM api_keys WHERE id=?",
+            (key_id,),
+        )
+        return build_api_key_row(
+            key_id=row["id"],
+            user_id=row["user_id"],
+            key_prefix=row["key_prefix"],
+            label=row["label"],
+            created_at=row["created_at"],
+            last_used=row["last_used"],
+            revoked=row["revoked"],
+        )
+
+    async def list_api_keys(self, tx: Transaction, user_id: str) -> list[Row]:
+        rows = await _fetch_all(
+            self._conn(tx),
+            "SELECT id, user_id, key_prefix, label, created_at, last_used, revoked "
+            "FROM api_keys WHERE user_id=? ORDER BY created_at",
+            (user_id,),
+        )
+        return [
+            build_api_key_row(
+                key_id=row["id"],
+                user_id=row["user_id"],
+                key_prefix=row["key_prefix"],
+                label=row["label"],
+                created_at=row["created_at"],
+                last_used=row["last_used"],
+                revoked=row["revoked"],
+            )
+            for row in rows
+        ]
+
+    async def revoke_api_key(self, tx: Transaction, key_id: Any) -> bool:
+        changed = await _execute_count(
+            self._conn(tx),
+            "UPDATE api_keys SET revoked=1, revoked_at=? WHERE id=? AND revoked=0",
+            (_now_iso(), str(key_id)),
+        )
+        return changed > 0
 
     async def resolve_active_session(self, tx: Transaction, session_id: str, *, now: Any) -> Row | None:
         conn = self._conn(tx)

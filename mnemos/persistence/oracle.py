@@ -49,6 +49,7 @@ from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.base import (
     AclRepository,
+    build_api_key_row,
     AuditChainRepository,
     BackendCapabilityMissing,
     BranchRepository,
@@ -5968,6 +5969,129 @@ class OracleOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
             )
         finally:
             await _call(cursor.close)
+
+    # ── admin API-key management (backend-neutral contract) ──────────────
+    #
+    # Oracle's api_keys predates the Postgres multiuser shape: the label
+    # lives in NOT NULL ``name``, ownership in ``owner_id`` (not
+    # ``user_id``), creation time in ``created`` (not ``created_at``),
+    # last use in ``last_used_at``, and revocation is the presence of
+    # ``revoked_at`` rather than a boolean flag. ``provider`` is NOT NULL
+    # and carries no meaning for a MNEMOS-issued key, so it is stamped
+    # with a constant. ``key_prefix`` arrives via
+    # migrations_oracle/0065_api_keys_key_prefix.sql. Db2 inherits the
+    # SQL shape but re-implements with positional binds.
+    #
+    # Known width constraint, deliberately not papered over: ``name`` is
+    # VARCHAR2(100) here (VARCHAR(255) on MySQL, TEXT on Postgres) while
+    # ApiKeyCreateRequest.label is unbounded, so a label longer than the
+    # column raises rather than being silently truncated. Truncating a
+    # caller's label without saying so is the worse failure; bounding the
+    # request model is the real fix and belongs with the users/label
+    # follow-up tracked in the audit, not here.
+
+    async def user_exists(self, tx: Transaction, user_id: str) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT 1 AS present FROM users WHERE id = :user_id",
+                {"user_id": user_id},
+            )
+            return await _call(cursor.fetchone) is not None
+        finally:
+            await _call(cursor.close)
+
+    async def count_active_api_keys(self, tx: Transaction, user_id: str) -> int:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT COUNT(*) AS active FROM api_keys WHERE owner_id = :user_id AND revoked_at IS NULL",
+                {"user_id": user_id},
+            )
+            row = await _call(cursor.fetchone)
+            return int(row[0]) if row else 0
+        finally:
+            await _call(cursor.close)
+
+    async def create_api_key(
+        self,
+        tx: Transaction,
+        *,
+        user_id: str,
+        key_hash: str,
+        key_prefix: str,
+        label: str | None,
+    ) -> Row:
+        key_id = uuid.uuid4().hex
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "INSERT INTO api_keys (id, name, provider, key_hash, key_prefix, owner_id) "
+                "VALUES (:id, :name, 'mnemos', :key_hash, :key_prefix, :owner_id)",
+                {
+                    "id": key_id,
+                    "name": label or "api-key",
+                    "key_hash": key_hash,
+                    "key_prefix": key_prefix,
+                    "owner_id": user_id,
+                },
+            )
+            await _call(
+                cursor.execute,
+                self._API_KEY_SELECT + " WHERE id = :id",
+                {"id": key_id},
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+            return self._api_key_row(row)
+        finally:
+            await _call(cursor.close)
+
+    async def list_api_keys(self, tx: Transaction, user_id: str) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                self._API_KEY_SELECT + " WHERE owner_id = :user_id ORDER BY created",
+                {"user_id": user_id},
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return [self._api_key_row(row) for row in rows]
+        finally:
+            await _call(cursor.close)
+
+    async def revoke_api_key(self, tx: Transaction, key_id: Any) -> bool:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE api_keys SET revoked_at = SYSTIMESTAMP WHERE id = :id AND revoked_at IS NULL",
+                {"id": str(key_id)},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
+        finally:
+            await _call(cursor.close)
+
+    _API_KEY_SELECT = (
+        "SELECT id, owner_id AS user_id, key_prefix, name AS label, "
+        "created AS created_at, last_used_at AS last_used, "
+        "CASE WHEN revoked_at IS NULL THEN 0 ELSE 1 END AS revoked "
+        "FROM api_keys"
+    )
+
+    @staticmethod
+    def _api_key_row(row: Row) -> Row:
+        return build_api_key_row(
+            key_id=row["id"],
+            user_id=row["user_id"],
+            key_prefix=row["key_prefix"],
+            label=row["label"],
+            created_at=row["created_at"],
+            last_used=row["last_used"],
+            revoked=row["revoked"],
+        )
 
     async def resolve_active_session(self, tx: Transaction, session_id: str, *, now: Any) -> Row | None:
         cursor = await _call(_conn_from_tx(tx).cursor)

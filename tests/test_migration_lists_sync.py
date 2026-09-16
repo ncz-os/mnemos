@@ -89,6 +89,7 @@ EXPECTED_MIGRATIONS = [
     "0043_memory_acl.sql",
     "0048_memory_versions_visibility.sql",
     "0054_memory_tags.sql",
+    "0065_api_keys_key_prefix.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [
@@ -157,6 +158,8 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "0054_memory_tags.sql",
     "0062_federation_journal.sql",
     "0064_federation_journal_dialects.sql",
+    "migrations_v7_0_api_keys_key_prefix_sqlite.sql",
+    "migrations_v7_0_default_user_seed_sqlite.sql",
 ]
 
 
