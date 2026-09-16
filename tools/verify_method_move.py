@@ -19,7 +19,7 @@ Why AST and not raw bytes?
 Usage (single symbol)::
 
     python tools/verify_method_move.py \
-        --before HEAD~1 \
+        --before 106671e^ \
         --before-file mnemos/persistence/oracle.py \
         --after-file mnemos/persistence/oracle_audit.py \
         --symbol OracleAuditChainRepository
@@ -31,8 +31,8 @@ Usage (summary across the split symbols and shared helpers)::
 This is a structural guard, not a proof of runtime equivalence: dynamic imports,
 transitive dependency changes, monkeypatching, and metaclass behavior need tests.
 
-Exit code is 0 if every check passes and nonzero if any real behavioral
-diff is detected (or if a symbol cannot be located in either the BEFORE
+Exit code is 0 if every check passes and nonzero if a structural or direct-binding
+difference is detected (or if a symbol cannot be located in either the BEFORE
 or AFTER tree, which would itself be a bug).
 
 The default ``--before`` is ``106671e^`` (the parent of the split commit).
@@ -211,7 +211,7 @@ def _dump(node: ast.AST) -> str:
     We deliberately use the default ``ast.dump`` (no
     ``include_attributes=True``) so that ``lineno``/``col_offset`` are not
     part of the comparison. The structural fingerprint is identical for
-    nodes that are syntactically and semantically equivalent regardless
+    nodes that are syntactically identical regardless
     of their position in the file or their indentation level.
     """
     return ast.dump(node, annotate_fields=True, indent=2)
