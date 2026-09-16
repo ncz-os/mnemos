@@ -57,7 +57,18 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
-## [7.0.0.dev0] — 2026-09-15
+## [7.0.0] — 2026-09-16
+
+### v7.0.0 release
+
+Development line opened 2026-09-15 as 7.0.0.dev0, pinned to 7.0.0 the
+following day after a full adversarial re-review (Codex, direct, not a
+delegated verdict) found and fixed real defects in the dev0 line before
+release: an Oracle import-cycle, audit-coverage exclusions masking
+reachable code, a backend-parity drift gate that was wired into the
+GitHub mirror workflow only (never canonical GitLab CI), defects in the
+oracle-split AST move-checker, a CHARON streaming-cursor validation gap,
+and stale composition pins. Full detail: `docs/V7_REVIEW_REMEDIATION.md`.
 
 ### Development began
 

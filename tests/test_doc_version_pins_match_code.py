@@ -337,9 +337,9 @@ _SKIP_DIRS = frozenset({
 # CHANGELOG is a release-by-release record; every entry names its own version.
 _SKIP_FILES = frozenset({"CHANGELOG.md"})
 
-# A version-shaped token: 6.1, 6.1.7, 4.2.0a14, 7.0.0.dev0. The
+# A version-shaped token: 6.1, 6.1.7, 4.2.0a14, 7.0.0. The
 # ".(dev|a|b|rc|post)N" alternative covers PEP 440 pre/dev/post
-# releases that use a dot before the qualifier -- v7.0.0.dev0 was
+# releases that use a dot before the qualifier -- v7.0.0 was
 # the first such version this repo pinned as current.
 _VER = r"v?(\d+\.\d+(?:\.\d+)?(?:[a-zA-Z]+\d+|\.(?:dev|a|b|rc|post)\d+)?)"
 # Same, but the leading "v" is required. Used where a bare number would
