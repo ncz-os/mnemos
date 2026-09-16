@@ -36,14 +36,6 @@ async def _reload_provider_manifest(pool: Any) -> None:
     await get_graeae_engine().reload_from_registry(pool)
 
 
-async def _close_graeae_engine() -> None:
-    if not is_extra_installed("graeae"):
-        return
-    from mnemos.domain.graeae.engine import get_graeae_engine
-
-    await get_graeae_engine().close()
-
-
 async def _close_pantheon_http_client() -> None:
     from mnemos.core.config import get_settings
 
@@ -392,7 +384,6 @@ def register_lifespan_hooks() -> None:
     lifecycle.register_auth_configurer(configure_auth)
     lifecycle.register_provider_manifest_reloader(_reload_provider_manifest)
     lifecycle.register_lifespan_cleanup_hook("mcp rest client", _close_rest_client)
-    lifecycle.register_lifespan_cleanup_hook("graeae engine", _close_graeae_engine)
     lifecycle.register_lifespan_cleanup_hook("pantheon http client", _close_pantheon_http_client)
     lifecycle.register_lifespan_cleanup_hook("mcp audit drain", _drain_audit_tasks)
     lifecycle.register_lifespan_cleanup_hook("public tunnel", _close_public_tunnel)

@@ -616,6 +616,7 @@ test:composition:
       PYTHON
     - python -m pip install --quiet -e ".[dev,sqlite,nats,persephone]" -e ../composition-graeae -e ../composition-knemon -e ../composition-pantheon -e ../composition-charon
   script:
+    - lint-imports --config pyproject.toml
     - python -m pytest tests/ --ignore=tests/test_live_e2e.py --tb=short -q --junitxml=composition.xml
   artifacts:
     when: always

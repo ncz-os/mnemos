@@ -31,7 +31,8 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
             async def close(self):
                 self.closed = True
 
-        engine = FakeGraeaeEngine() if graeae_engine is not None else None
+        engine = None
+        monkeypatch.setattr(lifecycle, "_lifespan_cleanup_hooks", {})
 
         monkeypatch.setattr(lifecycle, "_background_tasks", set())
         monkeypatch.setattr(lifecycle, "_worker_tasks", set())
@@ -50,7 +51,9 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_p
         # No aioredis to patch: the lifecycle no longer opens a Redis cache.
         # app.state.cache is unconditionally None, asserted below.
         if graeae_engine is not None:
-            monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: engine)
+            monkeypatch.setattr(graeae_engine, "GraeaeEngine", FakeGraeaeEngine)
+            monkeypatch.setattr(graeae_engine, "_graeae_engine", None)
+            engine = graeae_engine.get_graeae_engine()
 
         app = SimpleNamespace(state=SimpleNamespace())
 

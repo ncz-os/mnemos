@@ -15,7 +15,7 @@ from typing import Any
 from fastapi import HTTPException
 
 from mnemos.api.persistence_helpers import require_consultations_backend
-from mnemos.api.routes.consultations import (
+from mnemos.domain.graeae.consultation_support import (
     audit_genesis_hash,
     _extract_memory_ids,
     _require_non_empty_consultation_result,
@@ -106,11 +106,7 @@ async def tool_graeae_consult(
         # behaviour before audit persistence was made mandatory.
         from mnemos.core import lifecycle as _lifecycle
 
-        backend = (
-            require_consultations_backend()
-            if _lifecycle._persistence_backend is not None
-            else None
-        )
+        backend = require_consultations_backend() if _lifecycle._persistence_backend is not None else None
         engine = get_graeae_engine()
 
         # Map `category` → engine `task_type` (one-to-one for MCP callers)
@@ -329,24 +325,24 @@ TOOLS: dict[str, dict[str, Any]] = {
             "category": {
                 "type": "string",
                 "description": "Task category mapped to GRAEAE task_type. "
-                               "Default: 'general'. Common values: reasoning, "
-                               "architecture_design, code_generation, web_search.",
+                "Default: 'general'. Common values: reasoning, "
+                "architecture_design, code_generation, web_search.",
             },
             "muses": {
                 "type": "array",
                 "items": {"type": "string"},
                 "maxItems": 16,
                 "description": "Optional list of provider names to consult "
-                               "(e.g. ['claude', 'openai', 'gemini']). "
-                               "When set, only those providers are queried. "
-                               "When omitted, the engine uses its default "
-                               "auto lineup.",
+                "(e.g. ['claude', 'openai', 'gemini']). "
+                "When set, only those providers are queried. "
+                "When omitted, the engine uses its default "
+                "auto lineup.",
             },
             "mode": {
                 "type": "string",
                 "description": "Consultation mode. Default: 'auto'. "
-                               "Supported: auto, single, debate, majority, "
-                               "all, local, external.",
+                "Supported: auto, single, debate, majority, "
+                "all, local, external.",
             },
         },
         ["prompt"],
@@ -363,7 +359,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "consultation_id": {
                 "type": "string",
                 "description": "The consultation_id returned by a prior graeae_consult / "
-                               "listed by graeae_list_consultations.",
+                "listed by graeae_list_consultations.",
             },
             "section": {
                 "type": "string",
@@ -378,8 +374,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "page_size": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Char budget per page before a part is split into sub-pages. "
-                               "Default 6000.",
+                "description": "Char budget per page before a part is split into sub-pages. Default 6000.",
             },
         },
         ["consultation_id"],
