@@ -332,9 +332,7 @@ def test_archive_snapshot_fetches_embedding_field():
                 "embedding instead of hardcoded None)"
             )
             # And the column must be the 5th SELECT-list element.
-            assert "content, category, subcategory, metadata, embedding" in sql_text, (
-                sql_text
-            )
+            assert "content, category, subcategory, metadata, embedding" in sql_text, sql_text
     assert found_method, "fetch_memory_archive_snapshot not found in admin_lifecycle_repo"
 
 
@@ -354,17 +352,13 @@ async def test_archive_audit_entry_includes_real_embedding(sqlite_backend, monke
 
     spy = {}
 
-    real_payload_hash = importlib.import_module(
-        "mnemos.audit.crypto"
-    ).canonical_payload_hash
+    real_payload_hash = importlib.import_module("mnemos.audit.crypto").canonical_payload_hash
 
     def _spy(*args, **kwargs):
         spy["embedding"] = kwargs.get("embedding")
         return real_payload_hash(*args, **kwargs)
 
-    monkeypatch.setattr(
-        "mnemos.audit.route_helper.canonical_payload_hash", _spy
-    )
+    monkeypatch.setattr("mnemos.audit.route_helper.canonical_payload_hash", _spy)
 
     embedding_bytes = b"\x01\x02\x03\x04\x05" * 32
     mid = "mem_1779637500099_archive_real_emb"
@@ -391,9 +385,7 @@ async def test_archive_audit_entry_includes_real_embedding(sqlite_backend, monke
 
 
 @pytest.mark.asyncio
-async def test_write_audit_entry_required_create_row_never_commits(
-    sqlite_backend, monkeypatch
-):
+async def test_write_audit_entry_required_create_row_never_commits(sqlite_backend, monkeypatch):
     """F16 row-level regression: ``test_write_audit_entry_required_propagates_insert_failure``
     only asserts the ``AuditChainContinuityError`` propagates out of the
     ``async with tx:`` block. It does NOT then verify, in a fresh
@@ -614,9 +606,7 @@ async def test_fetch_audit_snapshot_missing_row_returns_none(sqlite_backend):
 
 
 @pytest.mark.asyncio
-async def test_write_transaction_audit_returns_early_when_disabled(
-    sqlite_backend, monkeypatch
-):
+async def test_write_transaction_audit_returns_early_when_disabled(sqlite_backend, monkeypatch):
     """write_transaction_audit: when MNEMOS_AUDIT_CHAIN is unset, must short-circuit."""
     from mnemos.audit.route_helper import write_transaction_audit
 
@@ -641,16 +631,12 @@ async def test_write_transaction_audit_returns_early_when_disabled(
     async with sqlite_backend.transactional() as tx:
         from mnemos.audit.route_helper import memory_id_to_audit_bytes
 
-        row = await sqlite_backend.audit_chain.get_latest_audit_entry(
-            tx, memory_id_to_audit_bytes("mem_disabled")
-        )
+        row = await sqlite_backend.audit_chain.get_latest_audit_entry(tx, memory_id_to_audit_bytes("mem_disabled"))
     assert row is None
 
 
 @pytest.mark.asyncio
-async def test_write_configured_audit_entry_returns_early_when_disabled(
-    sqlite_backend, monkeypatch
-):
+async def test_write_configured_audit_entry_returns_early_when_disabled(sqlite_backend, monkeypatch):
     """write_configured_audit_entry: when MNEMOS_AUDIT_CHAIN is unset, short-circuit."""
     from mnemos.audit.route_helper import write_configured_audit_entry
 
@@ -669,9 +655,7 @@ async def test_write_configured_audit_entry_returns_early_when_disabled(
 
 
 @pytest.mark.asyncio
-async def test_write_configured_audit_entry_required_raises_when_snapshot_none(
-    sqlite_backend, monkeypatch
-):
+async def test_write_configured_audit_entry_required_raises_when_snapshot_none(sqlite_backend, monkeypatch):
     """write_configured_audit_entry: snapshot=None in required mode is a hard refusal."""
     from mnemos.audit.route_helper import (
         AuditChainContinuityError,
@@ -700,9 +684,7 @@ async def test_write_configured_audit_entry_required_raises_when_snapshot_none(
 
 
 @pytest.mark.asyncio
-async def test_write_configured_audit_entry_required_raises_when_no_secret(
-    sqlite_backend, monkeypatch
-):
+async def test_write_configured_audit_entry_required_raises_when_no_secret(sqlite_backend, monkeypatch):
     """write_configured_audit_entry: required mode + empty session_secret is a hard refusal."""
     from mnemos.audit.route_helper import (
         AuditChainContinuityError,
@@ -712,9 +694,7 @@ async def test_write_configured_audit_entry_required_raises_when_no_secret(
     monkeypatch.setenv("MNEMOS_AUDIT_CHAIN", "required")
     from mnemos.core import config
 
-    monkeypatch.setattr(
-        config, "get_settings", lambda: SimpleNamespace(server=SimpleNamespace(session_secret=""))
-    )
+    monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(server=SimpleNamespace(session_secret="")))
 
     with pytest.raises(AuditChainContinuityError, match="requires a session secret"):
         await write_configured_audit_entry(
@@ -728,9 +708,7 @@ async def test_write_configured_audit_entry_required_raises_when_no_secret(
 
 
 @pytest.mark.asyncio
-async def test_write_configured_audit_entry_required_wraps_inner_failure(
-    sqlite_backend, monkeypatch
-):
+async def test_write_configured_audit_entry_required_wraps_inner_failure(sqlite_backend, monkeypatch):
     """write_configured_audit_entry: required mode re-raises an AuditChainContinuityError
     inner exception unchanged (the AuditChainContinuityError pass-through branch).
 
@@ -752,9 +730,7 @@ async def test_write_configured_audit_entry_required_wraps_inner_failure(
     async def _boom(*a, **kw):
         raise RuntimeError("simulated inner failure")
 
-    monkeypatch.setattr(
-        sqlite_backend.audit_chain, "insert_audit_entry", _boom
-    )
+    monkeypatch.setattr(sqlite_backend.audit_chain, "insert_audit_entry", _boom)
 
     # write_audit_entry converts RuntimeError -> AuditChainContinuityError
     # ("required audit write failed ..."), then write_configured_audit_entry
@@ -784,9 +760,7 @@ async def test_write_configured_audit_entry_required_wraps_inner_failure(
 
 
 @pytest.mark.asyncio
-async def test_write_configured_audit_entry_required_wraps_non_audit_inner(
-    sqlite_backend, monkeypatch
-):
+async def test_write_configured_audit_entry_required_wraps_non_audit_inner(sqlite_backend, monkeypatch):
     """write_configured_audit_entry: required mode wraps a non-AuditChainContinuityError
     inner failure as AuditChainContinuityError("required mutation audit failed")
     so the caller sees a single failure type.
@@ -836,9 +810,7 @@ async def test_write_configured_audit_entry_required_wraps_non_audit_inner(
 
 
 @pytest.mark.asyncio
-async def test_write_configured_audit_entry_best_effort_swallows(
-    sqlite_backend, monkeypatch
-):
+async def test_write_configured_audit_entry_best_effort_swallows(sqlite_backend, monkeypatch):
     """write_configured_audit_entry: best-effort (on, not required) must LOG+swallow,
     NOT raise -- backward compatibility for callers that don't sit inside a tx.
 
@@ -880,9 +852,7 @@ async def test_write_configured_audit_entry_best_effort_swallows(
 
 
 @pytest.mark.asyncio
-async def test_write_configured_audit_entry_parses_string_metadata(
-    sqlite_backend, monkeypatch
-):
+async def test_write_configured_audit_entry_parses_string_metadata(sqlite_backend, monkeypatch):
     """write_configured_audit_entry: metadata as a JSON string must be parsed before
     forwarding into ``write_audit_entry`` (drivers differ on this)."""
     from mnemos.audit.route_helper import write_configured_audit_entry
@@ -915,9 +885,7 @@ async def test_write_configured_audit_entry_parses_string_metadata(
 
 
 @pytest.mark.asyncio
-async def test_write_configured_audit_entry_reads_file_like_fields(
-    sqlite_backend, monkeypatch
-):
+async def test_write_configured_audit_entry_reads_file_like_fields(sqlite_backend, monkeypatch):
     """write_configured_audit_entry: file-like content/metadata/embedding must be
     awaited via ``.read()`` before they reach ``write_audit_entry`` (large-memory
     upload path)."""
@@ -967,9 +935,7 @@ async def test_write_configured_audit_entry_reads_file_like_fields(
 
 
 @pytest.mark.asyncio
-async def test_write_audit_entry_required_raises_when_no_session_secret(
-    sqlite_backend, monkeypatch
-):
+async def test_write_audit_entry_required_raises_when_no_session_secret(sqlite_backend, monkeypatch):
     """write_audit_entry: required=True with empty session_secret must raise
     AuditChainContinuityError -- not silently no-op."""
     from mnemos.audit.route_helper import (
@@ -979,9 +945,7 @@ async def test_write_audit_entry_required_raises_when_no_session_secret(
 
     monkeypatch.setenv("MNEMOS_AUDIT_CHAIN", "required")
 
-    with pytest.raises(
-        AuditChainContinuityError, match="required audit signing requires a session secret"
-    ):
+    with pytest.raises(AuditChainContinuityError, match="required audit signing requires a session secret"):
         await write_audit_entry(
             sqlite_backend,
             None,
@@ -999,9 +963,7 @@ async def test_write_audit_entry_required_raises_when_no_session_secret(
 
 
 @pytest.mark.asyncio
-async def test_write_audit_entry_expected_prev_head_no_predecessor(
-    sqlite_backend, monkeypatch
-):
+async def test_write_audit_entry_expected_prev_head_no_predecessor(sqlite_backend, monkeypatch):
     """write_audit_entry: expected_prev_head supplied but the local chain has NO
     prior entry must raise (no fallback to installing a peer-supplied head)."""
     from mnemos.audit.route_helper import (
@@ -1042,10 +1004,9 @@ async def test_write_audit_entry_expected_prev_head_no_predecessor(
     #     pass-through in write_audit_entry wraps it (which would mean the
     #     branch ordering changed; either way, the write did not commit).
     msg = str(raised)
-    assert (
-        "local audit chain has no predecessor" in msg
-        or "required audit write failed" in msg
-    ), f"unexpected error: {msg!r}"
+    assert "local audit chain has no predecessor" in msg or "required audit write failed" in msg, (
+        f"unexpected error: {msg!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -1101,10 +1062,9 @@ async def test_write_audit_entry_expected_prev_head_mismatch(sqlite_backend):
             raised = exc
     assert raised is not None, "expected prev head mismatch must raise"
     msg = str(raised)
-    assert (
-        "expected prev head does not match" in msg
-        or "required audit write failed" in msg
-    ), f"unexpected error: {msg!r}"
+    assert "expected prev head does not match" in msg or "required audit write failed" in msg, (
+        f"unexpected error: {msg!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -1151,9 +1111,7 @@ async def test_write_audit_entry_expected_prev_head_match_succeeds(
     # value that ``_audit_prev_head`` would return -- the column itself
     # is None for the very first entry (no predecessor).
     async with sqlite_backend.transactional() as tx:
-        head = await sqlite_backend.audit_chain.get_latest_audit_entry(
-            tx, memory_id_to_audit_bytes(mid)
-        )
+        head = await sqlite_backend.audit_chain.get_latest_audit_entry(tx, memory_id_to_audit_bytes(mid))
     assert head is not None
     matching_entry_id = head["entry_id"]
 
@@ -1216,18 +1174,14 @@ async def test_write_audit_entry_expected_prev_head_match_succeeds(
 
     # Confirm the new entry's prev matches what we supplied.
     async with sqlite_backend.transactional() as tx:
-        new_head = await sqlite_backend.audit_chain.get_latest_audit_entry(
-            tx, memory_id_to_audit_bytes(mid)
-        )
+        new_head = await sqlite_backend.audit_chain.get_latest_audit_entry(tx, memory_id_to_audit_bytes(mid))
     assert new_head["op"] == "update"
     assert new_head["prev_entry_id"] == matching_entry_id
     assert new_head["prev_entry_hash"] == matched_hash
 
 
 @pytest.mark.asyncio
-async def test_write_audit_entry_enforce_continuity_propagates(
-    sqlite_backend, monkeypatch
-):
+async def test_write_audit_entry_enforce_continuity_propagates(sqlite_backend, monkeypatch):
     """write_audit_entry: enforce_continuity=True must re-raise the underlying
     insert failure (federation callers depend on this signal)."""
     from mnemos.audit.route_helper import (
@@ -1238,9 +1192,7 @@ async def test_write_audit_entry_enforce_continuity_propagates(
     async def _boom(*a, **kw):
         raise RuntimeError("simulated federation outage")
 
-    monkeypatch.setattr(
-        sqlite_backend.audit_chain, "insert_audit_entry", _boom
-    )
+    monkeypatch.setattr(sqlite_backend.audit_chain, "insert_audit_entry", _boom)
 
     raised = None
     async with sqlite_backend.transactional() as tx:
@@ -1267,15 +1219,12 @@ async def test_write_audit_entry_enforce_continuity_propagates(
     # when enforce_continuity=True is the documented opt-in.
     assert raised is not None, "enforce_continuity=True must propagate"
     assert isinstance(raised, RuntimeError), (
-        f"enforce_continuity=True must re-raise the original exception type, "
-        f"got {type(raised).__name__}: {raised!r}"
+        f"enforce_continuity=True must re-raise the original exception type, got {type(raised).__name__}: {raised!r}"
     )
 
 
 @pytest.mark.asyncio
-async def test_write_audit_entry_savepoint_typeerror_fallback(
-    sqlite_backend, monkeypatch
-):
+async def test_write_audit_entry_savepoint_typeerror_fallback(sqlite_backend, monkeypatch):
     """write_audit_entry: when transaction_dialect(tx) raises TypeError (a tx
     wrapper that doesn't fit the supported shape), the helper must fall back
     to the no-savepoint path and still succeed.
@@ -1329,16 +1278,12 @@ async def test_write_audit_entry_savepoint_typeerror_fallback(
         row = await sqlite_backend.audit_chain.get_latest_audit_entry(
             tx, memory_id_to_audit_bytes("mem_savepoint_typeerror")
         )
-    assert row is not None, (
-        "TypeError-on-dialect-detection fallback must still insert the audit row"
-    )
+    assert row is not None, "TypeError-on-dialect-detection fallback must still insert the audit row"
     assert row["op"] == "create"
 
 
 @pytest.mark.asyncio
-async def test_audit_prev_head_raises_on_invalid_signature(
-    sqlite_backend, monkeypatch
-):
+async def test_audit_prev_head_raises_on_invalid_signature(sqlite_backend, monkeypatch):
     """_audit_prev_head: if the previous row's signature does not verify against
     ANY signed_at candidate, must raise AuditChainContinuityError."""
     from mnemos.audit.route_helper import (
@@ -1368,15 +1313,11 @@ async def test_audit_prev_head_raises_on_invalid_signature(
 
     # Now read the row, corrupt the signature, and feed it to _audit_prev_head.
     async with sqlite_backend.transactional() as tx:
-        row = await sqlite_backend.audit_chain.get_latest_audit_entry(
-            tx, memory_id_to_audit_bytes(mid)
-        )
+        row = await sqlite_backend.audit_chain.get_latest_audit_entry(tx, memory_id_to_audit_bytes(mid))
     assert row is not None
     row["signature"] = b"\x00" * len(row["signature"])
 
-    with pytest.raises(
-        AuditChainContinuityError, match="signature is invalid"
-    ):
+    with pytest.raises(AuditChainContinuityError, match="signature is invalid"):
         _audit_prev_head(row)
 
 
@@ -1421,8 +1362,7 @@ def test_audit_prev_head_returns_head_for_valid_signature():
                 verified = True
                 break
     assert verified, (
-        "row construction is wrong: no _signed_at_candidates value verifies "
-        "against the build_entry-produced signature"
+        "row construction is wrong: no _signed_at_candidates value verifies against the build_entry-produced signature"
     )
 
     head_id, head_hash = _audit_prev_head(row)
@@ -1557,9 +1497,7 @@ def test_decode_expected_prev_head_only_one_supplied_raises():
         _decode_expected_prev_head,
     )
 
-    with pytest.raises(
-        AuditChainContinuityError, match="must both be supplied or both be empty"
-    ):
+    with pytest.raises(AuditChainContinuityError, match="must both be supplied or both be empty"):
         _decode_expected_prev_head(
             expected_prev_entry_id_hex="ab" * 16,
             expected_prev_entry_hash_hex=None,
@@ -1588,3 +1526,41 @@ def test_decode_expected_prev_head_returns_none_when_both_empty():
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dialect", "expected"),
+    [
+        ("sqlite", "SqliteAuditChainRepository"),
+        ("postgres", "PostgresAuditChainRepository"),
+        ("oracle", "OracleAuditChainRepository"),
+        ("db2", "Db2AuditChainRepository"),
+        ("mysql", None),
+    ],
+)
+async def test_transaction_audit_dispatch_all_dialects(monkeypatch, dialect, expected):
+    from mnemos.audit import route_helper
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("MNEMOS_AUDIT_CHAIN", "on")
+    monkeypatch.setattr("mnemos.persistence.worker_lifecycle.transaction_dialect", lambda tx: dialect)
+    write = AsyncMock()
+    monkeypatch.setattr(route_helper, "write_configured_audit_entry", write)
+    tx = object()
+    await route_helper.write_transaction_audit(tx, op="delete", memory_id_str="mem_a", snapshot={}, writer_id="alice")
+    repo = write.call_args.args[0].audit_chain
+    assert (type(repo).__name__ if repo else None) == expected
+    assert write.call_args.args[1] is tx
+
+
+def test_signed_at_timezone_conversion_failure_keeps_original():
+    from datetime import datetime, timezone
+    from mnemos.audit.route_helper import _signed_at_candidates
+
+    class BadTimezone(datetime):
+        def astimezone(self, tz):
+            raise ValueError("unrepresentable timezone conversion")
+
+    value = BadTimezone(2026, 1, 1, tzinfo=timezone.utc)
+    assert value.isoformat() in _signed_at_candidates(value)

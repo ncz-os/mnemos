@@ -68,10 +68,10 @@ To see when the matrix was last refreshed, run
 answer lives in git's metadata, not in the file itself.
 The single-cell legend:
 
-* ``✅ implemented+tested``        — implementation present and tests cover it
-* ``⚠️ implemented, no test``     — code is there but no test exercises it
-* ``⚠️ test exists, stub impl``    — test exists but the backend is a stub
-* ``❌ neither``                   — no implementation, no test
+* ``◐ surface + test candidate``        — implementation present and tests cover it
+* ``◐ surface, no test candidate``     — code is there but no test exercises it
+* ``? test candidate, no surface``    — test exists but the backend is a stub
+* ``— no surface or test candidate``                   — no implementation, no test
 
 CI gate
 =======
@@ -88,6 +88,7 @@ Run locally with:
     python scripts/generate_backend_parity_matrix.py
     git diff --exit-code docs/BACKEND_PARITY.md
 """
+
 from __future__ import annotations
 
 import ast
@@ -146,7 +147,7 @@ class Capability:
     impl_property: tuple[str, ...]
     # Notes about the capability, shown on the matrix row.
     note: str = ""
-    # Backends known never to implement this; recorded as ``❌ neither``
+    # Backends known never to implement this; recorded as ``— no surface or test candidate``
     # automatically (saves redundant AST scans and documents the rule).
     forbidden_on: frozenset[str] = frozenset()
     # If non-empty, only these backends are inspected; others get ❌.
@@ -416,104 +417,72 @@ def _view_for_class(path: Path, class_name: str) -> _ClassView:
     tree = ast.parse(src, filename=str(path))
     view = _ClassView(raw_source=src)
 
-    seen_modules: set[Path] = {path}
+    modules = {path.resolve(): tree}
 
-    def _resolve_class(module_tree: ast.Module, name: str) -> ast.ClassDef | None:
-        for sub in ast.walk(module_tree):
-            if isinstance(sub, ast.ClassDef) and sub.name == name:
-                return sub
+    def module(file):
+        file = file.resolve()
+        if file not in modules:
+            modules[file] = ast.parse(_load_module_text(file), filename=str(file))
+        return modules[file]
+
+    def resolve_base(file, base):
+        if not isinstance(base, ast.Name):
+            return None
+        for node in module(file).body:
+            if isinstance(node, ast.ClassDef) and node.name == base.id:
+                return file, node.name
+            if isinstance(node, ast.ImportFrom) and node.module:
+                for alias in node.names:
+                    if (alias.asname or alias.name) == base.id:
+                        parent = (
+                            file.parent.joinpath(*node.module.split(".")).with_suffix(".py")
+                            if node.level == 1
+                            else REPO_ROOT.joinpath(*node.module.split(".")).with_suffix(".py")
+                        )
+                        if parent.exists():
+                            return parent.resolve(), alias.name
         return None
 
-    def _module_path_for(qualname: str) -> Path | None:
-        rel = qualname.replace(".", "/") + ".py"
-        candidate = REPO_ROOT / rel
-        return candidate if candidate.exists() else None
+    def linearize(key, active=()):
+        if key in active:
+            raise ValueError(f"cyclic inheritance: {key}")
+        file, name = key
+        cls = next((n for n in module(file).body if isinstance(n, ast.ClassDef) and n.name == name), None)
+        if cls is None:
+            return []
+        bases = [k for b in cls.bases if (k := resolve_base(file, b))]
+        sequences = [linearize(k, (*active, key)) for k in bases] + [bases[:]]
+        result = [key]
+        while any(sequences):
+            sequences = [seq for seq in sequences if seq]
+            candidate = next((seq[0] for seq in sequences if not any(seq[0] in other[1:] for other in sequences)), None)
+            if candidate is None:
+                raise ValueError(f"inconsistent inheritance: {key}")
+            result.append(candidate)
+            for seq in sequences:
+                if seq[0] == candidate:
+                    seq.pop(0)
+        return result
 
-    def _consume(cls: ast.ClassDef, module_tree: ast.Module) -> None:
-        # Class-level assignments.
-        for stmt in cls.body:
-            if isinstance(stmt, ast.Assign):
-                value_src = ast.unparse(stmt.value)
-                for tgt in stmt.targets:
-                    if isinstance(tgt, ast.Name):
-                        view.class_attrs.setdefault(tgt.id, value_src)
-            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-                value_src = ast.unparse(stmt.value) if stmt.value is not None else ""
-                view.class_attrs.setdefault(stmt.target.id, value_src)
-
-        # Methods + properties.
+    # Python uses C3, not breadth-first traversal. A descendant override must
+    # win even when its ancestor is another direct base of the facade.
+    shadowed = set()
+    for file, name in linearize((path.resolve(), class_name)):
+        cls = next(n for n in module(file).body if isinstance(n, ast.ClassDef) and n.name == name)
         for stmt in cls.body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                is_property = any(
-                    (isinstance(d, ast.Name) and d.id == "property")
-                    or (isinstance(d, ast.Attribute) and d.attr == "property")
-                    for d in stmt.decorator_list
-                )
-                if is_property:
-                    view.property_fget_bodies.setdefault(stmt.name, ast.unparse(stmt))
+                if stmt.name in shadowed:
+                    continue
+                shadowed.add(stmt.name)
                 view.method_names.add(stmt.name)
-
-    def _class_qualname_for(base: ast.expr) -> str | None:
-        """Resolve a base expression to a fully-qualified class name we can import.
-
-        Handles ``OracleBackend`` (Name) and ``mnemos.persistence.oracle.OracleBackend``
-        (Attribute chain) — both forms appear in the wild across this repo.
-        """
-        if isinstance(base, ast.Name):
-            # Try to find an import of this name in any module we've seen;
-            # fall back to the unqualified name as a last resort.
-            for module_path in seen_modules:
-                module_tree = ast.parse(_load_module_text(module_path), filename=str(module_path))
-                for node in ast.walk(module_tree):
-                    if isinstance(node, ast.ImportFrom) and node.module:
-                        for alias in node.names:
-                            if alias.name == base.id:
-                                return f"{node.module}.{alias.asname or alias.name}"
-                    if isinstance(node, ast.Import):
-                        for alias in node.names:
-                            if alias.asname == base.id:
-                                return alias.name
-            return base.id
-        if isinstance(base, ast.Attribute):
-            parts: list[str] = []
-            cur: ast.expr = base
-            while isinstance(cur, ast.Attribute):
-                parts.append(cur.attr)
-                cur = cur.value
-            if isinstance(cur, ast.Name):
-                parts.append(cur.id)
-            return ".".join(reversed(parts))
-        return None
-
-    visited: set[str] = set()
-    queue: list[tuple[Path, ast.ClassDef]] = []
-    direct_cls = _resolve_class(tree, class_name)
-    if direct_cls is not None:
-        queue.append((path, direct_cls))
-
-    while queue:
-        cur_path, cls = queue.pop(0)
-        key = f"{cur_path}::{cls.name}"
-        if key in visited:
-            continue
-        visited.add(key)
-        seen_modules.add(cur_path)
-        _consume(cls, ast.parse(_load_module_text(cur_path), filename=str(cur_path)))
-
-        for base in cls.bases:
-            qname = _class_qualname_for(base)
-            if not qname:
-                continue
-            parent_path = _module_path_for(qname.rsplit(".", 1)[0])
-            if parent_path is None:
-                # Same-file inheritance (rare — usually mixed-in traits).
-                parent_tree = ast.parse(_load_module_text(cur_path), filename=str(cur_path))
-            else:
-                parent_tree = ast.parse(_load_module_text(parent_path), filename=str(parent_path))
-            parent_cls = _resolve_class(parent_tree, qname.rsplit(".", 1)[-1])
-            if parent_cls is None:
-                continue
-            queue.append((parent_path, parent_cls))
+                if any(isinstance(d, ast.Name) and d.id == "property" for d in stmt.decorator_list):
+                    view.property_fget_bodies[stmt.name] = ast.unparse(stmt)
+            elif isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id not in shadowed:
+                        shadowed.add(target.id)
+                        view.class_attrs[target.id] = ast.unparse(stmt.value) if stmt.value else ""
 
     return view
 
@@ -530,17 +499,20 @@ def _property_implemented(view: _ClassView, prop_names: tuple[str, ...]) -> bool
         body = view.property_fget_bodies.get(name)
         if body is None:
             continue
-        # Treat these bodies as NOT implemented:
-        #   raise BackendCapabilityMissing("xxx")
-        #   return None        (audit_chain contract per base.py:2968)
-        #   raise NotImplementedError(...)
-        if re.search(r"BackendCapabilityMissing", body):
+        function = ast.parse(body).body[0]
+        # Inspect executable statements, never docstring mentions of a stub.
+        statements = [
+            stmt for stmt in function.body if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant))
+        ]
+        if any(isinstance(stmt, ast.Raise) for stmt in statements):
             continue
-        if re.search(r"raise\s+NotImplementedError", body):
-            continue
-        if re.search(r"return\s+None\b", body) and "audit_chain" in prop_names:
-            continue
-        return True
+        returns = [node for stmt in statements for node in ast.walk(stmt) if isinstance(node, ast.Return)]
+        if any(
+            node.value is not None and not (isinstance(node.value, ast.Constant) and node.value.value is None)
+            for node in returns
+        ):
+            return True
+
     return False
 
 
@@ -615,9 +587,7 @@ _CAPABILITY_DETAIL_SETS: dict[str, frozenset[str]] | None = None
 _CAPABILITY_DETAIL_NAMES: dict[str, str] | None = None
 
 
-def _load_capability_detail_sets() -> tuple[
-    dict[str, frozenset[str]], dict[str, str]
-]:
+def _load_capability_detail_sets() -> tuple[dict[str, frozenset[str]], dict[str, str]]:
     """Parse ``base.py`` and return two maps:
 
     * ``detail_sets``: ``{CONSTANT_NAME: frozenset(capability_names)}``
@@ -643,10 +613,7 @@ def _load_capability_detail_sets() -> tuple[
             continue
 
         # Singular: ``LEDGER_CAPABILITY: DetailedCapabilityName = "ledger"``
-        if (
-            isinstance(node.value, ast.Constant)
-            and isinstance(node.value.value, str)
-        ):
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
             names[target.id] = node.value.value
             continue
 
@@ -655,9 +622,7 @@ def _load_capability_detail_sets() -> tuple[
             continue
         call = node.value
         func = call.func
-        if not (
-            isinstance(func, ast.Name) and func.id in {"frozenset", "set"}
-        ):
+        if not (isinstance(func, ast.Name) and func.id in {"frozenset", "set"}):
             continue
         if not call.args:
             continue
@@ -870,9 +835,7 @@ def _route_gate_implemented(backend: str, route_module: str) -> bool:
 
 
 _TEST_FILE_GLOB = "test_*.py"
-_PARAM_BACKEND_PATTERN = re.compile(
-    r"(sqlite|postgres|mysql|mariadb|oracle|db2)", re.IGNORECASE
-)
+_PARAM_BACKEND_PATTERN = re.compile(r"(sqlite|postgres|mysql|mariadb|oracle|db2)", re.IGNORECASE)
 
 
 def _iter_test_files() -> Iterable[Path]:
@@ -906,9 +869,7 @@ def _test_file_matches(test_path: Path, backend: str, capability_id: str) -> boo
         tree = ast.parse(src)
     except (SyntaxError, OSError):
         return False
-    return _test_file_matches_inner(
-        name, parts, src, tree, backend, capability_id
-    )
+    return _test_file_matches_inner(name, parts, src, tree, backend, capability_id)
 
 
 def _file_has_parametrize_or_fixture_on_backend(tree: ast.Module, backend: str) -> bool:
@@ -1025,9 +986,7 @@ def _parametrize_hits_backend(call: ast.Call, backend: str) -> bool:
     if isinstance(first, ast.Constant) and isinstance(first.value, str):
         name_hits = backend in first.value.lower()
         if name_hits:
-            return len(call.args) >= 2 and _value_arg_hits_backend(
-                call.args[1], backend
-            )
+            return len(call.args) >= 2 and _value_arg_hits_backend(call.args[1], backend)
         # Name doesn't contain the backend — fall back to ids= AND/OR the
         # value list. Real-world parametrize-over-dialects falls here.
         if len(call.args) >= 2 and _value_arg_hits_backend(call.args[1], backend):
@@ -1143,14 +1102,10 @@ def _expr_hits_backend(node: ast.AST, scope: list[ast.stmt], backend: str) -> bo
         # Resolve through constant-indexed Name + the function scope.
         resolver = _BACKEND_LIST_RESOLVERS.get(node.id)
         if resolver is not None:
-            return any(
-                _value_arg_hits_backend(item, backend) for item in resolver()
-            )
+            return any(_value_arg_hits_backend(item, backend) for item in resolver())
         # Find the most recent assignment to this name in the scope.
         for stmt in reversed(scope):
-            if isinstance(stmt, ast.Assign) and any(
-                isinstance(t, ast.Name) and t.id == node.id for t in stmt.targets
-            ):
+            if isinstance(stmt, ast.Assign) and any(isinstance(t, ast.Name) and t.id == node.id for t in stmt.targets):
                 return _expr_hits_backend(stmt.value, scope, backend)
             if (
                 isinstance(stmt, ast.AnnAssign)
@@ -1162,9 +1117,7 @@ def _expr_hits_backend(node: ast.AST, scope: list[ast.stmt], backend: str) -> bo
         return False
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
         # ``return params + [...]`` (rare).
-        return _expr_hits_backend(node.left, scope, backend) or _expr_hits_backend(
-            node.right, scope, backend
-        )
+        return _expr_hits_backend(node.left, scope, backend) or _expr_hits_backend(node.right, scope, backend)
     return False
 
 
@@ -1238,9 +1191,7 @@ def _file_name_matches_capability(name: str, parts: list[str], capability_id: st
                     # ``federation_journal`` for the file
                     # ``test_federation_journal.py``), drop to that
                     # path so the standalone row doesn't over-match.
-                    if not _part_is_subtoken_of_longer_compound_match(
-                        syn_tokens, parts, capability_id
-                    ):
+                    if not _part_is_subtoken_of_longer_compound_match(syn_tokens, parts, capability_id):
                         return True
                 continue
             # Single-token synonym: require exact equality with a
@@ -1253,9 +1204,7 @@ def _file_name_matches_capability(name: str, parts: list[str], capability_id: st
                 # is one slice of a longer compound capability id
                 # that ALSO fully matches this filename, prefer the
                 # compound and skip the standalone row.
-                if _part_is_subtoken_of_longer_compound_match(
-                    list(syn_tokens), parts, capability_id
-                ):
+                if _part_is_subtoken_of_longer_compound_match(list(syn_tokens), parts, capability_id):
                     continue
                 return True
         return False
@@ -1267,9 +1216,7 @@ def _file_name_matches_capability(name: str, parts: list[str], capability_id: st
     return False
 
 
-def _part_is_subtoken_of_longer_compound_match(
-    matched_tokens: list[str], parts: list[str], capability_id: str
-) -> bool:
+def _part_is_subtoken_of_longer_compound_match(matched_tokens: list[str], parts: list[str], capability_id: str) -> bool:
     """True when ``matched_tokens`` form a strict subset of another
     multi-token capability id whose own tokens all appear in ``parts``.
 
@@ -1401,7 +1348,7 @@ def _any_test_function_references_capability(tree: ast.Module, capability_id: st
     def _name_matches(name: str) -> bool:
         if not name.startswith("test_"):
             return False
-        rest = name[len("test_"):]
+        rest = name[len("test_") :]
         leading_tokens: list[str] = []
         for token in rest.split("_"):
             if token:
@@ -1492,9 +1439,7 @@ def _listcomp_hits_backend(node: ast.ListComp, backend: str) -> bool:
         if not resolver:
             return False
         container = resolver()
-        return any(
-            _value_arg_hits_backend(item, backend) for item in container
-        )
+        return any(_value_arg_hits_backend(item, backend) for item in container)
     return False
 
 
@@ -1521,9 +1466,7 @@ def _module_top_level_lists(tree: ast.Module) -> None:
             continue
         items: list[ast.AST] = list(node.value.elts)
         # Only register if the items are constants or small constant tuples.
-        if all(
-            isinstance(it, (ast.Constant, ast.Tuple, ast.List)) for it in items
-        ):
+        if all(isinstance(it, (ast.Constant, ast.Tuple, ast.List)) for it in items):
             _BACKEND_LIST_RESOLVERS[target_name] = lambda items=items: items
 
 
@@ -1545,9 +1488,7 @@ def _value_arg_hits_backend(node: ast.AST, backend: str) -> bool:
         # level without doing full Python dataflow.
         resolver = _BACKEND_LIST_RESOLVERS.get(node.id)
         if resolver is not None:
-            return any(
-                _value_arg_hits_backend(item, backend) for item in resolver()
-            )
+            return any(_value_arg_hits_backend(item, backend) for item in resolver())
         return False
     return False
 
@@ -1653,9 +1594,7 @@ def _build_test_index() -> dict[tuple[str, str], bool]:
         for backend in BACKENDS:
             backend_in_filename = backend in parts
             fn_has_backend_prefix = _has_prefix(backend, meta)
-            file_targets_backend = backend_in_filename or _has_parametrize(
-                backend, tree, src
-            )
+            file_targets_backend = backend_in_filename or _has_parametrize(backend, tree, src)
             multi = _is_multi_backend(meta)
             for cap in _capabilities():
                 key = (backend, cap.id)
@@ -1706,9 +1645,7 @@ def _tree_metadata(tree: ast.Module) -> _TreeMeta:
     return _TreeMeta(tree=tree, test_func_names=names)
 
 
-def _file_has_parametrize_or_fixture_on_backend_cached(
-    tree: ast.Module, backend: str
-) -> bool:
+def _file_has_parametrize_or_fixture_on_backend_cached(tree: ast.Module, backend: str) -> bool:
     """Cacheable version of :func:`_file_has_parametrize_or_fixture_on_backend`.
 
     Same logic, just factored out so the index builder can wrap it.
@@ -1763,9 +1700,7 @@ def _test_file_matches_inner_cached(
         return True
 
     filename_has_cap = _file_name_matches_capability(name, parts, capability_id)
-    fn_refs_cap = _any_test_function_references_capability(
-        tree, capability_id, backend=backend
-    )
+    fn_refs_cap = _any_test_function_references_capability(tree, capability_id, backend=backend)
     backend_in_filename = backend in parts
 
     if filename_has_cap:
@@ -1801,17 +1736,10 @@ def _test_file_matches_inner(
 
     filename_has_cap = _file_name_matches_capability(name, parts, capability_id)
     backend_in_filename = backend in parts
-    fn_refs_cap = _any_test_function_references_capability(
-        tree, capability_id, backend=backend
-    )
+    fn_refs_cap = _any_test_function_references_capability(tree, capability_id, backend=backend)
     fn_has_backend_prefix = _any_test_function_has_backend_prefix(tree, backend)
-    file_targets_backend = (
-        backend_in_filename
-        or _file_has_parametrize_or_fixture_on_backend(tree, backend)
-    )
-    file_has_multi_backend_coverage = _file_has_test_functions_for_multiple_backends(
-        tree
-    )
+    file_targets_backend = backend_in_filename or _file_has_parametrize_or_fixture_on_backend(tree, backend)
+    file_has_multi_backend_coverage = _file_has_test_functions_for_multiple_backends(tree)
 
     if filename_has_cap:
         if file_targets_backend:
@@ -1843,12 +1771,12 @@ class Cell:
     @property
     def label(self) -> str:
         if self.implemented and self.tested:
-            return "✅ implemented+tested"
+            return "◐ surface + test candidate"
         if self.implemented and not self.tested:
-            return "⚠️ implemented, no test"
+            return "◐ surface, no test candidate"
         if not self.implemented and self.tested:
-            return "⚠️ test exists, stub impl"
-        return "❌ neither"
+            return "? test candidate, no surface"
+        return "— no surface or test candidate"
 
 
 def _backend_view(backend: str) -> _ClassView:
@@ -1917,9 +1845,7 @@ def _format_table(cells: list[Cell]) -> str:
     lines: list[str] = []
     for cap in caps:
         row_cells = by_cap.get(cap.id, {})
-        cell_text = " | ".join(
-            row_cells.get(b, Cell(cap.id, b, False, False)).label for b in BACKENDS
-        )
+        cell_text = " | ".join(row_cells.get(b, Cell(cap.id, b, False, False)).label for b in BACKENDS)
         lines.append(f"| {cap.label} | {cell_text} |")
     return "\n".join([header, align, *lines])
 
@@ -1929,10 +1855,10 @@ def _format_legend() -> str:
         "Cell legend:\n\n"
         "| Symbol | Meaning |\n"
         "|---|---|\n"
-        "| ✅ implemented+tested | The backend exposes the capability *and* at least one test exercises it. |\n"
-        "| ⚠️ implemented, no test | The backend exposes the capability but no test covers it. |\n"
-        "| ⚠️ test exists, stub impl | A test exists for the (capability, backend) cell but the backend's implementation is a stub / raises / returns None. |\n"
-        "| ❌ neither | No implementation and no test for the (capability, backend) cell. |\n"
+        "| ◐ surface + test candidate | A facade surface and a possible test were found statically; execution and behavior are unverified. |\n"
+        "| ◐ surface, no test candidate | A facade surface was found but the heuristic did not find a test candidate. |\n"
+        "| ? test candidate, no surface | A possible test was found but no supported facade surface was detected. |\n"
+        "| — no surface or test candidate | Neither a supported facade surface nor a test candidate was detected. |\n"
     )
 
 
@@ -1946,9 +1872,7 @@ def _render_markdown(cells: list[Cell]) -> str:
     # The four categories sum to len(cells); if they don't, the renderer
     # would be silently undercounting one of the categories — fail loudly
     # so the matrix never lies about itself.
-    assert (
-        full_count + impl_only + stub_with_test + gaps == len(cells)
-    ), f"category counts do not sum to {len(cells)}"
+    assert full_count + impl_only + stub_with_test + gaps == len(cells), f"category counts do not sum to {len(cells)}"
     # The header carries NO wall-clock timestamp and NO HEAD SHA on
     # purpose. Either would make the file a non-pure function of the
     # input tree (the timestamp ticks each second, the SHA changes
@@ -1971,22 +1895,25 @@ def _render_markdown(cells: list[Cell]) -> str:
         f"> timestamp lives in git, not in this file — see\n"
         f"> `git log -1 --format='%h %cI' -- docs/BACKEND_PARITY.md`.\n"
         f"\n"
+        f"**Static inventory, not behavioral parity or passing-test evidence.**\n"
+        f"Candidates can be skipped, mocked, negative tests, or unrelated name matches.\n"
+        f"Facade accessors do not prove repository methods are implemented.\n\n"
         f"This matrix enumerates the cross-cutting capability surface of\n"
         f"MNEMOS's six SQL persistence backends (sqlite, postgres, mysql,\n"
         f"mariadb, oracle, db2) and answers two questions for every cell:\n"
         f"\n"
-        f"1. **implemented** — does the backend's facade class actually wire\n"
+        f"1. **surface** — does the backend's facade class appear to wire\n"
         f"   up the capability, or does the property unconditionally raise\n"
         f"   `BackendCapabilityMissing` / return `None` / raise\n"
         f"   `NotImplementedError`?\n"
-        f"2. **tested** — does at least one test in `tests/` exercise the\n"
+        f"2. **test candidate** — does a source heuristic associate a test with the\n"
         f"   (capability, backend) pair, either via a `@pytest.mark.parametrize`\n"
         f"   over the backend name or via a file named\n"
         f"   `test_<capability>_<backend>*.py`?\n"
         f"\n"
-        f"Summary: **{full_count}/{len(cells)}** cells are fully covered\n"
-        f"(✅ implemented+tested), **{impl_only}** cells are implemented\n"
-        f"but untested, **{stub_with_test}** cells have a test against a\n"
+        f"Summary: **{full_count}/{len(cells)}** cells have a surface and a test candidate\n"
+        f"(◐ surface + test candidate), **{impl_only}** cells expose a surface\n"
+        f"without a test candidate, **{stub_with_test}** cells have a test candidate for a\n"
         f"stub backend implementation, and **{gaps}** cells have neither\n"
         f"implementation nor test. (Categories sum to {len(cells)}: "
         f"{full_count} + {impl_only} + {stub_with_test} + {gaps} = "
@@ -2056,8 +1983,8 @@ def _render_markdown(cells: list[Cell]) -> str:
         f"are all examples of features that *claimed* cross-backend support\n"
         f"in code while being silently absent from one of the six SQL\n"
         f"backends. This matrix is the machine-readable form of the answer\n"
-        f"to \"does this thing actually work on this backend, and do we have\n"
-        f"a test that proves it?\".\n"
+        f'to "does this thing actually work on this backend, and do we have\n'
+        f'a test that proves it?".\n'
         f"\n"
         f"The narrow federation-SQL parity test\n"
         f"(`tests/test_federation_backend_parity_static.py`) is left\n"
@@ -2079,6 +2006,7 @@ def main(argv: list[str] | None = None) -> int:
         if existing != rendered:
             # Print a short diff fragment so CI logs are actionable.
             import difflib
+
             diff_iter = difflib.unified_diff(
                 existing.splitlines(keepends=True),
                 rendered.splitlines(keepends=True),

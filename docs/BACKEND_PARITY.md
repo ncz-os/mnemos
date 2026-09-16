@@ -11,22 +11,26 @@
 > timestamp lives in git, not in this file — see
 > `git log -1 --format='%h %cI' -- docs/BACKEND_PARITY.md`.
 
+**Static inventory, not behavioral parity or passing-test evidence.**
+Candidates can be skipped, mocked, negative tests, or unrelated name matches.
+Facade accessors do not prove repository methods are implemented.
+
 This matrix enumerates the cross-cutting capability surface of
 MNEMOS's six SQL persistence backends (sqlite, postgres, mysql,
 mariadb, oracle, db2) and answers two questions for every cell:
 
-1. **implemented** — does the backend's facade class actually wire
+1. **surface** — does the backend's facade class appear to wire
    up the capability, or does the property unconditionally raise
    `BackendCapabilityMissing` / return `None` / raise
    `NotImplementedError`?
-2. **tested** — does at least one test in `tests/` exercise the
+2. **test candidate** — does a source heuristic associate a test with the
    (capability, backend) pair, either via a `@pytest.mark.parametrize`
    over the backend name or via a file named
    `test_<capability>_<backend>*.py`?
 
-Summary: **75/162** cells are fully covered
-(✅ implemented+tested), **44** cells are implemented
-but untested, **9** cells have a test against a
+Summary: **75/162** cells have a surface and a test candidate
+(◐ surface + test candidate), **44** cells expose a surface
+without a test candidate, **9** cells have a test candidate for a
 stub backend implementation, and **34** cells have neither
 implementation nor test. (Categories sum to 162: 75 + 44 + 9 + 34 = 162.)
 
@@ -34,33 +38,33 @@ implementation nor test. (Categories sum to 162: 75 + 44 + 9 + 34 = 162.)
 
 | Capability | sqlite | postgres | mysql | mariadb | oracle | db2 |
 |---|---|---|---|---|---|---|
-| memory_crud (MemoryRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
-| vector_search (semantic_search) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
-| fts_search (FTS5 / native FTS) | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
-| kg (KGRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
-| versions (VersionRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
-| branches (BranchRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
-| compression (CompressionRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
-| compression_queue (CompressionQueueRepository) | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test |
-| morpheus (MorpheusRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
-| webhooks (end-to-end delivery) | ⚠️ test exists, stub impl | ✅ implemented+tested | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl |
-| nats_dispatch_log (idempotency dedupe) | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test |
-| consultations_audit (model recommendation) | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
-| oauth (OAuthRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested | ✅ implemented+tested |
-| sessions (SessionsRepository) | ⚠️ implemented, no test | ⚠️ implemented, no test | ❌ neither | ❌ neither | ✅ implemented+tested | ✅ implemented+tested |
-| consultations (ConsultationsRepository) | ⚠️ implemented, no test | ⚠️ implemented, no test | ⚠️ test exists, stub impl | ❌ neither | ✅ implemented+tested | ✅ implemented+tested |
-| federation (FederationRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ✅ implemented+tested |
-| state (StateRepository) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ⚠️ implemented, no test | ⚠️ implemented, no test | ✅ implemented+tested |
-| audit_chain (AuditChainRepository) | ✅ implemented+tested | ✅ implemented+tested | ⚠️ test exists, stub impl | ⚠️ test exists, stub impl | ✅ implemented+tested | ✅ implemented+tested |
-| acl (AclRepository) | ⚠️ test exists, stub impl | ⚠️ implemented, no test | ❌ neither | ❌ neither | ⚠️ implemented, no test | ⚠️ implemented, no test |
-| journal (KNEMON journal entries) | ⚠️ implemented, no test | ⚠️ implemented, no test | ❌ neither | ❌ neither | ⚠️ implemented, no test | ⚠️ implemented, no test |
-| ledger (KNEMON usage_ledger) | ✅ implemented+tested | ⚠️ implemented, no test | ❌ neither | ❌ neither | ⚠️ implemented, no test | ⚠️ implemented, no test |
-| row_level_security (Postgres RLS) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
-| listen_notify (Postgres LISTEN/NOTIFY) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
-| advisory_locks (Postgres advisory locks) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
-| federation_journal (distinct journal table) | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested | ✅ implemented+tested |
-| morpheus HTTP-trigger (POST /admin/morpheus/runs) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
-| kronos routes (POSTGRES-only) | ❌ neither | ⚠️ implemented, no test | ❌ neither | ❌ neither | ❌ neither | ❌ neither |
+| memory_crud (MemoryRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
+| vector_search (semantic_search) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
+| fts_search (FTS5 / native FTS) | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
+| kg (KGRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
+| versions (VersionRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
+| branches (BranchRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
+| compression (CompressionRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
+| compression_queue (CompressionQueueRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface, no test candidate |
+| morpheus (MorpheusRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
+| webhooks (end-to-end delivery) | ? test candidate, no surface | ◐ surface + test candidate | ? test candidate, no surface | ? test candidate, no surface | ? test candidate, no surface | ? test candidate, no surface |
+| nats_dispatch_log (idempotency dedupe) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate |
+| consultations_audit (model recommendation) | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
+| oauth (OAuthRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
+| sessions (SessionsRepository) | ◐ surface, no test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
+| consultations (ConsultationsRepository) | ◐ surface, no test candidate | ◐ surface, no test candidate | ? test candidate, no surface | — no surface or test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
+| federation (FederationRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
+| state (StateRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
+| audit_chain (AuditChainRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ? test candidate, no surface | ? test candidate, no surface | ◐ surface + test candidate | ◐ surface + test candidate |
+| acl (AclRepository) | ? test candidate, no surface | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate |
+| journal (KNEMON journal entries) | ◐ surface, no test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate |
+| ledger (KNEMON usage_ledger) | ◐ surface + test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate |
+| row_level_security (Postgres RLS) | — no surface or test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate |
+| listen_notify (Postgres LISTEN/NOTIFY) | — no surface or test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate |
+| advisory_locks (Postgres advisory locks) | — no surface or test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate |
+| federation_journal (distinct journal table) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
+| morpheus HTTP-trigger (POST /admin/morpheus/runs) | — no surface or test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate |
+| kronos routes (POSTGRES-only) | — no surface or test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate |
 
 
 ## Legend
@@ -69,10 +73,10 @@ Cell legend:
 
 | Symbol | Meaning |
 |---|---|
-| ✅ implemented+tested | The backend exposes the capability *and* at least one test exercises it. |
-| ⚠️ implemented, no test | The backend exposes the capability but no test covers it. |
-| ⚠️ test exists, stub impl | A test exists for the (capability, backend) cell but the backend's implementation is a stub / raises / returns None. |
-| ❌ neither | No implementation and no test for the (capability, backend) cell. |
+| ◐ surface + test candidate | A facade surface and a possible test were found statically; execution and behavior are unverified. |
+| ◐ surface, no test candidate | A facade surface was found but the heuristic did not find a test candidate. |
+| ? test candidate, no surface | A possible test was found but no supported facade surface was detected. |
+| — no surface or test candidate | Neither a supported facade surface nor a test candidate was detected. |
 
 
 ## How cells are decided

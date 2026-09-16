@@ -62,15 +62,15 @@ on this Python + filesystem combo — it is not a hardware ceiling.)
   for completeness, not as a headline metric.
 - Wall-clock separation: `insert_wall_seconds` (timed region only) is
   reported separately from `wall_seconds` (the cell including
-  `SqliteBackend.open()` + migrations + sqlite-vec load + close), so
-  open-cost noise is visible in the JSON artifact even though it is
-  amortized to nothing at 10k corpus.
+  `SqliteBackend.open()` + migrations + sqlite-vec load + close), after the v7 review fix. The original 2026-09-15 artifact incorrectly
+  excluded setup, warmup, and cleanup from `wall_seconds`; its insert
+  throughput is unaffected. Historical wall values are not end-to-end costs.
 
 ## What Phase 1 surfaced (architectural observation, not a bug)
 
 `SqliteBackend.transactional()` (line ~7401 of
-`mnemos/persistence/sqlite.py`) acquires a single `asyncio.Lock` and
-opens one connection that runs `BEGIN IMMEDIATE` per transaction.
+`mnemos/persistence/sqlite.py`) acquires a single `asyncio.Lock` around
+its shared connection and runs `BEGIN IMMEDIATE` per transaction.
 That means **all writes serialize through one path**, regardless of
 how many concurrent writer tasks the bench dispatches. The numbers
 above show this clearly:
