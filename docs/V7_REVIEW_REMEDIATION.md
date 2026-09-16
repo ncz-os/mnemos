@@ -31,6 +31,7 @@ The review was performed directly against the canonical GitLab source.
    execution tests remain necessary. GitLab now runs the checker.
 5. **Streaming cursor rejection occurred after HTTP 200.** CHARON validates
    cursor syntax and tenant scope before constructing either streaming response.
+   Per-record client spooling batches commits instead of fsyncing every record.
    The existing shared authorization, verbatim redaction, canonical query,
    keyset ordering, and repeatable-read connection remain intact.
 6. **Benchmark evidence and lifecycle gaps.** The harness requires aiosqlite,
@@ -63,3 +64,20 @@ Live verification in this review uses a disposable local PostgreSQL 17 instance;
 no production data is modified. Oracle/Db2 changes receive import, AST, and mocked
 repository tests, not new live enterprise-backend qualification. Final literal
 suite results, commit IDs, and CI status are recorded in the completed handoff.
+
+## Local validation (2026-09-16)
+
+- Core plus pinned add-ons: 3,745 passed, 476 skipped.
+- Core only: 3,722 passed, 495 skipped; seven import contracts kept.
+- Audit gate: 156 passed, 35 skipped; 100% statements and branches without exclusions.
+- CHARON with disposable PostgreSQL 17: 320 passed, 4 skipped.
+- GRAEAE: 148 passed, 4 skipped; KNEMON with PostgreSQL: 227 passed, 1 skipped;
+  PANTHEON: 376 passed.
+- Oracle structural move check: nine symbols passed. Migration inventory: 62 with parity.
+- Full dependency resolution and installed-package compatibility check passed.
+- SQLite Phase 1: six cells completed; peak in-flight inserts equalled requested
+  concurrency in each cell. This shared-host run is not a capacity qualification.
+
+These counts separate executed tests from skips; no skipped test is treated as
+positive live evidence. Changes are on `fix/v7-review-20260916`; this review does
+not merge the branch or deploy a service.
