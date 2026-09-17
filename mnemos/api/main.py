@@ -268,6 +268,36 @@ def _warn_if_audit_token_unset(settings) -> bool:
     return False
 
 
+def _validate_audit_chain_startup() -> bool:
+    """Warn, or fail when opted in, if an enabled chain cannot be sealed."""
+    from mnemos.audit import load_root_keypair
+    from mnemos.core.config import audit_chain_enabled_flag, audit_chain_key_required
+
+    if not audit_chain_enabled_flag():
+        return False
+    try:
+        load_root_keypair()
+    except (TypeError, ValueError) as exc:
+        message = (
+            "MNEMOS_AUDIT_CHAIN is enabled but no usable "
+            "MNEMOS_AUDIT_ROOT_PRIVKEY is configured — audit entries cannot "
+            "be sealed. Set MNEMOS_AUDIT_ROOT_PRIVKEY or disable "
+            f"MNEMOS_AUDIT_CHAIN. Root-key error: {exc}"
+        )
+        if audit_chain_key_required():
+            raise RuntimeError(
+                message
+                + " (MNEMOS_REQUIRE_AUDIT_CHAIN_KEY=YES requires startup to fail.)"
+            ) from exc
+        logging.getLogger(__name__).warning(
+            message
+            + " Set MNEMOS_REQUIRE_AUDIT_CHAIN_KEY=YES to make this "
+            "configuration fail-loud at startup."
+        )
+        return True
+    return False
+
+
 _oauth_state_secret = _settings.server.session_secret
 if not _oauth_state_secret:
     # v6.1-roadmap #38 — operators running in production MUST set
@@ -296,6 +326,7 @@ if not _oauth_state_secret:
     _oauth_state_secret = _secrets.token_urlsafe(48)
 
 _warn_if_audit_token_unset(_settings)
+_validate_audit_chain_startup()
 app.add_middleware(
     _SessionMiddleware,
     secret_key=_oauth_state_secret,

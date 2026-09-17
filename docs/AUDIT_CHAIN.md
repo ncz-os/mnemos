@@ -46,7 +46,17 @@ export MNEMOS_AUDIT_CHAIN=required
 export MNEMOS_AUDIT_ROOT_PRIVKEY="$(python -c 'import os, base64; print(base64.b64encode(os.urandom(32)).decode())')"
 ```
 
-The root privkey is loaded once at sealer init via `mnemos.audit.crypto.load_root_keypair`; raises `ValueError` if unset/malformed so the boot fails loud rather than silently disabling audit (same fail-loud pattern as v6.1 P3 #38 session-secret hardening).
+Set `MNEMOS_REQUIRE_AUDIT_CHAIN_KEY=YES` to refuse API startup when the
+chain is enabled but `MNEMOS_AUDIT_ROOT_PRIVKEY` is missing or invalid.
+Without this opt-in, startup emits a warning and `/v1/audit/health` reports
+`chain_configured: true`, `chain_enabled: false`, and a `chain_error` so a
+best-effort deployment remains available without claiming the chain is
+operational.
+
+The root privkey is loaded at sealer init via
+`mnemos.audit.crypto.load_root_keypair`. The API validates it independently at
+startup and in `/v1/audit/health`; an unset or malformed value warns by default
+or fails startup when `MNEMOS_REQUIRE_AUDIT_CHAIN_KEY=YES`.
 
 `MNEMOS_SESSION_SECRET` is shared with the existing session-cookie path — already mandatory when auth is in use. Per-writer Ed25519 keys derive from `(session_secret, writer_id)` via HKDF-SHA256.
 
@@ -111,7 +121,9 @@ Per-backend audit-chain health snapshot. Use for operator dashboards + alerts:
 ```bash
 curl -H "Authorization: Bearer $TOKEN" http://mnemos:5002/v1/audit/health
 # {
+#   "chain_configured": true,
 #   "chain_enabled": true,
+#   "chain_error": null,
 #   "backend_has_audit_chain": true,
 #   "total_entries": 12453,
 #   "unsealed_count": 7,
@@ -122,7 +134,11 @@ curl -H "Authorization: Bearer $TOKEN" http://mnemos:5002/v1/audit/health
 # }
 ```
 
-Returns the snapshot with `chain_enabled=False` when the env var is off but the tables exist (lets operators inspect a disabled chain). 503 when the backend has no audit_chain repo (MySQL and MariaDB).
+Returns the snapshot with `chain_enabled=False` when the env var is off or a
+signing key is unusable, while `chain_configured` preserves the requested flag
+state and `chain_error` explains a broken configuration. The tables remain
+inspectable in either case. Returns 503 when the backend has no audit_chain repo
+(MySQL and MariaDB).
 
 **Recommended alerts:**
 

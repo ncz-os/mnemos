@@ -279,7 +279,11 @@ async def audit_health(
     """Per-backend audit-chain health snapshot.
 
     Returns:
-    * `chain_enabled`: ``MNEMOS_AUDIT_CHAIN`` flag state.
+    * `chain_configured`: ``MNEMOS_AUDIT_CHAIN`` flag state.
+    * `chain_enabled`: true only when the flag is on and both writer and
+      root signing keys are usable.
+    * `chain_error`: configuration error when the flag is on but signing is
+      not operational, otherwise null.
     * `backend_has_audit_chain`: backend.audit_chain attribute non-None.
     * `total_entries`, `unsealed_count`, `oldest_unsealed_signed_at`,
       `sealed_root_count`, `last_sealed_at`: live counts from the
@@ -287,7 +291,8 @@ async def audit_health(
       unsealed-growth ("sealer is wedged").
 
     Returns 503 if backend has no audit_chain repo. Returns the
-    snapshot with `chain_enabled=False` if env is off but tables
+    snapshot with `chain_enabled=False` if env is off or signing is not
+    operational, but tables
     still exist (lets operators inspect a disabled chain without
     re-enabling).
     """
@@ -297,8 +302,25 @@ async def audit_health(
             status_code=503,
             detail="backend has no audit_chain repository",
         )
+    chain_configured = audit_chain_enabled()
+    chain_errors: list[str] = []
+    if chain_configured:
+        try:
+            load_root_keypair()
+        except (TypeError, ValueError) as exc:
+            chain_errors.append(f"audit root key is unusable: {exc}")
+        from mnemos.core.config import get_settings
+
+        session_secret = (getattr(get_settings().server, "session_secret", "") or "").encode("utf-8")
+        try:
+            derive_writer_keypair(session_secret, "health-check")
+        except (TypeError, ValueError) as exc:
+            chain_errors.append(f"audit writer signing key is unusable: {exc}")
+    chain_error = "; ".join(chain_errors) or None
     out: dict = {
-        "chain_enabled": audit_chain_enabled(),
+        "chain_configured": chain_configured,
+        "chain_enabled": chain_configured and chain_error is None,
+        "chain_error": chain_error,
         "backend_has_audit_chain": True,
     }
     try:

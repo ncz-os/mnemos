@@ -1062,6 +1062,9 @@ class _AuditSettings(BaseModel):
     require_session_secret: str = Field(
         default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET")
     )
+    require_chain_key: str = Field(
+        default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_AUDIT_CHAIN_KEY")
+    )
     chain: str = Field(default_factory=lambda: runtime_env_value("MNEMOS_AUDIT_CHAIN", ""))
     root_private_key: str = Field(default_factory=lambda: runtime_env_value_stripped("MNEMOS_AUDIT_ROOT_PRIVKEY"))
 
@@ -1780,6 +1783,11 @@ def audit_chain_enabled_flag() -> bool:
 def audit_chain_required_flag() -> bool:
     """Require audited mutation callers to roll back if signing fails."""
     return runtime_env_value("MNEMOS_AUDIT_CHAIN", "").lower() == "required"
+
+
+def audit_chain_key_required() -> bool:
+    """Return whether a configured audit chain must have a usable root key."""
+    return runtime_env_value_stripped("MNEMOS_REQUIRE_AUDIT_CHAIN_KEY").lower() in {"yes", "1", "true"}
 
 
 def system_hive_url_env() -> str:

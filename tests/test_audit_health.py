@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import types
 import uuid
 from datetime import datetime, timezone
 
@@ -139,6 +140,12 @@ async def test_health_endpoint_returns_stats(sqlite_backend, fake_user, monkeypa
         "mnemos.api.routes.audit._backend_or_503",
         lambda: sqlite_backend,
     )
+    monkeypatch.setattr(
+        "mnemos.core.config.get_settings",
+        lambda: types.SimpleNamespace(
+            server=types.SimpleNamespace(session_secret="test-session-secret")
+        ),
+    )
 
     # Insert 2 + seal 1 by hand to populate stats
     await _insert_one(
@@ -152,6 +159,8 @@ async def test_health_endpoint_returns_stats(sqlite_backend, fake_user, monkeypa
 
     out = await audit_route.audit_health(user=fake_user)
     assert out["chain_enabled"] is True
+    assert out["chain_configured"] is True
+    assert out["chain_error"] is None
     assert out["backend_has_audit_chain"] is True
     assert out["total_entries"] == 2
     assert out["unsealed_count"] == 2
@@ -172,5 +181,54 @@ async def test_health_endpoint_when_chain_disabled(sqlite_backend, fake_user, mo
     out = await audit_route.audit_health(user=fake_user)
     # Still returns stats; just reports chain_enabled=False
     assert out["chain_enabled"] is False
+    assert out["chain_configured"] is False
+    assert out["chain_error"] is None
     assert out["backend_has_audit_chain"] is True
     assert "total_entries" in out
+
+
+@pytest.mark.asyncio
+async def test_health_reports_enabled_flag_with_missing_root_key_as_broken(
+    sqlite_backend, fake_user, monkeypatch
+):
+    """Regression: the raw flag must not masquerade as an operational chain."""
+    from mnemos.api.routes import audit as audit_route
+
+    monkeypatch.setattr(audit_route, "audit_chain_enabled", lambda: True)
+    monkeypatch.delenv("MNEMOS_AUDIT_ROOT_PRIVKEY", raising=False)
+    monkeypatch.setattr(
+        "mnemos.api.routes.audit._backend_or_503",
+        lambda: sqlite_backend,
+    )
+
+    out = await audit_route.audit_health(user=fake_user)
+
+    assert out["chain_configured"] is True
+    assert out["chain_enabled"] is False
+    assert "MNEMOS_AUDIT_ROOT_PRIVKEY is unset" in out["chain_error"]
+
+
+@pytest.mark.asyncio
+async def test_health_reports_missing_writer_signing_secret(
+    sqlite_backend, fake_user, monkeypatch
+):
+    from mnemos.api.routes import audit as audit_route
+
+    monkeypatch.setattr(audit_route, "audit_chain_enabled", lambda: True)
+    monkeypatch.setattr(
+        "mnemos.api.routes.audit._backend_or_503",
+        lambda: sqlite_backend,
+    )
+    monkeypatch.setattr(
+        "mnemos.core.config.get_settings",
+        lambda: types.SimpleNamespace(server=types.SimpleNamespace(session_secret="")),
+    )
+
+    out = await audit_route.audit_health(user=fake_user)
+
+    assert out["chain_configured"] is True
+    assert out["chain_enabled"] is False
+    assert out["chain_error"] == (
+        "audit writer signing key is unusable: session_secret is empty; "
+        "cannot derive writer key"
+    )
