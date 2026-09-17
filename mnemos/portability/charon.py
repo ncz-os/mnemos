@@ -236,6 +236,43 @@ def _is_vault_namespace(row: Any) -> bool:
     return _row_get(row, "namespace") == mif.VAULT_NAMESPACE
 
 
+#: Row fields that can carry a vault memory's secret payload. Mirrors the
+#: redaction rule in :func:`mif.memory_to_concept`, which blanks the body,
+#: masks the provenance ref, and omits the embedding ``sourceText`` and the
+#: compression summary for a vault concept. Keeping the two in lockstep is
+#: the whole point: a redacted sidecar row must not carry more secret
+#: material than the redacted concept file next to it.
+#:
+#: ``verbatim_content`` is the subtle one and is here because a live export
+#: proved it: it is the untransformed original body, so redacting ``content``
+#: alone still shipped the plaintext secret in the memories sidecar. The
+#: concept layer never emits it, which is exactly why it is easy to miss.
+_VAULT_BLANKED_FIELDS = ("content", "verbatim_content")
+_VAULT_DROPPED_FIELDS = ("compressed_content", "embedding")
+
+
+def _redact_vault_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``row`` with its secret-bearing payload removed.
+
+    Used when a caller asks for vault rows to be *present* in the bundle
+    (``include_vault=True``) but still *redacted* (``redact_vault=True``) —
+    i.e. "record that this vault memory exists, and its bookkeeping, but
+    never its secret". The surviving fields (id, namespace, category,
+    timestamps, metadata) are exactly the ones the MIF concept layer already
+    emits for a redacted vault concept.
+    """
+    out = dict(row)
+    for field in _VAULT_BLANKED_FIELDS:
+        if field in out and out[field] is not None:
+            out[field] = mif.VAULT_REDACTED_BODY
+    if out.get("source_session") is not None:
+        out["source_session"] = mif.VAULT_REDACTED_REF
+    for field in _VAULT_DROPPED_FIELDS:
+        if field in out:
+            out[field] = None
+    return out
+
+
 def _chunks(items: Sequence[str], size: int) -> Iterable[tuple[str, ...]]:
     for idx in range(0, len(items), size):
         yield tuple(items[idx : idx + size])
@@ -427,8 +464,17 @@ async def _write_batched_sidecar(
     batch_size: int,
     include_empty_batch: bool,
     fetch_batch: Callable[[Any, tuple[str, ...], bool, int], Any],
+    include_vault: bool = False,
 ) -> tuple[int, bool]:
-    """Fetch sidecar rows in bounded memory-id chunks and stream JSONL."""
+    """Fetch sidecar rows in bounded memory-id chunks and stream JSONL.
+
+    ``include_vault`` defaults to ``False``, which drops vault-namespace rows
+    exactly as this function always has. A caller taking a complete backup
+    passes ``True`` to keep them. There is deliberately no "redact" middle
+    ground here: a memory-version row *is* a historical content snapshot and
+    a compression row *is* derived content, so for these sidecars the only
+    two honest options are carry the secret or drop the row.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     truncated = False
@@ -449,7 +495,7 @@ async def _write_batched_sidecar(
                 rows = rows[:remaining]
             for row in rows:
                 plain = _plain_row(row)
-                if _is_vault_namespace(plain):
+                if not include_vault and _is_vault_namespace(plain):
                     continue
                 if count >= SIDECAR_HARD_LIMIT:
                     truncated = True
@@ -701,6 +747,7 @@ async def export_bundle_from_backend(
     namespace: str | None = None,
     include_sidecars: bool = True,
     redact_vault: bool = True,
+    include_vault: bool = False,
     page_size: int = DEFAULT_PAGE_SIZE,
     sidecar_batch_size: int = DEFAULT_SIDECAR_BATCH_SIZE,
     include_archived: bool = False,
@@ -724,19 +771,50 @@ async def export_bundle_from_backend(
         Bundle root. Will be created if missing.
     owner_id, namespace:
         Optional owner / namespace narrowing. Both ``None`` → cross-tenant
-        ROOT_BYPASS export (the vault is always excluded).
+        ROOT_BYPASS export. Vault-namespace memories are excluded unless
+        ``include_vault=True`` (see below).
     include_sidecars:
         When ``True`` (default) emit ``_sidecars/{kg_triples,memory_versions,
         compression}.jsonl`` and record their counts in the manifest. The
         three repos' ``hard_limit + 1`` sentinel row surfaces as the
         manifest's ``sidecars[*].truncated`` flag.
     redact_vault:
-        Forwarded to :func:`mif.memory_to_concept`. Default ``True`` —
-        vault memories are written as ``[CONTENT ENCRYPTED]`` with their
-        provenance masked. Set ``False`` only for a trusted
-        restore-to-same-operator flow (CHARON itself does not redact on
-        import — the caller controls vault semantics on the target
-        backend).
+        Controls how vault content is RENDERED, not whether vault rows are
+        present — see ``include_vault`` for that. Forwarded to
+        :func:`mif.memory_to_concept`. Default ``True`` — vault memories are
+        written as ``[CONTENT ENCRYPTED]`` with their provenance masked. Set
+        ``False`` only for a trusted restore-to-same-operator flow (CHARON
+        itself does not redact on import — the caller controls vault
+        semantics on the target backend).
+    include_vault:
+        Whether vault-namespace memories appear in the bundle at all.
+        Default ``False``, which preserves the historical behaviour: vault
+        rows are filtered out of the concept layer and every sidecar, and no
+        combination of other arguments could get them back.
+
+        Set ``True`` for a genuine backup, where an export that silently
+        drops the operator's own secrets is not a backup. The two flags
+        compose:
+
+        =================  ================  ====================================
+        ``include_vault``  ``redact_vault``  Result for a vault memory
+        =================  ================  ====================================
+        ``False`` (dflt)   any               Absent from the bundle entirely.
+        ``True``           ``True``          Present, but body is
+                                             ``[CONTENT ENCRYPTED]`` and the
+                                             secret-bearing row fields are
+                                             stripped. Version / compression /
+                                             KG sidecar rows are dropped,
+                                             because those *are* content.
+        ``True``           ``False``         Present in full, plaintext secret
+                                             included. This is the complete
+                                             backup; the caller is responsible
+                                             for encrypting the bundle at rest.
+        =================  ================  ====================================
+
+        ``include_vault=True, redact_vault=False`` writes live credentials to
+        disk in cleartext. Callers must treat the resulting directory as
+        secret material.
     page_size:
         Page size for the ``fetch_memory_export`` walk. Bounded so peak memory
         stays sane on multi-million-row stores; the repo already does
@@ -755,6 +833,11 @@ async def export_bundle_from_backend(
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
 
+    # Version / compression / KG sidecar rows for a vault memory are raw
+    # content, so they ride along only in the complete-backup mode. Under
+    # redaction they are dropped — see _write_batched_sidecar's docstring.
+    sidecar_vault = include_vault and not redact_vault
+
     memories_for_concept: list[dict[str, Any]] = []
     memory_ids: list[str] = []
     offset = 0
@@ -767,13 +850,17 @@ async def export_bundle_from_backend(
                 category=None,
                 limit=page_size,
                 offset=offset,
+                include_secrets=include_vault,
             )
         if not rows:
             break
         for row in rows:
             memory = _row_to_memory_dict(row)
             if _is_vault_namespace(memory):
-                continue
+                if not include_vault:
+                    continue
+                if redact_vault:
+                    memory = _redact_vault_row(memory)
             if not include_archived and memory.get("archived_at") is not None:
                 continue
             memories_for_concept.append(memory)
@@ -817,6 +904,7 @@ async def export_bundle_from_backend(
                 effective_ns=namespace,
                 include_unattached=first,
                 hard_limit=hard_limit,
+                include_secrets=sidecar_vault,
             )
 
         kg_count, kg_truncated = await _write_batched_sidecar(
@@ -826,6 +914,7 @@ async def export_bundle_from_backend(
             batch_size=sidecar_batch_size,
             include_empty_batch=True,
             fetch_batch=_fetch_kg_batch,
+            include_vault=sidecar_vault,
         )
         sidecar_block["kg_triples"] = {
             "path": f"{SIDECAR_DIR}/{KG_TRIPLES_SIDECAR}",
@@ -844,6 +933,7 @@ async def export_bundle_from_backend(
                 effective_owner=owner_id,
                 effective_ns=namespace,
                 hard_limit=hard_limit,
+                include_secrets=sidecar_vault,
             )
 
         ver_count, ver_truncated = await _write_batched_sidecar(
@@ -853,6 +943,7 @@ async def export_bundle_from_backend(
             batch_size=sidecar_batch_size,
             include_empty_batch=False,
             fetch_batch=_fetch_version_batch,
+            include_vault=sidecar_vault,
         )
         sidecar_block["memory_versions"] = {
             "path": f"{SIDECAR_DIR}/{MEMORY_VERSIONS_SIDECAR}",
@@ -878,6 +969,7 @@ async def export_bundle_from_backend(
             batch_size=sidecar_batch_size,
             include_empty_batch=False,
             fetch_batch=_fetch_compression_batch,
+            include_vault=sidecar_vault,
         )
         sidecar_block["compression"] = {
             "path": f"{SIDECAR_DIR}/{COMPRESSION_SIDECAR}",
@@ -891,6 +983,14 @@ async def export_bundle_from_backend(
     else:
         manifest["sidecars_included"] = False
         manifest["backend"] = type(backend).__name__
+
+    # Additive, and only in the new mode, so a default export's manifest is
+    # byte-identical to what it was before this parameter existed. A restorer
+    # (and STYX's own integrity gate) needs to be able to tell a complete
+    # backup from one that silently dropped the vault.
+    if include_vault:
+        manifest["vault_included"] = True
+        manifest["vault_redacted"] = bool(redact_vault)
 
     # Re-emit with the new keys merged in (export_bundle wrote its own
     # manifest; we re-write to preserve the same on-disk shape).

@@ -354,6 +354,156 @@ async def test_export_bundle_from_backend_excludes_vault_by_default(sqlite_backe
     assert "ordinary note" in blob
 
 
+# ── include_vault: the complete-backup escape hatch ─────────────────────────
+#
+# Regression cover for a real, measured gap: a full HTTP export of the
+# authoritative fleet instance (which passes ?include_secrets=true) returned
+# 18,423 records, while the same corpus through
+# ``export_bundle_from_backend(redact_vault=False)`` returned 17,374 — a
+# shortfall of exactly the 1,049 vault-namespace rows. ``redact_vault`` only
+# ever chose a rendering style for content that was already being filtered
+# out upstream, so no argument combination could produce a complete backup.
+
+
+_VAULT_SECRET = "AKIAIOSFODNN7EXAMPLE-charon-test-not-a-real-key"
+
+
+async def _seed_vault_pair(backend):
+    """One vault memory carrying a fake credential + one ordinary memory."""
+    vault_id = await _seed_memory(
+        backend, content=_VAULT_SECRET, namespace=VAULT_NAMESPACE
+    )
+    plain_id = await _seed_memory(
+        backend, content="ordinary note", namespace="default"
+    )
+    return vault_id, plain_id
+
+
+def _bundle_text(out_dir):
+    """Every byte a bundle puts on disk — concepts AND sidecars.
+
+    Deliberately reads the sidecars too. The concept layer redacts, but the
+    memories sidecar carries raw rows, so checking only ``*.md`` would have
+    declared a leaking bundle clean.
+    """
+    parts = [p.read_text() for p in out_dir.rglob("*.md")]
+    parts += [p.read_text() for p in out_dir.rglob("*.jsonl")]
+    return "\n".join(parts)
+
+
+@pytest.mark.asyncio
+async def test_export_bundle_from_backend_include_vault_false_matches_history(
+    sqlite_backend, tmp_path
+):
+    """Default and redact_vault=False both still exclude the vault entirely."""
+    await _seed_vault_pair(sqlite_backend)
+
+    for name, kwargs in (("default", {}), ("redact_false", {"redact_vault": False})):
+        out_dir = tmp_path / name
+        manifest = await charon.export_bundle_from_backend(
+            sqlite_backend, out_dir, include_sidecars=True, **kwargs
+        )
+        blob = _bundle_text(out_dir)
+        assert manifest["count"] == 1, f"{name}: vault row must stay excluded"
+        assert _VAULT_SECRET not in blob, f"{name}: secret leaked"
+        assert "ordinary note" in blob
+        # Additive keys must not appear in the historical default shape.
+        assert "vault_included" not in manifest
+        assert "vault_redacted" not in manifest
+
+
+@pytest.mark.asyncio
+async def test_export_bundle_from_backend_include_vault_complete_backup(
+    sqlite_backend, tmp_path
+):
+    """include_vault=True + redact_vault=False is a COMPLETE backup."""
+    await _seed_vault_pair(sqlite_backend)
+
+    out_dir = tmp_path / "complete"
+    manifest = await charon.export_bundle_from_backend(
+        sqlite_backend, out_dir, include_sidecars=True,
+        include_vault=True, redact_vault=False,
+    )
+
+    assert manifest["count"] == 2, "both memories must be present"
+    blob = _bundle_text(out_dir)
+    assert _VAULT_SECRET in blob, "a complete backup must carry the vault secret"
+    assert "ordinary note" in blob
+    assert manifest["vault_included"] is True
+    assert manifest["vault_redacted"] is False
+
+
+@pytest.mark.asyncio
+async def test_export_bundle_from_backend_include_vault_redacted_carries_no_secret(
+    sqlite_backend, tmp_path
+):
+    """include_vault=True + redact_vault=True records existence, not secrets.
+
+    The sidecar assertion is the load-bearing one: ``verbatim_content`` is an
+    untransformed copy of the body that the concept layer never emits, so
+    redacting ``content`` alone still shipped the plaintext to disk.
+    """
+    await _seed_vault_pair(sqlite_backend)
+
+    out_dir = tmp_path / "redacted"
+    manifest = await charon.export_bundle_from_backend(
+        sqlite_backend, out_dir, include_sidecars=True,
+        include_vault=True, redact_vault=True,
+    )
+
+    assert manifest["count"] == 2, "the vault row is present..."
+    blob = _bundle_text(out_dir)
+    assert _VAULT_SECRET not in blob, "...but its secret is not, anywhere in the bundle"
+    assert mif.VAULT_REDACTED_BODY in blob
+    assert "ordinary note" in blob
+    assert manifest["vault_included"] is True
+    assert manifest["vault_redacted"] is True
+
+    # Every vault row in the memories sidecar must be blanked, field by field.
+    rows = [
+        json.loads(line)
+        for line in (out_dir / "_sidecars" / "memories.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    vault_rows = [r for r in rows if r.get("namespace") == VAULT_NAMESPACE]
+    assert len(vault_rows) == 1
+    for field in ("content", "verbatim_content"):
+        assert vault_rows[0][field] == mif.VAULT_REDACTED_BODY
+    for field in ("compressed_content", "embedding"):
+        assert vault_rows[0].get(field) is None
+
+
+@pytest.mark.asyncio
+async def test_export_bundle_from_backend_include_vault_round_trips(
+    sqlite_backend, tmp_path
+):
+    """A complete backup re-imports with the vault memory's secret intact."""
+    from mnemos.persistence.sqlite import SqliteBackend
+
+    vault_id, _ = await _seed_vault_pair(sqlite_backend)
+
+    out_dir = tmp_path / "rt"
+    await charon.export_bundle_from_backend(
+        sqlite_backend, out_dir, include_sidecars=True,
+        include_vault=True, redact_vault=False,
+    )
+
+    dst = SqliteBackend(tmp_path / "dst.sqlite3", SimpleNamespace())
+    await dst.open()
+    try:
+        await charon.import_bundle_to_backend(dst, out_dir, redact_vault=False)
+        async with dst.transactional() as tx:
+            rows = await dst.memories.fetch_memory_export(
+                tx, effective_owner=None, effective_ns=None, category=None,
+                limit=100, offset=0, include_secrets=True,
+            )
+        restored = {r["id"]: r["content"] for r in rows}
+        assert vault_id in restored, "the vault memory must survive the round-trip"
+        assert restored[vault_id] == _VAULT_SECRET
+    finally:
+        await dst.close()
+
+
 @pytest.mark.asyncio
 async def test_export_bundle_from_backend_paginates(sqlite_backend, tmp_path):
     """A multi-page list_memories walk converges on the full row count."""
