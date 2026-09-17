@@ -9,21 +9,10 @@
     "",
     "To bump an add-on: replace the SHA with the desired commit id and",
     "open a PR. Tagging vX.Y.Z then publishes wheels built from exactly",
-    "the SHA recorded here -- the resulting image label is reproducible.",
-    "",
-    "TEMPORARY, NOT A RELEASE BUMP: the `charon` pin below points at the",
-    "branch commit fix/charon-backend-neutral-export-20260916 (b26e0d88),",
-    "not at charon's main. CHARON's MPF export/import path was rewired onto",
-    "persistence ABC methods that land in this same branch, so test:composition",
-    "-- which installs the pinned add-ons and runs this repo's suite against",
-    "them -- fails with a TypeError against charon's current main.",
-    "",
-    "REPIN THIS TO CHARON'S MAIN TIP once both branches merge. It is a",
-    "release-artifact pin: leaving it on a branch commit would publish",
-    "add-on wheels built from an unmerged branch."
+    "the SHA recorded here -- the resulting image label is reproducible."
   ],
-  "pantheon": "6a2292fbd386b37adc3b1394b4f7c5807626d06e",
-  "knemon": "95ca2e9cb3712338605a5edf2ee4e835dbe5b4fa",
-  "graeae": "c02185667deea0098fa2b297108419e59b087577",
-  "charon": "b26e0d889d438791ad46e731c96cc6ade1c23293"
+  "pantheon": "14f70779f82b95011efaa90426fbfe4bf7b8b359",
+  "knemon": "16b736d31f0744b5ef0e24328012049501888cf0",
+  "graeae": "66d726642d00d02d65f835a3481ea5b548b46d21",
+  "charon": "51fb62bb31a98bd602548c354754512c2b7f7279"
 }
