@@ -67,6 +67,21 @@ class _StubSqliteConn:
         self.calls.append((args, kwargs))
 
 
+class _StubOracleConn:
+    """oracledb-shaped connection: execute accepts one parameters object."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.__class__.__module__ = "oracledb"
+
+    async def execute(
+        self,
+        sql: str,
+        parameters: dict[str, Any] | None = None,
+    ) -> None:
+        self.calls.append((sql, parameters or {}))
+
+
 def test_insert_audit_record_writes_via_postgres_conn():
     from mnemos.domain.mcp_audit_repo import insert_audit_record
 
@@ -97,6 +112,40 @@ def test_insert_audit_record_writes_via_postgres_conn():
     assert parsed_shape == {"query": {"type": "str", "length": 5}}
     assert args[4] == "success"
     assert args[5] is None
+
+
+def test_insert_audit_record_uses_named_bind_mapping_for_oracle_conn():
+    """Oracle's AsyncConnection accepts ``execute(sql, mapping)``, not *args."""
+    from mnemos.domain.mcp_audit_repo import insert_audit_record
+
+    conn = _StubOracleConn()
+
+    async def run():
+        return await insert_audit_record(
+            conn,
+            caller_user_id="alice",
+            role="user",
+            tool="create_memory",
+            parameter_shape={"content": {"type": "str", "length": 20}},
+            outcome="success",
+        )
+
+    rc = asyncio.run(run())
+    assert rc is True
+    assert len(conn.calls) == 1
+    sql, parameters = conn.calls[0]
+    assert "VALUES (" in sql
+    assert ":tool_name" in sql
+    assert parameters["tool_name"] == "create_memory"
+    assert json.loads(parameters["request"]) == {
+        "caller_user_id": "alice",
+        "role": "user",
+        "parameter_shape": {"content": {"type": "str", "length": 20}},
+    }
+    assert json.loads(parameters["response"]) == {
+        "outcome": "success",
+        "error_class": None,
+    }
 
 
 def test_insert_audit_record_skips_sqlite_conn():

@@ -3,24 +3,26 @@
 Phase-D durable surface for the per-call audit trail. The Python
 logger entries from `mnemos.mcp.tools._security._mcp_log_tool_audit`
 remain (text-only, ephemeral), and this repo writes the same record
-to the `mcp_audit_log` table when a Postgres pool is available.
+to the active backend's `mcp_audit_log` table when that backend has one.
 
 The `parameter_shape` is already redacted at the call site by
 `_mcp_parameter_shape` — only key names + value-type shape, never
 raw values. So the table is safe to retain indefinitely under
 normal data-protection policies.
 
-Postgres-only by design. SQLite installs keep the logger-only
-behavior; the schema lives in db/migrations_sqlite for operators
-who run a custom query path, but the writer here is pg-only
-(mirrors `mnemos.db.deletion_log` pattern).
+Postgres uses the Phase-D columns directly. Oracle and Db2 retain the
+older portable audit-table shape (tool_name/request/response), so the
+same redacted record is encoded into those JSON columns with named
+binds. SQLite installs keep the logger-only behavior.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from inspect import isawaitable
 from typing import Any
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +42,75 @@ def _looks_like_sqlite_conn(conn: Any) -> bool:
     return "sqlite" in module or "sqlite" in name
 
 
+def _connection_identity(conn: Any) -> str:
+    return f"{type(conn).__module__}.{type(conn).__name__}".lower()
+
+
+async def _execute_oracle_compat_audit_insert(
+    conn: Any,
+    *,
+    caller_user_id: str,
+    role: str,
+    tool: str,
+    parameter_shape: dict[str, Any],
+    outcome: str,
+    error_class: str | None,
+) -> bool:
+    """Write through the Oracle/Db2 audit-table compatibility schema.
+
+    ``oracledb.AsyncConnection.execute`` accepts exactly one parameters
+    object, unlike asyncpg's ``execute(sql, *args)``.  Named binds keep the
+    call compatible with Oracle and Db2's Oracle-compat cursor adapter.
+    """
+    statement = """
+        INSERT INTO mcp_audit_log (
+            id, session_id, tool_name, request, response, duration_ms
+        )
+        VALUES (
+            :id, :session_id, :tool_name, :request, :response, :duration_ms
+        )
+    """
+    parameters = {
+        "id": str(uuid4()),
+        "session_id": None,
+        "tool_name": tool,
+        "request": json.dumps(
+            {
+                "caller_user_id": caller_user_id,
+                "role": role,
+                "parameter_shape": parameter_shape,
+            },
+            default=str,
+            separators=(",", ":"),
+        ),
+        "response": json.dumps(
+            {"outcome": outcome, "error_class": error_class},
+            default=str,
+            separators=(",", ":"),
+        ),
+        "duration_ms": None,
+    }
+
+    execute = getattr(conn, "execute", None)
+    if callable(execute):
+        await execute(statement, parameters)
+        return True
+
+    cursor_factory = getattr(conn, "cursor", None)
+    if not callable(cursor_factory):
+        return False
+    cursor = cursor_factory()
+    if isawaitable(cursor):
+        cursor = await cursor
+    try:
+        await cursor.execute(statement, parameters)
+    finally:
+        close = cursor.close()
+        if isawaitable(close):
+            await close
+    return True
+
+
 async def insert_audit_record(
     conn: Any,
     *,
@@ -50,11 +121,13 @@ async def insert_audit_record(
     outcome: str,
     error_class: str | None = None,
 ) -> bool:
-    """Insert one audit row. Returns True on a real DB write, False if
-    the connection is a SQLite handle (skipped, mirrors the
-    deletion_log pattern)."""
+    """Insert one audit row using the active backend's bind contract.
+
+    Returns True on a real DB write and False when the connection has no
+    supported durable audit-table path.
+    """
     execute = getattr(conn, "execute", None)
-    if conn is None or not callable(execute) or _looks_like_sqlite_conn(conn):
+    if conn is None or _looks_like_sqlite_conn(conn):
         return False
 
     if outcome not in VALID_OUTCOMES:
@@ -63,6 +136,21 @@ async def insert_audit_record(
         # so an unexpected value doesn't surface as a generic
         # ConstraintError later.
         raise ValueError(f"invalid mcp_audit_log outcome {outcome!r}; expected one of: {sorted(VALID_OUTCOMES)}")
+
+    identity = _connection_identity(conn)
+    if "oracledb" in identity or "_db2asyncconnection" in identity:
+        return await _execute_oracle_compat_audit_insert(
+            conn,
+            caller_user_id=caller_user_id,
+            role=role,
+            tool=tool,
+            parameter_shape=parameter_shape,
+            outcome=outcome,
+            error_class=error_class,
+        )
+
+    if not callable(execute):
+        return False
 
     await execute(
         """

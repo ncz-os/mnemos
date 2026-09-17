@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import inspect
 import logging
 from typing import Any
 
@@ -16,6 +18,7 @@ from ._runtime import (
     _mcp_is_root,
     _mcp_user_required,
     _mnemos_base,
+    _nullable_schema,
     _rest_delete,
     _rest_get,
     _rest_post,
@@ -177,9 +180,18 @@ TOOLS = TOOL_REGISTRY
 
 
 def tool_input_schema(tool_info: dict[str, Any]) -> dict[str, Any]:
+    properties = copy.deepcopy(tool_info["parameters"])
+    handler = tool_info.get("handler")
+    if handler is not None:
+        parameters = inspect.signature(handler).parameters
+        for name, property_schema in properties.items():
+            parameter = parameters.get(name)
+            if parameter is not None and parameter.default is None:
+                properties[name] = _nullable_schema(property_schema)
+
     schema: dict[str, Any] = {
         "type": "object",
-        "properties": tool_info["parameters"],
+        "properties": properties,
     }
     if tool_info.get("required"):
         schema["required"] = tool_info["required"]
