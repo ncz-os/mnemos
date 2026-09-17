@@ -934,4 +934,4 @@ sudo journalctl -u mnemos -f
 ---
 
 **Maintained by:** Operations team
-**Status:** Active, current for the v6.4.1 production line
+**Status:** Active, current for the v7.0.0 production line

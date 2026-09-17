@@ -11,7 +11,46 @@ list wishlist items, speculative features, or aspirational claims.
 
 ## Current status — v7.0.0
 
-The 6.3 line is current. What it delivers:
+The 7.0 line is current.
+
+What v7.0.0 itself delivered — a consolidation release, not a feature release:
+
+- **A critical-path coverage gate.** `test:audit-coverage-gate` holds
+  `mnemos/audit/` at 100% statement and branch coverage. This is scoped to that
+  module, not a global percentage, and it carries **no exclusion pragmas** — an
+  earlier pass had exclusions that were masking genuinely reachable code, and
+  they were removed rather than kept.
+- **A generated backend parity matrix.** [`docs/BACKEND_PARITY.md`](./docs/BACKEND_PARITY.md)
+  is produced by `scripts/generate_backend_parity_matrix.py` and gated against
+  drift by the `lint:backend-parity` job. That gate previously existed only on
+  the GitHub mirror workflow, so canonical GitLab CI never enforced it; it now
+  runs on both. The matrix reports static surfaces and test *candidates* with
+  explicit limits — it cannot distinguish a skipped, mocked or irrelevant test
+  from a real one, and does not claim to.
+- **One mechanical backend-file split.** `OracleAuditChainRepository` and the
+  journal methods moved out of `persistence/oracle.py` into `oracle_audit.py`
+  (with shared driver helpers in `oracle_helpers.py`), as a proof of the pattern
+  before the rest of the largest backend files are touched.
+  `tools/verify_method_move.py` checks such a move at the AST level and is wired
+  into CI. It explicitly disclaims dynamic and transitive semantic equivalence;
+  execution tests remain necessary.
+- **Phase 1 of a real SQLite throughput benchmark.**
+  `scripts/bench_sqlite_throughput_phase1.py` with provenance-tagged results
+  under `docs/proof/`. Phase 1 only: corpus 1k/10k, concurrency 1/5/10, local
+  SQLite. **Phase 2 — 100k/1M corpus, concurrency 25/50/100, packing density —
+  has not been performed** and is blocked on an operator hardware-allocation
+  decision. The harness measures overlapping tasks queued at one backend lock,
+  not parallel database writers, real embeddings, or end-to-end API throughput.
+- **CHARON intra-page streaming export**, distinct from the still-deferred MPF
+  v0.3 cross-page snapshot consistency work.
+
+The full adversarial-review trail for the release, including what was found
+wrong in the `7.0.0.dev0` line and fixed before the pin, is in
+[`docs/V7_REVIEW_REMEDIATION.md`](./docs/V7_REVIEW_REMEDIATION.md). Work merged
+to `master` after the v7.0.0 tag — and therefore not in the published artifact —
+is listed under *Unreleased* in [`CHANGELOG.md`](./CHANGELOG.md).
+
+Carried forward from the 6.x line:
 
 - **MIF 1.0 as the native portability format.** The CHARON adapter does a
   lossless round trip through MIF bundles (concept files plus a manifest) with
@@ -52,7 +91,9 @@ deterministic judge scoring, and SHA-256 batch hashing behind
 
 ---
 
-## Planned — v7.0 — Rust persistence layer
+## Planned — Rust persistence layer
+
+No release is committed to this yet; v7.0.0 shipped without it.
 
 **Goal:** move the database persistence layer — today a Python
 `PersistenceBackend` contract with per-engine implementations — onto a Rust

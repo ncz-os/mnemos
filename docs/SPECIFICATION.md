@@ -1,7 +1,8 @@
 # MNEMOS Specification
 
-**Version**: v7.0.0 current (patch release on the v6.0.0 split-distribution line; supersedes the v5.0.1 / v5.0.0
-GA line from 2026-05-02). Oracle AI Database 26ai, IBM Db2 12.1.5, MySQL and MariaDB
+**Version**: v7.0.0 current (major release; continues the v6.0.0
+split-distribution line and supersedes the v5.0.1 / v5.0.0 GA line from
+2026-05-02). Oracle AI Database 26ai, IBM Db2 12.1.5, MySQL and MariaDB
 backends sit behind the EPIMONE `PersistenceBackend` ABC alongside PostgreSQL and SQLite.
 
 > **Packaging note (v6.0.0).** Where this spec says "the `mnemos/` package," that is

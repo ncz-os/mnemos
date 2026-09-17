@@ -30,20 +30,25 @@ container/process.
 Dependency direction is enforced at runtime (the layer validators) and at
 install time (extras chaining in `pyproject.toml`).
 
-## Axis 2 — Published images (OCI layering)
+## Axis 2 — Published image (OCI layering)
 
-The image matrix is a small, principled set — **not** a combinatorial matrix.
-Each image is built `FROM` the one above, so the heavy base (llama-cpp-python
-compile + baked GGUF embedder) is built once and shared via registry layer
-dedup.
+One image is published. The build is still layered — each stage is built `FROM`
+the one above, so the heavy base (llama-cpp-python compile + baked GGUF
+embedder) is built once — but the intermediate stages never reach the registry,
+so the layering is a build-time optimisation rather than a pull-time one.
 
 ```
-ghcr.io/ncz-os/mnemos-core           kernel                       amd64 + arm64
-        └─ ghcr.io/ncz-os/mnemos      + graeae+pantheon+knemon+charon  amd64 + arm64   ← canonical "everything"
-              └─ ghcr.io/ncz-os/mnemos-enterprise  + Oracle/Db2/MySQL  amd64 ONLY
-
-ghcr.io/ncz-os/mnemos-stiphos        hive service (FROM core)     amd64 + arm64
+core layer (Dockerfile.core)              kernel                          build-context only
+  └─ everything layer (Dockerfile.everything)  + graeae+pantheon+knemon+charon  build-context only
+       └─ ghcr.io/ncz-os/mnemos-enterprise     + Oracle/Db2/MySQL          amd64 + arm64  ← the ONLY published image
 ```
+
+Only the final enterprise image is pushed. The core and everything layers are
+passed between BuildKit Bake targets as in-memory named contexts and are never
+pushed or tagged as their own packages; `ghcr.io/ncz-os/mnemos-core` and
+`ghcr.io/ncz-os/mnemos` exist in the registry but stopped being published at
+6.2.5. STIPHOS has no container image at all -- it is pip-only
+(`mnemos-stiphos`) and runs as its own service on port 8080.
 
 Why not a separate "core+graeae" image tier? graeae/pantheon/knemon/charon all
 mount into the **one** `mnemos.api.main:app` process and are runtime-gated, so a
@@ -52,19 +57,22 @@ one; the other three are nearly free. The only real image boundaries are:
 kernel · full-API · separate hive service · heavy enterprise drivers.
 
 Build sources: `Dockerfile.core`, `Dockerfile.everything`, `Dockerfile.enterprise`
-(core repo) and `Dockerfile` (mnemos-stiphos repo). Published by
-`.github/workflows/release-images.yml`.
+(core repo). Published by `.github/workflows/release-images.yml`, whose own
+header calls `mnemos-enterprise` "the one supported MNEMOS container package".
 
 ### Multi-arch notes
 
-- `mnemos-core` / `mnemos` / `mnemos-stiphos` are multi-arch (`amd64` + `arm64`).
+- `mnemos-enterprise` is multi-arch (`amd64` + `arm64`) — one OCI index, not
+  two images; `docker`/`podman pull` resolves the platform layer.
 - `llama-cpp-python` is the only base dep that compiles from source — it builds
   per-arch (AVX on amd64, NEON on arm64). Everything else ships aarch64 wheels.
 - The everything image installs add-on wheels **explicitly**, never via
   `mnemos-core[full]`, because `full` no longer pulls the Intel-only
   `openvino` accelerator (x86-only). Accelerators are host-opt-in.
-- `mnemos-enterprise` is **amd64-only** (`ibm_db` has no reliable arm64 wheel;
-  enterprise big iron is x86). Other arches are a sponsor-provided-CI request.
+- **Db2 is the only amd64 restriction**: `ibm_db` has no reliable arm64 wheel,
+  so Db2 support is present on the amd64 layer only. Oracle (thin), MySQL and
+  MariaDB work on both arches. Other arches (`ppc64le`, `s390x`) are a
+  sponsor-provided-CI request.
 
 ## Axis 3 — Storage backend (runtime, behind EPIMONE)
 
@@ -77,7 +85,7 @@ default baked into every image.
 |---|---|---|
 | SQLite + sqlite-vec | bundled | all (default) |
 | PostgreSQL + pgvector | `asyncpg` (bundled) | all |
-| Oracle Database 26ai | `oracledb` (thin) | `mnemos-enterprise`, or `mnemos` + `pip install oracledb` |
+| Oracle Database 26ai | `oracledb` (thin) | `mnemos-enterprise`, or a pip install plus `pip install oracledb` |
 | IBM Db2 12.1.5 | `ibm_db` | `mnemos-enterprise` |
 | MySQL 9.0+ | `aiomysql` | `mnemos-enterprise` |
 
@@ -89,11 +97,11 @@ lacks.
 
 | You want | Use |
 |---|---|
-| Minimal memory kernel, edge/embedded | `mnemos-core` image, or `pip install 'mnemos-core[sqlite]'` |
-| Full agent stack, any arch | `mnemos` image, or `pip install 'mnemos-core[server]'` |
+| Minimal memory kernel, edge/embedded | `pip install 'mnemos-core[sqlite]'` |
+| Full agent stack, any arch | `mnemos-enterprise` image, or `pip install 'mnemos-core[server]'` |
 | Full stack on Oracle/Db2/MySQL | `mnemos-enterprise` image |
-| Fleet coordination / job queue | `mnemos-stiphos` image (alongside the above) |
-| A custom subset | `FROM ghcr.io/ncz-os/mnemos-core` + `pip install` the dists you want |
+| Fleet coordination / job queue | `pip install mnemos-stiphos` (alongside the above) |
+| A custom subset | `pip install` the dists you want onto `mnemos-core` |
 
 See [INSTALL.md](INSTALL.md) for commands and [../AGENTS.md](../AGENTS.md) for
 the machine-readable agent install matrix.

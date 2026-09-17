@@ -1,4 +1,4 @@
-# Known limitations — v6.4
+# Known limitations — v7.0.0
 
 This file lists known operational caveats that aren't bugs in the strict
 sense but are worth surfacing for self-hosting operators. Each entry gives
@@ -80,6 +80,44 @@ UPDATE deletion_requests
 **Proper fix:** the same write-fence story as the final-verify race. Until
 then, bounded retry plus manual recovery is a reasonable shape for
 self-hosted MNEMOS, where operators have direct database access.
+
+## Parts of the HTTP surface still require a PostgreSQL pool
+
+**Where:** every call site of
+`mnemos.api.persistence_helpers.require_postgres_pool_or_503`.
+
+**Symptom:** the routes below hand-roll PostgreSQL SQL against
+`lifecycle.get_pool_manager()` rather than going through the persistence ABC.
+Core populates `lifecycle._pool` only for the PostgreSQL profile, so on SQLite,
+MySQL, MariaDB, Oracle and Db2 each returns **HTTP 503** with an explanatory
+detail. They fail loudly, not silently.
+
+| Module | Routes |
+|---|---|
+| `api/routes/admin.py` | `POST`/`GET /admin/users`; `POST`/`GET`/`PATCH`/`DELETE /admin/oauth/providers`; `GET /admin/oauth/identities` |
+| `api/routes/webhooks.py` | all five: `POST`/`GET /v1/webhooks`, `GET`/`DELETE /v1/webhooks/{id}`, `GET /v1/webhooks/{id}/deliveries` |
+| `api/routes/kg.py` | `POST`/`GET`/`PATCH`/`DELETE /v1/kg/triples`, `GET /v1/kg/timeline/{subject}` |
+| `api/routes/versions.py` | `GET .../versions`, `GET .../versions/{n}`, `GET .../diff`, `POST .../revert/{n}` |
+| `api/routes/dag.py` | `GET .../log`, `GET .../branches`, `POST .../branch`, `GET .../commits/{hash}`, `POST .../merge` |
+| `api/routes/memories.py` | `GET /v1/memories/{id}?restore=true`, `GET /v1/memories/{id}/compression-manifests`, `POST /v1/memories/rehydrate` |
+| `api/routes/kronos.py` | `GET /admin/kronos/anomalies`, `/drift`, `/forecast` |
+
+**Not all of these are the same kind of gap.** KRONOS is PostgreSQL-only *by
+design* (see [docs/KRONOS.md](docs/KRONOS.md)). The webhook routes are the
+opposite case: a complete `WebhookRepository` ABC is already implemented for all
+six backends (`persistence/{postgres,sqlite,mysql,mariadb,oracle,db2}.py`) and
+the routes simply do not use it. `POST`/`GET /admin/users` need their own
+migrations first — SQLite's `users` table has no `display_name`/`email` and
+requires a NOT NULL UNIQUE `username`, and MySQL's has no `created_at`.
+
+**Recovery:** run the `server` profile on PostgreSQL if a deployment depends on
+these surfaces. Memory CRUD, search, sessions, the API-key admin routes and —
+as of the change listed under *Unreleased* in [CHANGELOG.md](CHANGELOG.md) — the
+CHARON `/v1/export` and `/v1/import` routes work on every backend.
+
+**Note:** the machine-generated [docs/BACKEND_PARITY.md](docs/BACKEND_PARITY.md)
+tracks capability groups at the persistence layer. It does not track which HTTP
+routes bypass that layer, which is what this entry records.
 
 ## MCP audit log is written only on PostgreSQL
 
