@@ -181,14 +181,27 @@ def test_no_stale_docker_image_tag():
     not match the real published org (`ncz-os`) -- the mismatch meant
     this guard matched nothing and a stale `:6.1` pin in DEPLOYMENT.md
     went undetected. Every image reference in this repo is
-    `ghcr.io/ncz-os/*`; keep this pattern pointed at the real org."""
+    `ghcr.io/ncz-os/*`; keep this pattern pointed at the real org.
+
+    The same failure repeated on 2026-09-16 one level down: the pattern
+    named the `mnemos` image specifically, but the only image actually
+    published is `mnemos-enterprise`, so stale `:6.3.7`, `:6.3` and
+    `:6.4` pins sat in four docs while this test passed. The image-name
+    part is now a prefix match, and the scanned set includes the two
+    operator docs (QUICK_START_REQUIREMENTS.md, docs/INSTALL.md) that
+    carried pins and were never looked at.
+
+    `latest` and placeholder tags (`x.y.z`, `<old-version>`) do not match
+    `[0-9.]+` and are deliberately left alone."""
     version = _current_version()
     pattern = re.compile(
-        r"ghcr\.io/ncz-os/mnemos:(?P<v>[0-9.]+)"
+        r"ghcr\.io/ncz-os/mnemos[a-z-]*:(?P<v>[0-9]+(?:\.[0-9]+)*)"
     )
     bad: list[str] = []
     operator_docs: list[Path] = [REPO / "README.md",
-                                 REPO / "DEPLOYMENT.md"]
+                                 REPO / "DEPLOYMENT.md",
+                                 REPO / "QUICK_START_REQUIREMENTS.md",
+                                 REPO / "docs" / "INSTALL.md"]
     if (REPO / "docs" / "connectors").exists():
         operator_docs.extend(
             (REPO / "docs" / "connectors").glob("*.md")
@@ -211,6 +224,37 @@ def test_no_stale_docker_image_tag():
     assert not bad, (
         f"{len(bad)} stale Docker image tag(s):\n"
         + "\n".join(bad)
+    )
+
+
+def test_no_stale_pin_advice_in_prose():
+    """Prose telling operators which tag to pin must name the live version.
+
+    README.md and QUICK_START_REQUIREMENTS.md both carry a sentence of the
+    form "Pin an exact version (`:X`)". It sits outside any `ghcr.io/...`
+    URL, so the image-tag guard above cannot see it, and both drifted --
+    README said `:6.4` and QUICK_START said `:6.3` while the package was at
+    7.0.0. Two earlier commits fixed this same sentence by hand (`:6.2` ->
+    `:6.3`, `:6.3` -> `:6.4`) without pinning it, so it drifted again.
+    """
+    version = _current_version()
+    pattern = re.compile(
+        r"Pin (?:an exact version|the minor line) \(`:(?P<v>[0-9][0-9.]*)`\)"
+    )
+    bad: list[str] = []
+    for md in _markdown_files():
+        for lineno, line in enumerate(md.read_text().splitlines(), start=1):
+            m = pattern.search(line)
+            if not m:
+                continue
+            if m.group("v") == version:
+                continue
+            bad.append(
+                f"  {md.relative_to(REPO)}:{lineno}: pin advice names "
+                f":{m.group('v')}, expected :{version}"
+            )
+    assert not bad, (
+        f"{len(bad)} stale pin-advice string(s):\n" + "\n".join(bad)
     )
 
 

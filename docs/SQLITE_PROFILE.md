@@ -66,6 +66,57 @@ Where the terminal-success invariant is enforced also differs: Postgres uses a
 trigger, while the SQLite profile enforces it in `mnemos.webhooks.finalize`
 because the profile does not rely on trigger functions for retry-chain safety.
 
+## What Works On This Profile, And What Does Not
+
+Two long-standing PostgreSQL-only paths were closed on `master` after the
+v7.0.0 tag, so they are **not in the published `7.0.0` artifact**; see the
+*Unreleased* section of [`CHANGELOG.md`](../CHANGELOG.md).
+
+### API keys can now be minted here
+
+Looking a key up had been backend-neutral since v6.3, but *creating* one was
+PostgreSQL-only in both the admin route and the installer, so this profile could
+authenticate with a key and never produce one. Both now go through
+`OAuthRepository`. A second, quieter bug is fixed with it: PostgreSQL has seeded
+the `default` root user since `migrations_v1_multiuser.sql` and SQLite never
+did, so `api_keys.user_id` had nothing to join against and every minted key was
+silently dropped by `lookup_api_key`'s INNER JOIN.
+`migrations_v7_0_default_user_seed_sqlite.sql` seeds that row; seeding grants
+nothing on its own.
+
+### MPF export and import now run here
+
+The CHARON `/v1/export` and `/v1/import` path reached the database through a
+raw-asyncpg module and was gated behind a PostgreSQL pool check. It now uses the
+persistence ABC throughout and runs on this profile. The export's consistency
+guarantee is real here but is **reached by a different mechanism than on the
+other five backends**, and that is worth understanding before relying on it:
+
+- SQLite has no `READ COMMITTED` / `REPEATABLE READ` vocabulary — only
+  `DEFERRED` / `IMMEDIATE` / `EXCLUSIVE` locking modes. In **WAL mode** (which
+  this profile enables) a read transaction sees a snapshot taken at its first
+  read and nothing committed afterwards, which is the property the export needs.
+- A `BEGIN DEFERRED` does not take that snapshot until the first actual read, so
+  the implementation issues a trivial `SELECT` immediately after `BEGIN` to pin
+  it at transaction entry. Without that, rows committed in between would be
+  visible and the guarantee would be quietly weaker.
+- `readonly=True` is a server-enforced prohibition on the other five backends
+  and only a snapshot/locking hint here. A write issued on a `readonly=True`
+  SQLite transaction still succeeds; do not rely on SQLite to *reject* one.
+
+Round-tripping (export, restore into a second empty database, idempotent
+re-import, tenant/vault scoping, and a concurrent-write snapshot test) is
+live-tested on this profile.
+
+### Still returns 503 here
+
+`POST`/`GET /admin/users`, the OAuth provider/identity admin routes, all five
+`/v1/webhooks` routes, `/v1/kg/*`, the version and DAG routes,
+`/v1/memories/{id}/compression-manifests`, `restore=true`,
+`POST /v1/memories/rehydrate`, and the KRONOS routes still require a PostgreSQL
+pool. The full list, and which of them are deliberate, is in
+[`KNOWN_LIMITATIONS.md`](../KNOWN_LIMITATIONS.md).
+
 ## Configuration
 
 Install the optional dependencies:

@@ -11,10 +11,10 @@ run the container image. Use SQLite for `edge`/`dev`, or PostgreSQL 16 for
 ## Container (Fastest Deploy)
 
 ```bash
-docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:6.3
+docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:7.0.0
 ```
 
-SQLite-backed, zero configuration, no host Python. Pin the minor line (`:6.3`)
+SQLite-backed, zero configuration, no host Python. Pin an exact version (`:7.0.0`)
 to keep a fleet on identical code.
 
 **Total Time**: ~2 minutes
