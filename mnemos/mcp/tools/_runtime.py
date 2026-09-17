@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
 import re
 import urllib.parse
 from typing import Any
@@ -316,3 +317,19 @@ def _tool(
         "required": required or [],
         "handler": handler,
     }
+
+
+def _nullable_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return a JSON Schema that accepts the original value or ``null``.
+
+    MCP clients validate tool arguments against this advertised schema before
+    dispatch.  Keep the non-null branch intact so constraints such as enums,
+    lengths, and array item schemas are preserved exactly.
+    """
+    if schema.get("type") == "null" or any(
+        isinstance(branch, dict) and branch.get("type") == "null"
+        for keyword in ("anyOf", "oneOf")
+        for branch in schema.get(keyword, [])
+    ):
+        return copy.deepcopy(schema)
+    return {"anyOf": [copy.deepcopy(schema), {"type": "null"}]}

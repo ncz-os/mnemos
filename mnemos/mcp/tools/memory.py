@@ -19,6 +19,7 @@ from ._runtime import (
     _rest_get,
     _rest_get_text,
     _rest_post,
+    _nullable_schema,
     _safe_path_segment,
     _safe_path_value,
     _tool,
@@ -222,13 +223,15 @@ async def tool_get_memory(
 
 async def tool_create_memory(
     content: str,
-    category: str = "facts",
+    category: str | None = "facts",
     subcategory: str | None = None,
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     permission_mode: int | None = None,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
+    if category is None:
+        category = "facts"
     _safe_path_value(category, label="category", max_length=128)
     subcategory = _validate_optional_filter(subcategory, label="subcategory")
     body: dict[str, Any] = {"content": content, "category": category}
@@ -315,6 +318,8 @@ async def tool_bulk_create_memories(
             _validate_tags(row["tags"])
         if "namespace" in row and row["namespace"] is not None:
             _safe_path_value(row["namespace"], label=f"memories[{i}].namespace", max_length=128)
+        if row.get("category") is None:
+            row["category"] = "facts"
     ns = _connector_namespace()
     if ns:
         # Connector-scope env wins over per-row namespace. The
@@ -416,7 +421,10 @@ TOOLS: dict[str, dict[str, Any]] = {
         "Store a new memory in MNEMOS.",
         {
             "content": {"type": "string"},
-            "category": {"type": "string", "default": "facts"},
+            "category": {
+                **_nullable_schema({"type": "string"}),
+                "default": "facts",
+            },
             "subcategory": {"type": "string"},
             "tags": {
                 "type": "array",
@@ -468,15 +476,26 @@ TOOLS: dict[str, dict[str, Any]] = {
                     "type": "object",
                     "properties": {
                         "content": {"type": "string"},
-                        "category": {"type": "string", "default": "facts"},
-                        "subcategory": {"type": "string"},
-                        "tags": {
-                            "type": "array",
-                            "maxItems": MAX_TAGS_PER_REQUEST,
-                            "items": {"type": "string", "maxLength": MAX_TAG_LENGTH},
+                        "category": {
+                            **_nullable_schema({"type": "string"}),
+                            "default": "facts",
                         },
-                        "metadata": {"type": "object"},
-                        "verbatim_content": {"type": "string"},
+                        "subcategory": _nullable_schema({"type": "string"}),
+                        "tags": _nullable_schema(
+                            {
+                                "type": "array",
+                                "maxItems": MAX_TAGS_PER_REQUEST,
+                                "items": {"type": "string", "maxLength": MAX_TAG_LENGTH},
+                            }
+                        ),
+                        "metadata": _nullable_schema({"type": "object"}),
+                        "verbatim_content": _nullable_schema({"type": "string"}),
+                        "permission_mode": _nullable_schema(
+                            {
+                                "type": "integer",
+                                "description": "Unix-style octal permission digits, e.g. 600 or 644",
+                            }
+                        ),
                     },
                     "required": ["content"],
                 },

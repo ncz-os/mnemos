@@ -9,6 +9,7 @@ direct database helpers for another.
 from __future__ import annotations
 
 import logging
+import inspect
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -105,6 +106,78 @@ def test_array_typed_tool_parameters_have_explicit_caps():
     for tool_name, param_name, schema in array_params:
         assert "maxItems" in schema, f"{tool_name}.{param_name} lacks maxItems"
         assert schema["maxItems"] <= 100
+
+
+def test_none_default_tool_parameters_are_nullable_in_advertised_schema():
+    """Every handler argument that accepts ``None`` must advertise it.
+
+    MCP clients validate against ``inputSchema`` before dispatch, so a Python
+    default of ``None`` paired with a non-null schema makes the handler's own
+    optional contract unreachable for clients that send explicit JSON nulls.
+    """
+    from jsonschema import Draft202012Validator
+
+    from mnemos.mcp.tools import TOOL_REGISTRY, tool_input_schema
+
+    mismatches = []
+    for tool_name, tool_info in TOOL_REGISTRY.items():
+        schema = tool_input_schema(tool_info)
+        signature = inspect.signature(tool_info["handler"])
+        for parameter_name, parameter in signature.parameters.items():
+            if parameter_name not in schema["properties"]:
+                continue
+            if parameter.default is None and not Draft202012Validator(schema["properties"][parameter_name]).is_valid(
+                None
+            ):
+                mismatches.append(f"{tool_name}.{parameter_name}")
+
+    assert mismatches == []
+
+
+@pytest.mark.asyncio
+async def test_create_memory_accepts_explicit_null_for_every_optional_field():
+    """Regression for the exact MCP payload rejected by 6.3.7 through 7.0.0."""
+    from jsonschema import Draft202012Validator
+
+    from mnemos.mcp.tools import TOOL_REGISTRY, tool_input_schema
+    from mnemos.mcp.tools import memory as mcp_memory
+
+    arguments = {
+        "content": "Test minimal memory.",
+        "category": None,
+        "subcategory": None,
+        "tags": None,
+        "metadata": None,
+        "permission_mode": None,
+    }
+    Draft202012Validator(tool_input_schema(TOOL_REGISTRY["create_memory"])).validate(arguments)
+
+    with patch.object(
+        mcp_memory,
+        "_rest_post",
+        new=AsyncMock(return_value={"id": "mem_test"}),
+    ) as mock_post:
+        result = await mcp_memory.tool_create_memory(**arguments)
+
+    assert result == {"id": "mem_test"}
+    mock_post.assert_awaited_once_with(
+        "/v1/memories",
+        {"content": "Test minimal memory.", "category": "facts"},
+    )
+
+
+def test_memory_create_and_update_nullable_fields_use_any_of_null():
+    from mnemos.mcp.tools import TOOL_REGISTRY, tool_input_schema
+
+    for tool_name, fields in {
+        "create_memory": ("category", "subcategory", "tags", "metadata", "permission_mode"),
+        "update_memory": ("content", "category", "subcategory", "tags", "metadata", "permission_mode"),
+    }.items():
+        properties = tool_input_schema(TOOL_REGISTRY[tool_name])["properties"]
+        for field in fields:
+            assert any(branch == {"type": "null"} for branch in properties[field].get("anyOf", [])), (
+                f"{tool_name}.{field} does not advertise JSON null"
+            )
 
 
 @pytest.mark.asyncio
