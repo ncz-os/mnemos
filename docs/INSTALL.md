@@ -13,29 +13,36 @@ There are two ways to deploy: **pre-built container images** (turnkey) or
 
 ## 1. Container images (recommended)
 
-Published to `ghcr.io/ncz-os`. Composition is OCI-layered: each image is built
-`FROM` the one above it, so the heavy base is pulled once and shared.
+**One image is published**: `ghcr.io/ncz-os/mnemos-enterprise`.
 
 | Image | Contains | Arch | Pull |
 |---|---|---|---|
-| `ghcr.io/ncz-os/mnemos-core` | Kernel: EPIMONE persistence (SQLite default), API, MCP, in-process embedder | `amd64` + `arm64` | `docker pull ghcr.io/ncz-os/mnemos-core` |
-| `ghcr.io/ncz-os/mnemos` | **Everything**: core + GRAEAE + PANTHEON + KNEMON + CHARON, one API process | `amd64` + `arm64` | `docker pull ghcr.io/ncz-os/mnemos` |
-| `ghcr.io/ncz-os/mnemos-enterprise` | Everything + Oracle / Db2 / MySQL drivers | `amd64` only | `docker pull ghcr.io/ncz-os/mnemos-enterprise` |
-| `ghcr.io/ncz-os/mnemos-stiphos` | STIPHOS hive service (separate process) | `amd64` + `arm64` | `docker pull ghcr.io/ncz-os/mnemos-stiphos` |
+| `ghcr.io/ncz-os/mnemos-enterprise` | **Everything**: core + GRAEAE + PANTHEON + KNEMON + CHARON in one API process, plus the Oracle / MySQL / MariaDB / Db2 drivers | `amd64` + `arm64` (Db2 driver on the amd64 layer only) | `docker pull ghcr.io/ncz-os/mnemos-enterprise:7.0.0` |
 
-> **`mnemos` is the canonical "everything" image** and the same artifact the
-> reference quadlet deploys.
+The build is still OCI-layered internally -- `Dockerfile.core` and
+`Dockerfile.everything` are separate BuildKit Bake targets built `FROM` one
+another -- but those intermediate layers are passed between targets as
+in-memory named contexts and are **never pushed or tagged** as their own
+packages. See `.github/workflows/release-images.yml` and
+[RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md). The `ghcr.io/ncz-os/mnemos` and
+`ghcr.io/ncz-os/mnemos-core` packages still exist in the registry but stopped
+being published at 6.2.5; do not pull them for a v7 deployment.
 
-> **Enterprise is amd64-only by policy.** The Oracle thin driver would run on
-> arm64, but `ibm_db` (Db2) has no reliable arm64 wheel and the enterprise
-> audience runs x86. Other arches (Power/`ppc64le`, LinuxONE/`s390x`,
-> Ampere/`arm64`) are available on request with sponsor-provided build + CI
-> resources, because the native drivers need validation on that hardware.
+> **Db2 is the only amd64 restriction.** The published manifest is a real
+> multi-arch OCI index (verified: `7.0.0` resolves to `linux/amd64` and
+> `linux/arm64`), and Oracle/MySQL/MariaDB work on both. `ibm_db` has no
+> reliable arm64 wheel, so Db2 support is present on the amd64 layer only.
+> Other arches (Power/`ppc64le`, LinuxONE/`s390x`) are available on request
+> with sponsor-provided build + CI resources, because the native drivers need
+> validation on that hardware.
+
+> **STIPHOS has no container image.** It is pip-only (`mnemos-stiphos`) and
+> runs as its own service on its own port; see the pip section below.
 
 ### Run the everything image (SQLite, zero config)
 
 ```bash
-docker run --rm -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos:latest
+docker run --rm -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:7.0.0
 # → http://localhost:5002/health
 ```
 
@@ -47,14 +54,14 @@ The backend is chosen by `MNEMOS_DATABASE_DSN` at runtime — no rebuild:
 # PostgreSQL + pgvector
 docker run -p 5002:5002 \
   -e MNEMOS_DATABASE_DSN='postgres://user:pass@host:5432/mnemos' \
-  ghcr.io/ncz-os/mnemos:latest
+  ghcr.io/ncz-os/mnemos-enterprise:7.0.0
 
-# Oracle Database 26ai (thin mode — works on the everything image, no enterprise image needed)
+# Oracle Database 26ai (thin mode — no extra driver install needed)
 docker run -p 5002:5002 \
   -e MNEMOS_DATABASE_DSN='oracle://MNEMOS:pass@host:1521/ORCLPDB1' \
-  ghcr.io/ncz-os/mnemos:latest
+  ghcr.io/ncz-os/mnemos-enterprise:7.0.0
 
-# IBM Db2 — needs the enterprise image (ibm_db driver)
+# IBM Db2 — amd64 layer only (the ibm_db driver has no arm64 wheel)
 docker run -p 5002:5002 \
   -e MNEMOS_DATABASE_DSN='db2://MNEMOS:pass@host:50000/MNEMOS' \
   ghcr.io/ncz-os/mnemos-enterprise:latest
@@ -86,10 +93,13 @@ docker run -p 5002:5002 \
 > is the zero-dependency edge/dev default; Oracle 26ai and IBM Db2 12.1.5 target
 > enterprise/big-iron deployments.
 
-### Run the STIPHOS hive service (separate container)
+### Run the STIPHOS hive service (separate process)
+
+STIPHOS ships no container image. Install it alongside any deployment and run
+it as its own service on its own port:
 
 ```bash
-docker run -p 8080:8080 -v stiphos-data:/data ghcr.io/ncz-os/mnemos-stiphos:latest
+pip install mnemos-stiphos
 # → http://localhost:8080/health
 ```
 

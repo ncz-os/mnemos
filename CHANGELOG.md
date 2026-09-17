@@ -57,6 +57,84 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+Landed on `master` after the v7.0.0 tag, so **not present in the published
+`7.0.0` image or wheel**.
+
+### Fixed
+
+- **API-key creation is backend-neutral.** Minting a key was PostgreSQL-only in
+  two places while *looking one up* had been backend-neutral since v6.3, so an
+  operator on the SQLite edge profile could authenticate with a key but had no
+  supported way to create one: `POST /admin/users/{user_id}/apikeys` sat behind
+  `require_postgres_pool_or_503` and then ran a raw asyncpg INSERT (GET and
+  DELETE on the same table did the same), and `mnemos install`'s
+  `create_api_key` tried asyncpg, psycopg, psycopg2 and the `psql` CLI — all
+  four PostgreSQL-only — so an edge/dev install finished with no usable
+  credential. `OAuthRepository` gains five abstract methods (`user_exists`,
+  `count_active_api_keys`, `create_api_key`, `list_api_keys`,
+  `revoke_api_key`) implemented on all six backends, with a shared
+  `build_api_key_row` normalising six genuinely divergent `api_keys` tables
+  into one Row shape. The caller still generates and hashes the secret; the
+  repository never sees plaintext, matching `lookup_api_key`.
+  Live-verified on SQLite, PostgreSQL 17, MySQL 9.1 and MariaDB 12.3.
+  **Oracle and Db2 are code-reviewed against their migrations only and are not
+  live-tested.**
+- **SQLite deployments could mint a key that never worked.** PostgreSQL has
+  seeded the `default` root user since `migrations_v1_multiuser.sql`; SQLite
+  never did, so `api_keys.user_id` had nothing to join against and
+  `lookup_api_key`'s INNER JOIN silently dropped every key.
+  `migrations_v7_0_default_user_seed_sqlite.sql` seeds the row. Seeding grants
+  nothing on its own — a key must still be minted.
+- **`DELETE /admin/apikeys/{id}` with a malformed id** returned 500 on
+  PostgreSQL (the id reached the database as `$1::uuid`); it now validates the
+  UUID first and 404s like any other unknown id.
+- **`insert_memory` did not signal duplicates uniformly.** Five backends return
+  `"INSERT 0 0"`; SQLite raises `DuplicateMemoryError`. That divergence is
+  deliberate and stays, but any caller wanting an idempotent insert had to
+  handle both shapes — checking one silently broke the other. The predicate is
+  promoted to `persistence.base.is_duplicate_memory_error` so CHARON uses it
+  rather than growing a second copy.
+- **`scripts/ci_apply_postgres_migrations.py` could not connect at all.** It set
+  `PGOPTIONS="-c ON_ERROR_STOP=1"`, but that is a `psql` client variable, not a
+  server GUC, and PostgreSQL 17 rejects it with `FATAL: unrecognized
+  configuration parameter`. Unnoticed because its only caller,
+  `test:integration`, is gated behind `RUN_DB_TESTS`.
+
+### Added
+
+- **Persistence primitives for a backend-neutral export.** `transactional()`
+  takes `isolation=` and `readonly=`; `Transaction.savepoint()` /
+  `NestableTransaction` give explicit nested scopes; `fetch_server_now()`
+  returns the *database* clock (the MPF export anchors its cursor on it, so app
+  vs DB clock skew would admit or drop rows); and
+  `fetch_visible_export_memory_ids` / `fetch_deletion_log_for_export` supply the
+  neutral projection. A requested isolation level a backend cannot honor raises
+  rather than silently downgrading.
+  SQLite reaches the same guarantee by a **different mechanism**: it has no
+  `REPEATABLE READ` vocabulary, so the implementation relies on the WAL-mode
+  read snapshot and pins it with a probe `SELECT` immediately after `BEGIN`.
+  `readonly=True` is a server-enforced prohibition on the other five backends
+  and only a snapshot/locking hint on SQLite — a write issued on such a
+  transaction there still succeeds. See the `transactional()` docstring in
+  `mnemos/persistence/base.py`.
+  Live-tested against PostgreSQL 17 (pgvector) and SQLite;
+  **MySQL, MariaDB, Oracle and Db2 are code-reviewed against their dialects and
+  migration schemas, not live-tested.**
+
+### Changed
+
+- Add-on CI/release pins moved to the reviewed GRAEAE / KNEMON / PANTHEON /
+  CHARON tips.
+
+### Known to be unchanged
+
+`POST`/`GET /admin/users`, the OAuth provider and identity admin routes, all
+five `/v1/webhooks` routes, `/v1/kg/*`, `/v1/memories/{id}/versions` and
+friends, `/v1/memories/{id}/compression-manifests`, `restore=true`,
+`POST /v1/memories/rehydrate`, the DAG routes and the KRONOS routes still
+require a PostgreSQL pool and return 503 elsewhere. See
+[KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md).
+
 ## [7.0.0] — 2026-09-16
 
 ### v7.0.0 release
