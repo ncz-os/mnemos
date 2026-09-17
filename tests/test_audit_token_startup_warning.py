@@ -211,3 +211,53 @@ def test_module_calls_helper_at_import_time():
         "expected unconditional call site `_warn_if_audit_token_unset(_settings)` "
         "after the helper definition; otherwise the warning never fires."
     )
+
+
+def test_audit_chain_startup_warns_for_missing_root_key(fresh_caplog, monkeypatch):
+    from mnemos.api.main import _validate_audit_chain_startup
+
+    monkeypatch.setattr("mnemos.core.config.audit_chain_enabled_flag", lambda: True)
+    monkeypatch.setattr("mnemos.core.config.audit_chain_key_required", lambda: False)
+    monkeypatch.setattr(
+        "mnemos.audit.load_root_keypair",
+        lambda: (_ for _ in ()).throw(ValueError("missing test key")),
+    )
+
+    assert _validate_audit_chain_startup() is True
+    full_text = " ".join(rec.message for rec in fresh_caplog.records)
+    assert "MNEMOS_AUDIT_CHAIN is enabled" in full_text
+    assert "no usable MNEMOS_AUDIT_ROOT_PRIVKEY" in full_text
+    assert "audit entries cannot be sealed" in full_text
+    assert "MNEMOS_REQUIRE_AUDIT_CHAIN_KEY=YES" in full_text
+
+
+def test_audit_chain_startup_can_require_root_key(fresh_caplog, monkeypatch):
+    from mnemos.api.main import _validate_audit_chain_startup
+
+    monkeypatch.setattr("mnemos.core.config.audit_chain_enabled_flag", lambda: True)
+    monkeypatch.setattr("mnemos.core.config.audit_chain_key_required", lambda: True)
+    monkeypatch.setattr(
+        "mnemos.audit.load_root_keypair",
+        lambda: (_ for _ in ()).throw(ValueError("invalid test key")),
+    )
+
+    with pytest.raises(RuntimeError, match="MNEMOS_REQUIRE_AUDIT_CHAIN_KEY=YES"):
+        _validate_audit_chain_startup()
+    assert not fresh_caplog.records
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_audit_chain_startup_is_silent_when_not_broken(
+    fresh_caplog, monkeypatch, enabled
+):
+    from mnemos.api.main import _validate_audit_chain_startup
+
+    monkeypatch.setattr(
+        "mnemos.core.config.audit_chain_enabled_flag", lambda: enabled
+    )
+    monkeypatch.setattr(
+        "mnemos.audit.load_root_keypair", lambda: (object(), b"x" * 32)
+    )
+
+    assert _validate_audit_chain_startup() is False
+    assert not fresh_caplog.records
