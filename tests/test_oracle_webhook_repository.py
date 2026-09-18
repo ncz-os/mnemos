@@ -79,18 +79,17 @@ WEBHOOK_SCHEMA_DDL: tuple[str, ...] = (
         url             VARCHAR2(2000) NOT NULL,
         events          CLOB           NOT NULL,
         secret          VARCHAR2(2000) NOT NULL,
-        description     VARCHAR2(2000),
+        description     CLOB,
         owner_id        VARCHAR2(256)  NOT NULL,
         namespace       VARCHAR2(256)  NOT NULL,
-        created         TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
+        created_at      TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
         revoked         NUMBER(1)      DEFAULT 0 NOT NULL,
         revoked_at      TIMESTAMP WITH TIME ZONE,
         CONSTRAINT webhook_url_format
             CHECK (url LIKE 'http://%' OR url LIKE 'https://%')
     )
     """,
-    "CREATE INDEX idx_webhook_subscriptions_owner "
-    "    ON webhook_subscriptions(owner_id, namespace)",
+    "CREATE INDEX idx_webhook_subscriptions_owner     ON webhook_subscriptions(owner_id, namespace)",
     # Deliveries table — same logical shape as Postgres v3.5, adapted to
     # Oracle TIMESTAMP WITH TIME ZONE + NUMBER(1) for the BOOLEAN-ish
     # ``superseded`` flag (Oracle has no native BOOLEAN pre-23c).
@@ -108,7 +107,7 @@ WEBHOOK_SCHEMA_DDL: tuple[str, ...] = (
         error            VARCHAR2(2000),
         scheduled_at     TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
         delivered_at     TIMESTAMP WITH TIME ZONE,
-        created          TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
+        created_at       TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
         lease_token      VARCHAR2(64),
         lease_expires_at TIMESTAMP WITH TIME ZONE,
         writer_revision  NUMBER(10)      DEFAULT 0 NOT NULL,
@@ -116,12 +115,9 @@ WEBHOOK_SCHEMA_DDL: tuple[str, ...] = (
         superseded       NUMBER(1)       DEFAULT 0 NOT NULL
     )
     """,
-    "CREATE INDEX idx_webhook_deliveries_subscription "
-    "    ON webhook_deliveries(subscription_id, created DESC)",
-    "CREATE INDEX idx_webhook_deliveries_pending "
-    "    ON webhook_deliveries(scheduled_at)",
-    "CREATE INDEX idx_webhook_deliveries_lease_expires_at "
-    "    ON webhook_deliveries(lease_expires_at)",
+    "CREATE INDEX idx_webhook_deliveries_subscription     ON webhook_deliveries(subscription_id, created_at DESC)",
+    "CREATE INDEX idx_webhook_deliveries_pending     ON webhook_deliveries(scheduled_at)",
+    "CREATE INDEX idx_webhook_deliveries_lease_expires_at     ON webhook_deliveries(lease_expires_at)",
     # The two unique indexes that encode the v3.5 chain invariant.
     # Oracle doesn't support partial indexes directly — we use the
     # ``DBMS_LOB.INSTR(events, ...) > 0`` style NULL-trick: rows that
@@ -211,10 +207,11 @@ async def _ensure_webhook_schema(pool: Any) -> None:
 
     The fixture using this is function-scoped (one call per test), so
     CREATE TABLE/INDEX statements hit ORA-00955 ("name is already used
-    by an existing object") on every test after the first. Oracle has
-    no ``CREATE TABLE IF NOT EXISTS`` pre-23c, so swallow ORA-00955
-    specifically (already-exists) and let any other error propagate —
-    that's the Oracle-idiomatic equivalent of IF NOT EXISTS here.
+    by an existing object") on every test after the first.  A full schema
+    provision also has the 0001 subscription-owner index under its canonical
+    name, so the fixture's equivalent index gets ORA-01408 (same column list).
+    Swallow those two already-exists results and let every other error
+    propagate.
     """
     import oracledb as _oracledb
 
@@ -232,7 +229,7 @@ async def _ensure_webhook_schema(pool: Any) -> None:
                     await cur.execute(ddl)
                 except _oracledb.DatabaseError as exc:
                     (error_obj,) = exc.args
-                    if getattr(error_obj, "code", None) != 955:
+                    if getattr(error_obj, "code", None) not in {955, 1408}:
                         raise
         finally:
             cur.close()
@@ -285,8 +282,7 @@ async def oracle_pool() -> AsyncIterator[Any]:
     pytest.importorskip("oracledb")  # noqa: F811
     from mnemos.persistence.oracle import create_oracle_pool
 
-    pool = await create_oracle_pool(DSN, min_size=1, max_size=4
-    )
+    pool = await create_oracle_pool(DSN, min_size=1, max_size=4)
     await _ensure_webhook_schema(pool)
     try:
         yield pool
@@ -299,10 +295,7 @@ async def oracle_pool() -> AsyncIterator[Any]:
                     "(SELECT id FROM webhook_subscriptions "
                     "  WHERE owner_id LIKE 'webhook_repo_%')"
                 )
-                await cur.execute(
-                    "DELETE FROM webhook_subscriptions "
-                    "WHERE owner_id LIKE 'webhook_repo_%'"
-                )
+                await cur.execute("DELETE FROM webhook_subscriptions WHERE owner_id LIKE 'webhook_repo_%'")
             finally:
                 cur.close()
             await conn.commit()
@@ -428,9 +421,7 @@ async def test_list_subscriptions_partial_scope_is_rejected(repo, oracle_pool):
 
 
 @pytest.mark.asyncio
-async def test_list_subscriptions_respects_revoked_flag_and_owner_scope(
-    repo, oracle_pool
-):
+async def test_list_subscriptions_respects_revoked_flag_and_owner_scope(repo, oracle_pool):
     sub_a = str(uuid.uuid4())
     sub_b = str(uuid.uuid4())
     sub_c = str(uuid.uuid4())
@@ -583,7 +574,8 @@ async def test_dispatch_event_creates_pending_deliveries(repo, oracle_pool):
             "memory.created",
             {"memory_id": "abc", "count": 7},
             owner_id="webhook_repo_dispatch_user",
-            namespace="default",)
+            namespace="default",
+        )
         delivery_ids = [intent.delivery_id for intent in _intents]
     assert len(delivery_ids) == 1
 
@@ -612,9 +604,7 @@ async def test_dispatch_event_creates_pending_deliveries(repo, oracle_pool):
 
 
 @pytest.mark.asyncio
-async def test_claim_delivery_returns_claim_and_blocks_concurrent_claim(
-    repo, oracle_pool
-):
+async def test_claim_delivery_returns_claim_and_blocks_concurrent_claim(repo, oracle_pool):
     sub_id = str(uuid.uuid4())
     async with _tx(oracle_pool) as tx:
         await repo.create_subscription(
@@ -629,12 +619,16 @@ async def test_claim_delivery_returns_claim_and_blocks_concurrent_claim(
         )
 
     async with _tx(oracle_pool) as tx:
-        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
-            tx,
-            "memory.created",
-            {"memory_id": "x"},
-            owner_id="webhook_repo_claim_user",
-            namespace="default",)]
+        [delivery_id] = [
+            intent.delivery_id
+            for intent in await repo.dispatch_event(
+                tx,
+                "memory.created",
+                {"memory_id": "x"},
+                owner_id="webhook_repo_claim_user",
+                namespace="default",
+            )
+        ]
 
     async with _tx(oracle_pool) as tx:
         claim = await repo.claim_delivery(
@@ -682,12 +676,16 @@ async def test_claim_due_deliveries_returns_pending_in_order(repo, oracle_pool):
         )
 
     async with _tx(oracle_pool) as tx:
-        [d_id_a] = [intent.delivery_id for intent in await repo.dispatch_event(
-            tx,
-            "memory.created",
-            {"memory_id": "abc"},
-            owner_id="webhook_repo_due_user",
-            namespace="default",)]
+        [d_id_a] = [
+            intent.delivery_id
+            for intent in await repo.dispatch_event(
+                tx,
+                "memory.created",
+                {"memory_id": "abc"},
+                owner_id="webhook_repo_due_user",
+                namespace="default",
+            )
+        ]
 
     # dispatch_event returns one delivery per matching subscription; in
     # this test we only have one sub so we get one. Generate the other
@@ -748,9 +746,7 @@ async def test_claim_due_deliveries_returns_pending_in_order(repo, oracle_pool):
 
 
 @pytest.mark.asyncio
-async def test_finalize_success_marks_row_succeeded_and_returns_applied(
-    repo, oracle_pool
-):
+async def test_finalize_success_marks_row_succeeded_and_returns_applied(repo, oracle_pool):
     sub_id = str(uuid.uuid4())
     async with _tx(oracle_pool) as tx:
         await repo.create_subscription(
@@ -765,12 +761,16 @@ async def test_finalize_success_marks_row_succeeded_and_returns_applied(
         )
 
     async with _tx(oracle_pool) as tx:
-        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
-            tx,
-            "memory.created",
-            {"memory_id": "abc"},
-            owner_id="webhook_repo_fin_user",
-            namespace="default",)]
+        [delivery_id] = [
+            intent.delivery_id
+            for intent in await repo.dispatch_event(
+                tx,
+                "memory.created",
+                {"memory_id": "abc"},
+                owner_id="webhook_repo_fin_user",
+                namespace="default",
+            )
+        ]
 
     async with _tx(oracle_pool) as tx:
         claim = await repo.claim_delivery(
@@ -788,9 +788,7 @@ async def test_finalize_success_marks_row_succeeded_and_returns_applied(
             tx,
             delivery_id=delivery_id,
             lease_token="lease-fin",
-            outcome=WebhookDeliveryOutcome(
-                succeeded=True, response_status=200, response_body="ok"
-            ),
+            outcome=WebhookDeliveryOutcome(succeeded=True, response_status=200, response_body="ok"),
             max_attempts=3,
             backoff_schedule=[1, 2, 5],
         )
@@ -827,12 +825,16 @@ async def test_finalize_wrong_lease_token_returns_not_applied(repo, oracle_pool)
             namespace="default",
         )
     async with _tx(oracle_pool) as tx:
-        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
-            tx,
-            "memory.created",
-            {"memory_id": "x"},
-            owner_id="webhook_repo_fin2_user",
-            namespace="default",)]
+        [delivery_id] = [
+            intent.delivery_id
+            for intent in await repo.dispatch_event(
+                tx,
+                "memory.created",
+                {"memory_id": "x"},
+                owner_id="webhook_repo_fin2_user",
+                namespace="default",
+            )
+        ]
     async with _tx(oracle_pool) as tx:
         await repo.claim_delivery(
             tx,
@@ -848,9 +850,7 @@ async def test_finalize_wrong_lease_token_returns_not_applied(repo, oracle_pool)
             tx,
             delivery_id=delivery_id,
             lease_token="wrong-lease",
-            outcome=WebhookDeliveryOutcome(
-                succeeded=True, response_status=200, response_body="ok"
-            ),
+            outcome=WebhookDeliveryOutcome(succeeded=True, response_status=200, response_body="ok"),
             max_attempts=3,
             backoff_schedule=[1, 2, 5],
         )
@@ -858,9 +858,7 @@ async def test_finalize_wrong_lease_token_returns_not_applied(repo, oracle_pool)
 
 
 @pytest.mark.asyncio
-async def test_finalize_failure_enqueues_next_attempt_via_backoff(
-    repo, oracle_pool
-):
+async def test_finalize_failure_enqueues_next_attempt_via_backoff(repo, oracle_pool):
     sub_id = str(uuid.uuid4())
     async with _tx(oracle_pool) as tx:
         await repo.create_subscription(
@@ -874,12 +872,16 @@ async def test_finalize_failure_enqueues_next_attempt_via_backoff(
             namespace="default",
         )
     async with _tx(oracle_pool) as tx:
-        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
-            tx,
-            "memory.created",
-            {"memory_id": "x"},
-            owner_id="webhook_repo_fin3_user",
-            namespace="default",)]
+        [delivery_id] = [
+            intent.delivery_id
+            for intent in await repo.dispatch_event(
+                tx,
+                "memory.created",
+                {"memory_id": "x"},
+                owner_id="webhook_repo_fin3_user",
+                namespace="default",
+            )
+        ]
 
     async with _tx(oracle_pool) as tx:
         await repo.claim_delivery(
@@ -896,9 +898,7 @@ async def test_finalize_failure_enqueues_next_attempt_via_backoff(
             tx,
             delivery_id=delivery_id,
             lease_token="retry-lease",
-            outcome=WebhookDeliveryOutcome(
-                succeeded=False, response_status=503, error="upstream-down"
-            ),
+            outcome=WebhookDeliveryOutcome(succeeded=False, response_status=503, error="upstream-down"),
             max_attempts=3,
             backoff_schedule=[1, 2, 5],
         )
@@ -917,17 +917,13 @@ async def test_finalize_failure_enqueues_next_attempt_via_backoff(
     statuses = sorted((d.attempt_num, d.status, d.superseded) for d in deliveries)
     assert (1, "abandoned", True) in statuses
     assert any(
-        d.id == result.successor_delivery_id and d.attempt_num == 2
-        and d.status == "pending"
-        and d.superseded is False
+        d.id == result.successor_delivery_id and d.attempt_num == 2 and d.status == "pending" and d.superseded is False
         for d in deliveries
     )
 
 
 @pytest.mark.asyncio
-async def test_repair_delivery_chains_terminalizes_obsolete_live_rows(
-    repo, oracle_pool
-):
+async def test_repair_delivery_chains_terminalizes_obsolete_live_rows(repo, oracle_pool):
     sub_id = str(uuid.uuid4())
     async with _tx(oracle_pool) as tx:
         await repo.create_subscription(
@@ -1002,9 +998,7 @@ async def test_repair_delivery_chains_terminalizes_obsolete_live_rows(
 
 
 @pytest.mark.asyncio
-async def test_store_delivery_response_body_does_not_change_status(
-    repo, oracle_pool
-):
+async def test_store_delivery_response_body_does_not_change_status(repo, oracle_pool):
     sub_id = str(uuid.uuid4())
     async with _tx(oracle_pool) as tx:
         await repo.create_subscription(
@@ -1018,12 +1012,16 @@ async def test_store_delivery_response_body_does_not_change_status(
             namespace="default",
         )
     async with _tx(oracle_pool) as tx:
-        [delivery_id] = [intent.delivery_id for intent in await repo.dispatch_event(
-            tx,
-            "memory.created",
-            {"memory_id": "body"},
-            owner_id="webhook_repo_body_user",
-            namespace="default",)]
+        [delivery_id] = [
+            intent.delivery_id
+            for intent in await repo.dispatch_event(
+                tx,
+                "memory.created",
+                {"memory_id": "body"},
+                owner_id="webhook_repo_body_user",
+                namespace="default",
+            )
+        ]
     body = '{"hello":"world"}'
     async with _tx(oracle_pool) as tx:
         stored = await repo.store_delivery_response_body(
