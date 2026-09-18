@@ -5,7 +5,6 @@ import hashlib
 import importlib.util
 import json
 import logging
-import os
 import re
 from datetime import datetime, timezone
 from io import BytesIO
@@ -47,14 +46,14 @@ def _docling_max_concurrency() -> int:
     effectively serialized requests.  A default of one preserves that memory
     and throughput behavior while allowing unrelated async requests to run.
     """
-    return _positive_int(os.environ.get("MNEMOS_DOCLING_MAX_CONCURRENCY")) or 1
+    return _positive_int(runtime_env_value("MNEMOS_DOCLING_MAX_CONCURRENCY")) or 1
 
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.api.routes.memories import _validate_permission_mode
-from mnemos.core.config import get_settings
+from mnemos.core.config import get_settings, runtime_env_value
 from mnemos.core.ids import new_memory_id
 from mnemos.domain.document_repo import (
     DocumentChunkSoftDeletedConflictError,
@@ -108,7 +107,7 @@ _docling_conversion_semaphore = asyncio.Semaphore(_docling_max_concurrency())
 
 
 def _document_import_max_bytes() -> int:
-    env_limit = _positive_int(os.environ.get("MNEMOS_DOCUMENT_IMPORT_MAX_BYTES"))
+    env_limit = _positive_int(runtime_env_value("MNEMOS_DOCUMENT_IMPORT_MAX_BYTES"))
     if env_limit is not None:
         return env_limit
     try:
