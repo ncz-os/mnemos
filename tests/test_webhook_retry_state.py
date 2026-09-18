@@ -1101,8 +1101,8 @@ def test_delivery_audit_exposes_superseded_marker_for_abandoned_rows():
     compact_handler = " ".join(handler_source.split())
 
     assert "superseded: bool = False" in model_source
-    assert "SELECT id, subscription_id, event_type, attempt_num, status, superseded," in compact_handler
-    assert "superseded=r[\"superseded\"]" in compact_handler
+    assert "backend.webhooks.list_deliveries(" in compact_handler
+    assert "superseded=r.superseded" in compact_handler
 
 
 def test_successor_insert_uses_live_chain_attempt_uniqueness(monkeypatch):

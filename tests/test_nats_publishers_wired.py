@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.persistence.base import WebhookSubscriptionRecord
 from tests._fake_backend import install_fake_backend
 
 pytestmark = pytest.mark.asyncio
@@ -223,6 +224,23 @@ async def test_webhook_create_publishes_subscription_created(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr("mnemos.api.routes.webhooks._validate_url", AsyncMock())
+    backend = install_fake_backend(monkeypatch)
+    now = datetime(2026, 4, 30, 12, 0, 0)
+
+    async def _create_subscription(_tx, **kwargs):
+        return WebhookSubscriptionRecord(
+            id=kwargs["subscription_id"],
+            url=kwargs["url"],
+            events=tuple(kwargs["events"]),
+            description=kwargs["description"],
+            owner_id=kwargs["owner_id"],
+            namespace=kwargs["namespace"],
+            created=now,
+            revoked=False,
+            revoked_at=None,
+        )
+
+    backend.webhooks.create_subscription = _create_subscription
 
     resp = await client.post(
         "/v1/webhooks",

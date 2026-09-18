@@ -67,7 +67,6 @@ from mnemos.core import eligibility as _eligibility
 from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.base import (
-    BackendCapabilityMissing,
     BranchRepository,
     ClusterCandidateRow,
     CompressionStatsRow,
@@ -4909,10 +4908,9 @@ class MysqlWebhookRepository(WebhookRepository):
       ``RELEASE_LOCK``); the transaction's ``_release_named_locks`` hook
       releases any lock acquired during finalize/guard.
 
-    The ``MysqlBackend.webhooks`` accessor is intentionally kept failing
-    closed with ``BackendCapabilityMissing``: the storage layer is now
-    consistent with the ABC, but no MySQL/MariaDB delivery worker is
-    wired up in production, and advertising delivery would strand rows.
+    ``MysqlBackend.webhooks`` exposes this repository for subscription CRUD
+    and delivery-history reads. ``supports_webhooks`` remains false because
+    that flag advertises end-to-end event delivery, not repository access.
     The 13-method implementation is verified by the conformance gate +
     a live MariaDB integration test (``tests/test_mysql_webhook_repository.py``).
     """
@@ -7885,6 +7883,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         self._compression_repo = MysqlCompressionRepository()
         self._compression_queue_repo = MysqlCompressionQueueRepository()
         self._morpheus_repo = MysqlMorpheusRepository()
+        self._webhooks_repo = MysqlWebhookRepository()
         self._nats_dispatch_log_repo = MysqlNatsDispatchLogRepository()
         self._consultations_audit_repo = MysqlConsultationAuditRepository()
         self._federation_repo = MysqlFederationRepository()
@@ -8271,7 +8270,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
 
     @property
     def webhooks(self) -> WebhookRepository:
-        raise BackendCapabilityMissing("webhooks", type(self).__name__)
+        return self._webhooks_repo
 
     @property
     def nats_dispatch_log(self) -> NatsDispatchLogRepository:
