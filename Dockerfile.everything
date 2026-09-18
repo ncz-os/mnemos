@@ -36,6 +36,13 @@ LABEL org.opencontainers.image.title="mnemos" \
       org.mnemos.addon.knemon="${MNEMOS_KNEMON_REF}" \
       org.mnemos.addon.graeae="${MNEMOS_GRAEAE_REF}"
 
+# mnemos-core (FROM'd above) already dropped to the non-root runtime account
+# as its own final layer. This layer's pip install writes into
+# /usr/local/lib, which that account does not own — switch back to root for
+# the install, then drop again below. Same pattern mnemos-enterprise repeats
+# for its own driver/binary installs.
+USER root
+
 # Add-on wheels (mnemos_graeae, mnemos_pantheon, mnemos_knemon)
 # staged by CI. Their light third-party deps resolve from the index; mnemos-core
 # is already satisfied by the base image. A constraint pins mnemos-core so the
@@ -48,6 +55,11 @@ RUN MNEMOS_CORE_VERSION="$(python -c 'import importlib.metadata as m; print(m.ve
         /tmp/wheelhouse/*.whl && \
     python -m pip check && \
     rm -rf /tmp/wheelhouse /tmp/core-constraint.txt
+
+# mnemos-everything is independently published (ghcr.io/ncz-os/mnemos), so it
+# restores the non-root account itself rather than leaving that to
+# mnemos-enterprise. See Dockerfile.core for the uid/gid rationale.
+USER 10001:0
 
 # Inherits ENV (sqlite default), VOLUME /data, EXPOSE 5002, HEALTHCHECK, and the
 # uvicorn CMD from mnemos-core. Override MNEMOS_DATABASE_DSN at runtime for
