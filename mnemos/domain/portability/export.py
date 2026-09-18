@@ -5,11 +5,11 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
+from mnemos.core.config import runtime_env_value_stripped
 from mnemos.core.security import is_root
 
 
@@ -305,7 +305,7 @@ def _resolve_export_scope(
 
 def _export_record_batch_size(limit: int) -> int:
     """Resolve the streaming sub-batch stride, clamped to the page size."""
-    raw = os.getenv(_EXPORT_RECORD_BATCH_ENV)
+    raw = runtime_env_value_stripped(_EXPORT_RECORD_BATCH_ENV)
     size = _DEFAULT_EXPORT_RECORD_BATCH
     if raw:
         try:

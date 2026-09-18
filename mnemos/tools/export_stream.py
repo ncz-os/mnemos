@@ -10,6 +10,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from mnemos.core.config import runtime_env_int
+
 
 class ExportValidationError(ValueError):
     """The remote export cannot be published as a complete artifact."""
@@ -40,10 +42,7 @@ def iter_pages(endpoint, api_key, params):
 
     with request({**params, "stream": "true"}) as response:
         if "application/x-ndjson" in getattr(response, "headers", {}).get("Content-Type", ""):
-            cap = max(
-                1,
-                int(os.getenv("MNEMOS_EXPORT_PAGE_MAX_BYTES", str(128 * 1024 * 1024))),
-            )
+            cap = max(1, runtime_env_int("MNEMOS_EXPORT_PAGE_MAX_BYTES", 128 * 1024 * 1024))
             while True:
                 line = response.readline(cap + 1)
                 if not line:
