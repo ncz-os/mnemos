@@ -233,9 +233,12 @@ def _capabilities() -> tuple[Capability, ...]:
             id="webhooks",
             label="webhooks (end-to-end delivery)",
             test_keyword="webhook",
-            impl_kind="repo_property",
-            impl_property=("webhooks",),
-            note="End-to-end delivery (claim/send/finalize worker required).",
+            impl_kind="flag",
+            impl_property=("supports_webhooks",),
+            note=(
+                "End-to-end delivery (claim/send/finalize worker required); "
+                "the WebhookRepository CRUD accessor is intentionally broader."
+            ),
         ),
         Capability(
             id="nats_dispatch_log",
