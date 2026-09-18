@@ -196,6 +196,24 @@ async def maybe_set_pg_rls(tx, user: UserContext) -> None:
     )
 
 
+def require_webhooks_backend():
+    """Return a backend exposing the webhook repository CRUD surface.
+
+    ``supports_webhooks`` deliberately describes end-to-end event delivery,
+    not whether subscription and delivery-history rows can be managed.  The
+    route layer needs the narrower repository capability, so resolve the
+    accessor directly without changing the delivery-worker capability flag.
+    """
+    backend = backend_or_503()
+    try:
+        repository = backend.webhooks
+    except (AttributeError, BackendCapabilityMissing):
+        raise BackendCapabilityMissing("webhooks", type(backend).__name__)
+    if repository is None:
+        raise BackendCapabilityMissing("webhooks", type(backend).__name__)
+    return backend
+
+
 __all__ = [
     "backend_or_503",
     "capability_exception_to_503",
@@ -209,4 +227,5 @@ __all__ = [
     "require_postgres_pool_or_503",
     "require_sessions_backend",
     "require_state_backend",
+    "require_webhooks_backend",
 ]

@@ -18,12 +18,17 @@ two-dim gate:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
 from mnemos.api.dependencies import UserContext
+from mnemos.persistence.base import WebhookSubscriptionRecord
 
 
 def _alice(ns: str = "alice-ns") -> UserContext:
@@ -72,6 +77,93 @@ def _install(monkeypatch, conn):
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
+
+
+class _WebhookRepo:
+    def __init__(self):
+        self.subscriptions: list[WebhookSubscriptionRecord] = []
+        self.calls: list[tuple[str, dict]] = []
+
+    async def create_subscription(self, _tx, **kwargs):
+        self.calls.append(("create_subscription", kwargs))
+        row = WebhookSubscriptionRecord(
+            id=kwargs["subscription_id"],
+            url=kwargs["url"],
+            events=tuple(kwargs["events"]),
+            description=kwargs["description"],
+            owner_id=kwargs["owner_id"],
+            namespace=kwargs["namespace"],
+            created=datetime.now(timezone.utc),
+            revoked=False,
+            revoked_at=None,
+        )
+        self.subscriptions.append(row)
+        return row
+
+    async def list_subscriptions(self, _tx, **kwargs):
+        self.calls.append(("list_subscriptions", kwargs))
+        rows = self.subscriptions
+        if kwargs["owner_id"] is not None:
+            rows = [
+                row
+                for row in rows
+                if row.owner_id == kwargs["owner_id"]
+                and row.namespace == kwargs["namespace"]
+            ]
+        if not kwargs["include_revoked"]:
+            rows = [row for row in rows if not row.revoked]
+        return rows[: kwargs["limit"]]
+
+    async def get_subscription(self, _tx, **kwargs):
+        self.calls.append(("get_subscription", kwargs))
+        for row in self.subscriptions:
+            if row.id != kwargs["subscription_id"]:
+                continue
+            if kwargs["owner_id"] is not None and (
+                row.owner_id != kwargs["owner_id"]
+                or row.namespace != kwargs["namespace"]
+            ):
+                continue
+            return row
+        return None
+
+    async def revoke_subscription(self, _tx, **kwargs):
+        self.calls.append(("revoke_subscription", kwargs))
+        for index, row in enumerate(self.subscriptions):
+            if row.id != kwargs["subscription_id"] or row.revoked:
+                continue
+            if kwargs["owner_id"] is not None and (
+                row.owner_id != kwargs["owner_id"]
+                or row.namespace != kwargs["namespace"]
+            ):
+                continue
+            self.subscriptions[index] = dataclasses.replace(
+                row,
+                revoked=True,
+                revoked_at=datetime.now(timezone.utc),
+            )
+            return True
+        return False
+
+
+class _WebhookBackend:
+    supports_webhooks = False
+
+    def __init__(self):
+        self.webhooks = _WebhookRepo()
+
+    @asynccontextmanager
+    async def transactional(self):
+        yield SimpleNamespace(conn=None)
+
+
+def _install_webhooks(monkeypatch):
+    import mnemos.core.lifecycle as lc
+
+    backend = _WebhookBackend()
+    monkeypatch.setattr(lc, "_pool", None)
+    monkeypatch.setattr(lc, "_persistence_backend", backend)
+    return backend.webhooks
 
 
 def _install_public_dns(monkeypatch, wh):
@@ -185,37 +277,32 @@ def test_entities_assert_owned_root_bypasses_namespace(monkeypatch):
 def test_webhook_list_filters_by_owner_and_namespace(monkeypatch):
     from mnemos.api.routes import webhooks as wh
 
-    conn = _Conn(rows=[])
-    _install(monkeypatch, conn)
-
-    asyncio.run(wh.list_webhooks(user=_alice("alice-ns"), include_revoked=False))
-
-    sql, args = conn.fetch_calls[-1]
-    assert "owner_id = $" in sql
-    assert "namespace = $" in sql
-    assert "alice" in args
-    assert "alice-ns" in args
+    repo = _install_webhooks(monkeypatch)
+    result = asyncio.run(wh.list_webhooks(user=_alice("alice-ns"), include_revoked=False))
+    _, args = repo.calls[-1]
+    assert args["owner_id"] == "alice"
+    assert args["namespace"] == "alice-ns"
+    assert args["include_revoked"] is False
+    assert result.count == 0
+    assert result.webhooks == []
 
 
 def test_webhook_list_root_sees_all_without_filter(monkeypatch):
     from mnemos.api.routes import webhooks as wh
 
-    conn = _Conn(rows=[])
-    _install(monkeypatch, conn)
-
-    asyncio.run(wh.list_webhooks(user=_root(), include_revoked=False))
-
-    sql, _ = conn.fetch_calls[-1]
-    # Root path: no owner/namespace filter
-    assert "owner_id = $" not in sql
-    assert "namespace = $" not in sql
+    repo = _install_webhooks(monkeypatch)
+    result = asyncio.run(wh.list_webhooks(user=_root(), include_revoked=False))
+    _, args = repo.calls[-1]
+    assert args["owner_id"] is None
+    assert args["namespace"] is None
+    assert result.count == 0
+    assert result.webhooks == []
 
 
 def test_webhook_get_filters_by_owner_and_namespace(monkeypatch):
     from mnemos.api.routes import webhooks as wh
 
-    conn = _Conn(row=None)
-    _install(monkeypatch, conn)
+    repo = _install_webhooks(monkeypatch)
 
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc:
@@ -223,18 +310,15 @@ def test_webhook_get_filters_by_owner_and_namespace(monkeypatch):
             str(uuid.uuid4()), user=_alice("alice-ns"),
         ))
     assert exc.value.status_code == 404
-    sql, args = conn.fetchrow_calls[-1]
-    assert "owner_id = $" in sql
-    assert "namespace = $" in sql
-    assert "alice" in args
-    assert "alice-ns" in args
+    _, args = repo.calls[-1]
+    assert args["owner_id"] == "alice"
+    assert args["namespace"] == "alice-ns"
 
 
 def test_webhook_revoke_filters_by_owner_and_namespace(monkeypatch):
     from mnemos.api.routes import webhooks as wh
 
-    conn = _Conn(row=None)
-    _install(monkeypatch, conn)
+    repo = _install_webhooks(monkeypatch)
 
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc:
@@ -242,10 +326,9 @@ def test_webhook_revoke_filters_by_owner_and_namespace(monkeypatch):
             str(uuid.uuid4()), user=_alice("alice-ns"),
         ))
     assert exc.value.status_code == 404
-    sql, args = conn.fetchrow_calls[-1]
-    assert "owner_id = $" in sql
-    assert "namespace = $" in sql
-    assert "alice-ns" in args
+    _, args = repo.calls[-1]
+    assert args["owner_id"] == "alice"
+    assert args["namespace"] == "alice-ns"
 
 
 def test_webhook_create_rejects_cross_namespace_for_non_root(monkeypatch):
@@ -253,8 +336,7 @@ def test_webhook_create_rejects_cross_namespace_for_non_root(monkeypatch):
     a webhook in another namespace. v3.2 closes this: 403."""
     from mnemos.api.routes import webhooks as wh
 
-    conn = _Conn(row=None)
-    _install(monkeypatch, conn)
+    _install_webhooks(monkeypatch)
     _install_public_dns(monkeypatch, wh)
 
     req = wh.WebhookCreateRequest(
@@ -275,18 +357,7 @@ def test_webhook_create_own_namespace_succeeds_for_non_root(monkeypatch):
     only mismatched namespaces are rejected."""
     from mnemos.api.routes import webhooks as wh
 
-    ok_row = {
-        "id": uuid.uuid4(),
-        "url": "https://example.com/hook",
-        "events": ["memory.created"],
-        "description": None,
-        "owner_id": "alice",
-        "namespace": "alice-ns",
-        "created": __import__("datetime").datetime(2026, 4, 24),
-        "revoked": False,
-    }
-    conn = _Conn(row=ok_row)
-    _install(monkeypatch, conn)
+    _install_webhooks(monkeypatch)
     _install_public_dns(monkeypatch, wh)
 
     req = wh.WebhookCreateRequest(
@@ -298,3 +369,7 @@ def test_webhook_create_own_namespace_succeeds_for_non_root(monkeypatch):
 
     resp = asyncio.run(wh.create_webhook(req, user=_alice("alice-ns")))
     assert resp.namespace == "alice-ns"
+    assert resp.url == "https://example.com/hook"
+    assert resp.events == ["memory.created"]
+    assert resp.description is None
+    assert resp.owner_id == "alice"

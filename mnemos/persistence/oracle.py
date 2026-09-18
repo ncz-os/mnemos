@@ -51,7 +51,6 @@ from mnemos.persistence.base import (
     AclRepository,
     build_api_key_row,
     AuditChainRepository,
-    BackendCapabilityMissing,
     BranchRepository,
     ClusterCandidateRow,
     CompressionQueueRepository,
@@ -4022,11 +4021,9 @@ class OracleWebhookRepository(WebhookRepository):
       pretty-printed JSON without requiring the JSON parser (same idiom
       the live :class:`OracleBackend.webhooks` dispatch used pre-item-6).
 
-    The ``OracleBackend.webhooks`` accessor still raises
-    ``BackendCapabilityMissing`` for now (matching the
-    Postgres/MySQL/SQLite posture where the storage layer is consistent
-    with the ABC but the delivery worker is not yet wired). Wiring the
-    delivery worker through this repository is a later item.
+    ``OracleBackend.webhooks`` exposes this repository for subscription CRUD
+    and delivery-history reads. ``supports_webhooks`` remains false because
+    that flag advertises end-to-end event delivery, not repository access.
     """
 
     # ── helpers ──────────────────────────────────────────────────────────────
@@ -8775,7 +8772,7 @@ class OracleBackend(OracleAuditJournalMixin):
 
     @property
     def webhooks(self) -> WebhookRepository:
-        raise BackendCapabilityMissing("webhooks", type(self).__name__)
+        return self._webhooks_repo
 
     @property
     def nats_dispatch_log(self) -> NatsDispatchLogRepository:

@@ -26,7 +26,6 @@ from typing import Any
 from mnemos.core import eligibility as _eligibility
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.base import (
-    BackendCapabilityMissing,
     BranchRepository,
     ClusterCandidateRow,
     CORE_CAPABILITY,
@@ -1309,6 +1308,7 @@ class MariadbBackend(MysqlBackend):
         self._compression_repo = MariadbCompressionRepository()
         self._compression_queue_repo = MariadbCompressionQueueRepository()
         self._morpheus_repo = MariadbMorpheusRepository()
+        self._webhooks_repo = MariadbWebhookRepository()
         self._nats_dispatch_log_repo = MariadbNatsDispatchLogRepository()
         self._consultations_audit_repo = MariadbConsultationAuditRepository()
         self._federation_repo = MariadbFederationRepository()
@@ -1353,7 +1353,7 @@ class MariadbBackend(MysqlBackend):
 
     @property
     def webhooks(self) -> WebhookRepository:
-        raise BackendCapabilityMissing("webhooks", type(self).__name__)
+        return self._webhooks_repo
 
     @property
     def nats_dispatch_log(self) -> NatsDispatchLogRepository:

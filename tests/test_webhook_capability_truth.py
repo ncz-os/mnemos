@@ -27,37 +27,35 @@ def test_capability_details_hide_webhooks_for_unknown_backend() -> None:
     assert capability_details_for_backend(backend) == {"memory_crud"}
 
 
-def test_sqlite_does_not_claim_webhook_delivery() -> None:
+def test_sqlite_exposes_repository_without_claiming_webhook_delivery() -> None:
     from mnemos.persistence.base import (
-        BackendCapabilityMissing,
         WEBHOOKS_CAPABILITY,
         capability_details_for_backend,
     )
-    from mnemos.persistence.sqlite import SqliteBackend
+    from mnemos.persistence.sqlite import SqliteBackend, SqliteWebhookRepository
 
     backend = SqliteBackend(":memory:", SimpleNamespace())
 
     assert backend.supports_webhooks is False
     assert WEBHOOKS_CAPABILITY not in capability_details_for_backend(backend)
-    with pytest.raises(BackendCapabilityMissing, match="webhooks"):
-        _ = backend.webhooks
+    assert isinstance(backend.webhooks, SqliteWebhookRepository)
 
 
 @pytest.mark.parametrize(
-    "module_name,backend_name",
+    "module_name,backend_name,repo_name",
     [
-        ("mnemos.persistence.oracle", "OracleBackend"),
-        ("mnemos.persistence.db2", "Db2Backend"),
+        ("mnemos.persistence.oracle", "OracleBackend", "OracleWebhookRepository"),
+        ("mnemos.persistence.db2", "Db2Backend", "Db2WebhookRepository"),
     ],
 )
-def test_enterprise_non_postgres_backends_do_not_claim_webhook_delivery(
+def test_enterprise_backends_expose_repository_without_claiming_delivery(
     module_name: str,
     backend_name: str,
+    repo_name: str,
 ) -> None:
     import importlib
 
     from mnemos.persistence.base import (
-        BackendCapabilityMissing,
         WEBHOOKS_CAPABILITY,
         capability_details_for_backend,
     )
@@ -68,36 +66,41 @@ def test_enterprise_non_postgres_backends_do_not_claim_webhook_delivery(
         pytest.skip(f"optional backend driver unavailable: {exc.name}")
     backend_type = getattr(module, backend_name)
     backend = object.__new__(backend_type)
+    repository = getattr(module, repo_name)()
+    backend._webhooks_repo = repository
 
     assert backend.supports_webhooks is False
     assert WEBHOOKS_CAPABILITY not in capability_details_for_backend(backend)
-    with pytest.raises(BackendCapabilityMissing, match="webhooks"):
-        _ = backend.webhooks
+    assert backend.webhooks is repository
 
 
 @pytest.mark.parametrize(
-    "module_name,backend_name",
+    "module_name,backend_name,repo_name",
     [
-        ("mnemos.persistence.mysql", "MysqlBackend"),
-        ("mnemos.persistence.mariadb", "MariadbBackend"),
+        ("mnemos.persistence.mysql", "MysqlBackend", "MysqlWebhookRepository"),
+        ("mnemos.persistence.mariadb", "MariadbBackend", "MariadbWebhookRepository"),
     ],
 )
-def test_mysql_family_webhook_accessor_fails_loud(module_name: str, backend_name: str) -> None:
+def test_mysql_family_exposes_repository_without_claiming_delivery(
+    module_name: str,
+    backend_name: str,
+    repo_name: str,
+) -> None:
     import importlib
 
     from mnemos.persistence.base import (
-        BackendCapabilityMissing,
         WEBHOOKS_CAPABILITY,
         capability_details_for_backend,
     )
 
     module = importlib.import_module(module_name)
     backend = object.__new__(getattr(module, backend_name))
+    repository = getattr(module, repo_name)()
+    backend._webhooks_repo = repository
 
     assert backend.supports_webhooks is False
     assert WEBHOOKS_CAPABILITY not in capability_details_for_backend(backend)
-    with pytest.raises(BackendCapabilityMissing, match="webhooks"):
-        _ = backend.webhooks
+    assert backend.webhooks is repository
 
 
 @pytest.mark.asyncio
