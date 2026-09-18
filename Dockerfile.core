@@ -148,6 +148,32 @@ RUN mkdir -p /opt/mnemos/models && \
     curl -fsSL -o /opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf \
       https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf
 
+# Hosted/multi-tenant hardening: create the non-root account every published
+# image in the matrix (this one, mnemos-everything, mnemos-enterprise)
+# switches to as its own FINAL layer. Created here, in the shared base, so
+# the uid/gid and directory ownership are baked once and inherited — not
+# re-created per downstream image. The USER switch below happens only at
+# the very end of THIS file, right before CMD: derived Dockerfiles still
+# need root for their own apt/pip/curl install layers (mnemos-enterprise
+# installs Oracle/MySQL drivers + cloudflared/ngrok/rclone after FROM'ing
+# this image), so each one does `USER root` first, does its installs, then
+# `USER 10001:0` again as its own final line.
+#
+# GID 0 (the existing "root" group, not a new one) rather than a dedicated
+# app group: this is the standard arbitrary-UID pattern hardened platforms
+# (Kubernetes restricted PodSecurityStandard, OpenShift restricted SCC)
+# expect — such a platform may run the container as an arbitrary injected
+# UID rather than uid 10001 specifically, but it always keeps GID 0. Mode
+# g=u on every directory the process touches means that arbitrary UID works
+# correctly as long as it carries GID 0, without needing to match uid 10001
+# exactly.
+RUN useradd --uid 10001 --gid 0 --no-create-home --home-dir /home/mnemos \
+      --shell /usr/sbin/nologin mnemos && \
+    mkdir -p /home/mnemos /data && \
+    chown -R 10001:0 /app /home/mnemos /data /opt/mnemos && \
+    chmod -R g=u /app /home/mnemos /data /opt/mnemos
+ENV HOME=/home/mnemos
+
 # Portable defaults: SQLite under /data (a mountable volume). Override
 # MNEMOS_DATABASE_DSN at runtime to select Postgres / Oracle / Db2 / MySQL
 # without rebuilding.
@@ -179,6 +205,13 @@ EXPOSE 5002
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5002/health').read()" || exit 1
+
+# mnemos-core is independently published (ghcr.io/ncz-os/mnemos-core), so it
+# drops root itself rather than leaving that to a downstream Dockerfile.
+# Port 5002 needs no privileged bind. Numeric uid:gid (not the account name)
+# so a hosted platform's own SecurityContext/SCC can still recognize and
+# enforce runAsNonRoot against this image.
+USER 10001:0
 
 # Go through `mnemos serve` so the bind address is validated: it refuses to
 # publish an unauthenticated API off-host (set

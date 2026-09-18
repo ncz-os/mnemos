@@ -59,6 +59,32 @@ These hold in 6.3:
   to providers and rejects unsupported tool, response-format, or multimodal
   requests instead of silently ignoring them.
 
+## Container hardening
+
+`mnemos-core`, `mnemos` (the "everything" image), and `mnemos-enterprise`
+all drop root as their final build layer and run as a fixed non-root
+account (`uid 10001`, `gid 0` — the existing `root` group, not a dedicated
+one). Every directory the process writes to (`/app`, `/data`,
+`/opt/mnemos`, `/home/mnemos`) is owned `10001:0` with mode `g=u`, so the
+image also runs correctly under a hosted platform's own injected arbitrary
+UID as long as that UID carries GID 0 — the standard Kubernetes restricted
+`PodSecurityStandard` / OpenShift restricted-SCC pattern. Set
+`securityContext.runAsNonRoot: true` (and `runAsUser`/`runAsGroup` if your
+platform requires an explicit value rather than the image default) — no
+image rebuild needed to satisfy it.
+
+Each derived image (`mnemos`, `mnemos-enterprise`) switches back to `root`
+only for its own install layer (pip/apt/curl-fetched binaries) and restores
+`10001:0` as its last instruction, so no published image ships root as its
+actual runtime default.
+
+This changed the image's default `HOME` from `/root` to `/home/mnemos`. A
+deployment that bind-mounts credentials into `/root/.config/...` (as an
+older root-default quadlet/compose file might) needs to move those mounts
+to `/home/mnemos/.config/...` — or explicitly force the container back to
+`root` at the orchestrator level — before upgrading to an image built from
+this Dockerfile revision.
+
 ## Reporting a vulnerability
 
 Do not open a public issue for a suspected vulnerability.
