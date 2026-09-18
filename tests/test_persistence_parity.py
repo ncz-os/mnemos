@@ -20,7 +20,6 @@ from mnemos.api.routes import memories as memories_handler
 import mnemos.core.lifecycle as lifecycle
 from mnemos.core.auth_context import UserContext
 from mnemos.persistence import (
-    BackendCapabilityMissing,
     BranchRepository,
     CompressionRepository,
     ConsultationAuditRepository,
@@ -434,11 +433,7 @@ async def test_backend_exposes_all_repository_properties(backend_case: BackendCa
     assert isinstance(backend.memory_versions, VersionRepository)
     assert isinstance(backend.memory_branches, BranchRepository)
     assert isinstance(backend.compression, CompressionRepository)
-    if backend.supports_webhooks:
-        assert isinstance(backend.webhooks, WebhookRepository)
-    else:
-        with pytest.raises(BackendCapabilityMissing, match="webhooks"):
-            _ = backend.webhooks
+    assert isinstance(backend.webhooks, WebhookRepository)
     assert isinstance(backend.consultations_audit, ConsultationAuditRepository)
     assert isinstance(backend.oauth, OAuthRepository)
     assert isinstance(backend.sessions, SessionsRepository)

@@ -39,7 +39,6 @@ from mnemos.persistence.base import (
     AuditChainRepository,
     build_api_key_row,
     BranchRepository,
-    BackendCapabilityMissing,
     ClusterCandidateRow,
     CompressionQueueRepository,
     CompressionRepository,
@@ -7787,7 +7786,7 @@ class SqliteBackend:
 
     @property
     def webhooks(self) -> WebhookRepository:
-        raise BackendCapabilityMissing("webhooks", type(self).__name__)
+        return self._webhooks
 
     @property
     def nats_dispatch_log(self) -> NatsDispatchLogRepository:
