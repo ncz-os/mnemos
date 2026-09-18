@@ -1870,10 +1870,7 @@ class OracleMemoryRepository(MemoryRepository):
                 # Oracle supports row-value comparison only in restricted
                 # forms, so the keyset is expressed as its expanded
                 # lexicographic equivalent.
-                where.append(
-                    "(created > :cur_created "
-                    "OR (created = :cur_created_eq AND id > :cur_id))"
-                )
+                where.append("(created > :cur_created OR (created = :cur_created_eq AND id > :cur_id))")
                 params["cur_created"] = record_cursor[0]
                 params["cur_created_eq"] = record_cursor[0]
                 params["cur_id"] = record_cursor[1]
@@ -1958,10 +1955,7 @@ class OracleMemoryRepository(MemoryRepository):
                 where.append("executed_at <= :dl_to")
                 params["dl_to"] = to_executed_at
             if cursor_executed_at and cursor_id:
-                where.append(
-                    "(executed_at > :cur_exec "
-                    "OR (executed_at = :cur_exec_eq AND id > :cur_id))"
-                )
+                where.append("(executed_at > :cur_exec OR (executed_at = :cur_exec_eq AND id > :cur_id))")
                 params["cur_exec"] = cursor_executed_at
                 params["cur_exec_eq"] = cursor_executed_at
                 params["cur_id"] = cursor_id
@@ -4147,7 +4141,7 @@ class OracleWebhookRepository(WebhookRepository):
                 ) VALUES (
                     :id, :url, :events, :secret, :description, :owner_id, :namespace
                 )
-                RETURNING id, created INTO :new_id, :new_created
+                RETURNING id, created_at INTO :new_id, :new_created
                 """,
                 {
                     "id": subscription_id,
@@ -4208,9 +4202,9 @@ class OracleWebhookRepository(WebhookRepository):
         params["limit"] = int(limit)
         sql = (
             "SELECT id, url, events, description, owner_id, namespace, "
-            "created AS created_at, revoked, revoked_at "
+            "created_at, revoked, revoked_at "
             f"FROM webhook_subscriptions {where} "
-            "ORDER BY created DESC FETCH FIRST :limit ROWS ONLY"
+            "ORDER BY created_at DESC FETCH FIRST :limit ROWS ONLY"
         )
         cursor = await _call(conn.cursor)
         try:
@@ -4248,7 +4242,7 @@ class OracleWebhookRepository(WebhookRepository):
             params["namespace"] = namespace
         sql = (
             "SELECT id, url, events, description, owner_id, namespace, "
-            "created AS created_at, revoked, revoked_at "
+            "created_at, revoked, revoked_at "
             f"FROM webhook_subscriptions WHERE {' AND '.join(conditions)}"
         )
         cursor = await _call(conn.cursor)
@@ -4331,7 +4325,7 @@ class OracleWebhookRepository(WebhookRepository):
                 f"""
                 {oracle_webhook_delivery_select_clause()}
                 WHERE d.subscription_id = :subscription_id{scope_sql}
-                ORDER BY d.created DESC
+                ORDER BY d.created_at DESC
                 FETCH FIRST :limit ROWS ONLY
                 """,
                 params,
@@ -5306,7 +5300,7 @@ def oracle_webhook_delivery_select_clause() -> str:
     return (
         "SELECT d.id, d.subscription_id, d.event_type, d.payload, d.payload_hash, "
         "d.attempt_num, d.status, d.response_status, d.response_body, d.error, "
-        "d.scheduled_at, d.delivered_at, d.created AS created_at, "
+        "d.scheduled_at, d.delivered_at, d.created_at, "
         "d.status_updated_at, d.superseded, d.lease_token, d.lease_expires_at, "
         "d.writer_revision, "
         "s.url, s.secret, s.revoked, s.owner_id, s.namespace "
@@ -8022,17 +8016,11 @@ class OracleBackend(OracleAuditJournalMixin):
                 elif isolation == "serializable":
                     stmt = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
                 elif isolation == "repeatable_read":
-                    stmt = (
-                        "SET TRANSACTION READ ONLY"
-                        if readonly
-                        else "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
-                    )
+                    stmt = "SET TRANSACTION READ ONLY" if readonly else "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
                 elif isolation is None:
                     stmt = "SET TRANSACTION READ ONLY"
                 else:
-                    raise ValueError(
-                        f"unsupported isolation level for Oracle: {isolation!r}"
-                    )
+                    raise ValueError(f"unsupported isolation level for Oracle: {isolation!r}")
                 cursor = await _call(conn.cursor)
                 try:
                     await _call(cursor.execute, stmt)
@@ -8063,17 +8051,9 @@ class OracleBackend(OracleAuditJournalMixin):
             await _call(cursor.close)
         raw = row[0] if row else None
         if isinstance(raw, datetime):
-            return (
-                raw.astimezone(timezone.utc)
-                if raw.tzinfo
-                else raw.replace(tzinfo=timezone.utc)
-            )
+            return raw.astimezone(timezone.utc) if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
         parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        return (
-            parsed.astimezone(timezone.utc)
-            if parsed.tzinfo
-            else parsed.replace(tzinfo=timezone.utc)
-        )
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
     async def insert_pantheon_routing_audit(
         self,
