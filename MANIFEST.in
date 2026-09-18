@@ -29,6 +29,11 @@ recursive-include mnemos/db_migrations *.sql
 # Bundled last-good seed data for offline PANTHEON pricing refreshes
 recursive-include mnemos/domain/pantheon *.json
 recursive-include mnemos/portability/mif_schemas *.json
+recursive-include mnemos/domain/portability/vendor *.json
+
+# STYX systemd units and deployment examples are part of the supported base
+# package now that encrypted backup is no longer supplied by an add-on wheel.
+recursive-include deploy/styx *
 
 # Integrations bundle (claude-code / openclaw / zeroclaw / hermes) —
 # include every file. These directories carry mixed extensions (*.md /

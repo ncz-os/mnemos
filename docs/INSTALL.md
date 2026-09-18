@@ -1,7 +1,7 @@
 # MNEMOS Install Guide
 
-MNEMOS ships as a small memory kernel (`mnemos-core`) plus a set of **separate,
-optional subsystem distributions** that all contribute to the same `mnemos.*`
+MNEMOS ships as a memory kernel (`mnemos-core`) plus a set of **separate,
+optional subsystem distributions** that contribute to the same `mnemos.*`
 PEP 420 namespace and are **runtime-gated** — if a subsystem isn't installed,
 its routes/MCP tools are simply not mounted (and return HTTP 503 with the exact
 install command, never an import crash).
@@ -17,7 +17,7 @@ There are two ways to deploy: **pre-built container images** (turnkey) or
 
 | Image | Contains | Arch | Pull |
 |---|---|---|---|
-| `ghcr.io/ncz-os/mnemos-enterprise` | **Everything**: core + GRAEAE + PANTHEON + KNEMON + CHARON in one API process, plus the Oracle / MySQL / MariaDB / Db2 drivers | `amd64` + `arm64` (Db2 driver on the amd64 layer only) | `docker pull ghcr.io/ncz-os/mnemos-enterprise:7.0.0` |
+| `ghcr.io/ncz-os/mnemos-enterprise` | **Everything**: core (including CHARON/STYX) + GRAEAE + PANTHEON + KNEMON in one API process, plus rclone and the Oracle / MySQL / MariaDB / Db2 drivers | `amd64` + `arm64` (Db2 driver on the amd64 layer only) | `docker pull ghcr.io/ncz-os/mnemos-enterprise:7.0.0` |
 
 The build is still OCI-layered internally -- `Dockerfile.core` and
 `Dockerfile.everything` are separate BuildKit Bake targets built `FROM` one
@@ -118,7 +118,7 @@ pip install 'mnemos-core[sqlite]'
 # kernel + reasoning
 pip install 'mnemos-core[graeae]'
 
-# everything (matches the `mnemos` image) — installs the four add-on dists
+# everything (matches the API layer) — installs the three add-on dists
 pip install 'mnemos-core[server]'
 
 # everything + enterprise drivers
@@ -127,7 +127,7 @@ pip install 'mnemos-core[full,enterprise]'
 
 > **Do not use `[full]` on arm64 hosts** — `full` no longer pulls the
 > Intel-only `openvino` accelerator. Use `[server]` (which is
-> `nats,persephone,pantheon,knemon,graeae,charon`) for an arch-neutral
+> `nats,persephone,pantheon,knemon,graeae`) for an arch-neutral
 > everything install, and add accelerators per host (`[openvino]`/`[cuda]`/`[amd]`)
 > only where supported.
 
@@ -138,7 +138,7 @@ pip install 'mnemos-core[full,enterprise]'
 | `pantheon` | `mnemos-pantheon` | PANTHEON model catalog/facade |
 | `knemon` | `mnemos-knemon` | KNEMON cost/model routing + ledger |
 | `graeae` | `mnemos-graeae` | GRAEAE multi-muse reasoning bus |
-| `charon` | `mnemos-charon` | CHARON portability (MPF import/export, migrate-in, Docling) |
+| `docling` | Docling libraries | Optional document conversion; CHARON routes/tools and STYX are already in core |
 | `oracle` | `oracledb` | Oracle Database 26ai backend (thin) |
 | `db2` | `ibm_db` | IBM Db2 12.1.5 backend |
 | `mysql` | `aiomysql` | MySQL 9.0+ backend (Enterprise/HeatWave for vectors) |
@@ -158,15 +158,15 @@ uvicorn mnemos.hive_mind.service:app --host 0.0.0.0 --port 8080
 | Bundle | Expands to |
 |---|---|
 | `edge` | `aiosqlite`, `sqlite-vec` |
-| `server` | `nats`, `persephone`, `pantheon`, `knemon`, `graeae`, `charon` |
+| `server` | `nats`, `persephone`, `pantheon`, `knemon`, `graeae` |
 | `ml` | `morpheus`, `kronos`, `apollo`, `artemis`, `hot` |
-| `full` | `server` + ML + `edge` + all four add-on dists |
+| `full` | `server` + ML + `edge` + all three add-on dists |
 | `enterprise` | `oracle`, `db2`, `mysql` |
 
 ### Adding a subsystem later
 
 ```bash
-pip install 'mnemos-core[charon]'   # or any extra
+pip install 'mnemos-core[docling]'  # optional heavy document conversion
 systemctl restart mnemos
 mnemos doctor                        # reports installed extras/bundles
 ```
@@ -239,7 +239,7 @@ See [docs/db2-eap-recipe-2026-05-20.md](db2-eap-recipe-2026-05-20.md) and
 
 ## Migrating between backends (CHARON)
 
-CHARON's MPF v0.1 export is backend-agnostic and lossless for native rows:
+Core's CHARON MPF export is backend-agnostic and lossless for native rows:
 
 ```bash
 # 1. Export from the current backend

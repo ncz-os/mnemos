@@ -30,11 +30,16 @@ What is in the box:
   SYNTHESISE → EXTRACT
 - a GDPR right-to-be-forgotten worker
 - the **PERSEPHONE** archival subsystem
+- first-party **CHARON portability**: MIF/MPF import and export, universal
+  ingest, migrate-in adapters, and **STYX** encrypted off-fleet backups
 - **KRONOS** recall observability
 
 > **How it is packaged.** MNEMOS ships as a small core (`mnemos-core`) plus
 > separately installable `mnemos.*` namespace subsystems (GRAEAE, PANTHEON,
-> KNEMON, CHARON) and the standalone STIPHOS hive service. The published
+> KNEMON) and the standalone STIPHOS hive service. CHARON's portability,
+> migration, ingestion, and STYX backup code became first-party core modules
+> on 2026-09-18; only Docling's heavy document-conversion dependencies remain
+> optional through `mnemos-core[docling]`. The published
 > container image is `ghcr.io/ncz-os/mnemos-enterprise` — a single multi-arch
 > (amd64 + arm64) manifest with every backend driver (Oracle, MySQL, MariaDB)
 > except Db2, which is amd64-only. Pin an exact version (`:7.0.0`) to keep a fleet
@@ -72,14 +77,14 @@ via extras). `mnemos` is the published **image** name, not a pip package.
 
 ```
 docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:latest
-# everything image: core + graeae + pantheon + knemon + charon. SQLite by default.
+# everything image: core (including CHARON/STYX) + graeae + pantheon + knemon. SQLite by default.
 # Point at a real DB with -e MNEMOS_DATABASE_DSN='postgres://…' (or oracle://… thin).
 ```
 
 **pip (compose your own):**
 
 > **None of `mnemos-core`, `mnemos-graeae`, `mnemos-pantheon`, `mnemos-knemon`,
-> `mnemos-charon`, or `mnemos-stiphos` are currently published to PyPI.**
+> or `mnemos-stiphos` are currently published to PyPI.**
 > `pip install 'mnemos-core[...]'` will 404 — the `[server]`/`[full]` extras
 > recurse into these names on the public index. Until they're published, install
 > from source. This exact sequence is tested in a clean venv:
@@ -95,7 +100,6 @@ python -m pip install -e .
 pip install 'git+https://gitlab.com/ncz-os/graeae.git'
 pip install 'git+https://gitlab.com/ncz-os/knemon.git'
 pip install 'git+https://gitlab.com/ncz-os/pantheon.git'   # needs graeae + knemon installed first
-pip install 'git+https://gitlab.com/ncz-os/charon.git'
 
 mnemos init                         # scaffold config + token
 mnemos serve                        # start API on :5002
@@ -136,7 +140,6 @@ python -m pip install -e '.[enterprise]'   # or '.[oracle]' / '.[db2]' — core'
 pip install 'git+https://gitlab.com/ncz-os/graeae.git'
 pip install 'git+https://gitlab.com/ncz-os/knemon.git'
 pip install 'git+https://gitlab.com/ncz-os/pantheon.git'
-pip install 'git+https://gitlab.com/ncz-os/charon.git'
 export MNEMOS_DATABASE_DSN='oracle://user:pass@host:1521/service_name'
 # or:  MNEMOS_DATABASE_DSN='db2://user:pass@host:50000/dbname'
 mnemos install --profile server

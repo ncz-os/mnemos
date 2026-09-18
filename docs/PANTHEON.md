@@ -52,14 +52,10 @@ Every existing tool keeps working — PANTHEON is OpenAI-shape. The win is the c
 
 ## CHARON contract note (related work)
 
-CHARON is likewise a separate add-on: the portability and ingest routes
-(`/v1/import`, `/v1/export`, universal ingest, document import) mount only when
-the `mnemos-charon` distribution is installed and `MNEMOS_ENABLE_CHARON` is
-left on. Without the extra the routers are never included, so the endpoints are
-**absent (404)** rather than present-and-restricted — unless strict layering is
-configured, in which case startup fails loudly instead of degrading quietly.
-The `mpf`/`mif` import CLI (`mnemos.tools.memory_import`) ships in that same
-distribution.
+As of 2026-09-18, CHARON portability and ingest routes (`/v1/import`,
+`/v1/export`, universal ingest, document import), their CLI tools, adapters,
+and STYX ship in `mnemos-core` and mount unconditionally. Only Docling's heavy
+conversion dependencies require the optional `docling` extra.
 
 The CHARON portability subsystem restricts the trigger-suppressed
 `memory_versions` sidecar import path to the **root + preserve_owner=true**
@@ -73,7 +69,7 @@ review surfaced a sequence of stale-state edge cases that each required
 extending the equality check on every column. The architectural restriction
 collapses the entire class.
 
-**Practical impact for PANTHEON clients:** none, where CHARON is installed.
+**Practical impact for PANTHEON clients:** none; CHARON is always installed.
 Callers hitting `/v1/import` for non-DAG-history use cases (typical agent
 memory sync) work normally. Cross-system migrations go through the documented
 root path. A peer-system adapter that wants to preserve authoritative version

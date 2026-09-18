@@ -5,10 +5,11 @@ split-distribution line and supersedes the v5.0.1 / v5.0.0 GA line from
 2026-05-02). Oracle AI Database 26ai, IBM Db2 12.1.5, MySQL and MariaDB
 backends sit behind the EPIMONE `PersistenceBackend` ABC alongside PostgreSQL and SQLite.
 
-> **Packaging note (v6.0.0).** Where this spec says "the `mnemos/` package," that is
-> now the **`mnemos-core`** distribution plus separately installable `mnemos.*`
-> namespace distributions (`mnemos-graeae`, `mnemos-pantheon`, `mnemos-knemon`,
-> `mnemos-charon`) and the standalone **STIPHOS** hive service (`mnemos-stiphos`).
+> **Packaging note (updated 2026-09-18).** Where this spec says "the `mnemos/`
+> package," that is the **`mnemos-core`** distribution (including CHARON
+> portability, migration, ingest, adapters, and STYX) plus separately installable
+> namespace distributions (`mnemos-graeae`, `mnemos-pantheon`, `mnemos-knemon`)
+> and the standalone **STIPHOS** hive service (`mnemos-stiphos`).
 > The subsystems described below are unchanged in behavior; they are simply shipped
 > as separate, optionally installed layers. See
 > [MNEMOS_CORE_BOUNDARY.md](MNEMOS_CORE_BOUNDARY.md), [INSTALL.md](INSTALL.md), and
@@ -123,8 +124,9 @@ exercised by the shared parity test suite. Apache-2.0.
   loop-prevention via `federation_source`.
 - **Webhooks**: SSRF-hardened outbound delivery with HMAC signing, persisted
   leases, retry-chain convergence, and terminal-success database guard.
-- **Portability**: MPF v0.1.x export/import with sidecars, Docling-based
-  document ingest (optional extra).
+- **Portability**: MIF 1.0 and MPF export/import with sidecars, migrate-in
+  adapters, universal ingest, and STYX encrypted backups. Docling-based
+  document conversion remains an optional extra.
 - **Observability**: request-ID ContextVar, Prometheus `/metrics`,
   OpenTelemetry spans (opt-in), structured JSON logs (opt-in).
 - **MORPHEUS**: operator-triggered dream-state runs with REPLAY / CLUSTER /
@@ -229,8 +231,8 @@ warning when used with multiple workers.
 | visibility | `mnemos/core/visibility.py` | - | Live and historical read predicates; `MN001` conflict mapping |
 | federation | `mnemos/api/routes/federation.py` | `federation_peers`, `federation_sync_log` | Pull-based peer sync and schema preflight |
 | webhooks | `mnemos/api/routes/webhooks.py`, `mnemos/webhooks/` | `webhook_subscriptions`, `webhook_deliveries` | Outbound delivery, leases, repair/recovery |
-| portability | `mnemos/api/routes/portability.py`, `mnemos/portability/` | - | `/v1/export` + `/v1/import` (MPF v0.1; CHARON add-on) |
-| ingest | `mnemos/api/routes/ingest.py` | - | Universal ingest and Docling-based PDF/DOCX/HTML extraction (CHARON add-on) |
+| portability | `mnemos/api/routes/portability.py`, `mnemos/domain/portability/`, `mnemos/portability/charon.py` | - | Core `/v1/export` + `/v1/import`; MPF orchestration and MIF bundle adapter |
+| ingest | `mnemos/api/routes/ingest.py` | - | Core universal ingest; Docling-based PDF/DOCX/HTML conversion uses the optional `docling` extra |
 
 ### 3.4 Persistence feature matrix
 
@@ -773,15 +775,14 @@ nats       = [nats-py >=2.14.0]
 hot        = [mnemos-hot >=0.2.0]
 knemon     = [mnemos-knemon >=0.1,<0.2]
 graeae     = [mnemos-graeae >=0.1,<0.2]
-charon     = [mnemos-charon >=0.1,<0.2]
 
 # Deployment bundles
 edge       = [aiosqlite >=0.20.0, sqlite-vec >=0.1.6]
-server     = [mnemos-core[nats,persephone,pantheon,knemon,graeae,charon]]
+server     = [mnemos-core[nats,persephone,pantheon,knemon,graeae]]
 ml         = [mnemos-core[morpheus,kronos,apollo,artemis,hot]]
 interop    = [mnemos-core[knossos]]
 full       = [mnemos-core[morpheus,persephone,kronos,knossos,apollo,artemis,nats,hot,edge],
-              mnemos-pantheon, mnemos-knemon, mnemos-graeae, mnemos-charon]
+              mnemos-pantheon, mnemos-knemon, mnemos-graeae]
 
 # Embedder acceleration
 semantic   = [fastembed >=0.3.0]                # CPU embeddings, ONNX, no torch

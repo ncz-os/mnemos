@@ -109,6 +109,28 @@ RUN set -eux; \
     rm -f /tmp/ngrok.tgz; \
     ngrok --version
 
+# rclone: STYX's personal-Google-Drive destination delegates OAuth and remote
+# credentials entirely to this system binary.  Pin immutable upstream release
+# archives and verify per-architecture digests before installation.
+ARG RCLONE_VERSION=1.75.1
+ARG RCLONE_SHA256_amd64=982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab
+ARG RCLONE_SHA256_arm64=03f2504174034b6d004152ed7369251c9a9ec1f7e0836eda420f5c7a5ec0dff9
+RUN set -eux; \
+    arch="${TARGETARCH:-amd64}"; \
+    case "$arch" in \
+      amd64) sha="${RCLONE_SHA256_amd64}" ;; \
+      arm64) sha="${RCLONE_SHA256_arm64}" ;; \
+      *) echo "unsupported TARGETARCH for rclone: $arch" >&2; exit 1 ;; \
+    esac; \
+    asset="rclone-v${RCLONE_VERSION}-linux-${arch}"; \
+    curl -fsSL -o /tmp/rclone.zip \
+      "https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/${asset}.zip"; \
+    echo "${sha}  /tmp/rclone.zip" | sha256sum -c -; \
+    python -m zipfile -e /tmp/rclone.zip /tmp/rclone; \
+    install -m 0755 "/tmp/rclone/${asset}/rclone" /usr/local/bin/rclone; \
+    rm -rf /tmp/rclone /tmp/rclone.zip; \
+    rclone version
+
 # Default to Oracle; override MNEMOS_DATABASE_DSN at runtime to pick any backend.
 ENV MNEMOS_PERSISTENCE_BACKEND=oracle
 

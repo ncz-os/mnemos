@@ -6,21 +6,19 @@ monorepo-extras scaffold.
 MNEMOS is layered along three **orthogonal** axes. You select each
 independently.
 
-## Axis 1 — Feature layers (separate distributions, runtime-gated)
+## Axis 1 — Core and external feature layers
 
-Every subsystem is its own pip distribution on the shared `mnemos.*` PEP 420
-namespace. Core never hard-imports them; routes/MCP tools/workers are mounted
-only when the dist is present (`mnemos.core.extras` presence probes +
-`_include_optional_router`). A missing subsystem returns HTTP 503 with its exact
-install command — never an `ImportError`.
+External subsystems use separate pip distributions on the shared `mnemos.*`
+PEP 420 namespace. CHARON portability, migration, ingest, and STYX moved into
+core on 2026-09-18 and their routes are always mounted. Docling remains an
+optional dependency because its conversion stack is large.
 
 | Distribution | Layer | Depends on |
 |---|---|---|
-| `mnemos-core` | kernel: EPIMONE persistence, API runtime, MCP, embedder | — |
+| `mnemos-core` | kernel, CHARON MIF/MPF portability, migrate-in adapters, ingest, STYX | — |
 | `mnemos-graeae` | GRAEAE multi-muse reasoning bus | core |
 | `mnemos-pantheon` | PANTHEON model catalog/facade | core |
 | `mnemos-knemon` | KNEMON cost/model routing + usage ledger | core |
-| `mnemos-charon` | CHARON portability (MPF, migrate-in, Docling) | core |
 | `mnemos-stiphos` | **STIPHOS hive** — agent coordination, job queue, cost-tier dispatch (beta) | core |
 
 **STIPHOS is a separate *service*, not a router** — its own ASGI app and port
@@ -38,8 +36,8 @@ embedder) is built once — but the intermediate stages never reach the registry
 so the layering is a build-time optimisation rather than a pull-time one.
 
 ```
-core layer (Dockerfile.core)              kernel                          build-context only
-  └─ everything layer (Dockerfile.everything)  + graeae+pantheon+knemon+charon  build-context only
+core layer (Dockerfile.core)              kernel + CHARON/STYX             build-context only
+  └─ everything layer (Dockerfile.everything)  + graeae+pantheon+knemon     build-context only
        └─ ghcr.io/ncz-os/mnemos-enterprise     + Oracle/Db2/MySQL          amd64 + arm64  ← the ONLY published image
 ```
 
@@ -50,11 +48,11 @@ pushed or tagged as their own packages; `ghcr.io/ncz-os/mnemos-core` and
 6.2.5. STIPHOS has no container image at all -- it is pip-only
 (`mnemos-stiphos`) and runs as its own service on port 8080.
 
-Why not a separate "core+graeae" image tier? graeae/pantheon/knemon/charon all
+Why not a separate "core+graeae" image tier? graeae/pantheon/knemon all
 mount into the **one** `mnemos.api.main:app` process and are runtime-gated, so a
 separate image just toggles routers that are already lazy. graeae is the heavy
 one; the other three are nearly free. The only real image boundaries are:
-kernel · full-API · separate hive service · heavy enterprise drivers.
+kernel/CHARON/STYX · full-API · separate hive service · heavy enterprise drivers.
 
 Build sources: `Dockerfile.core`, `Dockerfile.everything`, `Dockerfile.enterprise`
 (core repo). Published by `.github/workflows/release-images.yml`, whose own

@@ -1,15 +1,14 @@
 # MNEMOS-OS Dockerfile - split umbrella Oracle-profile image.
 #
 # This is the deploy-switch option-a image for the repo split. It expects the
-# build context root to contain four sibling package source trees:
+# build context root to contain core plus three sibling add-on source trees:
 #
 #   ./core     mnemos-core
 #   ./pantheon ncz-os/ncz-pantheon
 #   ./knemon   ncz-os/ncz-knemon
 #   ./graeae   ncz-os/ncz-graeae
-#   ./charon   ncz-os/ncz-charon
 #
-# The five projects are installed as distinct distributions. Their PEP 420
+# The four projects are installed as distinct distributions. Their PEP 420
 # mnemos.* namespace package trees overlay into one importable runtime tree.
 # Import contract for parity with the old monorepo image:
 #
@@ -17,7 +16,7 @@
 #   import mnemos.domain.pantheon
 #   import mnemos.domain.knemon
 #   import mnemos.domain.graeae
-#   import mnemos.domain.portability   (mnemos-charon)
+#   import mnemos.domain.portability   (first-party in mnemos-core)
 #
 # Build with the helper:
 #   ./build-split.sh
@@ -26,7 +25,6 @@ ARG MNEMOS_CORE_REF=unknown
 ARG MNEMOS_PANTHEON_REF=unknown
 ARG MNEMOS_KNEMON_REF=unknown
 ARG MNEMOS_GRAEAE_REF=unknown
-ARG MNEMOS_CHARON_REF=unknown
 
 FROM python:3.13-slim AS builder
 
@@ -43,7 +41,6 @@ COPY core/requirements.txt core/pyproject.toml ./core/
 COPY pantheon/pyproject.toml ./pantheon/
 COPY knemon/pyproject.toml ./knemon/
 COPY graeae/pyproject.toml ./graeae/
-COPY charon/pyproject.toml ./charon/
 COPY core/scripts/merge_split_requirements.py \
      core/scripts/audit_split_namespace.py \
      core/scripts/resolve_split_wheels.py \
@@ -65,7 +62,6 @@ COPY core ./core
 COPY pantheon ./pantheon
 COPY knemon ./knemon
 COPY graeae ./graeae
-COPY charon ./charon
 
 # Wheels share the mnemos PEP 420 namespace at install time. Fail before wheel
 # build if two distributions would install the same module file, or if any tree
@@ -76,8 +72,7 @@ RUN python -m pip wheel --no-deps --no-build-isolation --wheel-dir /wheelhouse \
     ./core \
     ./pantheon \
     ./knemon \
-    ./graeae \
-    ./charon
+    ./graeae
 
 FROM python:3.13-slim
 
@@ -85,22 +80,19 @@ ARG MNEMOS_CORE_REF
 ARG MNEMOS_PANTHEON_REF
 ARG MNEMOS_KNEMON_REF
 ARG MNEMOS_GRAEAE_REF
-ARG MNEMOS_CHARON_REF
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.21 /uv /uvx /bin/
 
 LABEL org.opencontainers.image.title="mnemos-os split" \
-      org.opencontainers.image.description="MNEMOS split umbrella image built from mnemos-core plus pantheon, knemon, graeae, and charon namespace packages" \
+      org.opencontainers.image.description="MNEMOS split umbrella image built from mnemos-core (including CHARON/STYX) plus pantheon, knemon, and graeae namespace packages" \
       mnemos.split.core-ref="${MNEMOS_CORE_REF}" \
       mnemos.split.pantheon-ref="${MNEMOS_PANTHEON_REF}" \
       mnemos.split.knemon-ref="${MNEMOS_KNEMON_REF}" \
       mnemos.split.graeae-ref="${MNEMOS_GRAEAE_REF}" \
-      mnemos.split.charon-ref="${MNEMOS_CHARON_REF}" \
       org.mnemos.core="${MNEMOS_CORE_REF}" \
       org.mnemos.addon.pantheon="${MNEMOS_PANTHEON_REF}" \
       org.mnemos.addon.knemon="${MNEMOS_KNEMON_REF}" \
-      org.mnemos.addon.graeae="${MNEMOS_GRAEAE_REF}" \
-      org.mnemos.addon.charon="${MNEMOS_CHARON_REF}"
+      org.mnemos.addon.graeae="${MNEMOS_GRAEAE_REF}"
 
 WORKDIR /app
 

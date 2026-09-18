@@ -35,6 +35,7 @@ def test_export_layout_and_manifest(tmp_path):
     manifest = charon.export_bundle(_memories(), tmp_path)
     assert manifest["count"] == 2
     assert manifest["mif_version"] == "1.0.0"
+    assert manifest["generator"] == "mnemos-core"
     # files laid out by conceptType/<uuid>.md
     assert (tmp_path / charon.MANIFEST_NAME).is_file()
     assert (tmp_path / "semantic").is_dir()  # 'decisions' -> semantic

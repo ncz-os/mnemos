@@ -4,23 +4,21 @@ MNEMOS imports documents through IBM's [Docling](https://www.ibm.com/products/do
 
 ## Installation
 
-Document import routes ship in the `charon` add-on and additionally require
-the Docling extra:
+Document import routes ship in `mnemos-core`. Actual document conversion uses
+the optional Docling dependency group:
 
 ```bash
-pip install 'mnemos-core[charon,docling]'
+pip install 'mnemos-core[docling]'
 ```
 
 This installs:
-- `mnemos-charon` — mounts the `/v1/documents/import` routes
+- `mnemos-core` — always mounts the `/v1/documents/import` routes
 - `docling>=2.5.0` — Main document parsing library
 - `docling-core>=2.0.0` — Core parsing utilities
 - `pillow>=10.0.0` — Image handling for PDF/multi-format support
 
-Without the `charon` extra, the document import routes are not mounted at
-all (no route to return an error from). With `charon` installed but
-`docling` absent, the routes exist and return an error indicating the
-missing dependency.
+Without the `docling` extra, the routes remain mounted and return an explicit
+missing-dependency response for formats that need Docling.
 
 ## Supported Formats
 

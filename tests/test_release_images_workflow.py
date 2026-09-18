@@ -1,7 +1,7 @@
 """Verify the release-images workflow pins add-on overlays to known SHAs.
 
 The release workflow (``/.github/workflows/release-images.yml``) must
-fetch each add-on (pantheon/knemon/graeae/charon) at a known SHA so a
+fetch each add-on (pantheon/knemon/graeae) at a known SHA so a
 ``vX.Y.Z`` tag can be reproduced from the lock file
 (``.github/addons.lock.json``). These tests pin:
 
@@ -22,7 +22,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCK_PATH = REPO_ROOT / ".github" / "addons.lock.json"
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release-images.yml"
-ADDONS = ("pantheon", "knemon", "graeae", "charon")
+ADDONS = ("pantheon", "knemon", "graeae")
 
 
 def _read_lock() -> dict:

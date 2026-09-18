@@ -28,14 +28,12 @@ EXTERNAL_EXTRA_DISTS: dict[str, str] = {
     "pantheon": "mnemos-pantheon",
     "knemon": "mnemos-knemon",
     "graeae": "mnemos-graeae",
-    "charon": "mnemos-charon",
 }
 
 EXTERNAL_EXTRA_IMPORT_PROBES: dict[str, str] = {
     "pantheon": "mnemos.domain.pantheon",
     "knemon": "mnemos.domain.knemon.router",
     "graeae": "mnemos.domain.graeae.engine",
-    "charon": "mnemos.domain.portability.schemas",
 }
 
 UNAVAILABLE_EXTRAS: dict[str, str] = {
@@ -44,7 +42,7 @@ UNAVAILABLE_EXTRAS: dict[str, str] = {
 
 FEATURE_BUNDLES: dict[str, tuple[str, ...]] = {
     "edge": ("edge",),
-    "server": ("nats", "persephone", "pantheon", "knemon", "graeae", "charon"),
+    "server": ("nats", "persephone", "pantheon", "knemon", "graeae"),
     "ml": ("morpheus", "kronos", "apollo", "artemis", "hot"),
     "interop": ("knossos",),
     "full": (
@@ -53,7 +51,6 @@ FEATURE_BUNDLES: dict[str, tuple[str, ...]] = {
         "pantheon",
         "knemon",
         "graeae",
-        "charon",
         "kronos",
         "knossos",
         "apollo",
@@ -73,12 +70,9 @@ def is_extra_installed(name: str) -> bool:
     ``[tool.uv.sources]`` may resolve a name-only stub (see the
     ``mnemos-stubs/<name>`` entries in pyproject.toml) that satisfies the
     resolver without providing any actual add-on code. Without the import
-    probe, ``mnemos-charon`` etc. would falsely report "installed" after
-    `uv pip install .[charon]` in this repository and the CHARON/PANTHEON/
-    KNEMON/GRAEAE/HOT routes would mount at 503-or-broken instead of
+    probe, PANTHEON/KNEMON/GRAEAE routes could mount at 503-or-broken instead of
     cleanly returning 503 with the install hint. In production with the
-    real wheels (which DO contain ``mnemos.domain.portability.schemas``,
-    ``mnemos.domain.pantheon``, ``mnemos.domain.knemon.router``,
+    real wheels (which DO contain ``mnemos.domain.pantheon``, ``mnemos.domain.knemon.router``,
     ``mnemos.domain.graeae.engine``, ``mnemos_hot``) both probes succeed
     and the extra is reported as installed.
 
@@ -98,9 +92,8 @@ def is_extra_installed(name: str) -> bool:
         except PackageNotFoundError:
             metadata_ok = False
         probe = EXTERNAL_EXTRA_IMPORT_PROBES.get(name)
-        # When metadata IS present (the typical ``uv pip install .[charon]``
-        # case), BOTH probes must succeed — this rejects the name-only
-        # stubs from ``[tool.uv.sources]`` so CHARON/PANTHEON/etc. routes
+        # When metadata IS present, BOTH probes must succeed — this rejects
+        # name-only stubs from ``[tool.uv.sources]`` so add-on routes
         # return 503 instead of mounting with no real code behind them.
         # When metadata is MISSING (editable / partial installs without
         # metadata), the import probe is sufficient — that's the pre-F01

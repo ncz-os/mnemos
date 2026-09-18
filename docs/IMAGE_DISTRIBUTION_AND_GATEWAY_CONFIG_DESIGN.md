@@ -12,8 +12,9 @@ and the published `ghcr.io/ncz-os` image set.
 MNEMOS publishes **public, mass-distribution OSS images**:
 `mnemos-core` (kernel: EPIMONE persistence) → `mnemos` (everything) →
 `mnemos-enterprise` (+ Oracle/Db2/MySQL backends), built from `mnemos-core`
-with the add-on wheels (`mnemos-pantheon`, `mnemos-graeae`, `mnemos-knemon`,
-`mnemos-charon`) pip-installed. Arbitrary third parties pull and run these.
+with the add-on wheels (`mnemos-pantheon`, `mnemos-graeae`, `mnemos-knemon`)
+pip-installed. CHARON and STYX are first-party core code as of 2026-09-18.
+Arbitrary third parties pull and run these.
 
 A deployment had been running a **patched variant** of the enterprise image: a
 small overlay that copied modified gateway modules over the installed wheels

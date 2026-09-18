@@ -609,12 +609,12 @@ test:composition:
       import subprocess
       from pathlib import Path
       pins = json.loads(Path(".github/addons.lock.json").read_text())
-      for name in ("graeae", "knemon", "pantheon", "charon"):
+      for name in ("graeae", "knemon", "pantheon"):
           target = "../composition-" + name
           subprocess.run(["git", "clone", "https://gitlab.com/ncz-os/" + name + ".git", target], check=True)
           subprocess.run(["git", "-C", target, "checkout", pins[name]], check=True)
       PYTHON
-    - python -m pip install --quiet -e ".[dev,sqlite,nats,persephone]" -e ../composition-graeae -e ../composition-knemon -e ../composition-pantheon -e ../composition-charon
+    - python -m pip install --quiet -e ".[dev,sqlite,nats,persephone]" -e ../composition-graeae -e ../composition-knemon -e ../composition-pantheon
   script:
     - lint-imports --config pyproject.toml
     - python -m pytest tests/ --ignore=tests/test_live_e2e.py --tb=short -q --junitxml=composition.xml

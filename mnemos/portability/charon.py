@@ -558,7 +558,7 @@ def export_bundle(
             "mif_version": MIF_VERSION,
             "schema": MIF_SCHEMA_ID,
             "context": mif.MIF_CONTEXT_URI,
-            "generator": "mnemos-charon",
+            "generator": "mnemos-core",
             "count": count,
         }
         if stream_manifest:

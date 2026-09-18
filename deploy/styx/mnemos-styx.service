@@ -1,0 +1,52 @@
+[Unit]
+Description=STYX backup of this host's MNEMOS data to Google Drive
+After=network-online.target
+Wants=network-online.target
+# On a host running the MNEMOS service in http source mode, the local
+# instance must be up for the loopback export to answer.
+After=mnemos-api.service
+
+[Service]
+Type=oneshot
+
+# STYX exits non-zero on ANY failed integrity gate and never reports a
+# partial success, so a failure here is a REAL failure worth surfacing in
+# `systemctl list-timers` and in the OnFailure hook below.
+ExecStart=/opt/mnemos/venv/bin/python -m mnemos.tools.styx backup
+
+# Wire this to whatever this fleet uses for alerting. A backup that fails
+# quietly is the exact defect STYX was built to remove: the previous NFS
+# backup job reported success while writing nothing for five weeks.
+OnFailure=status-email@%n.service
+
+# Secrets. MNEMOS_STYX_AGE_RECIPIENT is the PUBLIC half only — the identity
+# that can decrypt these backups must never exist on a fleet host.
+EnvironmentFile=/etc/mnemos/styx.env
+
+# The work directory holds the CLEARTEXT bundle, including live vault
+# credentials, for the few seconds between export and encryption. Keep it on
+# a private tmpfs so it never touches persistent storage.
+PrivateTmp=true
+RuntimeDirectory=styx
+RuntimeDirectoryMode=0700
+Environment=MNEMOS_STYX_WORK_DIR=/run/styx
+
+# Least privilege: STYX reads one database and talks to one HTTPS endpoint.
+User=mnemos
+Group=mnemos
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+UMask=0077
+
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target

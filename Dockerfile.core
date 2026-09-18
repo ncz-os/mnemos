@@ -11,11 +11,12 @@
 # built ONCE and shared across the mnemos / mnemos-enterprise / mnemos-stiphos
 # tags):
 #
-#   mnemos-core            (this file)          kernel: EPIMONE persistence
+#   mnemos-core            (this file)          kernel + CHARON portability +
+#                                               STYX backup, EPIMONE persistence
 #                                               (SQLite default), API runtime,
 #                                               MCP, in-process embedder.
 #   mnemos                 Dockerfile.everything   FROM core + graeae + pantheon
-#                                               + knemon + charon wheels.
+#                                               + knemon wheels.
 #   mnemos-enterprise      Dockerfile.enterprise   FROM mnemos + Oracle/Db2/MySQL
 #                                               drivers (amd64-only).
 #   mnemos-stiphos         (mnemos-stiphos repo)   FROM core + the hive service.
@@ -128,6 +129,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /wheelhouse /wheelhouse
 
 RUN python -m pip install --no-deps --no-index --find-links /wheelhouse mnemos-core && \
+    python -c "import mnemos.api.routes.portability, mnemos.domain.portability, mnemos.tools.styx" && \
     python -m pip check && \
     rm -rf /wheelhouse
 
