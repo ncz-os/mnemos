@@ -12,8 +12,10 @@ Code: `mnemos/tools/styx/` (`config.py`, `crypto.py`, `destination.py`,
 `drive.py`, `errors.py`, `retention.py`, `runner.py`, `source.py`). Deploy
 assets: `deploy/styx/{mnemos-styx.service,mnemos-styx.timer,styx.env.example}`.
 CI-green (unit-tested with mocked destinations/age/retention fakes —
-`tests/test_styx_*.py`). **Not yet run against a real destination end to
-end** — see Prerequisites below.
+`tests/test_styx_*.py`), and **proven end-to-end in production** on the
+fleet's authoritative Oracle-backed instance (PYTHIA) against both the `r2`
+and `rclone` destinations with a real, complete 18,651-record export — see
+"Status as of 2026-09-18" below.
 
 ## Design, in short
 
@@ -206,11 +208,72 @@ managed Google Workspace deployment), not by default.
   is a placeholder — wire it to whatever this fleet actually uses for
   alerting before relying on the timer unattended.
 
+## Running multiple destinations from one host
+
+STYX's own service/timer pair (above) assumes one destination per host, a
+native venv install, and `User=mnemos` reading the store directly. PYTHIA
+runs `mnemos-api` as a container instead, and deliberately backs up to
+**both** `r2` and `rclone` in parallel rather than picking one — belt and
+suspenders for the fleet's single authoritative Oracle-backed instance. The
+pattern that took (two independent env files, two independent
+service/timer pairs, staggered so they don't contend for the same export):
+
+- `/etc/mnemos/styx-r2.env` and `/etc/mnemos/styx-rclone.env` — same keys as
+  `styx.env.example`, one file per destination, `root:root 0600`.
+- `mnemos-styx-r2.service` / `.timer` (02:40 UTC) and
+  `mnemos-styx-rclone.service` / `.timer` (03:10 UTC) — each `Type=oneshot`,
+  `EnvironmentFile=` pointing at its own env file, `Persistent=true`,
+  `RandomizedDelaySec=300`, `After=`/`Requisite=mnemos-api.service`.
+- Instead of a native `ExecStart`, each service runs STYX **inside the
+  running container**: `ExecStart=/usr/bin/podman exec -e VAR1 -e VAR2 ...
+  mnemos-api python3 -m mnemos.tools.styx backup` — every `MNEMOS_STYX_*`
+  variable the destination needs is named with a bare `-e VARNAME` (no
+  value), so `podman exec` forwards it from the unit's own
+  `EnvironmentFile=` into the container rather than needing it duplicated
+  in the quadlet's own `Environment=` lines.
+- For the `rclone` destination specifically, the container also needs
+  `rclone.conf` itself: the quadlet mounts
+  `/etc/mnemos/rclone.conf:/root/.config/rclone/rclone.conf:ro`
+  (`Volume=` line in `mnemos-api.container`) so the containerized `rclone`
+  binary can see the already-authorized remote without the OAuth token ever
+  being baked into the image.
+
+This is a per-host customization, not a repo-shipped template — build it
+from `styx.env.example` + the generic unit above, split per destination as
+shown, when a host needs more than one destination or runs its MNEMOS
+instance in a container.
+
 ## Status as of 2026-09-18
 
-STYX now ships in every base `mnemos-core` install. Its HTTP source consumes
-the API's paged streaming frames, verifies the completion marker and declared
-record total, and materializes a restorable MPF envelope before encryption.
-The enterprise image also contains pinned rclone binaries on amd64 and arm64.
-Destination credentials and the offline age-key ceremony are still operator
-prerequisites before an end-to-end production backup can run.
+STYX ships in every base `mnemos-core` install (`boto3`, `pyrage`, and
+pinned `rclone` binaries for amd64/arm64 are unconditional
+`mnemos-enterprise` image dependencies, not optional extras — the whole
+mnemos-charon repo, including STYX, was merged into mnemos-core as
+first-party code this date; docling ingestion is the one part that stayed
+optional). Its HTTP source consumes the API's paged streaming frames via
+the export route's keyset cursor, verifies the completion marker and
+declared record total, and materializes a restorable MPF envelope before
+encryption — an earlier version of this source miscounted NDJSON protocol
+frames as individual records, which looked like data truncation; that is
+fixed.
+
+**Proven end-to-end in production, not just CI-green.** On PYTHIA (the
+fleet's authoritative Oracle-backed instance) STYX ran against real,
+complete data — 18,651 records, not a truncated test — to both `r2` and
+`rclone`/Google Drive simultaneously (see "Running multiple destinations
+from one host" above). Both destinations were independently verified
+outside STYX itself: R2 via direct S3 `ListObjects` (size + ETag matched),
+Drive via `rclone lsl` (size matched). Both destinations' retention logic
+correctly pruned earlier partial-test artifacts once the real backup
+landed. Daily timers are installed and armed on PYTHIA:
+`mnemos-styx-r2.timer` (02:40 UTC) and `mnemos-styx-rclone.timer` (03:10
+UTC). The `age` keypair for PYTHIA's backups was generated off-fleet per
+the design above; only the public recipient exists anywhere on the fleet.
+
+**Not yet done**: cerberus/proteus/achilles (the SQLite-backed satellites)
+don't have their own STYX timers yet — only PYTHIA's authoritative instance
+is backed up on a schedule so far. `OnFailure=status-email@%n.service` in
+the generic unit is still a placeholder pending real alerting wiring.
+rclone's shared `client_id` deprecation (retiring during 2026) is a known,
+non-urgent follow-up — re-run the `rclone config` ceremony with a
+dedicated client id before then.
