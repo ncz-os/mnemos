@@ -44,6 +44,12 @@ LABEL org.opencontainers.image.title="mnemos-enterprise" \
       org.mnemos.core="${MNEMOS_CORE_REF}" \
       org.mnemos.variant="enterprise"
 
+# mnemos-everything (FROM'd above) already dropped to the non-root runtime
+# account as its own final layer. Every install step below (pip, and the
+# cloudflared/ngrok/rclone binary installs to /usr/local/bin) needs root;
+# restored to the hardened account as the very last line of this file.
+USER root
+
 # Enterprise persistence drivers. oracledb = thin mode by default (no Instant
 # Client), works on every arch. aiomysql is pure Python and serves both the
 # MySQL 9.0+ and MariaDB 11.x async paths, also every arch. ibm_db bundles
@@ -141,5 +147,11 @@ RUN set -eux; \
 
 # Default to Oracle; override MNEMOS_DATABASE_DSN at runtime to pick any backend.
 ENV MNEMOS_PERSISTENCE_BACKEND=oracle
+
+# mnemos-enterprise is the single published, deployed image (see header
+# above), so it is the last chance to restore the hardened account before
+# anything actually runs the container. See Dockerfile.core for the uid/gid
+# rationale.
+USER 10001:0
 
 # Inherits VOLUME /data, EXPOSE 5002, HEALTHCHECK, and the uvicorn CMD.
