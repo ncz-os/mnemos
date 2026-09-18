@@ -112,7 +112,15 @@ RUN set -eux; \
 # rclone: STYX's personal-Google-Drive destination delegates OAuth and remote
 # credentials entirely to this system binary.  Pin immutable upstream release
 # archives and verify per-architecture digests before installation.
-ARG RCLONE_VERSION=1.75.1
+#
+# NOTE: the pinned version ARG is deliberately named RCLONE_PIN_VERSION, not
+# RCLONE_VERSION -- rclone maps any RCLONE_<FLAGNAME> environment variable to
+# the matching CLI flag automatically, and RCLONE_VERSION collides with the
+# boolean --version flag. With that name set, `rclone version` (the sanity
+# check below) fails: "invalid argument "1.75.1" for "--version" flag:
+# strconv.ParseBool". Confirmed by a real build failure on both arches before
+# this rename.
+ARG RCLONE_PIN_VERSION=1.75.1
 ARG RCLONE_SHA256_amd64=982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab
 ARG RCLONE_SHA256_arm64=03f2504174034b6d004152ed7369251c9a9ec1f7e0836eda420f5c7a5ec0dff9
 RUN set -eux; \
@@ -122,9 +130,9 @@ RUN set -eux; \
       arm64) sha="${RCLONE_SHA256_arm64}" ;; \
       *) echo "unsupported TARGETARCH for rclone: $arch" >&2; exit 1 ;; \
     esac; \
-    asset="rclone-v${RCLONE_VERSION}-linux-${arch}"; \
+    asset="rclone-v${RCLONE_PIN_VERSION}-linux-${arch}"; \
     curl -fsSL -o /tmp/rclone.zip \
-      "https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/${asset}.zip"; \
+      "https://github.com/rclone/rclone/releases/download/v${RCLONE_PIN_VERSION}/${asset}.zip"; \
     echo "${sha}  /tmp/rclone.zip" | sha256sum -c -; \
     python -m zipfile -e /tmp/rclone.zip /tmp/rclone; \
     install -m 0755 "/tmp/rclone/${asset}/rclone" /usr/local/bin/rclone; \
