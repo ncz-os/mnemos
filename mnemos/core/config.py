@@ -1516,6 +1516,22 @@ def runtime_env_bool(name: str, default: bool = False) -> bool:
     return raw.lower() in {"1", "true", "yes", "on"}
 
 
+def export_stream_timeout_seconds_env() -> float:
+    """Preserve the streaming export's strict float conversion semantics."""
+    return max(
+        1.0,
+        float(runtime_env_value("MNEMOS_EXPORT_STREAM_TIMEOUT_SECONDS", "300")),
+    )
+
+
+def export_page_max_bytes_env() -> int:
+    """Preserve the export client's strict integer conversion semantics."""
+    return max(
+        1,
+        int(runtime_env_value("MNEMOS_EXPORT_PAGE_MAX_BYTES", str(128 * 1024 * 1024))),
+    )
+
+
 def set_runtime_env_value(name: str, value: str) -> None:
     """Set a process environment value on behalf of a runtime accessor.
 
