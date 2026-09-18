@@ -77,9 +77,8 @@ if curl -sS --fail-with-body --max-time 10 \
 else
   # --fail-with-body makes curl exit non-zero on any HTTP 4xx/5xx (not just
   # network errors), so success is no longer logged on a failed POST. A
-  # 404/503 here usually means the backend lacks the CHARON ingest route:
-  # POST /ingest/session ships in the mnemos-charon / "everything" image,
-  # not in core.
-  log "ingest failed (session $session_id) — POST /ingest/session requires the CHARON/everything image"
+  # The ingest route ships in core; 404/503 indicates a deployment/version or
+  # service-health problem rather than a missing CHARON add-on wheel.
+  log "ingest failed (session $session_id) — check the MNEMOS core deployment and service logs"
 fi
 printf '{}\n'

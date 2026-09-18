@@ -12,9 +12,8 @@ FIRST_PARTY = {
     "mnemos-pantheon",
     "mnemos-knemon",
     "mnemos-graeae",
-    "mnemos-charon",
 }
-ADDON_PACKAGES = ("pantheon", "knemon", "graeae", "charon")
+ADDON_PACKAGES = ("pantheon", "knemon", "graeae")
 
 
 def parse_args() -> argparse.Namespace:

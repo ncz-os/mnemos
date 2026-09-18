@@ -34,17 +34,14 @@ def test_v1_export_route_is_get_not_post():
     the doc claim agrees with it."""
     portability_path = (REPO / "mnemos" / "api" / "routes"
                         / "portability.py")
-    if portability_path.exists():
-        portability = portability_path.read_text()
-        assert '@router.get(\n    "/export"' in portability \
-            or '@router.get("/export"' in portability, (
-            "/v1/export is no longer a GET. Update "
-            "tests/test_doc_endpoints_match_routes.py and the docs "
-            "if the verb intentionally changed."
-        )
-    # else: the export route was carved into the sibling mnemos-charon
-    # package, where the GET verb contract is enforced. The in-tree doc
-    # consistency check below still applies.
+    assert portability_path.exists(), "core must ship the CHARON portability router"
+    portability = portability_path.read_text()
+    assert '@router.get(\n    "/export"' in portability \
+        or '@router.get("/export"' in portability, (
+        "/v1/export is no longer a GET. Update "
+        "tests/test_doc_endpoints_match_routes.py and the docs "
+        "if the verb intentionally changed."
+    )
 
     # No remaining `POST /v1/export` claim in operator-facing docs.
     pattern = re.compile(r"`?\bPOST\s+/v1/export\b`?")

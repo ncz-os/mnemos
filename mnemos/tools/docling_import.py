@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""
+docling_import.py - IBM Docling integration for importing documents as MNEMOS memories.
+
+Supports PDF, DOCX, DOC, HTML, HTM, Markdown, PPTX, TXT via Docling.
+
+CLI usage:
+    python -m mnemos.tools.docling_import --file /path/to/doc.pdf --endpoint http://localhost:5002
+    python -m mnemos.tools.docling_import --source /path/to/docs --endpoint http://localhost:5002 \
+        --category documents --chunk-size 800 --overlap 100 --recursive --tags "tag1,tag2"
+
+Library usage:
+    from mnemos.tools.docling_import import DoclingImporter
+    importer = DoclingImporter(endpoint="http://localhost:5002", category="documents")
+    stats = importer.import_directory(Path("/path/to/docs"), recursive=True)
+"""
+
+import argparse
+from collections import Counter
+import json
+import re
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+class DoclingImporter:
+    """Import documents via IBM Docling into MNEMOS as chunked memories."""
+
+    SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".doc", ".html", ".htm", ".md", ".pptx", ".txt"}
+
+    def __init__(
+        self,
+        endpoint: str = "http://localhost:5002",
+        api_key: str = None,
+        category: str = "documents",
+        chunk_size: int = 800,
+        overlap: int = 100,
+        tags: list = None,
+        dry_run: bool = False,
+        owner_id: str = None,
+        namespace: str = None,
+        emit_mif: str = None,
+    ):
+        """
+        Args:
+            endpoint: MNEMOS API base URL (e.g. http://localhost:5002)
+            api_key:  Optional Bearer token for MNEMOS auth
+            category: Memory category to assign imported chunks
+            chunk_size: Target token count per chunk (1 token ≈ 0.75 words)
+            overlap:    Token overlap between consecutive chunks
+            tags:       List of extra tags to attach to every memory
+            dry_run:    If True, print what would be imported without POSTing
+        """
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+        self.category = category
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+        self.tags = tags or []
+        self.dry_run = dry_run
+        self.owner_id = owner_id
+        self.namespace = namespace
+        # When set, ingested chunks are NOT POSTed to the API; they are collected
+        # and written as a MIF 1.0 bundle (directory of conformant concept files)
+        # under this path. Lets Docling document ingest produce portable MIF
+        # directly, alongside the existing MNEMOS-API ingest path.
+        self.emit_mif = emit_mif
+        self.collected: list[dict] = []
+        self.post_successes = 0
+        self.post_failures = 0
+        # Tracks files the operator asked us to ingest whose text
+        # extraction failed (e.g. corrupt PDF, unsupported variant).
+        # Distinct from post_failures (HTTP POST errors) — both must
+        # contribute to a nonzero exit code so the operator sees the
+        # failed import instead of an apparently-successful zero-row
+        # run.
+        self.extraction_failures = 0
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mif_memory_id(mem: dict) -> str:
+        """Stable source id for a chunk so re-ingesting the same document yields
+        the same MIF concept ``@id`` (memory_to_concept hashes this to a UUIDv5)."""
+        meta = mem.get("metadata") or {}
+        src = meta.get("source_path") or meta.get("source_file") or "doc"
+        return f"docling:{src}#{meta.get('chunk_index', 0)}"
+
+    def import_file(self, path: Path) -> list:
+        """Extract, chunk, and (optionally) POST a single file.
+
+        Returns:
+            List of memory dicts that were (or would be) imported.
+        """
+        path = Path(path)
+        if path.suffix.lower() not in self.SUPPORTED_EXTENSIONS:
+            print(f"  SKIP  {path.name}  (unsupported extension '{path.suffix}')")
+            return []
+
+        print(f"  Processing {path.name} ...")
+        try:
+            sections = self._extract_text(path)
+        except ImportError as exc:
+            print(f"  ERROR  {path.name}: {exc}")
+            raise
+        except Exception as exc:
+            print(f"  ERROR  {path.name}: {exc}")
+            self.extraction_failures += 1
+            return []
+
+        memories = []
+        for section in sections:
+            chunks = self._chunk(
+                section["text"],
+                {
+                    "source_file": path.name,
+                    "source_path": str(path.resolve()),
+                    "page": section.get("page"),
+                    "section": section.get("section"),
+                    "title": section.get("title"),
+                    "import_tool": "docling_import",
+                    "import_date": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            memories.extend(chunks)
+
+        # Re-number total_chunks across all sections for this file
+        total = len(memories)
+        for idx, mem in enumerate(memories):
+            mem["metadata"]["chunk_index"] = idx
+            mem["metadata"]["total_chunks"] = total
+
+        if self.dry_run:
+            print(f"  DRY RUN  {path.name}: {total} chunk(s) would be created")
+            for mem in memories:
+                preview = mem["content"][:120].replace("\n", " ")
+                print(f"    chunk {mem['metadata']['chunk_index']}/{total - 1}: {preview!r} | meta={mem['metadata']}")
+            return memories
+
+        if self.emit_mif is not None:
+            # MIF mode: collect chunks (with a stable source id) for a bundle
+            # written once at the end of the run — do not POST to the API.
+            # `is not None` (not truthiness): an explicitly-set DIR must never
+            # silently fall through to the POST path.
+            for mem in memories:
+                # Assign unconditionally so the advertised stable Docling source
+                # id holds even if an upstream chunk ever carries its own id.
+                mem["id"] = self._mif_memory_id(mem)
+            self.collected.extend(memories)
+            print(f"  MIF  {path.name}: {total} chunk(s) staged for the MIF bundle")
+            return memories
+
+        ok, fail = self._post_batch(memories)
+        print(f"  Done  {path.name}: {ok} imported, {fail} failed")
+        return memories
+
+    def write_mif_bundle(self) -> dict:
+        """Write all collected chunks as a MIF 1.0 bundle.
+
+        Delegates to the canonical MIF mapper/serializer in mnemos-core
+        (``mnemos.portability.charon.export_bundle``), which converts each chunk
+        to a MIF concept, validates it against the published MIF JSON Schema, and
+        writes ``<conceptType>/<uuid>.md`` + ``mif-manifest.json``. Raises if the
+        MIF portability module is unavailable or a concept is non-conformant.
+        """
+        if self.emit_mif is None:
+            raise RuntimeError("write_mif_bundle() called without emit_mif set")
+        if not self.collected:
+            raise RuntimeError(
+                "no chunks collected to emit as a MIF bundle "
+                "(no supported documents ingested, or all extractions failed)"
+            )
+        # Each id hashes to the concept's UUID and thus its bundle path; duplicate
+        # ids (a file re-imported on the same importer, or a symlink + its target)
+        # would collapse/overwrite concepts. Fail loudly with the offenders.
+        ids = [m.get("id") for m in self.collected]
+        dups = sorted(i for i, count in Counter(ids).items() if count > 1)
+        if dups:
+            raise RuntimeError(
+                "duplicate MIF source ids staged (re-imported document or "
+                f"symlink+target?): {', '.join(dups[:10])}" + (" …" if len(dups) > 10 else "")
+            )
+        export_bundle = self._require_charon()
+        return export_bundle(self.collected, self.emit_mif, validate=True)
+
+    @staticmethod
+    def _require_charon():
+        """Return mnemos-core's MIF ``export_bundle`` or raise a clear error.
+
+        Factored so MIF availability can be checked UP FRONT (before spending time
+        extracting/chunking documents) as well as at bundle-write time.
+        """
+        try:
+            from mnemos.portability.charon import export_bundle
+        except ImportError as exc:  # pragma: no cover - depends on install extras
+            raise RuntimeError(
+                "MIF emit requires the mnemos-core portability module "
+                "(mnemos.portability.charon); it is not importable in this "
+                f"environment: {exc}"
+            ) from exc
+        return export_bundle
+
+    def import_directory(self, path: Path, recursive: bool = False) -> dict:
+        """Import all supported files found under *path*.
+
+        Args:
+            path:      Directory to scan
+            recursive: If True, descend into sub-directories
+
+        Returns:
+            Stats dict: {"files_found": N, "files_ok": N, "files_err": N,
+                         "memories_imported": N, "memories_failed": N}
+        """
+        path = Path(path)
+        if not path.is_dir():
+            raise ValueError(f"Not a directory: {path}")
+
+        glob_pattern = "**/*" if recursive else "*"
+        candidates = [
+            p for p in path.glob(glob_pattern) if p.is_file() and p.suffix.lower() in self.SUPPORTED_EXTENSIONS
+        ]
+        candidates.sort()
+
+        stats = {
+            "files_found": len(candidates),
+            "files_ok": 0,
+            "files_err": 0,
+            "memories_imported": 0,
+            "memories_failed": 0,
+        }
+
+        print(f"Found {len(candidates)} supported file(s) under {path}")
+        for i, fpath in enumerate(candidates, start=1):
+            print(f"Importing [{i}/{len(candidates)}] {fpath.name}")
+            try:
+                memories = self.import_file(fpath)
+                if memories:
+                    if not self.dry_run:
+                        # _post_batch already ran inside import_file; just tally
+                        stats["files_ok"] += 1
+                    else:
+                        stats["files_ok"] += 1
+                        stats["memories_imported"] += len(memories)
+                else:
+                    stats["files_err"] += 1
+            except Exception:
+                stats["files_err"] += 1
+
+        print(f"\nImport complete: {stats}")
+        return stats
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _extract_text(self, path: Path) -> list:
+        """Use Docling to extract text from *path*.
+
+        Returns:
+            List of dicts: [{text, page, section, title}, ...]
+        """
+        try:
+            from docling.document_converter import DocumentConverter
+        except ImportError:
+            raise ImportError(
+                "Docling is not installed.\n"
+                "Install docling: pip install docling\n"
+                "For OCR support: pip install docling[ocr]"
+            )
+
+        converter = DocumentConverter()
+        result = converter.convert(str(path))
+        doc = result.document
+
+        sections = []
+
+        # Try to iterate export_to_dict structure for rich metadata
+        try:
+            doc_dict = doc.export_to_dict()
+            body = doc_dict.get("body", [])
+
+            current_section = None
+            current_title = None
+
+            def _harvest(items, page_num=None):
+                nonlocal current_section, current_title
+                for item in items:
+                    itype = item.get("type", "")
+                    text_val = item.get("text", "").strip()
+                    pnum = page_num or (item.get("prov", [{}])[0].get("page_no") if item.get("prov") else None)
+
+                    if itype in ("section_header", "title") and text_val:
+                        current_title = text_val
+                        current_section = text_val
+                    elif itype in ("paragraph", "text", "list_item", "table") and text_val:
+                        sections.append(
+                            {
+                                "text": text_val,
+                                "page": pnum,
+                                "section": current_section,
+                                "title": current_title,
+                            }
+                        )
+
+                    children = item.get("children", [])
+                    if children:
+                        _harvest(children, pnum)
+
+            _harvest(body)
+
+        except Exception:
+            # Fallback: export whole document as markdown and treat as one section
+            try:
+                md_text = doc.export_to_markdown()
+            except Exception:
+                md_text = ""
+
+            if not md_text:
+                # Last resort: concatenate all text items
+                try:
+                    md_text = "\n\n".join(item.text for item in doc.texts if hasattr(item, "text") and item.text)
+                except Exception:
+                    md_text = str(doc)
+
+            if md_text.strip():
+                sections.append(
+                    {
+                        "text": md_text.strip(),
+                        "page": None,
+                        "section": None,
+                        "title": path.stem,
+                    }
+                )
+
+        if not sections:
+            # Nothing extracted at all - return one empty-ish entry so caller knows
+            sections.append(
+                {
+                    "text": "",
+                    "page": None,
+                    "section": None,
+                    "title": path.stem,
+                }
+            )
+
+        return sections
+
+    def _chunk(self, text: str, metadata: dict) -> list:
+        """Split *text* into overlapping chunks sized by token approximation.
+
+        Token approximation: 1 token ≈ 0.75 words  →  words_per_chunk = chunk_size * 0.75
+
+        Strategy:
+          1. Split on paragraph boundaries (\\n\\n)
+          2. If a paragraph exceeds chunk_size, split further on sentences ('. ')
+          3. Prepend overlap words from the previous chunk
+
+        Returns:
+            List of memory dicts ready for POSTing.
+        """
+        if not text or not text.strip():
+            return []
+
+        words_per_chunk = max(1, int(self.chunk_size * 0.75))
+        words_per_overlap = max(0, int(self.overlap * 0.75))
+
+        # Step 1: split into paragraphs
+        raw_paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+
+        # Step 2: further split oversized paragraphs on sentence boundaries
+        segments = []
+        for para in raw_paragraphs:
+            words = para.split()
+            if len(words) <= words_per_chunk:
+                segments.append(para)
+            else:
+                # Split on '. ' boundaries
+                sentences = re.split(r"(?<=\.)\s+", para)
+                current_words = []
+                for sentence in sentences:
+                    s_words = sentence.split()
+                    if current_words and len(current_words) + len(s_words) > words_per_chunk:
+                        segments.append(" ".join(current_words))
+                        current_words = s_words
+                    else:
+                        current_words.extend(s_words)
+                if current_words:
+                    segments.append(" ".join(current_words))
+
+        # Step 3: assemble chunks with overlap
+        chunks = []
+        overlap_words = []
+
+        for seg in segments:
+            seg_words = seg.split()
+
+            # Prefix with overlap from previous chunk
+            if overlap_words:
+                chunk_words = overlap_words + seg_words
+            else:
+                chunk_words = seg_words
+
+            chunk_text = " ".join(chunk_words)
+
+            # Save last N words as next overlap
+            if words_per_overlap > 0:
+                overlap_words = seg_words[-words_per_overlap:]
+            else:
+                overlap_words = []
+
+            # Build memory dict (chunk_index / total_chunks filled in by caller)
+            mem = {
+                "content": chunk_text,
+                "category": self.category,
+                "tags": list(self.tags),
+                "metadata": dict(metadata),
+            }
+            if self.owner_id is not None:
+                mem["owner_id"] = self.owner_id
+            if self.namespace is not None:
+                mem["namespace"] = self.namespace
+            # Attach source tags automatically
+            source = metadata.get("source_file", "")
+            if source:
+                ext = Path(source).suffix.lstrip(".")
+                if ext and ext not in mem["tags"]:
+                    mem["tags"].append(ext)
+
+            chunks.append(mem)
+
+        return chunks
+
+    def _post_memory(self, memory: dict) -> bool:
+        """POST a single memory to MNEMOS.
+
+        Returns:
+            True on HTTP 2xx, False otherwise.
+        """
+        url = f"{self.endpoint}/v1/memories"
+        data = json.dumps(memory).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return 200 <= resp.status < 300
+        except urllib.error.HTTPError as exc:
+            print(f"    WARNING  POST failed {exc.code}: {exc.reason}")
+            return False
+        except urllib.error.URLError as exc:
+            print(f"    WARNING  POST error: {exc.reason}")
+            return False
+        except Exception as exc:
+            print(f"    WARNING  POST exception: {exc}")
+            return False
+
+    def _post_batch(self, memories: list, batch_size: int = 20) -> tuple:
+        """POST memories in batches.
+
+        Returns:
+            (success_count, failure_count)
+        """
+        ok = 0
+        fail = 0
+        total = len(memories)
+        source = memories[0]["metadata"].get("source_file", "?") if memories else "?"
+
+        for i, mem in enumerate(memories, start=1):
+            chunk_idx = mem["metadata"].get("chunk_index", i - 1)
+            total_chunks = mem["metadata"].get("total_chunks", total)
+            print(f"    Importing [{i}/{total}] {source} chunk {chunk_idx}/{total_chunks - 1} ...")
+
+            if self._post_memory(mem):
+                ok += 1
+            else:
+                fail += 1
+
+            # Yield in batches (no-op here but preserves batch_size contract)
+            _ = batch_size  # used for API contract
+
+        self.post_successes += ok
+        self.post_failures += fail
+        return ok, fail
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="docling_import",
+        description="Import documents into MNEMOS memories via IBM Docling.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single file
+  python -m mnemos.tools.docling_import --file report.pdf --endpoint http://localhost:5002
+
+  # Directory (recursive)
+  python -m mnemos.tools.docling_import --source /docs --recursive --category documents \\
+      --tags "project,q1" --dry-run
+
+  # With auth
+  python -m mnemos.tools.docling_import --file deck.pptx --api-key secret123
+""",
+    )
+
+    source_group = parser.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--file", metavar="PATH", help="Single file to import")
+    source_group.add_argument("--source", metavar="DIR", help="Directory of files to import")
+
+    parser.add_argument(
+        "--endpoint", default="http://localhost:5002", help="MNEMOS API base URL (default: http://localhost:5002)"
+    )
+    parser.add_argument("--api-key", metavar="KEY", default=None, help="Optional Bearer token for MNEMOS auth")
+    parser.add_argument("--category", default="documents", help="Memory category (default: documents)")
+    parser.add_argument(
+        "--chunk-size", type=int, default=800, metavar="TOKENS", help="Target tokens per chunk (default: 800)"
+    )
+    parser.add_argument(
+        "--overlap", type=int, default=100, metavar="TOKENS", help="Overlap tokens between chunks (default: 100)"
+    )
+    parser.add_argument(
+        "--tags", metavar="TAG1,TAG2", default="", help="Comma-separated extra tags to attach to every memory"
+    )
+    parser.add_argument("--recursive", action="store_true", help="Recurse into sub-directories (only with --source)")
+    parser.add_argument("--dry-run", action="store_true", help="Print what would be imported without POSTing")
+    parser.add_argument("--owner-id", default=None, help="Override owner_id on imported memories when supported")
+    parser.add_argument("--namespace", default=None, help="Override namespace on imported memories when supported")
+    parser.add_argument(
+        "--emit-mif",
+        metavar="DIR",
+        default=None,
+        help="Write ingested chunks as a MIF 1.0 bundle under DIR "
+        "(directory of schema-validated concept files + manifest) "
+        "instead of POSTing them to the MNEMOS API.",
+    )
+    return parser
+
+
+def main(argv=None):
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.emit_mif is not None and not args.emit_mif.strip():
+        parser.error("--emit-mif requires a non-empty directory path")
+
+    if args.emit_mif is not None and not args.dry_run:
+        # Fail fast if the MIF portability module is missing, before spending
+        # time extracting/chunking documents.
+        DoclingImporter._require_charon()
+
+    tags = [t.strip() for t in args.tags.split(",") if t.strip()] if args.tags else []
+
+    importer = DoclingImporter(
+        endpoint=args.endpoint,
+        api_key=args.api_key,
+        category=args.category,
+        chunk_size=args.chunk_size,
+        overlap=args.overlap,
+        tags=tags,
+        dry_run=args.dry_run,
+        owner_id=args.owner_id,
+        namespace=args.namespace,
+        emit_mif=args.emit_mif,
+    )
+
+    if args.file:
+        path = Path(args.file)
+        if not path.exists():
+            print(f"ERROR: File not found: {path}", file=sys.stderr)
+            sys.exit(1)
+        memories = importer.import_file(path)
+        total = len(memories)
+        suffix = f" (extraction FAILED for {path.name})" if importer.extraction_failures else ""
+        print(f"\nResult: {total} chunk(s) processed from {path.name}{suffix}")
+    else:
+        path = Path(args.source)
+        if not path.is_dir():
+            print(f"ERROR: Not a directory: {path}", file=sys.stderr)
+            sys.exit(1)
+        stats = importer.import_directory(path, recursive=args.recursive)
+        print(f"\nFinal stats: {stats}")
+
+    if args.emit_mif is not None and not args.dry_run:
+        manifest = importer.write_mif_bundle()
+        print(
+            f"\nMIF bundle: {args.emit_mif}  concepts={manifest['count']}  "
+            f"mif_version={manifest['mif_version']}  schema={manifest['schema']}"
+        )
+
+    return 1 if (importer.post_failures or importer.extraction_failures) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -78,10 +78,10 @@ namespaced under a `mnemos:` key prefix so the round-trip is lossless and valid.
   in `persistence/types.py` is shared, so the column must land in sqlite +
   postgres + oracle + mysql + db2); own branch/MR, needs per-backend test infra.
 - **3 — surfaces:** ✅ `mnemos export --format mif` / `mnemos import --from mif`
-  registered here; the `mif` export/import CLI tools live in **`ncz-os/charon`**
-  (MR !1). `/v1/export`,`/v1/import` REST MIF surface = follow-up.
+  and the MIF/MPF tools and REST routes now live in `mnemos-core`; the former
+  `ncz-os/charon` repository was merged and retired on 2026-09-18.
 - **4 — retire MPF:** ✅ offline MPF→MIF migration tool (`mnemos.tools.mpf_to_mif`,
-  `ncz-os/charon` MR !1). Remaining: flip the `mnemos export` default to `mif`
+  now in core). Remaining: flip the `mnemos export` default to `mif`
   (post-merge — must not point at unreleased tooling), archive `mnemos-os/mpf`,
   CI conformance gate (OKF + lossless round-trip), richer Level-3 citations /
   DocumentReference (#84) wiring.

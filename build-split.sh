@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build the MNEMOS split umbrella image from four package source trees.
+# Build the MNEMOS split umbrella image from core plus three add-on trees.
 #
 # The generated build context contains:
 #   ./core     this mnemos-core repository at the selected build ref
 #   ./pantheon gitlab.com/ncz-os/pantheon.git at a resolved full commit
 #   ./knemon   gitlab.com/ncz-os/knemon.git at a resolved full commit
 #   ./graeae   gitlab.com/ncz-os/graeae.git at a resolved full commit
-#   ./charon   gitlab.com/ncz-os/charon.git at a resolved full commit
 #
 # Runtime import contract, matching the old monorepo image:
 #   import mnemos.core
 #   import mnemos.domain.pantheon
 #   import mnemos.domain.knemon
 #   import mnemos.domain.graeae
-#   import mnemos.domain.portability   (mnemos-charon)
+#   import mnemos.domain.portability   (first-party in mnemos-core)
 
 usage() {
   cat <<'EOF'
@@ -61,7 +60,6 @@ ADDON_REF=${ADDON_REF:-main}
 ADDON_PANTHEON_REF=${ADDON_PANTHEON_REF:-$ADDON_REF}
 ADDON_KNEMON_REF=${ADDON_KNEMON_REF:-$ADDON_REF}
 ADDON_GRAEAE_REF=${ADDON_GRAEAE_REF:-$ADDON_REF}
-ADDON_CHARON_REF=${ADDON_CHARON_REF:-$ADDON_REF}
 PODMAN=${PODMAN:-podman}
 VERIFY_IMPORTS=${VERIFY_IMPORTS:-1}
 
@@ -194,8 +192,8 @@ fi
 
 echo "[split] context: $CONTEXT_DIR"
 echo "[split] core:    $CORE_COMMIT"
-echo "[split] add-ons: $(redact_url "$ADDON_REMOTE_BASE")/{pantheon,knemon,graeae,charon}.git"
-echo "[split] refs:    pantheon=$ADDON_PANTHEON_REF knemon=$ADDON_KNEMON_REF graeae=$ADDON_GRAEAE_REF charon=$ADDON_CHARON_REF"
+echo "[split] add-ons: $(redact_url "$ADDON_REMOTE_BASE")/{pantheon,knemon,graeae}.git"
+echo "[split] refs:    pantheon=$ADDON_PANTHEON_REF knemon=$ADDON_KNEMON_REF graeae=$ADDON_GRAEAE_REF"
 echo "[split] image:   $IMAGE_TAG"
 
 safe_rm_rf "$CONTEXT_DIR"
@@ -370,13 +368,11 @@ clone_addon() {
 PANTHEON_COMMIT=$(clone_addon pantheon pantheon "$ADDON_PANTHEON_REF")
 KNEMON_COMMIT=$(clone_addon knemon knemon "$ADDON_KNEMON_REF")
 GRAEAE_COMMIT=$(clone_addon graeae graeae "$ADDON_GRAEAE_REF")
-CHARON_COMMIT=$(clone_addon charon charon "$ADDON_CHARON_REF")
 
 echo "[split] resolved add-on commits:"
 echo "        pantheon $PANTHEON_COMMIT"
 echo "        knemon   $KNEMON_COMMIT"
 echo "        graeae   $GRAEAE_COMMIT"
-echo "        charon   $CHARON_COMMIT"
 
 audit_namespace_collisions() {
   local tmp
@@ -387,7 +383,7 @@ audit_namespace_collisions() {
   local duplicates
 
   tmp=$(mktemp "$CONTEXT_DIR/mnemos-files.XXXXXX")
-  for pkg in core pantheon knemon graeae charon; do
+  for pkg in core pantheon knemon graeae; do
     root="$CONTEXT_DIR/$pkg/mnemos"
     [[ -d "$root" ]] || continue
     for rel in "__init__.py" "domain/__init__.py" "api/__init__.py" "api/routes/__init__.py"; do
@@ -424,11 +420,9 @@ audit_namespace_collisions
   printf 'MNEMOS_PANTHEON_REF=%q\n' "$PANTHEON_COMMIT"
   printf 'MNEMOS_KNEMON_REF=%q\n' "$KNEMON_COMMIT"
   printf 'MNEMOS_GRAEAE_REF=%q\n' "$GRAEAE_COMMIT"
-  printf 'MNEMOS_CHARON_REF=%q\n' "$CHARON_COMMIT"
   printf 'ADDON_PANTHEON_REPO=%q\n' "ncz-pantheon"
   printf 'ADDON_KNEMON_REPO=%q\n' "ncz-knemon"
   printf 'ADDON_GRAEAE_REPO=%q\n' "ncz-graeae"
-  printf 'ADDON_CHARON_REPO=%q\n' "ncz-charon"
 } >"$CONTEXT_DIR/split-provenance.env"
 
 (
@@ -438,7 +432,6 @@ audit_namespace_collisions
     --build-arg "MNEMOS_PANTHEON_REF=$PANTHEON_COMMIT" \
     --build-arg "MNEMOS_KNEMON_REF=$KNEMON_COMMIT" \
     --build-arg "MNEMOS_GRAEAE_REF=$GRAEAE_COMMIT" \
-    --build-arg "MNEMOS_CHARON_REF=$CHARON_COMMIT" \
     -f Dockerfile.split \
     -t "$IMAGE_TAG" \
     .
@@ -581,7 +574,7 @@ verify_module_imports() {
   "$PODMAN" run --rm "$IMAGE_TAG" python -m pip check
 
   echo "[split] verifying exact split module imports"
-  "$PODMAN" run --rm "$IMAGE_TAG" python -c 'import importlib; import importlib.metadata as metadata; import pkgutil; core_root = importlib.import_module("mnemos.core"); modules = ["mnemos", "mnemos.api.main", "mnemos.core"]; modules.extend(module.name for module in pkgutil.walk_packages(core_root.__path__, "mnemos.core.")); optional_modules = {"mnemos-pantheon": ("mnemos.api.routes.pantheon", "mnemos.domain.pantheon.catalog"), "mnemos-knemon": ("mnemos.api.routes.ledger", "mnemos.api.routes.knemon_dashboard", "mnemos.api.routes.knemon_router", "mnemos.api.routes.knemon_utilization", "mnemos.domain.knemon.router"), "mnemos-graeae": ("mnemos.api.routes.providers", "mnemos.api.routes.consultations", "mnemos.domain.graeae.engine"), "mnemos-charon": ("mnemos.api.routes.portability", "mnemos.api.routes.ingest", "mnemos.domain.portability.schemas", "mnemos.domain.portability.serializers", "mnemos.tools.adapters.mem0")}; installed = []; missing = [];
+  "$PODMAN" run --rm "$IMAGE_TAG" python -c 'import importlib; import importlib.metadata as metadata; import pkgutil; core_root = importlib.import_module("mnemos.core"); modules = ["mnemos", "mnemos.api.main", "mnemos.core", "mnemos.api.routes.portability", "mnemos.api.routes.ingest", "mnemos.domain.portability.schemas", "mnemos.domain.portability.serializers", "mnemos.tools.adapters.mem0", "mnemos.tools.styx"]; modules.extend(module.name for module in pkgutil.walk_packages(core_root.__path__, "mnemos.core.")); optional_modules = {"mnemos-pantheon": ("mnemos.api.routes.pantheon", "mnemos.domain.pantheon.catalog"), "mnemos-knemon": ("mnemos.api.routes.ledger", "mnemos.api.routes.knemon_dashboard", "mnemos.api.routes.knemon_router", "mnemos.api.routes.knemon_utilization", "mnemos.domain.knemon.router"), "mnemos-graeae": ("mnemos.api.routes.providers", "mnemos.api.routes.consultations", "mnemos.domain.graeae.engine")}; installed = []; missing = [];
 for dist, dist_modules in optional_modules.items():
     try:
         metadata.version(dist)

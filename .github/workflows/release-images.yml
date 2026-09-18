@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       addon_ref:
-        description: 'Add-on branch/tag/SHA for pantheon/knemon/graeae/charon (default: main)'
+        description: 'Add-on branch/tag/SHA for pantheon/knemon/graeae (default: main)'
         required: false
         default: 'main'
       build_enterprise:
@@ -93,7 +93,7 @@ jobs:
       - name: Ensure setuptools is present for --no-build-isolation wheel builds
         run: python -m pip install --upgrade pip setuptools wheel
 
-      # Pre-build the four add-on wheels from their GitLab repos and stage them
+      # Pre-build the three add-on wheels from their GitLab repos and stage them
       # into ./wheelhouse for Dockerfile.everything. They are pure-Python
       # (setuptools) so --no-deps wheel builds need no native toolchain and the
       # same wheel is arch-independent for both target platforms.
@@ -139,7 +139,7 @@ jobs:
             echo "── not a tag push; using ADDON_REF=${ADDON_REF} (mutable) ──"
           fi
 
-          for name in pantheon knemon graeae charon; do
+          for name in pantheon knemon graeae; do
              if [ -n "${LOCK}" ]; then
                pin="$(echo "${LOCK}" | jq -r --arg k "${name}" '.[$k] // empty')"
                if [ -z "${pin}" ] || [ "${pin}" = "null" ]; then

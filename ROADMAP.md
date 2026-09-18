@@ -60,8 +60,8 @@ Carried forward from the 6.x line:
   PostgreSQL, Oracle Database 26ai, IBM Db2 12.1, MySQL, and MariaDB, each with
   a native vector path.
 - **Split-distribution modular install.** A profile-to-services manifest driving
-  `install --profile/--with`, scoped migrations, and GRAEAE, PANTHEON, KNEMON,
-  and CHARON as opt-in extras over a small `mnemos-core`.
+  `install --profile/--with`, scoped migrations, and GRAEAE, PANTHEON, and
+  KNEMON as opt-in extras. CHARON/STYX are foundational core capabilities.
 - **PANTHEON LLM gateway.** An OpenAI-compatible multi-provider mesh with
   adaptive routing, cross-provider fallback, durable cooldown stores, external
   pricing-catalog ingest, per-tenant budget pre-gate, BYOK, and lossless
