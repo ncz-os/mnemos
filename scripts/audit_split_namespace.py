@@ -5,13 +5,13 @@ from pathlib import Path
 import sys
 
 
-DEFAULT_ROOTS = ("core", "pantheon", "knemon", "graeae", "charon")
+DEFAULT_ROOTS = ("core", "pantheon", "knemon", "graeae")
 FORBIDDEN_NAMESPACE_MARKERS = {
     "mnemos/__init__.py",
     "mnemos/domain/__init__.py",
     "mnemos/api/__init__.py",
     "mnemos/api/routes/__init__.py",
-    # mnemos.tools spans core + the charon add-on (adapters / MPF tools), and the
+    # mnemos.tools includes first-party CHARON adapters / MPF tools in core, and the
     # umbrella image runs with core's source tree on sys.path AHEAD of the
     # installed wheels. A regular-package __init__.py here pins mnemos.tools.__path__
     # to the core source dir and hides the add-on's tools submodules, so it MUST

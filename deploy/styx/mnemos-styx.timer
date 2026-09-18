@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily STYX backup of this host's MNEMOS data to Google Drive
+
+[Timer]
+# 02:40, ahead of the 03:21 ncz-backup run so the two do not contend for the
+# same host's IO. Persistent=true so a host that was powered off at the
+# scheduled time still backs up once it returns, rather than silently
+# skipping a day.
+OnCalendar=*-*-* 02:40:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

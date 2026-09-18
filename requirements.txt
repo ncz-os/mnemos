@@ -67,7 +67,18 @@ anyio>=4.4.0
 # psutil dropped 2026-05-01 (zero imports in mnemos/ source)
 typer>=0.9.0
 
+# First-party CHARON portability + STYX encrypted backup.  These stay in the
+# base closure so every mnemos-core install can export, restore, encrypt, and
+# use the R2 or service-account Drive destinations without an add-on wheel.
+jsonschema>=4.0.0
+PyYAML>=6.0
+pyrage>=1.1
+boto3>=1.34
+google-api-python-client>=2.100
+google-auth>=2.23
+
 # Optional subsystem dependencies now live in pyproject extras:
+#   docling         -> IBM Docling document conversion
 #   morpheus/kronos -> numpy
 #   persephone      -> zstandard
 #   nats            -> nats-py

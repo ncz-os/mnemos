@@ -2,6 +2,12 @@
 
 Date: 2026-06-14
 
+> **2026-09-18 update:** CHARON portability, migration, ingest, adapters, and
+> STYX were merged into `mnemos-core`; `mnemos-charon` is retired. References
+> below to four external add-ons describe the state at the date of this audit.
+> The current external add-ons are PANTHEON, KNEMON, and GRAEAE, while Docling
+> remains an optional in-tree dependency group.
+
 ## Executive summary
 
 MNEMOS already has the raw packaging primitives for modular deployment: `pyproject.toml` exposes per-component extras and bundles, and `mnemos/core/extras.py` can probe installed optional dependencies at runtime. The missing layer was deployment composition. `MNEMOS_PROFILE` historically selected backend/auth/worker-count defaults, but it did not declare which runtime services should run. Operators had to know and set separate knobs for NATS, federation, webhooks, distillation, and PANTHEON.
@@ -21,13 +27,13 @@ Verified in canonical master:
 1. `pyproject.toml` declares optional dependencies for individual components and composite bundles. In full:
 
    - **In-tree feature extras** (dependency groups whose code ships in this repository): `morpheus`, `persephone`, `kronos`, `kronos-gpu`, `knossos`, `apollo`, `artemis`, `nats`, `hot`, `edge`, `sqlite`.
-   - **External add-on distributions** — these extras are *pointers to separately built and separately versioned wheels*, not in-tree dependency groups: `pantheon = ["mnemos-pantheon>=0.2,<0.3"]`, `knemon = ["mnemos-knemon>=0.1,<0.2"]`, `graeae = ["mnemos-graeae>=0.1,<0.2"]`, `charon = ["mnemos-charon>=0.1,<0.2"]`. Installing one pulls a wheel that contributes into the shared `mnemos.*` PEP 420 namespace (so `mnemos.domain.graeae.*` is a valid import path at runtime), but the source does not live here. This is the architectural distinction this document tracks: a component boundary that is enforced by *packaging*, not merely by an extras flag.
+   - **External add-on distributions** — these extras are *pointers to separately built and separately versioned wheels*, not in-tree dependency groups: `pantheon = ["mnemos-pantheon>=0.2,<0.3"]`, `knemon = ["mnemos-knemon>=0.1,<0.2"]`, and `graeae = ["mnemos-graeae>=0.1,<0.2"]`. Installing one pulls a wheel that contributes into the shared `mnemos.*` PEP 420 namespace. CHARON is in-tree.
    - **The HIVE is not an extra at all.** It is carved out entirely as the standalone STIPHOS service (`mnemos-stiphos`), which deploys as its own ASGI app; `mnemos/core/extras.py::UNAVAILABLE_EXTRAS["hive"]` records that so a request for a `hive` extra returns an explanation rather than a missing-package error.
    - **Operational / runtime extras:** `redis`, `tracing`, `structlog`, `metrics`, `docling`, `semantic`, `gpu`, `phi`, `openvino`, `cuda`, `amd`, `dev`.
    - **Backend drivers:** `oracle`, `db2`, `mysql`.
-   - **Composite bundles:** `edge`; `server` (`nats`, `persephone`, `pantheon`, `knemon`, `graeae`, `charon`); `ml` (`morpheus`, `kronos`, `apollo`, `artemis`, `hot`); `interop` (`knossos`); `enterprise` (`oracle`, `db2`, `mysql`); and `full`, which recurses through the in-tree bundle plus the four external add-on distributions. Bundle extras recurse via `mnemos-core[...]` self-references and therefore require pip>=21.2 or uv.
+   - **Composite bundles:** `edge`; `server` (`nats`, `persephone`, `pantheon`, `knemon`, `graeae`); `ml` (`morpheus`, `kronos`, `apollo`, `artemis`, `hot`); `interop` (`knossos`); `enterprise` (`oracle`, `db2`, `mysql`); and `full`, which recurses through the in-tree bundle plus the three external add-on distributions. Bundle extras recurse via `mnemos-core[...]` self-references and therefore require pip>=21.2 or uv.
 
-2. `mnemos/core/extras.py` carries the runtime availability checks and UX hints: `EXTRA_PROBES` (import probes for in-tree extras), `EXTERNAL_EXTRA_DISTS` plus `EXTERNAL_EXTRA_IMPORT_PROBES` (distribution-metadata-first checks for the four external add-ons, falling back to an import probe so editable installs still resolve), `UNAVAILABLE_EXTRAS` (deliberately-absent components, currently `hive`), and `FEATURE_BUNDLES`.
+2. `mnemos/core/extras.py` carries runtime availability checks and UX hints for in-tree extras and the three external add-ons, plus `UNAVAILABLE_EXTRAS` and `FEATURE_BUNDLES`.
 3. `mnemos/core/config.py` has `PROFILE_DEFAULTS` for `server`, `edge`, and `dev`, plus `personal -> edge` aliasing.
 4. Installer entry points are `install.sh` and `python -m mnemos.installer`; migrations are orchestrated in `mnemos/installer/db.py`.
 5. The compression stack is collaborative: PERSEPHONE + MORPHEUS + APOLLO + ARTEMIS work as one operational slice. PANTHEON is an optional model-proxy surface, not required for a normal server.

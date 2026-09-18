@@ -12,13 +12,13 @@ package — never run `pip install mnemos` or `pip install mnemos-os`.
 
 ```yaml
 # id -> how to obtain it. Subsystems share the mnemos.* namespace and are
-# runtime-gated: installing the dist mounts the routes; absence => HTTP 503.
+# external subsystems are runtime-gated; CHARON portability and STYX are core.
 modules:
   core:       { dist: mnemos-core,     extra: null,       kind: kernel,   arch: [amd64, arm64] }
   graeae:     { dist: mnemos-graeae,   extra: graeae,     kind: router,   arch: [amd64, arm64] }
   pantheon:   { dist: mnemos-pantheon, extra: pantheon,   kind: router,   arch: [amd64, arm64] }
   knemon:     { dist: mnemos-knemon,   extra: knemon,     kind: router,   arch: [amd64, arm64] }
-  charon:     { dist: mnemos-charon,   extra: charon,     kind: router,   arch: [amd64, arm64] }
+  charon:     { dist: mnemos-core,     extra: null,       kind: core-router, arch: [amd64, arm64], note: "first-party MIF/MPF portability, ingest, adapters, and STYX; Docling conversion needs the docling extra" }
   stiphos:    { dist: mnemos-stiphos,  extra: null,       kind: service,  arch: [amd64, arm64], port: 8080, note: "separate service, not in the everything image" }
 
 backends:           # selected at RUNTIME via MNEMOS_DATABASE_DSN, not by image
@@ -92,7 +92,7 @@ Given `requested` (a set of module ids) and `backend` (one backend id) and
             + [ backends[backend].extra if present ]
    - if arch == arm64: ensure 'openvino' is NOT in extras; prefer extra "server", which does not pull openvino.
    - Install core from the canonical GitLab checkout first: python -m pip install -e .
-   - Install requested add-ons from their GitLab URLs in dependency order (graeae, knemon, pantheon, charon).
+   - Install requested add-ons from their GitLab URLs in dependency order (graeae, knemon, pantheon). CHARON is already in core.
    - Public PyPI names are not published; module extras alone cannot bootstrap these packages.
    - if "stiphos" in requested: ALSO pip install 'mnemos-stiphos[mcp] @ git+https://gitlab.com/ncz-os/mnemos-stiphos.git' and run it as a separate service.
 ```
@@ -134,7 +134,6 @@ python -m pip install -e .
 pip install 'git+https://gitlab.com/ncz-os/graeae.git'
 pip install 'git+https://gitlab.com/ncz-os/knemon.git'
 pip install 'git+https://gitlab.com/ncz-os/pantheon.git'
-pip install 'git+https://gitlab.com/ncz-os/charon.git'
 
 # pip: everything + enterprise drivers (any arch except db2, which needs amd64)
 # After installing core and add-ons above, install architecture-compatible

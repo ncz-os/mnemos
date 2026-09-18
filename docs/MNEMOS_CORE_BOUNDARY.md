@@ -4,6 +4,12 @@
 `c1f5cda104864e568d216390200395be` (mode=all, winning muse gemini, consensus 1.0;
 groq/claude/perplexity/xai/gemini concurred).
 
+> **Superseded in part on 2026-09-18.** The operator directed that CHARON's
+> portability, migration, ingest, adapters, and STYX backup capabilities return
+> to `mnemos-core` because they are foundational. The standalone Charon repo is
+> archived; Docling alone remains optional. The rest of this document is kept
+> as the historical rationale for the remaining split distributions.
+
 > **SHIPPED in v6.0.0 (2026-06-17).** The extraction described below is complete.
 > `mnemos-core` is carved, and PANTHEON, KNEMON, GRAEAE, CHARON, and the HIVE
 > (now **STIPHOS**) are live as separate `ncz-os` repos — each a `mnemos.*` PEP 420

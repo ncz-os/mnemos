@@ -19,6 +19,7 @@ from mnemos.api.routes.dag import router as dag_router
 from mnemos.api.routes.entities import router as entities_router
 from mnemos.api.routes.federation import router as federation_router
 from mnemos.api.routes.health import router as health_router
+from mnemos.api.routes.ingest import router as ingest_router
 from mnemos.api.routes.journal import router as journal_router
 from mnemos.api.routes.kronos import router as kronos_router
 from mnemos.api.routes.kg import router as kg_router
@@ -27,11 +28,13 @@ from mnemos.api.routes.morpheus import router as morpheus_router
 from mnemos.api.routes.narrate import router as narrate_router
 from mnemos.api.routes.oauth import router as oauth_router
 from mnemos.api.routes.openai_compat import router as openai_compat_router
+from mnemos.api.routes.portability import router as portability_router
 from mnemos.api.routes.sessions import router as sessions_router
 from mnemos.api.routes.state import router as state_router
 from mnemos.api.routes.tunnels import router as tunnels_router
 from mnemos.api.routes.versions import router as versions_router
 from mnemos.api.routes.webhooks import router as webhooks_router
+from mnemos.api.routes.document_import import router as document_import_router
 from mnemos.api.lifecycle_hooks import register_lifespan_hooks
 from mnemos.core.config import get_settings, session_secret_required
 from mnemos.core.extras import EXTERNAL_EXTRA_DISTS, is_extra_installed
@@ -474,14 +477,12 @@ app.include_router(audit_router)  # v6.2 M-2.2.1: audit chain pubkey + proof
 app.include_router(admin_decay_router)  # v6.2 M-2.2.4: category-decay admin
 app.include_router(narrate_router)  # v3.3 S-II: APOLLO dense-form narration
 app.include_router(kg_router)
-# CHARON (mnemos-charon add-on): MPF /v1/import + /v1/export, universal ingest,
-# and Docling document import. Mounted only when the distribution is installed
-# (default in the umbrella + server/full bundles; absent in minimal core). The
-# SQL/data-access for the MPF flow stays in core (mnemos.db.portability_repo +
-# persistence backends); only the orchestration/route surface is carved out.
-if _settings.layers.enable_charon:
-    _include_optional_router("charon", "mnemos.api.routes.portability", label="CHARON")
-    _include_optional_router("charon", "mnemos.api.routes.ingest", label="CHARON")
+# CHARON is a first-party core capability: MIF/MPF portability and universal
+# ingest must be present in every installation.  The document-import route is
+# also always mounted, but its handler returns a clear 501 until the optional
+# ``mnemos-core[docling]`` dependency set is installed.
+app.include_router(portability_router)
+app.include_router(ingest_router)
 app.include_router(admin_router)
 app.include_router(mcp_audit_router)  # Phase-D MCP audit (#146)
 app.include_router(tunnels_router)  # /admin/tunnels/*: public tunnel bridge (root + MNEMOS_TUNNELS_ENABLED)
@@ -492,10 +493,7 @@ app.include_router(state_router)
 app.include_router(entities_router)
 app.include_router(morpheus_router)  # v3.3 MORPHEUS dream-state subsystem
 
-# CHARON document import (IBM Docling) — mounts only when mnemos-charon is
-# installed AND its docling extra is importable (the route module guards its
-# own docling import). Absent otherwise.
-_include_optional_router("charon", "mnemos.api.routes.document_import", label="CHARON")
+app.include_router(document_import_router)
 
 if __name__ == "__main__":
     import uvicorn

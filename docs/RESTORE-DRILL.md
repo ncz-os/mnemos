@@ -5,23 +5,11 @@ primary tools for moving an MNEMOS corpus between deployments.
 This document is the operator runbook for the drill — exporting from
 a source MNEMOS, validating the envelope, and restoring into a target.
 
-## Prerequisite — install CHARON
+## Prerequisite
 
-Every step in this runbook depends on the CHARON add-on distribution. The
-`memory_export`, `memory_import`, and `mpf_validate` modules ship in
-`mnemos-charon`, not in `mnemos-core`, and the `/v1/export` and `/v1/import`
-routes mount conditionally on it.
-
-```bash
-pip install 'mnemos-core[charon]'
-```
-
-The `server` and `full` bundles already include it. Without CHARON installed,
-`python3 -m mnemos.tools.memory_export` (and its siblings) fail with
-`ModuleNotFoundError`, and `GET /v1/export` / `POST /v1/import` return 404
-because their routers were never mounted. Confirm the target deployment has it
-too, not just the workstation running the drill — export and import can land on
-different hosts.
+CHARON's `memory_export`, `memory_import`, and `mpf_validate` tools and the
+`/v1/export` and `/v1/import` routes ship in every `mnemos-core` installation
+as of 2026-09-18. No separate add-on is required.
 
 ## When to run this
 
@@ -42,7 +30,7 @@ Throughput was ~770 records/sec end-to-end.
 
 ### 1. Export from source
 
-`/v1/export` is CHARON-gated; a source without the add-on returns 404 here.
+`/v1/export` is part of the core API.
 
 ```bash
 TOKEN="${MNEMOS_API_TOKEN:?set MNEMOS_API_TOKEN env var}"
@@ -76,8 +64,7 @@ the file was corrupted in transit.
 ### 3. Import into target
 
 **Direct POST to `/v1/import` works ONLY for envelopes ≤ 5 MB body.**
-For anything bigger, use the CLI tool. The route is CHARON-gated on the target
-as well — a 404 here means the add-on is missing, not that the path is wrong.
+For anything bigger, use the CLI tool.
 
 ```bash
 TARGET='http://<host>:5002'

@@ -74,7 +74,7 @@ def test_component_selection_normalization_and_pip_expansion():
     assert "persephone" in spec
     assert "knemon" in spec
     assert "graeae" in spec
-    assert "charon" in spec
+    assert "charon" not in spec
     assert "morpheus" in spec
     assert "pantheon" in spec
 
@@ -85,7 +85,7 @@ def test_full_bundle_includes_all_split_subsystems():
     assert "pantheon" in spec
     assert "knemon" in spec
     assert "graeae" in spec
-    assert "charon" in spec
+    assert "charon" not in spec
 
 
 def test_installer_service_flags_map_to_existing_env_names():
