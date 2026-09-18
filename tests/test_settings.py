@@ -28,6 +28,8 @@ _ENV_KEYS = (
     "MNEMOS_KNEMON_G2_QUALITY_FLOOR",
     "MNEMOS_NATS_PUBLISH_PANTHEON_ROUTING",
     "MNEMOS_NATS_AUDIT_CONSUMER_ENABLED",
+    "MNEMOS_EXPORT_PAGE_MAX_BYTES",
+    "MNEMOS_EXPORT_STREAM_TIMEOUT_SECONDS",
 )
 
 
@@ -72,6 +74,49 @@ def test_default_values_when_env_unset(monkeypatch: pytest.MonkeyPatch, tmp_path
         assert settings.knemon.g2_quality_floor == 0.75
         assert settings.nats.publish_pantheon_routing is False
         assert settings.nats.audit_consumer_enabled is False
+        assert config.export_stream_timeout_seconds_env() == 300.0
+        assert config.export_page_max_bytes_env() == 128 * 1024 * 1024
+
+
+def test_merged_export_limit_env_overrides_preserve_types(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    with _isolated_settings(
+        monkeypatch,
+        str(tmp_path / "missing.toml"),
+        {
+            "MNEMOS_EXPORT_PAGE_MAX_BYTES": "8192",
+            "MNEMOS_EXPORT_STREAM_TIMEOUT_SECONDS": "12.5",
+        },
+    ):
+        assert config.export_page_max_bytes_env() == 8192
+        assert config.export_stream_timeout_seconds_env() == 12.5
+
+
+@pytest.mark.parametrize(
+    ("name", "accessor"),
+    [
+        ("MNEMOS_EXPORT_PAGE_MAX_BYTES", config.export_page_max_bytes_env),
+        (
+            "MNEMOS_EXPORT_STREAM_TIMEOUT_SECONDS",
+            config.export_stream_timeout_seconds_env,
+        ),
+    ],
+)
+def test_merged_export_limit_invalid_values_still_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    name: str,
+    accessor,
+) -> None:
+    with _isolated_settings(
+        monkeypatch,
+        str(tmp_path / "missing.toml"),
+        {name: "invalid"},
+    ):
+        with pytest.raises(ValueError):
+            accessor()
 
 
 def test_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
