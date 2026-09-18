@@ -9,8 +9,9 @@ WAL rather than through an isolation level).
 
 import asyncio
 import json
-import os
 from datetime import UTC, datetime
+
+from mnemos.core.config import runtime_env_float
 
 from .export import (
     _build_export_sidecars,
@@ -31,7 +32,7 @@ async def stream_export(backend, **options):
     repeatable-read readonly transaction. A missing completion marker means the
     client must discard its staged export.
     """
-    timeout = max(1.0, float(os.getenv("MNEMOS_EXPORT_STREAM_TIMEOUT_SECONDS", "300")))
+    timeout = max(1.0, runtime_env_float("MNEMOS_EXPORT_STREAM_TIMEOUT_SECONDS", 300.0))
     async with asyncio.timeout(timeout):
         async with backend.transactional(isolation="repeatable_read", readonly=True) as tx:
             count = 0
@@ -178,7 +179,7 @@ async def stream_export_records(backend, **options):
     effective_ns = cursor_state["effective_ns"]
     batch_size = _export_record_batch_size(limit)
 
-    timeout = max(1.0, float(os.getenv("MNEMOS_EXPORT_STREAM_TIMEOUT_SECONDS", "300")))
+    timeout = max(1.0, runtime_env_float("MNEMOS_EXPORT_STREAM_TIMEOUT_SECONDS", 300.0))
     async with asyncio.timeout(timeout):
         async with backend.transactional(isolation="repeatable_read", readonly=True) as tx:
             header = {

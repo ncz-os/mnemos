@@ -1,17 +1,16 @@
 """STYX configuration — every knob, resolved from the environment in one place.
 
 Centralising the environment reads keeps the rest of STYX pure and testable:
-nothing below this module touches ``os.environ``, so tests construct a
-``StyxConfig`` directly instead of mutating process state.
+tests construct a ``StyxConfig`` directly instead of mutating process state.
 """
 
 from __future__ import annotations
 
-import os
 import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from mnemos.core.config import runtime_env_snapshot
 from mnemos.tools.styx.errors import StyxConfigError
 
 #: Environment variable carrying the Google service-account credential. It
@@ -205,7 +204,7 @@ class StyxConfig:
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> StyxConfig:
         """Build a config from the process environment (or a supplied mapping)."""
-        src = dict(os.environ if env is None else env)
+        src = runtime_env_snapshot() if env is None else dict(env)
         sqlite_raw = src.get(ENV_SQLITE_PATH)
         return cls(
             gdrive_folder_id=src.get(ENV_GDRIVE_FOLDER_ID, ""),

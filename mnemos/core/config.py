@@ -1479,6 +1479,11 @@ def runtime_env_value(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 
+def runtime_env_snapshot() -> dict[str, str]:
+    """Return a copy for config objects that support an injectable env mapping."""
+    return dict(os.environ)
+
+
 def runtime_env_value_stripped(name: str, default: str = "") -> str:
     """Return a stripped environment value for dynamic-name runtime accessors."""
     return runtime_env_value(name, default).strip()
