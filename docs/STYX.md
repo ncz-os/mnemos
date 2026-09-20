@@ -13,7 +13,7 @@ Code: `mnemos/tools/styx/` (`config.py`, `crypto.py`, `destination.py`,
 assets: `deploy/styx/{mnemos-styx.service,mnemos-styx.timer,styx.env.example}`.
 CI-green (unit-tested with mocked destinations/age/retention fakes —
 `tests/test_styx_*.py`), and **proven end-to-end in production** on the
-fleet's authoritative Oracle-backed instance (PYTHIA) against both the `r2`
+fleet's authoritative Oracle-backed instance against both the `r2`
 and `rclone` destinations with a real, complete 18,651-record export — see
 "Status as of 2026-09-18" below.
 
@@ -211,8 +211,8 @@ managed Google Workspace deployment), not by default.
 ## Running multiple destinations from one host
 
 STYX's own service/timer pair (above) assumes one destination per host, a
-native venv install, and `User=mnemos` reading the store directly. PYTHIA
-runs `mnemos-api` as a container instead, and deliberately backs up to
+native venv install, and `User=mnemos` reading the store directly. The
+authoritative instance runs `mnemos-api` as a container instead, and deliberately backs up to
 **both** `r2` and `rclone` in parallel rather than picking one — belt and
 suspenders for the fleet's single authoritative Oracle-backed instance. The
 pattern that took (two independent env files, two independent
@@ -257,21 +257,21 @@ encryption — an earlier version of this source miscounted NDJSON protocol
 frames as individual records, which looked like data truncation; that is
 fixed.
 
-**Proven end-to-end in production, not just CI-green.** On PYTHIA (the
-fleet's authoritative Oracle-backed instance) STYX ran against real,
+**Proven end-to-end in production, not just CI-green.** On the
+fleet's authoritative Oracle-backed instance, STYX ran against real,
 complete data — 18,651 records, not a truncated test — to both `r2` and
 `rclone`/Google Drive simultaneously (see "Running multiple destinations
 from one host" above). Both destinations were independently verified
 outside STYX itself: R2 via direct S3 `ListObjects` (size + ETag matched),
 Drive via `rclone lsl` (size matched). Both destinations' retention logic
 correctly pruned earlier partial-test artifacts once the real backup
-landed. Daily timers are installed and armed on PYTHIA:
+landed. Daily timers are installed and armed on the authoritative instance:
 `mnemos-styx-r2.timer` (02:40 UTC) and `mnemos-styx-rclone.timer` (03:10
-UTC). The `age` keypair for PYTHIA's backups was generated off-fleet per
+UTC). The `age` keypair for the authoritative instance's backups was generated off-fleet per
 the design above; only the public recipient exists anywhere on the fleet.
 
 **Not yet done**: cerberus/proteus/achilles (the SQLite-backed satellites)
-don't have their own STYX timers yet — only PYTHIA's authoritative instance
+don't have their own STYX timers yet — only the authoritative instance
 is backed up on a schedule so far. `OnFailure=status-email@%n.service` in
 the generic unit is still a placeholder pending real alerting wiring.
 rclone's shared `client_id` deprecation (retiring during 2026) is a known,
