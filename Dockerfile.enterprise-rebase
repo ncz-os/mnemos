@@ -18,7 +18,7 @@ COPY . ./
 # scripts while keeping that tested runtime closure intact.
 RUN python -m pip install --no-deps --no-build-isolation . && \
     python -m pip check && \
-    python -c "from importlib.metadata import version; assert version('mnemos-core') == '7.0.2'" && \
+    python -c "from importlib.metadata import version; assert version('mnemos-core') == '7.0.3'" && \
     install -m 0755 scripts/serve_api_and_mcp.sh /usr/local/bin/mnemos-serve-api-and-mcp
 
 USER 10001:0
