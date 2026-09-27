@@ -1047,6 +1047,68 @@ async def _drain_audit_tasks_on_shutdown() -> None:
         logger.exception("mcp_audit drain on http shutdown failed")
 
 
+#: The backend this process registered as the lifecycle backend, so shutdown
+#: only clears a registration it made.
+_registered_ledger_backend = None
+
+
+def _budget_cap_configured(settings) -> bool:
+    knemon = getattr(settings, "knemon", None)
+    if knemon is None:
+        return False
+    try:
+        weekly = float(getattr(knemon, "weekly_budget_cap_usd", 0) or 0)
+    except (TypeError, ValueError):
+        weekly = 0.0
+    parse = getattr(knemon, "parsed_provider_budget_caps_usd", None)
+    provider_caps = parse() if callable(parse) else {}
+    return weekly > 0 or bool(provider_caps)
+
+
+async def _register_budget_ledger(_app: Starlette, settings, reusable_backend):
+    """Give in-process GRAEAE the KNEMON spend ledger.
+
+    graeae_consult runs the engine in THIS process, and its budget gate reads
+    lifecycle._persistence_backend. The REST lifespan sets that; this one did
+    not, so with a weekly cap configured every MCP consultation failed closed
+    with "budget ledger unavailable" (ProviderBudgetExceeded) while the same
+    request over /v1/consultations succeeded. Opened only when a cap is
+    configured -- without one the gate allows everything and needs no ledger.
+
+    Returns a backend this call opened (the caller owns and closes it), or None.
+    """
+    global _registered_ledger_backend
+    from mnemos.core import lifecycle
+
+    if lifecycle._persistence_backend is not None or not _budget_cap_configured(settings):
+        return None
+    backend = reusable_backend or getattr(_app.state, "persistence_backend", None)
+    opened = None
+    if backend is None:
+        try:
+            _backend_type, backend = await lifecycle.build_configured_persistence_backend(settings)
+        except Exception:
+            logger.exception(
+                "KNEMON budget cap configured but the ledger backend could not be "
+                "opened; MCP GRAEAE consultations will be refused"
+            )
+            return None
+        opened = backend
+    lifecycle._persistence_backend = backend
+    _registered_ledger_backend = backend
+    logger.info("KNEMON budget ledger for MCP GRAEAE wired to %s.", type(backend).__name__)
+    return opened
+
+
+def _unregister_budget_ledger() -> None:
+    global _registered_ledger_backend
+    from mnemos.core import lifecycle
+
+    if _registered_ledger_backend is not None and lifecycle._persistence_backend is _registered_ledger_backend:
+        lifecycle._persistence_backend = None
+    _registered_ledger_backend = None
+
+
 @asynccontextmanager
 async def _mcp_http_lifespan(_app: Starlette):
     """Use the node's shared backend for durable OAuth state.
@@ -1101,8 +1163,12 @@ async def _mcp_http_lifespan(_app: Starlette):
             )
             oauth_module.set_oauth_service(service)
             logger.info("OAuth store wired to %s (MNEMOS_DATABASE_DSN).", type(backend).__name__)
+        ledger_backend = await _register_budget_ledger(_app, settings, owned_backend)
+        if ledger_backend is not None and owned_backend is None:
+            owned_backend = ledger_backend
         yield
     finally:
+        _unregister_budget_ledger()
         oauth_module.set_oauth_service(None)
         await _drain_audit_tasks_on_shutdown()
         try:
