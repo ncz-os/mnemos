@@ -148,6 +148,12 @@ RUN set -eux; \
 # Default to Oracle; override MNEMOS_DATABASE_DSN at runtime to pick any backend.
 ENV MNEMOS_PERSISTENCE_BACKEND=oracle
 
+# The API and MCP transports run as one supervised pair (deploy quadlet
+# Exec=/usr/local/bin/mnemos-serve-api-and-mcp). 6bd4fba7 installed the
+# launcher only in Dockerfile.enterprise-rebase, so the published 7.0.2 image
+# lacked it and could not replace a rebase-built container.
+RUN install -m 0755 /app/scripts/serve_api_and_mcp.sh /usr/local/bin/mnemos-serve-api-and-mcp
+
 # mnemos-enterprise is the single published, deployed image (see header
 # above), so it is the last chance to restore the hardened account before
 # anything actually runs the container. See Dockerfile.core for the uid/gid
