@@ -60,6 +60,14 @@ All notable changes to MNEMOS are documented here.
 Landed on `master` after the v7.0.0 tag, so **not present in the published
 `7.0.0` image or wheel**.
 
+### Added
+
+- **Streamable HTTP MCP at `/mcp`.** MNEMOS now exposes the current MCP
+  transport alongside the OAuth-protected legacy `/sse` fallback. Both routes
+  use the same tool registry, bearer/OAuth authorization, role, namespace,
+  and backend context. `/mcp` is the preferred endpoint for Codex and modern
+  remote MCP clients.
+
 ### Fixed
 
 - **API-key creation is backend-neutral.** Minting a key was PostgreSQL-only in

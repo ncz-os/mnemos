@@ -150,7 +150,7 @@ def _first_stdio_config(doc_path: Path) -> dict[str, Any]:
             if cfg.get("command") == "mnemos" and cfg.get("args", [])[:2] == ["serve", "mcp-stdio"]:
                 return cfg
         command_match = re.search(r'command\s*=\s*"mnemos"', block)
-        args_match = re.search(r'args\s*=\s*(\[[^\]]+\])', block)
+        args_match = re.search(r"args\s*=\s*(\[[^\]]+\])", block)
         if command_match and args_match and json.loads(args_match.group(1))[:2] == ["serve", "mcp-stdio"]:
             return {"command": "mnemos", "args": ["serve", "mcp-stdio"], "env": {}}
 
@@ -189,11 +189,7 @@ def _base_env(base_url: str, config_path: Path) -> dict[str, str]:
 
 
 def _safe_process_env() -> dict[str, str]:
-    return {
-        key: os.environ[key]
-        for key in ("HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER")
-        if key in os.environ
-    }
+    return {key: os.environ[key] for key in ("HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER") if key in os.environ}
 
 
 def _stdio_server_params(cfg: dict[str, Any], base_url: str, config_path: Path):
@@ -354,6 +350,96 @@ async def _run_sse_smoke(base_url: str) -> dict[str, Any]:
                     read_timeout_seconds=timedelta(seconds=TRANSPORT_TIMEOUT_SECONDS),
                 )
                 return _assert_search_payload(call_result)
+
+
+async def _run_streamable_http_smoke(base_url: str) -> dict[str, Any]:
+    """Exercise the preferred Streamable HTTP endpoint with the real SDK."""
+    from mcp.client.session import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
+    with anyio.fail_after(TRANSPORT_TIMEOUT_SECONDS):
+        async with streamablehttp_client(
+            f"{base_url}/mcp",
+            headers={"Authorization": f"Bearer {MCP_EDGE_TOKEN}"},
+            timeout=2,
+            sse_read_timeout=TRANSPORT_TIMEOUT_SECONDS,
+        ) as (read_stream, write_stream, _get_session_id):
+            async with ClientSession(
+                read_stream,
+                write_stream,
+                read_timeout_seconds=timedelta(seconds=TRANSPORT_TIMEOUT_SECONDS),
+            ) as session:
+                await session.initialize()
+                tools_result = await session.list_tools()
+                _assert_canonical_tool_registry(tools_result.tools)
+                call_result = await session.call_tool(
+                    "search_memories",
+                    {"query": SEARCH_QUERY, "limit": 1},
+                    read_timeout_seconds=timedelta(seconds=TRANSPORT_TIMEOUT_SECONDS),
+                )
+                return _assert_search_payload(call_result)
+
+
+def test_streamable_http_mcp_smoke(tmp_path: Path) -> None:
+    """Codex-preferred `/mcp` works while legacy SSE remains separately tested."""
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+
+    with _mock_mnemos_backend() as (backend_url, requests):
+        config_path = _write_empty_config(tmp_path)
+        env = _safe_process_env()
+        env.update(_base_env(backend_url, config_path))
+        env["MNEMOS_MCP_TOKENS"] = f"smoke:{MCP_EDGE_TOKEN}:{BACKEND_TOKEN}"
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "mnemos.cli.main",
+                "serve",
+                "mcp-http",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            _wait_for_http_ready(proc, base_url)
+            unauthenticated = urllib.request.Request(
+                f"{base_url}/mcp",
+                data=json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": {},
+                            "clientInfo": {"name": "smoke", "version": "1"},
+                        },
+                    }
+                ).encode(),
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                urllib.request.urlopen(unauthenticated, timeout=TRANSPORT_TIMEOUT_SECONDS)
+            assert exc_info.value.code == 401
+            try:
+                payload = anyio.run(_run_streamable_http_smoke, base_url)
+            except Exception as exc:
+                _stop_process(proc)
+                raise AssertionError(f"Streamable HTTP MCP smoke failed\n{_process_output(proc)}") from exc
+        finally:
+            _stop_process(proc)
+
+    assert payload["result"]["count"] == 0
+    _assert_backend_search_request(requests)
 
 
 @pytest.mark.parametrize("surface,doc_path", HTTP_SURFACES, ids=[name for name, _path in HTTP_SURFACES])
