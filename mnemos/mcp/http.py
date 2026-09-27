@@ -40,11 +40,12 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, quote
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import uvicorn
 import jwt
 from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http import StreamableHTTPServerTransport
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
@@ -55,7 +56,7 @@ try:
     from starlette.responses import StreamingResponse
 except ImportError:  # pragma: no cover - exercised only by lightweight test stubs.
     StreamingResponse = None  # type: ignore[assignment]
-from starlette.routing import Mount, Route
+from starlette.routing import BaseRoute, Match, Mount, NoMatchFound, Route
 
 from mnemos.core.config import get_settings, mcp_nats_raw_enabled
 from mnemos.mcp.oauth import (
@@ -235,11 +236,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request, call_next):
         path = request.url.path
-        if (
-            path in {"/health", "/healthz"}
-            or path.startswith("/.well-known/")
-            or path.startswith("/oauth/")
-        ):
+        if path in {"/health", "/healthz"} or path.startswith("/.well-known/") or path.startswith("/oauth/"):
             return await call_next(request)
         auth = request.headers.get("authorization", "")
         if not auth.lower().startswith("bearer "):
@@ -264,6 +261,166 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 sse = SseServerTransport("/messages/")
 _sse_session_principals: dict[str, str] = {}
 _sse_session_bind_lock = asyncio.Lock()
+
+
+class _RawASGIRoute(BaseRoute):
+    """Route an ASGI transport without Starlette trying to add a response.
+
+    The MCP SDK owns the HTTP response for both SSE and Streamable HTTP.  A
+    normal ``Route`` expects its endpoint to return a Response after the SDK
+    has written one, which used to turn a clean SSE disconnect into a noisy
+    ``TypeError: 'NoneType' object is not callable``.
+    """
+
+    def __init__(self, path: str, app, methods: set[str]) -> None:
+        self.path = path
+        self.app = app
+        self.methods = methods
+
+    def matches(self, scope):
+        if scope["type"] != "http" or scope["path"] != self.path:
+            return Match.NONE, {}
+        if scope["method"] not in self.methods:
+            return Match.PARTIAL, {}
+        return Match.FULL, {}
+
+    def url_path_for(self, name: str, /, **path_params):
+        raise NoMatchFound(name, path_params)
+
+    async def handle(self, scope, receive, send) -> None:
+        await self.app(scope, receive, send)
+
+
+@dataclass
+class _StreamableSession:
+    transport: StreamableHTTPServerTransport
+    principal_id: str
+    principal: MCPClientPrincipal
+    context: MCPUserContext
+    ready: asyncio.Future[None]
+    task: asyncio.Task[None] | None = None
+
+
+class _StreamableHTTPMCP:
+    """Per-principal session manager for the preferred MCP ``/mcp`` route."""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, _StreamableSession] = {}
+        self._lock = asyncio.Lock()
+
+    async def _run_session(self, session_id: str, session: _StreamableSession) -> None:
+        context_tokens = set_mcp_backend_context(
+            api_key=session.principal.api_key,
+            user_id=session.context.user_id,
+            role=session.context.role,
+            namespace=session.context.namespace,
+        )
+        try:
+            async with session.transport.connect() as streams:
+                if not session.ready.done():
+                    session.ready.set_result(None)
+                read_stream, write_stream = streams
+                await app.run(read_stream, write_stream, app.create_initialization_options())
+        except BaseException as exc:
+            if not session.ready.done():
+                session.ready.set_exception(exc)
+            elif not isinstance(exc, asyncio.CancelledError):
+                logger.exception("Streamable HTTP MCP session %s failed", session_id)
+        finally:
+            reset_mcp_backend_context(context_tokens)
+            async with self._lock:
+                if self._sessions.get(session_id) is session:
+                    self._sessions.pop(session_id, None)
+
+    async def _new_session(self, request) -> _StreamableSession | PlainTextResponse:
+        principal = getattr(request.state, "mnemos_mcp_principal", None)
+        principal_id = getattr(request.state, "mnemos_mcp_principal_id", None)
+        if principal is None or principal_id is None:
+            return PlainTextResponse("unauthorized", status_code=403)
+        try:
+            context = await _resolve_mcp_user_context(request)
+        except PermissionError:
+            return PlainTextResponse("unauthorized", status_code=403)
+
+        session_id = uuid4().hex
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[None] = loop.create_future()
+        transport = StreamableHTTPServerTransport(session_id)
+        session = _StreamableSession(transport, principal_id, principal, context, ready)
+        async with self._lock:
+            self._sessions[session_id] = session
+        session.task = asyncio.create_task(self._run_session(session_id, session))
+        try:
+            await ready
+        except BaseException:
+            self._sessions.pop(session_id, None)
+            raise
+        return session
+
+    async def __call__(self, scope, receive, send) -> None:
+        from starlette.requests import Request
+
+        request = Request(scope, receive, send)
+        session_id = request.headers.get("mcp-session-id")
+        if session_id:
+            async with self._lock:
+                session = self._sessions.get(session_id)
+            if session is None or (session.task is not None and session.task.done()):
+                async with self._lock:
+                    self._sessions.pop(session_id, None)
+                response = PlainTextResponse("session expired or never existed", status_code=404)
+                await response(scope, receive, send)
+                return
+            if getattr(request.state, "mnemos_mcp_principal_id", None) != session.principal_id:
+                response = PlainTextResponse("session does not belong to caller", status_code=403)
+                await response(scope, receive, send)
+                return
+        else:
+            if scope["method"] != "POST":
+                response = PlainTextResponse("MCP session id is required", status_code=400)
+                await response(scope, receive, send)
+                return
+            body = await request.body()
+            try:
+                initial_request = json.loads(body)
+            except json.JSONDecodeError:
+                initial_request = None
+            if not isinstance(initial_request, dict) or initial_request.get("method") != "initialize":
+                response = PlainTextResponse("initialize is required to create an MCP session", status_code=400)
+                await response(scope, receive, send)
+                return
+
+            # ``Request.body()`` consumed the original ASGI receive callable.
+            # Replay its exact bytes so the SDK still owns JSON-RPC parsing and
+            # response framing below.  Refusing non-initialize requests before
+            # allocating a transport also prevents session-map growth from
+            # malformed first requests.
+            sent_body = False
+            original_receive = receive
+
+            async def replay_receive():
+                nonlocal sent_body
+                if not sent_body:
+                    sent_body = True
+                    return {"type": "http.request", "body": body, "more_body": False}
+                return await original_receive()
+
+            receive = replay_receive
+            try:
+                session = await self._new_session(request)
+            except Exception:
+                logger.exception("Could not start Streamable HTTP MCP session")
+                response = PlainTextResponse("MCP session unavailable", status_code=503)
+                await response(scope, receive, send)
+                return
+            if isinstance(session, PlainTextResponse):
+                await session(scope, receive, send)
+                return
+
+        await session.transport.handle_request(scope, receive, send)
+
+
+streamable_mcp = _StreamableHTTPMCP()
 
 
 def _session_id_key(session_id) -> str:
@@ -432,6 +589,18 @@ async def handle_sse(request):
         reset_mcp_backend_context(context_tokens)
 
 
+async def handle_sse_asgi(scope, receive, send) -> None:
+    """ASGI wrapper for legacy SSE.
+
+    ``SseServerTransport`` writes its response directly.  Keeping that work
+    out of a regular Starlette ``Route`` prevents Starlette from attempting a
+    second response after the client disconnects.
+    """
+    from starlette.requests import Request
+
+    await handle_sse(Request(scope, receive, send))
+
+
 # MCP principal context cache (entry → resolved MCPUserContext +
 # monotonic-time expiry). Until #203 this was an unbounded dict
 # that NEVER expired — operator role / namespace changes were
@@ -481,6 +650,8 @@ def principal_cache_invalidate(generation: int | None = None) -> None:
             return
         _principal_cache_generation = generation
     _principal_context_cache.clear()
+
+
 _PRINCIPAL_CACHE_TTL_SECONDS = 300.0  # 5 min — short enough that
 # role/namespace changes propagate within a sane window; long
 # enough that high-rps SSE callers don't re-hit /auth/oauth/me.
@@ -598,9 +769,7 @@ async def _resolve_mcp_user_context(request) -> MCPUserContext:
             # and never consults revocation.
             status = exc.response.status_code if exc.response is not None else None
             if status in (401, 403):
-                logger.warning(
-                    "MCP principal context rejected by auth service (HTTP %s); denying", status
-                )
+                logger.warning("MCP principal context rejected by auth service (HTTP %s); denying", status)
                 raise PermissionError("MCP principal is not authorized") from exc
             logger.warning("MCP principal context lookup failed with HTTP %s: %s", status, exc)
         except Exception as exc:
@@ -954,7 +1123,8 @@ starlette_app = Starlette(
         Route("/oauth/authorize", endpoint=authorize_post_route, methods=["POST"]),
         Route("/oauth/token", endpoint=token_route, methods=["POST"]),
         Route("/oauth/register", endpoint=register_route, methods=["POST"]),
-        Route("/sse", endpoint=handle_sse),
+        _RawASGIRoute("/mcp", streamable_mcp, {"POST", "GET", "DELETE"}),
+        _RawASGIRoute("/sse", handle_sse_asgi, {"GET"}),
         Route(NATS_SSE_PATH, endpoint=handle_nats_event_stream),
         Mount("/messages/", app=handle_post_message),
     ],
