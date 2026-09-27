@@ -9,7 +9,8 @@ Codex CLI 0.125.0 and newer can register MNEMOS as an MCP server with `codex mcp
 - MNEMOS REST reachable at `http://<mnemos-host>:5002`.
 - The `mnemos` CLI installed on the same machine as Codex CLI.
 - Config path: `~/.codex/config.toml`.
-- Optional HTTP/SSE MCP bridge reachable at `http://<mnemos-host>:5003/sse`.
+- Preferred Streamable HTTP MCP endpoint reachable at `http://<mnemos-host>:5003/mcp`.
+- Legacy HTTP/SSE fallback reachable at `http://<mnemos-host>:5003/sse`.
 - A new Codex process after config changes.
 - Shell access to run `codex mcp add`.
 - `jq` available for the verification command.
@@ -46,16 +47,20 @@ Some pre-release Codex builds used the older table name
 `[mcp.servers.mnemos]`. If your local `codex --version` is older than
 `0.125.0`, upgrade before debugging the table spelling.
 
-For HTTP/SSE, use a URL registration when the Codex build supports remote
-MCP transport:
+For a direct remote connection, use Streamable HTTP. This is the preferred
+transport for Codex and other current MCP clients:
 
 ```toml
-[mcp_servers.mnemos-sse]
-url = "http://<mnemos-host>:5003/sse"
+[mcp_servers.mnemos]
+url = "http://<mnemos-host>:5003/mcp"
 
-[mcp_servers.mnemos-sse.headers]
-Authorization = "Bearer $MNEMOS_TOKEN"
+[mcp_servers.mnemos.env_http_headers]
+Authorization = "MNEMOS_TOKEN"
 ```
+
+Use `/sse` only for legacy clients that do not support Streamable HTTP. Both
+routes use the same bearer and OAuth authorization service, tool registry,
+role, and namespace checks.
 
 Restart Codex after editing the TOML file. `codex exec` inherits the same
 MCP registration as interactive sessions.
@@ -105,7 +110,7 @@ against real ChatGPT and Codex clients:
   ```
 
 Register the connector: ChatGPT → Settings → Connectors → Add custom (URL =
-`https://<tunnel-url>/sse`); Codex follows the equivalent remote-MCP add flow
+`https://<tunnel-url>/mcp`); Codex follows the equivalent remote-MCP add flow
 in its own connector/registry UI once Developer Mode is on. See the full
 walkthrough — architecture diagram, verification curls, troubleshooting — in
 [ChatGPT Pro Developer Mode](./chatgpt-pro-developer-mode.md).
