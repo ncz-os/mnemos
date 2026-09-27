@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from mnemos.api.persistence_helpers import require_consultations_backend
 from mnemos.domain.graeae.consultation_support import (
     audit_genesis_hash,
+    _audit_hmac_key,
     _extract_memory_ids,
     _require_non_empty_consultation_result,
     _to_graeae_provider,
@@ -195,6 +196,10 @@ async def tool_graeae_consult(
                             namespace=user.namespace,
                             memory_ids=memory_ids,
                             genesis_hash=audit_genesis_hash(),
+                            # The REST route passes the signing key; without it
+                            # every MCP consultation raised AuditChainKeyMissing
+                            # after the engine had already answered.
+                            audit_key=_audit_hmac_key(),
                         )
                     )
             except HTTPException as e:
