@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1
+#
+# Local release rebase for a source-only MNEMOS patch.  The regular enterprise
+# image is built from the published everything image, so rebuilding it needs
+# the full image matrix.  This layer preserves the proven enterprise runtime
+# (including its Oracle, Db2, and add-on dependencies) while replacing only
+# the application source and installed mnemos distribution for this release.
+ARG MNEMOS_ENTERPRISE_BASE=ghcr.io/ncz-os/mnemos-enterprise:7.0.0
+FROM ${MNEMOS_ENTERPRISE_BASE}
+
+USER root
+WORKDIR /app
+
+COPY . ./
+
+# Dependencies are inherited from the pinned base.  Installing this project
+# without dependency resolution updates application metadata and console
+# scripts while keeping that tested runtime closure intact.
+RUN python -m pip install --no-deps --no-build-isolation . && \
+    python -m pip check && \
+    python -c "from importlib.metadata import version; assert version('mnemos-core') == '7.0.1'"
+
+USER 10001:0
