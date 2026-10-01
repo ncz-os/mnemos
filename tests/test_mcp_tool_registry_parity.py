@@ -14,6 +14,7 @@ import json
 import sys
 import types
 import uuid
+from enum import Enum
 
 
 class _Tool:
@@ -141,13 +142,29 @@ def _install_mcp_stubs(monkeypatch):
             self.args = args
             self.kwargs = kwargs
 
+    class BaseRoute:
+        pass
+
+    class Match(Enum):
+        NONE = 0
+        PARTIAL = 1
+        FULL = 2
+
+    class NoMatchFound(Exception):
+        pass
+
     starlette_applications.Starlette = Starlette
     starlette_middleware.Middleware = Middleware
     starlette_middleware_base.BaseHTTPMiddleware = BaseHTTPMiddleware
     starlette_responses.JSONResponse = JSONResponse
     starlette_responses.PlainTextResponse = PlainTextResponse
+    starlette_responses.HTMLResponse = PlainTextResponse
+    starlette_responses.RedirectResponse = PlainTextResponse
     starlette_routing.Mount = Mount
     starlette_routing.Route = Route
+    starlette_routing.BaseRoute = BaseRoute
+    starlette_routing.Match = Match
+    starlette_routing.NoMatchFound = NoMatchFound
 
     monkeypatch.setitem(sys.modules, "uvicorn", uvicorn)
     monkeypatch.setitem(sys.modules, "starlette", starlette)
@@ -171,11 +188,15 @@ def _install_mcp_stubs(monkeypatch):
     mcp_sse = types.ModuleType("mcp.server.sse")
     mcp_sse.SseServerTransport = _SseServerTransport
 
+    mcp_streamable = types.ModuleType("mcp.server.streamable_http")
+    mcp_streamable.StreamableHTTPServerTransport = type("StreamableHTTPServerTransport", (), {})
+
     monkeypatch.setitem(sys.modules, "mcp", mcp_mod)
     monkeypatch.setitem(sys.modules, "mcp.types", mcp_types)
     monkeypatch.setitem(sys.modules, "mcp.server", mcp_server_mod)
     monkeypatch.setitem(sys.modules, "mcp.server.stdio", mcp_stdio)
     monkeypatch.setitem(sys.modules, "mcp.server.sse", mcp_sse)
+    monkeypatch.setitem(sys.modules, "mcp.server.streamable_http", mcp_streamable)
 
 
 def _fresh_import(module_name: str):
