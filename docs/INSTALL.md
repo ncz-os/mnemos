@@ -17,7 +17,7 @@ There are two ways to deploy: **pre-built container images** (turnkey) or
 
 | Image | Contains | Arch | Pull |
 |---|---|---|---|
-| `ghcr.io/ncz-os/mnemos-enterprise` | **Everything**: core (including CHARON/STYX) + GRAEAE + PANTHEON + KNEMON in one API process, plus rclone and the Oracle / MySQL / MariaDB / Db2 drivers | `amd64` + `arm64` (Db2 driver on the amd64 layer only) | `docker pull ghcr.io/ncz-os/mnemos-enterprise:7.0.0` |
+| `ghcr.io/ncz-os/mnemos-enterprise` | **Everything**: core (including CHARON/STYX) + GRAEAE + PANTHEON + KNEMON in one API process, plus rclone and the Oracle / MySQL / MariaDB / Db2 drivers | `amd64` + `arm64` (Db2 driver on the amd64 layer only) | `docker pull ghcr.io/ncz-os/mnemos-enterprise:7.0.5` |
 
 The build is still OCI-layered internally -- `Dockerfile.core` and
 `Dockerfile.everything` are separate BuildKit Bake targets built `FROM` one
@@ -42,7 +42,7 @@ being published at 6.2.5; do not pull them for a v7 deployment.
 ### Run the everything image (SQLite, zero config)
 
 ```bash
-docker run --rm -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:7.0.0
+docker run --rm -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:7.0.5
 # → http://localhost:5002/health
 ```
 
@@ -54,12 +54,12 @@ The backend is chosen by `MNEMOS_DATABASE_DSN` at runtime — no rebuild:
 # PostgreSQL + pgvector
 docker run -p 5002:5002 \
   -e MNEMOS_DATABASE_DSN='postgres://user:pass@host:5432/mnemos' \
-  ghcr.io/ncz-os/mnemos-enterprise:7.0.0
+  ghcr.io/ncz-os/mnemos-enterprise:7.0.5
 
 # Oracle Database 26ai (thin mode — no extra driver install needed)
 docker run -p 5002:5002 \
   -e MNEMOS_DATABASE_DSN='oracle://MNEMOS:pass@host:1521/ORCLPDB1' \
-  ghcr.io/ncz-os/mnemos-enterprise:7.0.0
+  ghcr.io/ncz-os/mnemos-enterprise:7.0.5
 
 # IBM Db2 — amd64 layer only (the ibm_db driver has no arm64 wheel)
 docker run -p 5002:5002 \

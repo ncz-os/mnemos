@@ -942,6 +942,9 @@ async def _install(monkeypatch, rows: list[dict[str, Any]], statuses: list[int])
     store.pool = pool
     conn = _FakeWebhookConn(store)
     monkeypatch.setattr(lifecycle, "_pool", pool)
+    # Other suites install and then close a real backend.  These tests
+    # deliberately exercise the legacy pool adapter, independent of order.
+    monkeypatch.setattr(lifecycle, "_persistence_backend", None)
 
     async def _accept_url(url: str) -> webhook_validation.ValidatedWebhookURL:
         from urllib.parse import urlparse
