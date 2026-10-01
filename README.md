@@ -11,7 +11,7 @@
 
 # MNEMOS + GRAEAE
 
-**MNEMOS v7.0.0 is the memory operating system for serious agentic work.** It is
+**MNEMOS v7.0.5 is the memory operating system for serious agentic work.** It is
 not just a place to put bytes: it is a runtime of named subsystems that manage
 the full lifecycle of agent memory across providers, agents, and time horizons —
 write, embed, search, compress, version, reason over, audit, federate, export,
@@ -42,7 +42,7 @@ What is in the box:
 > optional through `mnemos-core[docling]`. The published
 > container image is `ghcr.io/ncz-os/mnemos-enterprise` — a single multi-arch
 > (amd64 + arm64) manifest with every backend driver (Oracle, MySQL, MariaDB)
-> except Db2, which is amd64-only. Pin an exact version (`:7.0.0`) to keep a fleet
+> except Db2, which is amd64-only. Pin an exact version (`:7.0.5`) to keep a fleet
 > on identical code. Install and DSN/driver setup for each backend are in
 > [docs/INSTALL.md](docs/INSTALL.md); the agent-facing contract is in
 > [AGENTS.md](AGENTS.md).

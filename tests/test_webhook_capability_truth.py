@@ -124,6 +124,7 @@ async def test_delivery_attempt_without_supported_handle_fails_loud(monkeypatch)
     from mnemos.webhooks.sender import _attempt_delivery
 
     monkeypatch.setattr(lifecycle, "_pool", None)
+    monkeypatch.setattr(lifecycle, "_persistence_backend", None)
 
     with pytest.raises(RuntimeError, match="cannot run without a supported persistence handle"):
         await _attempt_delivery("delivery_test")
