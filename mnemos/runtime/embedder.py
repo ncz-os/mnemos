@@ -42,7 +42,10 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import math
 import os
+import time
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 from typing import Iterable
 
@@ -54,6 +57,8 @@ from mnemos.core.config import (
     embed_gpu_layers_env,
     embed_http_concurrency_env,
     embed_http_model_env,
+    embed_http_pool_urls_env,
+    embedding_dim_env,
     embed_http_timeout_env,
     embed_http_url_env,
     embed_http_url_fallback_env,
@@ -392,6 +397,43 @@ class _CixNpuBackend:
         return self._embed_dim
 
 
+def _validate_http_pool(urls, model, expected_dim):
+    """Reject unsafe or incompatible configuration before opening HTTP clients."""
+    if not isinstance(urls, list) or len(urls) < 2:
+        raise ValueError("Pool must have at least 2 URLs")
+
+    seen = set()
+    normalized_urls = []
+    for url in urls:
+        if not isinstance(url, str) or not url:
+            raise ValueError("URLs must be non-empty strings")
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("Invalid scheme")
+        if not parsed.hostname:
+            raise ValueError("Hostname required")
+        if parsed.username or parsed.password:
+            raise ValueError("Auth not allowed")
+        if parsed.query or parsed.fragment:
+            raise ValueError("Query/fragment not allowed")
+        normalized_path = parsed.path.rstrip("/")
+        if normalized_path != "/v1/embeddings":
+            raise ValueError("Path must be /v1/embeddings")
+        if parsed.port is not None and not (1 <= parsed.port <= 65535):
+            raise ValueError("Invalid port")
+        normalized_url = urlunsplit(parsed._replace(path=normalized_path))
+        if normalized_url in seen:
+            raise ValueError("URLs must be distinct")
+        seen.add(normalized_url)
+        normalized_urls.append(normalized_url)
+
+    if model != "bge-m3":
+        raise ValueError("Model must be bge-m3")
+    if isinstance(expected_dim, bool) or not isinstance(expected_dim, int) or expected_dim != 1024:
+        raise ValueError("Expected dim must be 1024")
+    return normalized_urls
+
+
 class _HttpBackend:
     """OpenAI-compatible /v1/embeddings HTTP backend.
 
@@ -592,6 +634,248 @@ class _HttpBackend:
             return [[] for _ in texts]
 
 
+class _HttpPoolBackend(_HttpBackend):
+    def __init__(self, urls, model, timeout, max_chars, expected_dim):
+        urls = _validate_http_pool(urls, model, expected_dim)
+
+        super().__init__(
+            url=urls[0], model=model, timeout=timeout, max_chars=max_chars, cb_threshold=1, cb_cooldown=30.0
+        )
+
+        self._urls = urls
+        self._expected_dim = expected_dim
+        self._children = []
+        self._inflight = [0] * len(urls)
+        self._ewma_ms = [0.0] * len(urls)
+        self._sequence = 0
+        self._last_selected_seq = [0] * len(urls)
+        self._probe_flags = [False] * len(urls)
+
+    def _load_sync(self):
+        if self._children:
+            return
+        for url in self._urls:
+            child = _HttpBackend(
+                url=url,
+                model=self.model,
+                timeout=self.timeout,
+                max_chars=self.max_chars,
+                cb_threshold=1,
+                cb_cooldown=30.0,
+            )
+            child._load_sync()
+            self._children.append(child)
+        self._client = self._children[0]._client
+
+    @property
+    def loaded(self):
+        if not self._children:
+            return False
+        return all(isinstance(c, _HttpBackend) and c.loaded for c in self._children)
+
+    @property
+    def embed_dim(self):
+        return self._expected_dim
+
+    def _synchronous_reserve(self, attempted):
+        now_seq = self._sequence
+        now = time.monotonic()
+        candidates = []
+
+        for i in range(len(self._children)):
+            if i in attempted or self._probe_flags[i]:
+                continue
+
+            child = self._children[i]
+            is_open = child._breaker_opened_at is not None
+
+            if is_open:
+                age = now - child._breaker_opened_at
+                if age < child._cb_cooldown:
+                    continue
+                if self._inflight[i] > 0 or self._probe_flags[i]:
+                    continue
+                candidates.append((i, "halfopen"))
+            else:
+                candidates.append((i, "normal"))
+
+        if not candidates:
+            return -1, None
+
+        explore = []
+        normal = []
+        for i, typ in candidates:
+            if typ == "halfopen":
+                explore.append(i)
+            else:
+                if now_seq - self._last_selected_seq[i] >= 4 or self._ewma_ms[i] == 0:
+                    explore.append(i)
+                else:
+                    normal.append(i)
+
+        if explore:
+            best_i = explore[0]
+            best_score = float("inf")
+            for i in explore:
+                score = (self._inflight[i] + 1) * max(self._ewma_ms[i], 1.0)
+                if score < best_score:
+                    best_score = score
+                    best_i = i
+            return best_i, "halfopen" if self._children[best_i]._breaker_opened_at is not None else "normal"
+
+        best_i = -1
+        best_score = float("inf")
+        for i in normal:
+            score = (self._inflight[i] + 1) * max(self._ewma_ms[i], 1.0)
+            if score < best_score:
+                best_score = score
+                best_i = i
+
+        return best_i, "normal"
+
+    def _validate_vec(self, vec):
+        if not isinstance(vec, list) or len(vec) != self._expected_dim:
+            return False
+        for v in vec:
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                return False
+            if not math.isfinite(v):
+                return False
+        norm = math.hypot(*vec)
+        return math.isfinite(norm) and norm > 0
+
+    async def _call_endpoint(self, idx, texts):
+        child = self._children[idx]
+        start = time.monotonic()
+        try:
+            resp = await child._client.post(child.url, json={"model": self.model, "input": texts}, timeout=self.timeout)
+            if resp.status_code != 200:
+                child._record_failure()
+                return None
+            data = resp.json()
+            if not isinstance(data, dict) or "data" not in data:
+                child._record_failure()
+                return None
+            items = data["data"]
+            if not isinstance(items, list) or len(items) != len(texts):
+                child._record_failure()
+                return None
+
+            indices = []
+            vecs = []
+            for item in items:
+                if not isinstance(item, dict) or "index" not in item or "embedding" not in item:
+                    child._record_failure()
+                    return None
+                idx_val = item["index"]
+                if isinstance(idx_val, bool) or not isinstance(idx_val, int):
+                    child._record_failure()
+                    return None
+                if idx_val < 0 or idx_val >= len(texts):
+                    child._record_failure()
+                    return None
+                indices.append(idx_val)
+                vecs.append(item["embedding"])
+
+            if len(set(indices)) != len(indices):
+                child._record_failure()
+                return None
+
+            for i in range(len(texts)):
+                if i not in indices:
+                    child._record_failure()
+                    return None
+
+            for v in vecs:
+                if not self._validate_vec(v):
+                    child._record_failure()
+                    return None
+
+            elapsed_ms = (time.monotonic() - start) * 1000.0
+            if self._ewma_ms[idx] == 0.0:
+                self._ewma_ms[idx] = elapsed_ms
+            else:
+                self._ewma_ms[idx] = 0.3 * elapsed_ms + 0.7 * self._ewma_ms[idx]
+
+            result = [None] * len(texts)
+            for i, v in zip(indices, vecs):
+                norm = math.hypot(*v)
+                if norm > 0 and math.isfinite(norm):
+                    result[i] = [x / norm for x in v]
+                else:
+                    child._record_failure()
+                    return None
+            child._record_success()
+            return result
+        except Exception:
+            child._record_failure()
+            return None
+        finally:
+            self._inflight[idx] -= 1
+            if self._probe_flags[idx]:
+                self._probe_flags[idx] = False
+
+    async def _embed_batch_core(self, texts):
+        if not texts:
+            return []
+
+        cleaned = [(t or "")[: self.max_chars] for t in texts]
+        nonempty_idx = [i for i, c in enumerate(cleaned) if c.strip()]
+
+        if not nonempty_idx:
+            return [[] for _ in texts]
+
+        attempted = set()
+        for _ in range(len(self._children)):
+            idx, state = self._synchronous_reserve(attempted)
+            if idx == -1:
+                break
+
+            attempted.add(idx)
+            self._inflight[idx] += 1
+            self._sequence += 1
+            self._last_selected_seq[idx] = self._sequence
+
+            child = self._children[idx]
+            original_opened_at = child._breaker_opened_at
+            was_halfopen = False
+
+            if state == "halfopen":
+                self._probe_flags[idx] = True
+                was_halfopen = True
+                child._breaker_open()
+
+            try:
+                ne_texts = [cleaned[i] for i in nonempty_idx]
+                res = await self._call_endpoint(idx, ne_texts)
+                if res is not None:
+                    out = [[] for _ in texts]
+                    # _call_endpoint uses each response `index` to restore
+                    # the order of ne_texts before this maps back to the
+                    # original batch slots.
+                    for original_index, embedding in zip(nonempty_idx, res, strict=True):
+                        out[original_index] = embedding
+                    return out
+            except asyncio.CancelledError:
+                if was_halfopen:
+                    child._breaker_opened_at = original_opened_at
+                raise
+            except Exception:
+                pass
+        return [[] for _ in texts]
+
+    async def embed_async(self, text):
+        if not text or not text.strip():
+            return []
+        res = await self._embed_batch_core([text])
+        if res and res[0]:
+            return res[0]
+        return []
+
+    async def embed_batch_async(self, texts):
+        return await self._embed_batch_core(texts)
+
+
 def _cix_npu_available() -> bool:
     """Return True if Cix NPU is usable on this host (device + library + model)."""
     if not Path("/dev/aipu").exists():
@@ -672,6 +956,7 @@ class InProcessEmbedder:
         http_model: str | None = None,
         http_timeout: float | None = None,
         http_concurrency: int | None = None,
+        http_pool_urls: list[str] | None = None,
         # hybrid knobs
         hybrid: bool | None = None,
         npu_threshold_chars: int | None = None,
@@ -703,10 +988,16 @@ class InProcessEmbedder:
         # a GPU host outage path falls to a fallback host before in-process llamacpp.
         self.http_url_fallback = http_url_fallback if http_url_fallback is not None else embed_http_url_fallback_env()
         self.http_model = http_model or embed_http_model_env()
+        self.http_pool_urls = http_pool_urls if http_pool_urls is not None else embed_http_pool_urls_env()
+        if self.http_pool_urls:
+            if self.http_model != "bge-m3":
+                raise ValueError("HTTP pool requires bge-m3 model")
+            if embedding_dim_env() != 1024:
+                raise ValueError("HTTP pool requires 1024 dim")
+        if self.http_pool_urls and requested != "http":
+            raise ValueError("Explicit HTTP pool requires http backend")
         self.http_timeout = float(http_timeout if http_timeout is not None else embed_http_timeout_env())
-        self.http_concurrency = int(
-            http_concurrency if http_concurrency is not None else embed_http_concurrency_env()
-        )
+        self.http_concurrency = int(http_concurrency if http_concurrency is not None else embed_http_concurrency_env())
         if self.http_concurrency < 1:
             self.http_concurrency = 1
         self.max_text_chars = int(max_text_chars if max_text_chars is not None else embed_max_chars_env())
@@ -751,6 +1042,15 @@ class InProcessEmbedder:
                 trust_remote_code=self.trust_remote_code,
             )
         if name == "http":
+            if self.http_pool_urls:
+                return _HttpPoolBackend(
+                    urls=self.http_pool_urls,
+                    model=self.http_model,
+                    timeout=self.http_timeout,
+                    max_chars=self.max_text_chars,
+                    expected_dim=embedding_dim_env(),
+                )
+
             return _HttpBackend(
                 url=self.http_url,
                 model=self.http_model,
@@ -794,7 +1094,7 @@ class InProcessEmbedder:
         # intentionally have only http available doesn't fail startup.
         self._http_fallback_remote: _HttpBackend | None = None
         self._http_fallback: _LlamaCppBackend | None = None
-        if resolved == "http":
+        if resolved == "http" and not self.http_pool_urls:
             if self.http_url_fallback and self.http_url_fallback != self.http_url:
                 self._http_fallback_remote = _HttpBackend(
                     url=self.http_url_fallback,
@@ -854,9 +1154,7 @@ class InProcessEmbedder:
         # race past the ``self._backend is None`` check and double-init.
         # We re-check inside the lock so already-loaded embedders skip
         # the lock acquisition entirely on the hot path.
-        if self._backend and self._backend.loaded and (
-            self._npu_sidecar is None or self._npu_sidecar.loaded
-        ):
+        if self._backend and self._backend.loaded and (self._npu_sidecar is None or self._npu_sidecar.loaded):
             return
         async with self._lock:
             if not (self._backend and self._backend.loaded):
