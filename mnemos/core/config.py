@@ -1062,9 +1062,7 @@ class _AuditSettings(BaseModel):
     require_session_secret: str = Field(
         default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET")
     )
-    require_chain_key: str = Field(
-        default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_AUDIT_CHAIN_KEY")
-    )
+    require_chain_key: str = Field(default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_AUDIT_CHAIN_KEY"))
     chain: str = Field(default_factory=lambda: runtime_env_value("MNEMOS_AUDIT_CHAIN", ""))
     root_private_key: str = Field(default_factory=lambda: runtime_env_value_stripped("MNEMOS_AUDIT_ROOT_PRIVKEY"))
 
@@ -1634,6 +1632,16 @@ def embed_http_url_env() -> str:
 
 def embed_http_url_fallback_env() -> str:
     return runtime_env_value("MNEMOS_EMBED_HTTP_URL_FALLBACK", "http://192.168.207.64:8090/v1/embeddings")
+
+
+def embed_http_pool_urls_env() -> list[str]:
+    raw = runtime_env_value("MNEMOS_EMBED_HTTP_POOL_URLS", "")
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",")]
+    if any(not p for p in parts):
+        raise ValueError("MNEMOS_EMBED_HTTP_POOL_URLS contains empty segments")
+    return parts
 
 
 def embed_http_model_env() -> str:
