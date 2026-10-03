@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -365,6 +365,11 @@ async def test_oracle_fetch_memory_export_binds_cursor_as_explicit_timestamp_tz(
     binds are coerced by the driver and the boundary row can compare as
     greater than its own cursor, re-emitted as the first row of the next page
     (the 2026-10-03 defect; on the feed path, the 2026-05-23 infinite loops).
+
+    Parametrized over the three cursor value domains the raw side channel can
+    carry: aware datetime (fast path, bound verbatim), naive datetime
+    (normalized to a UTC instant so setvalue accepts it), and ISO string
+    (passed through so a naive-text row is never coerced).
     """
     import sys
     import types
@@ -395,29 +400,58 @@ async def test_oracle_fetch_memory_export_binds_cursor_as_explicit_timestamp_tz(
     monkeypatch.setattr(oracle_mod, "_conn_from_tx", lambda tx: SimpleNamespace(cursor=lambda: cursor))
     monkeypatch.setattr(oracle_mod, "_fetch_all_dicts", _fake_fetch_all_dicts)
 
-    cursor_ts = datetime(2026, 10, 1, 12, 30, 45, 987654, tzinfo=UTC)
+    # (cursor value, expected bound value after _export_cursor_instant)
+    aware = datetime(2026, 10, 1, 12, 30, 45, 987654, tzinfo=UTC)
+    naive = datetime(2026, 10, 1, 12, 30, 45, 987654)
+    iso_str = "2026-10-01T12:30:45.987654"
+    cases = [
+        (aware, aware),
+        (naive, aware),  # naive -> UTC instant
+        (iso_str, iso_str),  # string passthrough
+    ]
     repo = oracle_mod.OracleMemoryRepository.__new__(oracle_mod.OracleMemoryRepository)
-    await oracle_mod.OracleMemoryRepository.fetch_memory_export(
-        repo,
-        SimpleNamespace(conn=SimpleNamespace(cursor=lambda: cursor)),
-        effective_owner=None,
-        effective_ns=None,
-        category=None,
-        limit=1000,
-        offset=0,
-        include_secrets=True,
-        record_cursor=(cursor_ts, "mem_01999"),
-    )
-    assert executed, "fetch_memory_export must issue the keyset query"
-    sql, params = executed[0]
-    assert "(created > :cur_created OR (created = :cur_created_eq AND id > :cur_id))" in sql
-    assert isinstance(params["cur_created"], _FakeVar)
-    assert isinstance(params["cur_created_eq"], _FakeVar)
-    assert params["cur_created"].type_code == bind_type
-    assert params["cur_created_eq"].type_code == bind_type
-    assert params["cur_created"].value == cursor_ts
-    assert params["cur_created_eq"].value == cursor_ts
-    assert params["cur_id"] == "mem_01999"
+    for cursor_value, expected_bound in cases:
+        executed.clear()
+        await oracle_mod.OracleMemoryRepository.fetch_memory_export(
+            repo,
+            SimpleNamespace(conn=SimpleNamespace(cursor=lambda: cursor)),
+            effective_owner=None,
+            effective_ns=None,
+            category=None,
+            limit=1000,
+            offset=0,
+            include_secrets=True,
+            record_cursor=(cursor_value, "mem_01999"),
+        )
+        assert executed, "fetch_memory_export must issue the keyset query"
+        sql, params = executed[0]
+        assert "(created > :cur_created OR (created = :cur_created_eq AND id > :cur_id))" in sql
+        assert isinstance(params["cur_created"], _FakeVar)
+        assert isinstance(params["cur_created_eq"], _FakeVar)
+        assert params["cur_created"].type_code == bind_type
+        assert params["cur_created_eq"].type_code == bind_type
+        assert params["cur_created"].value == expected_bound
+        assert params["cur_created_eq"].value == expected_bound
+        assert params["cur_id"] == "mem_01999"
+
+
+def test_export_cursor_instant_normalizes_value_domain():
+    """The Oracle cursor normalizer preserves the value domain:
+    aware datetime binds verbatim, naive datetime becomes a UTC instant,
+    ISO string passes through, and an unknown type is returned unchanged so
+    it fails loudly at bind time rather than being silently mutated."""
+    import mnemos.persistence.oracle as oracle_mod
+
+    aware = datetime(2026, 10, 1, 12, 30, 45, 987654, tzinfo=UTC)
+    naive = datetime(2026, 10, 1, 12, 30, 45, 987654)
+    iso_str = "2026-10-01T12:30:45.987654"
+    assert oracle_mod._export_cursor_instant(aware) == aware
+    assert oracle_mod._export_cursor_instant(naive) == aware  # naive -> UTC instant
+    assert oracle_mod._export_cursor_instant(iso_str) == iso_str  # string passthrough
+    assert oracle_mod._export_cursor_instant(123) == 123  # unknown -> unchanged
+    # A non-UTC aware offset is normalized to the same UTC instant.
+    shifted = datetime(2026, 10, 1, 14, 30, 45, 987654, tzinfo=timezone(timedelta(hours=2)))
+    assert oracle_mod._export_cursor_instant(shifted) == aware
 
 
 def test_oracle_feed_keyset_already_uses_explicit_timestamp_tz_bind():

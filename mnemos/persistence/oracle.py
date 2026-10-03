@@ -163,6 +163,34 @@ def _rank_score_sort_key(row: Row) -> float:
     return score if math.isfinite(score) else math.inf
 
 
+def _export_cursor_instant(value: Any) -> Any:
+    """Normalize a keyset cursor timestamp to the backend value domain.
+
+    The export keyset compares the cursor against the `created` column
+    (TIMESTAMP WITH TIME ZONE). The cursor arrives as the RAW `created`
+    value the previous page's row carried — which is what `setvalue(0, ...)`
+    on a DB_TYPE_TIMESTAMP_TZ bind accepts without loss:
+
+    * aware datetime  -> bound verbatim (the lossless fast path);
+    * naive datetime  -> treated as UTC (matches how the MPF serializer
+      renders naive storage, and how Oracle reads SYSTIMESTAMP defaults in
+      a UTC session);
+    * ISO string      -> passed through unmodified so a naive-text row can
+      never be coerced into an aware instant by a guessed offset.
+
+    Never raises for a well-formed value; a non-datetime/non-str cursor is
+    returned as-is so a genuinely foreign type fails loudly at bind time
+    rather than being silently mutated here.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    if isinstance(value, str):
+        return value
+    return value
+
+
 def _recency_date(row: Row) -> date:
     def _coerce_date(value: Any) -> date | None:
         if isinstance(value, datetime):
@@ -1878,21 +1906,23 @@ class OracleMemoryRepository(MemoryRepository):
                 where.append("(created > :cur_created OR (created = :cur_created_eq AND id > :cur_id))")
                 # Bind the cursor timestamp with an EXPLICIT
                 # DB_TYPE_TIMESTAMP_TZ type (same pattern the federation feed
-                # keyset uses; see fetch_exportable_memories in this module):
-                # in thin mode, binding a Python datetime whose precision or
-                # tzinfo differs from what the driver infers lets the bind be
-                # coerced to a different type, so the boundary row can
-                # compare as strictly greater than its own cursor value. The
-                # export then re-emits that row as the first row of the next
-                # page — byte-identical duplicate at the page seam, the exact
-                # defect behind the 2026-10-03 intermittent STYX offsite
-                # backup failures (and, on the feed path, the 2026-05-23
-                # tied-timestamp infinite-loop pulls). Explicitly typed binds
-                # preserve the exact instant, so resumption is gap-free and
-                # overlap-free regardless of the driver's default coercion.
+                # keyset uses at fetch_exportable_memories' :upd bind): in
+                # thin mode, binding a Python datetime without an explicit
+                # type lets the driver coerce it (the 2026-05-23 feed
+                # infinite-loop pull was exactly that, to VARCHAR). The
+                # `created` column is TIMESTAMP WITH TIME ZONE (see
+                # migrations_oracle/0001_core_schema.sql), so an aware
+                # instant binds back exactly.
+                #
+                # `_export_cursor_instant` normalizes the cursor to the
+                # backend value domain the query compares against: an aware
+                # datetime binds verbatim (lossless), a naive datetime is
+                # treated as UTC (matching how the serializer renders
+                # naive storage), and a raw ISO string passes through
+                # unmodified so a naive-text row can never be coerced.
                 import oracledb
 
-                cursor_ts = record_cursor[0]
+                cursor_ts = _export_cursor_instant(record_cursor[0])
                 for _bind_name in ("cur_created", "cur_created_eq"):
                     bind = cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ)
                     bind.setvalue(0, cursor_ts)
