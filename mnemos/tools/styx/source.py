@@ -27,12 +27,15 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import tarfile
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+
+logger = logging.getLogger(__name__)
 
 from mnemos.tools.styx.config import SOURCE_BACKEND, SOURCE_HTTP, StyxConfig
 from mnemos.tools.styx.errors import StyxConfigError, StyxError
@@ -206,9 +209,26 @@ def _validate_http_export(payload: Path) -> int:
     A clean transport EOF is not proof that the application completed.  The
     terminal marker is the snapshot's commit record and its declared count
     must equal the records that actually arrived.
+
+    Duplicate-identity policy (defense in depth against the 2026-10-03
+    keyset-boundary defect, where the server re-emitted the last row of a
+    page as the first row of the next): the protocol's completion marker
+    declares the SNAPSHOT's record count, not the wire frame count — a
+    byte-identical duplicate on the wire still declares the unique count,
+    and ``write_export`` deduplicates by identity anyway. So:
+
+    * a duplicate identity whose payload is byte-identical to the first
+      occurrence is TOLERATED: logged as a WARNING naming the duplicated
+      ids, and the returned count is the UNIQUE identity count (what the
+      completion marker and the materialized envelope agree on);
+    * a duplicate identity with a DIFFERENT payload still fails hard —
+      that is corruption, not a pagination seam.
     """
     record_count = 0
     completed = False
+    unique_count = 0
+    payloads_by_identity: dict[str, str] = {}
+    duplicates: list[str] = []
     try:
         with payload.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -228,10 +248,18 @@ def _validate_http_export(payload: Path) -> int:
                         raise StyxError("streaming export completion marker has an invalid record_count")
                     if frame.get("records") not in (None, []):
                         raise StyxError("streaming export completion marker also contains records")
-                    if declared != record_count:
+                    if declared != unique_count:
                         raise StyxError(
-                            "streaming export completion count does not match received "
-                            f"records ({declared} != {record_count})"
+                            "streaming export completion count does not match unique "
+                            f"record identities ({declared} != {unique_count})"
+                        )
+                    if duplicates:
+                        logger.warning(
+                            "streaming export contained %d byte-identical duplicate "
+                            "record(s) at page boundaries; counted unique identities. "
+                            "duplicated ids: %s",
+                            len(duplicates),
+                            ", ".join(duplicates[:20]) + (" …" if len(duplicates) > 20 else ""),
                         )
                     completed = True
                     continue
@@ -239,11 +267,30 @@ def _validate_http_export(payload: Path) -> int:
                 if not isinstance(records, list):
                     raise StyxError(f"streaming export frame {line_number} has no records array")
                 record_count += len(records)
+                for entry in records:
+                    if not isinstance(entry, dict):
+                        raise StyxError(f"streaming export frame {line_number} has a non-object record")
+                    identity = entry.get("id")
+                    if not isinstance(identity, str) or not identity:
+                        raise StyxError(f"streaming export frame {line_number} has a record without an identity")
+                    serialized = json.dumps(entry, sort_keys=True, ensure_ascii=False)
+                    prior = payloads_by_identity.get(identity)
+                    if prior is None:
+                        payloads_by_identity[identity] = serialized
+                        unique_count += 1
+                    elif prior != serialized:
+                        raise StyxError(
+                            f"streaming export re-emitted record {identity!r} with a "
+                            "DIFFERENT payload (first at line unknown, again at line "
+                            f"{line_number}); refusing to back up a divergent stream"
+                        )
+                    elif identity not in duplicates:
+                        duplicates.append(identity)
     except UnicodeDecodeError as exc:
         raise StyxError("streaming export is not valid UTF-8 NDJSON") from exc
     if not completed:
         raise StyxError("streaming export ended before its completion marker")
-    return record_count
+    return unique_count
 
 
 async def produce_bundle(config: StyxConfig, dest: Path, *, allow_remote_http: bool = False) -> BundleResult:

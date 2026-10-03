@@ -81,6 +81,15 @@ class MPFEnvelope(BaseModel):
     # This makes the trust-boundary crossing machine-visible in the MPF
     # envelope without changing the default export shape.
     includes_secrets: Optional[bool] = None
+    # Internal (never serialized to the wire): the RAW `created` value,
+    # backend-typed, of the last record in `records`. The streaming layer
+    # advances its (created, id) keyset from this value, NOT from the
+    # re-serialized payload — the payload's `created` has been through the
+    # MPF serializer and may be in a different value domain than the raw
+    # row (see stream.py for the exact failure mode that this side channel
+    # exists to close). The stream layer strips the key before the page is
+    # json.dumps'd, so no client ever sees it.
+    raw_last_created: Optional[Any] = None
 
 
 class ImportStats(BaseModel):

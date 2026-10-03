@@ -124,11 +124,18 @@ def write_export(pages, output, *, jsonl=False, include_sidecars=True):
             metadata = None
             complete = False
             wire_count = 0
+            unique_records = 0
             pending_entries = 0
             for page in pages:
                 if page.get("export_complete") is True:
-                    if page.get("record_count") != wire_count:
-                        raise ExportValidationError("export completion count does not match received records")
+                    # The completion marker declares the SNAPSHOT's unique
+                    # record count. A server that (before the 2026-10-03
+                    # cursor fix) re-emitted a boundary row byte-identically
+                    # on the wire still declared the unique count, so the
+                    # accepted comparison is against unique identities —
+                    # wire frames are transport, not records.
+                    if page.get("record_count") != unique_records:
+                        raise ExportValidationError("export completion count does not match unique record identities")
                     complete = True
                     break
                 records = page.get("records")
@@ -174,6 +181,7 @@ def write_export(pages, output, *, jsonl=False, include_sidecars=True):
                             )
                             if surface == "records":
                                 new_records += 1
+                                unique_records += 1
                 if records and not new_records:
                     raise ExportValidationError("export records did not advance")
                 # Per-record framing must not turn one page commit into

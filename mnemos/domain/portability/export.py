@@ -888,7 +888,8 @@ async def export_memories(
     # readonly=True)`, and every read below -- records, sidecars, tombstones --
     # runs inside it.
     records = []
-    async for record, _created in _iter_page_records(
+    raw_last_created: Optional[Any] = None
+    async for record, created in _iter_page_records(
         backend,
         tx,
         effective_owner=effective_owner,
@@ -902,6 +903,7 @@ async def export_memories(
         redact_secrets=redact_secrets,
     ):
         records.append(record)
+        raw_last_created = created
     memory_ids = [r.id for r in records]
 
     sidecars = await _build_export_sidecars(
@@ -938,4 +940,5 @@ async def export_memories(
         deletion_log=sidecars["deletion_log"],
         deletion_log_next_cursor=sidecars["deletion_log_next_cursor"],
         includes_secrets=True if include_secrets else None,
+        raw_last_created=raw_last_created,
     )

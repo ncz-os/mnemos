@@ -42,9 +42,16 @@ async def stream_export(backend, **options):
             count = 0
             cursor = options.get("deletion_log_cursor")
             first = True
+            raw_last_created = None
             while True:
                 envelope = await export_memories(backend, tx, **options)
+                # The RAW `created` of the last row is internal state for
+                # the keyset advance below — capture it BEFORE the
+                # serialization that drops it (the wire envelope must not
+                # carry backend-typed values).
+                raw_last_created = envelope.raw_last_created
                 page = envelope.model_dump(mode="json", exclude_none=True)
+                page.pop("raw_last_created", None)
                 records = page["records"]
                 count += len(records)
                 if first:
@@ -57,10 +64,30 @@ async def stream_export(backend, **options):
                 if len(records) < options["limit"]:
                     break
                 last = records[-1]
-                created = datetime.fromisoformat(last["payload"]["created"])
-                if created.tzinfo is None:
-                    created = created.replace(tzinfo=UTC)
-                options["record_cursor"] = (created, last["id"])
+                # The cursor MUST be the RAW `created` value the backend's
+                # export query binds against — the domain the keyset
+                # predicate compares with on the next page. The serialized
+                # payload re-renders `created` through the MPF serializer
+                # (`_iso`), which normalizes to an aware ISO string and so
+                # can shift the domain the raw row was stored/returned in:
+                # e.g. SQLite stores naive ISO text and returns `str`, and
+                # re-binding an aware datetime into that naive-text
+                # comparison coerces the bind, so the boundary row compares
+                # as greater than its own cursor and is re-emitted as the
+                # first row of the next page (the 2026-10-03 STYX offsite
+                # backup defect; same mechanism class as the 2026-05-23
+                # federation feed ties).
+                if raw_last_created is not None:
+                    options["record_cursor"] = (raw_last_created, last["id"])
+                else:
+                    # Backward-compat fallback for a backend whose envelope
+                    # does not carry the raw side channel: parse the
+                    # payload, keeping it naive so a naive-text backend is
+                    # not coerced to aware by the bind.
+                    raw_created = datetime.fromisoformat(last["payload"]["created"])
+                    if raw_created.tzinfo is None:
+                        raw_created = raw_created.replace(tzinfo=UTC)
+                    options["record_cursor"] = (raw_created, last["id"])
                 options["offset"] = 0
             seen = set()
             while cursor:

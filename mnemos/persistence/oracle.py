@@ -1876,8 +1876,27 @@ class OracleMemoryRepository(MemoryRepository):
                 # forms, so the keyset is expressed as its expanded
                 # lexicographic equivalent.
                 where.append("(created > :cur_created OR (created = :cur_created_eq AND id > :cur_id))")
-                params["cur_created"] = record_cursor[0]
-                params["cur_created_eq"] = record_cursor[0]
+                # Bind the cursor timestamp with an EXPLICIT
+                # DB_TYPE_TIMESTAMP_TZ type (same pattern the federation feed
+                # keyset uses; see fetch_exportable_memories in this module):
+                # in thin mode, binding a Python datetime whose precision or
+                # tzinfo differs from what the driver infers lets the bind be
+                # coerced to a different type, so the boundary row can
+                # compare as strictly greater than its own cursor value. The
+                # export then re-emits that row as the first row of the next
+                # page — byte-identical duplicate at the page seam, the exact
+                # defect behind the 2026-10-03 intermittent STYX offsite
+                # backup failures (and, on the feed path, the 2026-05-23
+                # tied-timestamp infinite-loop pulls). Explicitly typed binds
+                # preserve the exact instant, so resumption is gap-free and
+                # overlap-free regardless of the driver's default coercion.
+                import oracledb
+
+                cursor_ts = record_cursor[0]
+                for _bind_name in ("cur_created", "cur_created_eq"):
+                    bind = cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ)
+                    bind.setvalue(0, cursor_ts)
+                    params[_bind_name] = bind
                 params["cur_id"] = record_cursor[1]
             sql = (
                 "SELECT id, content, category, subcategory, created, updated, "

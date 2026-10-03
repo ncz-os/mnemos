@@ -27,6 +27,38 @@ from mnemos.tools.styx.source import (
     produce_bundle,
 )
 
+
+class _LogCapture:
+    """Minimal context-free log record grabber for source-level WARNINGs."""
+
+    def __init__(self, logger_name: str):
+        import logging
+
+        self._records: list = []
+        self._handler = logging.Handler()
+        self._handler.emit = lambda record: self._records.append(record)
+        self._logger = logging.getLogger(logger_name)
+        self._old_level = self._logger.level
+
+    def start(self):
+        import logging
+
+        self._logger.addHandler(self._handler)
+        if self._logger.level == logging.NOTSET or self._logger.level > logging.WARNING:
+            self._logger.setLevel(logging.WARNING)
+
+    def stop(self):
+        self._logger.removeHandler(self._handler)
+        self._logger.setLevel(self._old_level)
+        return self._records
+
+
+def _capture_logs(logger_name: str) -> _LogCapture:
+    cap = _LogCapture(logger_name)
+    cap.start()
+    return cap
+
+
 RECIPIENT = "age1qyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3n0qmt"
 
 
@@ -204,3 +236,105 @@ async def test_http_source_rejects_incomplete_or_inconsistent_stream(monkeypatch
     with pytest.raises(StyxError, match=message):
         await produce_bundle(_http_config(tmp_path, "http://127.0.0.1:5002/v1/export"), bundle)
     assert not (bundle / "export.ndjson").exists()
+
+
+# ── Duplicate-identity defense (2026-10-03 keyset-boundary regression) ─────
+#
+# The server-side fix makes the cursor lossless; these tests pin the
+# client-side backstop: a byte-identical duplicate at a page boundary is
+# tolerated (unique-identity count, WARNING naming the id), while a
+# duplicate with a DIFFERENT payload still fails hard.
+
+
+def _dup_record(number, content="x" * 100):
+    return {
+        "id": f"mem_{number}",
+        "kind": "memory",
+        "payload": {
+            "created": "2026-10-01T00:00:00",
+            "content": content,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_http_source_tolerates_byte_identical_duplicate_at_page_boundary(monkeypatch, tmp_path):
+    """Last record of page 1 re-emitted byte-identical as first of page 2:
+    the backup proceeds, counting UNIQUE identities, and logs a WARNING
+    naming the duplicated id (the completion marker declares the snapshot's
+    unique count, matching the materialized envelope)."""
+    page1 = [_dup_record(0), _dup_record(1)]
+    page2 = [_dup_record(1), _dup_record(2)]  # mem_1 duplicated, byte-identical
+    body = (
+        json.dumps({"records": page1}, separators=(",", ":"))
+        + "\n"
+        + json.dumps({"records": page2}, separators=(",", ":"))
+        + "\n"
+        + json.dumps({"export_complete": True, "record_count": 3})
+        + "\n"
+    )
+
+    class Response(io.BytesIO):
+        headers: ClassVar[dict[str, str]] = {"Content-Type": "application/x-ndjson"}
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: Response(body.encode()))
+    captured = _capture_logs("mnemos.tools.styx.source")
+    try:
+        result = await produce_bundle(_http_config(tmp_path, "http://127.0.0.1:5002/v1/export"), tmp_path / "bundle")
+    finally:
+        records = captured.stop()
+    assert result.record_count == 3, "unique identities, not wire frames"
+    exported = json.loads((result.path / "export.mpf.json").read_text())
+    assert [r["id"] for r in exported["records"]] == ["mem_0", "mem_1", "mem_2"]
+    warnings = [r for r in records if r.levelname == "WARNING" and "mem_1" in r.getMessage()]
+    assert warnings, f"expected a WARNING naming mem_1, got: {[r.getMessage() for r in records]}"
+
+
+@pytest.mark.asyncio
+async def test_http_source_rejects_duplicate_identity_with_divergent_payload(monkeypatch, tmp_path):
+    """Same id, DIFFERENT payload on the wire: corruption, not a pagination
+    seam — the backup must fail hard."""
+    page1 = [_dup_record(0), _dup_record(1, content="original")]
+    page2 = [_dup_record(1, content="TAMPERED"), _dup_record(2)]
+    body = (
+        json.dumps({"records": page1}, separators=(",", ":"))
+        + "\n"
+        + json.dumps({"records": page2}, separators=(",", ":"))
+        + "\n"
+        + json.dumps({"export_complete": True, "record_count": 3})
+        + "\n"
+    )
+
+    class Response(io.BytesIO):
+        headers: ClassVar[dict[str, str]] = {"Content-Type": "application/x-ndjson"}
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: Response(body.encode()))
+    with pytest.raises(StyxError, match="DIFFERENT payload"):
+        await produce_bundle(_http_config(tmp_path, "http://127.0.0.1:5002/v1/export"), tmp_path / "bundle")
+    assert not (tmp_path / "bundle" / "export.ndjson").exists()
+    assert not (tmp_path / "bundle" / "export.mpf.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_http_source_rejects_completion_count_mismatching_unique_identities(monkeypatch, tmp_path):
+    """The completion marker must match the UNIQUE identity count: a stream
+    that duplicated on the wire but declares the WIRE count (N) is
+    inconsistent and must fail — only the unique-count declaration is the
+    trusted snapshot count."""
+    page1 = [_dup_record(0), _dup_record(1)]
+    page2 = [_dup_record(1), _dup_record(2)]
+    body = (
+        json.dumps({"records": page1}, separators=(",", ":"))
+        + "\n"
+        + json.dumps({"records": page2}, separators=(",", ":"))
+        + "\n"
+        + json.dumps({"export_complete": True, "record_count": 4})  # wire count, not unique
+        + "\n"
+    )
+
+    class Response(io.BytesIO):
+        headers: ClassVar[dict[str, str]] = {"Content-Type": "application/x-ndjson"}
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: Response(body.encode()))
+    with pytest.raises(StyxError, match="completion count does not match unique"):
+        await produce_bundle(_http_config(tmp_path, "http://127.0.0.1:5002/v1/export"), tmp_path / "bundle")

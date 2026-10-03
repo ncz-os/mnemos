@@ -23,6 +23,15 @@ def record(number):
     }
 
 
+def _envelope(page, raw_last_created=None):
+    """Fake `export_memories` return: an envelope with a `model_dump` and
+    the raw `created` side channel the stream layer reads for the keyset."""
+    return SimpleNamespace(
+        model_dump=lambda **_: page,
+        raw_last_created=raw_last_created,
+    )
+
+
 def pages(count, size=2):
     for start in range(0, count, size):
         yield {
@@ -135,6 +144,13 @@ async def test_stream_holds_one_snapshot_uses_keyset_and_drains_deletion_cursor(
 
     backend = Backend()
 
+    # The raw `created` the backend hands back for the last row of each
+    # page — DISTINCT from the serialized payload string on purpose: the
+    # stream layer must advance the keyset from this value, not by
+    # re-parsing the payload (domain-shift regression, 2026-10-03).
+    raw_page1 = datetime(2026, 1, 1, 0, 0, 0)  # naive: SQLite-style domain
+    raw_page2 = datetime(2026, 1, 2, 0, 0, 0, tzinfo=UTC)  # aware: PG-style
+
     async def export(be, tx, **kwargs):
         assert be is backend
         assert tx is sentinel_tx
@@ -142,23 +158,25 @@ async def test_stream_holds_one_snapshot_uses_keyset_and_drains_deletion_cursor(
         calls.append(kwargs.copy())
         if kwargs.get("deletion_log_cursor"):
             page = {"records": [record(999)], "deletion_log": [{"id": "d2"}]}
+            raw = None
         elif kwargs.get("record_cursor"):
             page = {"records": [record(2)], "deletion_log": [{"id": "d1"}]}
+            raw = raw_page2
         else:
             page = {
                 "records": [record(0), record(1)],
                 "deletion_log": [{"id": "d1"}],
                 "deletion_log_next_cursor": "next",
             }
-        return SimpleNamespace(model_dump=lambda **_: page)
+            raw = raw_page1
+        return _envelope(page, raw)
 
     monkeypatch.setattr(stream, "export_memories", export)
     result = [json.loads(line) async for line in stream.stream_export(backend, limit=2, offset=0)]
     assert not active
-    assert calls[1]["record_cursor"] == (
-        datetime(2026, 1, 1, tzinfo=UTC),
-        "mem_1",
-    )
+    # The cursor passed to page 2 is the RAW value from page 1, verbatim —
+    # not the re-parsed (aware-normalized) payload string.
+    assert calls[1]["record_cursor"] == (raw_page1, "mem_1")
     assert calls[1]["offset"] == 0
     assert calls[2]["record_cursor"] is None
     assert [r["id"] for page in result[:-1] for r in page["records"]] == [
@@ -191,7 +209,7 @@ async def test_stream_close_releases_transaction_and_connection(monkeypatch):
     backend = SimpleNamespace(transactional=lambda **_: resource("transaction"))
 
     async def export(*_, **kwargs):
-        return SimpleNamespace(model_dump=lambda **_: {"records": [record(0)]})
+        return _envelope({"records": [record(0)]})
 
     monkeypatch.setattr(stream, "export_memories", export)
     generator = stream.stream_export(backend, limit=1, offset=0)
