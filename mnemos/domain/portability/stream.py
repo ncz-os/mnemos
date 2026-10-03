@@ -81,12 +81,17 @@ async def stream_export(backend, **options):
                     options["record_cursor"] = (raw_last_created, last["id"])
                 else:
                     # Backward-compat fallback for a backend whose envelope
-                    # does not carry the raw side channel: parse the
-                    # payload, keeping it naive so a naive-text backend is
-                    # not coerced to aware by the bind.
+                    # does not carry the raw side channel: parse the payload
+                    # and keep the result in the domain the payload was
+                    # serialized in. The serializer (`_iso`) renders naive
+                    # storage (SQLite ISO text, Oracle naive datetimes) as a
+                    # naive string and aware storage as an aware string, so
+                    # re-parsing WITHOUT re-attaching tzinfo preserves the
+                    # original domain. Force-attaching UTC here would turn a
+                    # naive cursor into an aware one and re-introduce the
+                    # exact bind-coercion this fix removes on naive-text
+                    # backends.
                     raw_created = datetime.fromisoformat(last["payload"]["created"])
-                    if raw_created.tzinfo is None:
-                        raw_created = raw_created.replace(tzinfo=UTC)
                     options["record_cursor"] = (raw_created, last["id"])
                 options["offset"] = 0
             seen = set()
