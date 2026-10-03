@@ -164,21 +164,27 @@ def _rank_score_sort_key(row: Row) -> float:
 
 
 def _export_cursor_instant(value: Any) -> Any:
-    """Normalize a keyset cursor timestamp to the backend value domain.
+    """Normalize a keyset cursor timestamp to a bindable instant.
 
     The export keyset compares the cursor against the `created` column
     (TIMESTAMP WITH TIME ZONE). The cursor arrives as the RAW `created`
-    value the previous page's row carried — which is what `setvalue(0, ...)`
-    on a DB_TYPE_TIMESTAMP_TZ bind accepts without loss:
+    value the previous page's row carried. This normalizer guarantees the
+    DB_TYPE_TIMESTAMP_TZ bind always receives a *datetime* (the thin driver
+    rejects a raw string for a typed TZ bind) while staying lossless:
 
-    * aware datetime  -> bound verbatim (the lossless fast path);
+    * aware datetime  -> UTC instant (astimezone preserves the instant;
+      the lossless fast path);
     * naive datetime  -> treated as UTC (matches how the MPF serializer
       renders naive storage, and how Oracle reads SYSTIMESTAMP defaults in
       a UTC session);
-    * ISO string      -> passed through unmodified so a naive-text row can
-      never be coerced into an aware instant by a guessed offset.
+    * ISO string      -> parsed, domain preserved: a naive ISO string
+      becomes a naive datetime then UTC (never an offset is guessed for a
+      value that carried none), an aware ISO string becomes its instant.
+      Parsing (rather than passing the string through) keeps the bind
+      driver-safe while still never coercing a naive-text row to an
+      aware instant by a guessed offset.
 
-    Never raises for a well-formed value; a non-datetime/non-str cursor is
+    A cursor that is neither a datetime nor a parseable ISO string is
     returned as-is so a genuinely foreign type fails loudly at bind time
     rather than being silently mutated here.
     """
@@ -187,7 +193,13 @@ def _export_cursor_instant(value: Any) -> Any:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
     if isinstance(value, str):
-        return value
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     return value
 
 

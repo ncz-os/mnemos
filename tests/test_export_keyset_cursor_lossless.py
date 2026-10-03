@@ -404,10 +404,12 @@ async def test_oracle_fetch_memory_export_binds_cursor_as_explicit_timestamp_tz(
     aware = datetime(2026, 10, 1, 12, 30, 45, 987654, tzinfo=UTC)
     naive = datetime(2026, 10, 1, 12, 30, 45, 987654)
     iso_str = "2026-10-01T12:30:45.987654"
+    aware_iso_str = "2026-10-01T14:30:45.987654+02:00"  # same instant as `aware`
     cases = [
         (aware, aware),
         (naive, aware),  # naive -> UTC instant
-        (iso_str, iso_str),  # string passthrough
+        (iso_str, aware),  # naive ISO string -> parsed to a UTC instant (driver-safe)
+        (aware_iso_str, aware),  # aware ISO string -> its instant
     ]
     repo = oracle_mod.OracleMemoryRepository.__new__(oracle_mod.OracleMemoryRepository)
     for cursor_value, expected_bound in cases:
@@ -436,19 +438,28 @@ async def test_oracle_fetch_memory_export_binds_cursor_as_explicit_timestamp_tz(
 
 
 def test_export_cursor_instant_normalizes_value_domain():
-    """The Oracle cursor normalizer preserves the value domain:
-    aware datetime binds verbatim, naive datetime becomes a UTC instant,
-    ISO string passes through, and an unknown type is returned unchanged so
-    it fails loudly at bind time rather than being silently mutated."""
+    """The Oracle cursor normalizer always yields a bindable datetime for a
+    well-formed cursor: aware datetime binds to its UTC instant, naive
+    datetime becomes a UTC instant, a naive ISO string is parsed (never
+    offset-guessed) to a UTC instant, an aware ISO string to its instant,
+    and an unparseable / unknown type is returned unchanged so it fails
+    loudly at bind time rather than being silently mutated."""
     import mnemos.persistence.oracle as oracle_mod
 
     aware = datetime(2026, 10, 1, 12, 30, 45, 987654, tzinfo=UTC)
     naive = datetime(2026, 10, 1, 12, 30, 45, 987654)
-    iso_str = "2026-10-01T12:30:45.987654"
+    naive_iso = "2026-10-01T12:30:45.987654"
+    aware_iso = "2026-10-01T14:30:45.987654+02:00"  # same instant as `aware`
+    # Every well-formed cursor yields a datetime the TZ bind will accept.
+    for value in (aware, naive, naive_iso, aware_iso):
+        result = oracle_mod._export_cursor_instant(value)
+        assert isinstance(result, datetime), f"expected a datetime, got {type(result)} for {value!r}"
     assert oracle_mod._export_cursor_instant(aware) == aware
     assert oracle_mod._export_cursor_instant(naive) == aware  # naive -> UTC instant
-    assert oracle_mod._export_cursor_instant(iso_str) == iso_str  # string passthrough
+    assert oracle_mod._export_cursor_instant(naive_iso) == aware  # naive string -> UTC instant
+    assert oracle_mod._export_cursor_instant(aware_iso) == aware  # aware string -> its instant
     assert oracle_mod._export_cursor_instant(123) == 123  # unknown -> unchanged
+    assert oracle_mod._export_cursor_instant("not-a-timestamp") == "not-a-timestamp"  # unparseable -> unchanged
     # A non-UTC aware offset is normalized to the same UTC instant.
     shifted = datetime(2026, 10, 1, 14, 30, 45, 987654, tzinfo=timezone(timedelta(hours=2)))
     assert oracle_mod._export_cursor_instant(shifted) == aware
