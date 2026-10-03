@@ -164,23 +164,28 @@ def _rank_score_sort_key(row: Row) -> float:
 
 
 def _export_cursor_instant(value: Any) -> Any:
-    """Normalize a keyset cursor timestamp to a bindable instant.
+    """Normalize a keyset cursor timestamp to a bindable value.
 
     The export keyset compares the cursor against the `created` column
     (TIMESTAMP WITH TIME ZONE). The cursor arrives as the RAW `created`
     value the previous page's row carried. This normalizer guarantees the
-    DB_TYPE_TIMESTAMP_TZ bind always receives a *datetime* (the thin driver
-    rejects a raw string for a typed TZ bind) while staying lossless:
+    DB_TYPE_TIMESTAMP_TZ bind always receives a *datetime* for a
+    well-formed cursor (the thin driver rejects a raw string for a typed
+    TZ bind) while staying **domain-preserving** — it never invents an
+    offset for a value that carried none:
 
     * aware datetime  -> UTC instant (astimezone preserves the instant;
-      the lossless fast path);
-    * naive datetime  -> treated as UTC (matches how the MPF serializer
-      renders naive storage, and how Oracle reads SYSTIMESTAMP defaults in
-      a UTC session);
+      the lossless fast path — Oracle's TIMESTAMPTZ column always
+      round-trips as an aware datetime, so this is the normal path);
+    * naive datetime  -> bound verbatim (naive). A naive value means the
+      backend stored/returned naive timestamps; binding it verbatim keeps
+      the comparison in the stored domain. (Oracle's TIMESTAMPTZ column
+      does not in practice return naive values, so this is a defensive
+      path — but coercing it to UTC here would be exactly the domain
+      shift this fix removes.)
     * ISO string      -> parsed, domain preserved: a naive ISO string
-      becomes a naive datetime then UTC (never an offset is guessed for a
-      value that carried none), an aware ISO string becomes its instant.
-      Parsing (rather than passing the string through) keeps the bind
+      stays naive, an aware ISO string becomes its instant. Parsing
+      (rather than passing the string through) keeps the bind
       driver-safe while still never coercing a naive-text row to an
       aware instant by a guessed offset.
 
@@ -190,16 +195,15 @@ def _export_cursor_instant(value: Any) -> Any:
     """
     if isinstance(value, datetime):
         if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
+            return value  # naive stays naive — no offset is guessed
         return value.astimezone(timezone.utc)
     if isinstance(value, str):
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return value
-        if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
+        # Domain preserved: naive string -> naive, aware string -> its instant.
+        return parsed
     return value
 
 
@@ -1918,7 +1922,7 @@ class OracleMemoryRepository(MemoryRepository):
                 where.append("(created > :cur_created OR (created = :cur_created_eq AND id > :cur_id))")
                 # Bind the cursor timestamp with an EXPLICIT
                 # DB_TYPE_TIMESTAMP_TZ type (same pattern the federation feed
-                # keyset uses at fetch_exportable_memories' :upd bind): in
+                # keyset uses at _legacy_feed_query's :upd bind): in
                 # thin mode, binding a Python datetime without an explicit
                 # type lets the driver coerce it (the 2026-05-23 feed
                 # infinite-loop pull was exactly that, to VARCHAR). The
@@ -1926,12 +1930,16 @@ class OracleMemoryRepository(MemoryRepository):
                 # migrations_oracle/0001_core_schema.sql), so an aware
                 # instant binds back exactly.
                 #
-                # `_export_cursor_instant` normalizes the cursor to the
-                # backend value domain the query compares against: an aware
-                # datetime binds verbatim (lossless), a naive datetime is
-                # treated as UTC (matching how the serializer renders
-                # naive storage), and a raw ISO string passes through
-                # unmodified so a naive-text row can never be coerced.
+                # `_export_cursor_instant` is the SINGLE normalization point
+                # for this keyset's cursor (the only fetch_*_export method
+                # here binds a (created, id) keyset). It normalizes the
+                # cursor to a bindable value while preserving the domain:
+                # aware datetime -> its UTC instant (the normal path —
+                # Oracle's TIMESTAMPTZ column round-trips as aware), naive
+                # datetime / naive ISO string -> bound verbatim (naive, so a
+                # naive-storage domain is never coerced to an aware instant),
+                # aware ISO string -> its instant. An unparseable / foreign
+                # value passes through to fail loudly at bind time.
                 import oracledb
 
                 cursor_ts = _export_cursor_instant(record_cursor[0])

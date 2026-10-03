@@ -403,13 +403,13 @@ async def test_oracle_fetch_memory_export_binds_cursor_as_explicit_timestamp_tz(
     # (cursor value, expected bound value after _export_cursor_instant)
     aware = datetime(2026, 10, 1, 12, 30, 45, 987654, tzinfo=UTC)
     naive = datetime(2026, 10, 1, 12, 30, 45, 987654)
-    iso_str = "2026-10-01T12:30:45.987654"
-    aware_iso_str = "2026-10-01T14:30:45.987654+02:00"  # same instant as `aware`
+    naive_iso = "2026-10-01T12:30:45.987654"
+    aware_iso = "2026-10-01T14:30:45.987654+02:00"  # same instant as `aware`
     cases = [
-        (aware, aware),
-        (naive, aware),  # naive -> UTC instant
-        (iso_str, aware),  # naive ISO string -> parsed to a UTC instant (driver-safe)
-        (aware_iso_str, aware),  # aware ISO string -> its instant
+        (aware, aware),  # aware datetime -> its UTC instant
+        (naive, naive),  # naive datetime -> bound verbatim (domain preserved)
+        (naive_iso, naive),  # naive ISO string -> parsed naive (domain preserved)
+        (aware_iso, aware),  # aware ISO string -> its instant
     ]
     repo = oracle_mod.OracleMemoryRepository.__new__(oracle_mod.OracleMemoryRepository)
     for cursor_value, expected_bound in cases:
@@ -438,12 +438,13 @@ async def test_oracle_fetch_memory_export_binds_cursor_as_explicit_timestamp_tz(
 
 
 def test_export_cursor_instant_normalizes_value_domain():
-    """The Oracle cursor normalizer always yields a bindable datetime for a
-    well-formed cursor: aware datetime binds to its UTC instant, naive
-    datetime becomes a UTC instant, a naive ISO string is parsed (never
-    offset-guessed) to a UTC instant, an aware ISO string to its instant,
-    and an unparseable / unknown type is returned unchanged so it fails
-    loudly at bind time rather than being silently mutated."""
+    """The Oracle cursor normalizer is domain-preserving: aware datetime
+    binds to its UTC instant, naive datetime is bound verbatim (naive, no
+    offset guessed), a naive ISO string parses to naive, an aware ISO
+    string to its instant, and an unparseable / unknown type is returned
+    unchanged so it fails loudly at bind time rather than being silently
+    mutated. The key invariant: a value that carries NO offset is never
+    given one (that coercion was the defect class this fix removes)."""
     import mnemos.persistence.oracle as oracle_mod
 
     aware = datetime(2026, 10, 1, 12, 30, 45, 987654, tzinfo=UTC)
@@ -454,9 +455,11 @@ def test_export_cursor_instant_normalizes_value_domain():
     for value in (aware, naive, naive_iso, aware_iso):
         result = oracle_mod._export_cursor_instant(value)
         assert isinstance(result, datetime), f"expected a datetime, got {type(result)} for {value!r}"
-    assert oracle_mod._export_cursor_instant(aware) == aware
-    assert oracle_mod._export_cursor_instant(naive) == aware  # naive -> UTC instant
-    assert oracle_mod._export_cursor_instant(naive_iso) == aware  # naive string -> UTC instant
+    assert oracle_mod._export_cursor_instant(aware) == aware  # aware -> its instant
+    assert oracle_mod._export_cursor_instant(naive) == naive  # naive -> verbatim (stays naive)
+    assert oracle_mod._export_cursor_instant(naive).tzinfo is None  # no offset invented
+    assert oracle_mod._export_cursor_instant(naive_iso) == naive  # naive string -> naive
+    assert oracle_mod._export_cursor_instant(naive_iso).tzinfo is None
     assert oracle_mod._export_cursor_instant(aware_iso) == aware  # aware string -> its instant
     assert oracle_mod._export_cursor_instant(123) == 123  # unknown -> unchanged
     assert oracle_mod._export_cursor_instant("not-a-timestamp") == "not-a-timestamp"  # unparseable -> unchanged
@@ -466,19 +469,48 @@ def test_export_cursor_instant_normalizes_value_domain():
 
 
 def test_oracle_feed_keyset_already_uses_explicit_timestamp_tz_bind():
-    """The federation feed keyset (fetch_exportable_memories) ALREADY binds
-    its cursor with an explicit DB_TYPE_TIMESTAMP_TZ variable — the export
-    walk is the outlier this fix brings into parity. Assert the pattern is
-    present in the source so the two keysets cannot silently drift apart.
+    """The federation feed keyset (_legacy_feed_query) ALREADY binds its
+    cursor with an explicit DB_TYPE_TIMESTAMP_TZ variable — the export walk
+    is the outlier this fix brings into parity. Parse the module with
+    ``ast`` (robust to any refactor of unrelated code) and assert both
+    keyset methods contain a ``cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ)``
+    call, so the two keysets cannot silently drift apart.
     """
-    from pathlib import Path
+    import ast
 
     source = Path(mnemos_oracle_source()).read_text(encoding="utf-8")
-    assert "DB_TYPE_TIMESTAMP_TZ" in source
-    # The export path must now carry the same pattern (regression guard).
-    export_body = source.split("async def fetch_memory_export", 1)[1].split("async def ", 1)[0]
-    assert "DB_TYPE_TIMESTAMP_TZ" in export_body, (
-        "fetch_memory_export must bind its cursor with an explicit DB_TYPE_TIMESTAMP_TZ variable, like the feed keyset"
+    tree = ast.parse(source)
+
+    def _has_typed_tz_bind(node) -> bool:
+        """True if the function body contains cursor.var(oracledb.DB_TYPE_TIMESTAMP_TZ)."""
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            # Look for oracledb.DB_TYPE_TIMESTAMP_TZ as an argument.
+            for arg in sub.args:
+                if (
+                    isinstance(arg, ast.Attribute)
+                    and arg.attr == "DB_TYPE_TIMESTAMP_TZ"
+                    and isinstance(arg.value, ast.Name)
+                    and arg.value.id == "oracledb"
+                ):
+                    return True
+        return False
+
+    target_methods = {"fetch_memory_export", "_legacy_feed_query"}
+    found: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in target_methods:
+            found[node.name] = _has_typed_tz_bind(node)
+
+    assert "_legacy_feed_query" in found, "_legacy_feed_query (feed keyset) must exist in oracle.py"
+    assert found["_legacy_feed_query"], (
+        "_legacy_feed_query (feed keyset) must bind its cursor with an explicit DB_TYPE_TIMESTAMP_TZ variable"
+    )
+    assert "fetch_memory_export" in found, "fetch_memory_export must exist in oracle.py"
+    assert found["fetch_memory_export"], (
+        "fetch_memory_export (export keyset) must bind its cursor with an explicit "
+        "DB_TYPE_TIMESTAMP_TZ variable, like the feed keyset"
     )
 
 
