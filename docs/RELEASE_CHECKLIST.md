@@ -30,8 +30,8 @@ sections that apply to what's shipping.
       where applicable.
 - [ ] `ruff check .` clean.
 - [ ] Author email on all commits in the release range is
-      `Jason Perlow <jperlow@gmail.com>` (per `~/.claude/CLAUDE.md`
-      directive #2 — never `jperlow@nvidia.com` on public OSS).
+      `Jason Perlow <jperlow@gmail.com>` (the personal address is the
+      only author address used on public releases).
 
 ### Tag + push
 
