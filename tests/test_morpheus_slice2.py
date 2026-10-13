@@ -603,7 +603,7 @@ async def test_phase_synthesise_inserts_one_per_cluster():
             self.executed: list[tuple[str, tuple]] = []
 
         async def fetchrow(self, *_args, **_kwargs):
-            # F01 (adbeeb63): phase_synthesise_load now returns
+            # F01 (b5ca7829): phase_synthesise_load now returns
             # (cluster_min_size, clusters); the mock returns
             # (3, config) so partitioning + min_size both work.
             return {"cluster_min_size": 3, "config": config}
@@ -683,7 +683,7 @@ async def test_phase_synthesise_inherits_majority_category():
             self.executed: list[tuple[str, tuple]] = []
 
         async def fetchrow(self, *_args, **_kwargs):
-            # F01 (adbeeb63): phase_synthesise_load returns
+            # F01 (b5ca7829): phase_synthesise_load returns
             # (cluster_min_size, clusters); mock mirrors it.
             return {"cluster_min_size": 3, "config": config}
 

@@ -3323,7 +3323,7 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
 
         Returns ``(cluster_min_size, clusters)`` so the runner can
         partition clusters per-(owner_id, namespace) for the F01
-        cross-owner privacy isolation fix (adbeeb63) while still
+        cross-owner privacy isolation fix (b5ca7829) while still
         surfacing the run's ``cluster_min_size`` for audit logging.
         The ``cluster_min_size`` lives on ``morpheus_runs`` and is read
         in the same SELECT as ``config`` to avoid an extra round-trip.

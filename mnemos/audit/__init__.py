@@ -12,7 +12,7 @@ Public surface:
         merkle_root,
     )
 
-Schemas shipped in db/migrations*/0029-0030 (commit 614d483).
+Schemas shipped in db/migrations*/0029-0030 (commit 932b127).
 Sealer worker + route wiring follow in later commits.
 """
 

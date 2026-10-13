@@ -1,6 +1,6 @@
 # MNEMOS SQLite Persistence Throughput — Phase 1
 
-Refreshed 2026-09-16 from clean source `0ea31e2ec9a0d3418af764d245c31377f5fafdb0`. The canonical
+Refreshed 2026-09-16 from clean source `7aa4d225a05be34d434c66ca675601ce0e6d6fc2`. The canonical
 artifact is `docs/proof/bench-sqlite-phase1-20260916T041833Z.{json,md}`.
 The earlier 2026-09-15 artifacts remain available in git history.
 

@@ -1,4 +1,4 @@
-"""Regression test for F01 (adbeeb63) — MORPHEUS cross-owner privacy isolation.
+"""Regression test for F01 (b5ca7829) — MORPHEUS cross-owner privacy isolation.
 
 The pre-F01 ``phase_synthesise`` runner combined cluster members from
 multiple owners into one summary memory and assigned the synthesis to the

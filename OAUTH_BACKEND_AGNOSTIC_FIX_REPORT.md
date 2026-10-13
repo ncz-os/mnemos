@@ -7,7 +7,7 @@ The blockers listed below were sandbox constraints at the time of writing
 Date: 2026-09-09 (America/New_York)
 Repository: `/tmp/mnemos-audit-clones/mnemos-oauth-backend-fix`
 Branch: `feat/oauth-backend-agnostic-store`
-Starting HEAD: `1258bad81fd309facf10d1d0f04e09b009f4f954`
+Starting HEAD: `bb2b7281926a7c2e6ce8083e77744f57d5bd39c5`
 
 ## Outcome and limits
 

@@ -1,7 +1,7 @@
 # MNEMOS SQLite throughput bench — Phase 1
 
 Run at: `2026-09-16T04:19:20.341242+00:00`  
-Git SHA: `0ea31e2ec9a0d3418af764d245c31377f5fafdb0`  
+Git SHA: `7aa4d225a05be34d434c66ca675601ce0e6d6fc2`  
 Python: `3.13.9 (main, Nov 19 2025, 23:39:32) [Clang 21.1.4 ]`  
 Platform: `macOS-27.0-arm64-arm-64bit-Mach-O`  
 Backend: `sqlite` (mock vectors, embedding_dim=768)  

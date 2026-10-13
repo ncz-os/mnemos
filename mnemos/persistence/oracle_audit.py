@@ -5,7 +5,7 @@ alongside the rest of :mod:`mnemos.persistence.oracle` (a 9k-line file):
 
 1. :class:`OracleAuditChainRepository` -- the v6.2 M-2.2.1 audit chain
    repository. Tables: ``memory_audit_chain`` + ``memory_audit_roots``
-   (migrations 0029 + 0030; shipped at 614d483 for Oracle).
+   (migrations 0029 + 0030; shipped at 932b127 for Oracle).
 
 2. :class:`OracleAuditJournalMixin` -- a mixin holding the three journal
    methods (``create_journal_entry``, ``list_journal_entries``,

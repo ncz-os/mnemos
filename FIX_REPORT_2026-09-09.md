@@ -10,7 +10,7 @@ Date: 2026-09-09
 
 Branch: `feat/oauth-mcp-provider-agnostic-v2`
 
-Implementation commit: `7628ef0` (`fix(mcp): close OAuth audit findings`)
+Implementation commit: `1a2351a` (`fix(mcp): close OAuth audit findings`)
 
 ## Outcome
 
