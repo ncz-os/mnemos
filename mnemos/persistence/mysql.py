@@ -4360,7 +4360,7 @@ class MysqlMorpheusRepository(MorpheusRepository):
         Returns ``(cluster_min_size, clusters)`` so the runner can apply
         the per-(owner_id, namespace) partition while still honoring the
         run's ``cluster_min_size`` (F01 cross-owner privacy isolation,
-        adbeeb63). The ``cluster_min_size`` lives on ``morpheus_runs``
+        b5ca7829). The ``cluster_min_size`` lives on ``morpheus_runs``
         and is read in the same SELECT as ``config`` to avoid an extra
         round-trip.
         """

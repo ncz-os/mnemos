@@ -2832,7 +2832,7 @@ class MorpheusRepository(ABC):
         for a run with no usable clusters. The ``cluster_min_size`` is
         read from ``morpheus_runs`` in the same SELECT that pulls
         ``config`` — it is logged by ``phase_synthesise`` for audit
-        purposes (it is NOT re-applied after the F01 (adbeeb63)
+        purposes (it is NOT re-applied after the F01 (b5ca7829)
         per-(owner_id, namespace) partition: the cluster already passed
         the size check at CLUSTER time, and the partition is purely a
         privacy scoping).

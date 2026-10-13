@@ -1,6 +1,6 @@
 # v7 adversarial review remediation
 
-Review base: core `1d8ad87^..b53835b`, CHARON `65e458e..1b2e90b`.
+Review base: core `65ebfcd^..b8edc06`, CHARON `65e458e..1b2e90b`.
 The review was performed directly against the canonical GitLab source.
 
 ## Findings and fixes

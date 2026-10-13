@@ -19,7 +19,7 @@ Why AST and not raw bytes?
 Usage (single symbol)::
 
     python tools/verify_method_move.py \
-        --before 106671e^ \
+        --before 2a1356b^ \
         --before-file mnemos/persistence/oracle.py \
         --after-file mnemos/persistence/oracle_audit.py \
         --symbol OracleAuditChainRepository
@@ -35,7 +35,7 @@ Exit code is 0 if every check passes and nonzero if a structural or direct-bindi
 difference is detected (or if a symbol cannot be located in either the BEFORE
 or AFTER tree, which would itself be a bug).
 
-The default ``--before`` is ``106671e^`` (the parent of the split commit).
+The default ``--before`` is ``2a1356b^`` (the parent of the split commit).
 For diffing against an older ref, pass ``--before <ref>`` explicitly. If
 the split is uncommitted in your working tree, pass ``--before HEAD`` so
 the BEFORE tree is the last committed snapshot rather than the split
@@ -476,9 +476,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--before",
-        default="106671e^",
+        default="2a1356b^",
         help=(
-            "Git ref for the BEFORE tree (default: 106671e^, i.e. the parent "
+            "Git ref for the BEFORE tree (default: 2a1356b^, i.e. the parent "
             "of the split commit). The verifier is designed to compare the "
             "post-split source (read from disk / index) against the "
             "pre-split source pulled from git history. HEAD itself is the "

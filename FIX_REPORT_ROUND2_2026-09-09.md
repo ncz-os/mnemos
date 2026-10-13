@@ -9,7 +9,7 @@ implementation. This report is retained as a historical record.
 
 Work was performed directly in `/tmp/mnemos-audit-clones/mnemos-oauth-fix`
 on `feat/oauth-mcp-provider-agnostic-v2`, starting from round-1 report HEAD
-`3558f2c` (`7628ef0` is the round-1 code fix). No clone, fetch, merge, deploy,
+`cbfe52f` (`1a2351a` is the round-1 code fix). No clone, fetch, merge, deploy,
 or push was performed.
 
 | Gap | Outcome | Commit |

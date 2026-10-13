@@ -153,7 +153,7 @@
     }
   ],
   "embedding_dim": 768,
-  "git_sha": "0ea31e2ec9a0d3418af764d245c31377f5fafdb0",
+  "git_sha": "7aa4d225a05be34d434c66ca675601ce0e6d6fc2",
   "note": "Mock vectors are deterministic per corpus_size (seeded random.Random(corpus_size)). Phase 1 only; Phase 2 (100k/1M corpus, concurrency 25/50/100, multi-instance) is out of scope.",
   "phase": 1,
   "phase2_status": "blocked on operator hardware-allocation decision",

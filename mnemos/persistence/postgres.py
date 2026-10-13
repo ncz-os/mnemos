@@ -5599,7 +5599,7 @@ class PostgresAuditChainRepository(AuditChainRepository):
     """Postgres impl of the v6.2 M-2.2.1 audit chain repository.
 
     Tables: ``memory_audit_chain`` + ``memory_audit_roots``
-    (migrations 0029 + 0030; shipped at 614d483).
+    (migrations 0029 + 0030; shipped at 932b127).
 
     Atomicity: all operations run inside the caller's tx so audit
     inserts and the memory UPSERT commit together. The sealer's
@@ -6408,7 +6408,7 @@ class PostgresMorpheusRepository(MorpheusRepository):
         Returns ``(cluster_min_size, clusters)`` so the runner can apply
         the per-(owner_id, namespace) partition while still honoring the
         run's ``cluster_min_size`` (F01 cross-owner privacy isolation,
-        adbeeb63). The ``cluster_min_size`` lives on ``morpheus_runs``
+        b5ca7829). The ``cluster_min_size`` lives on ``morpheus_runs``
         and is read in the same SELECT as ``config`` to avoid an extra
         round-trip.
         """

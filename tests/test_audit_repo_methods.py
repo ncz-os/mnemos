@@ -1,5 +1,5 @@
 """Integration tests for v6.2 M-2.2.1 audit repository methods that
-landed in the cleanup pass (commits a9069b9 + aa8b96f):
+landed in the cleanup pass (commits 6dca9bb + 025042a):
 
 * `get_audit_entry_by_id(tx, entry_id) -> Row | None`
 * `get_latest_audit_entries_batch(tx, memory_ids) -> dict[bytes, Row]`

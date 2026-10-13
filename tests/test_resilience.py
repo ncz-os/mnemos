@@ -832,7 +832,7 @@ def test_nats_concurrency_slot_record_is_renewed_while_a_call_is_in_flight():
     slot forever. Without a heartbeat that same expiry fires under a call that
     is STILL RUNNING: the capacity is silently handed back and the limiter
     over-admits. Regression test for the renewal dropped in the resilience
-    refactor (restores master efa3849).
+    refactor (restores master cd049a0).
     """
     import mnemos.core.resilience as res
 

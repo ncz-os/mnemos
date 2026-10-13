@@ -402,7 +402,7 @@ implemented" and "currently inert" language is gone.
   persistence capability from `/health` — its startup probe query hit
   the same error and was caught elsewhere as "capability absent" rather
   than surfacing loudly. Root cause: the item 6/12 webhook work
-  (`7469ad94`) added a per-session `ALTER SESSION SET TIME_ZONE = 'UTC'`
+  (`780b8e88`) added a per-session `ALTER SESSION SET TIME_ZONE = 'UTC'`
   to make `SYSTIMESTAMP`-derived values unambiguously UTC. `'UTC'` is a
   **named** zone; Oracle records `SESSIONTIMEZONE` exactly as entered,
   and python-oracledb's thin driver (no Oracle Client libs required) can

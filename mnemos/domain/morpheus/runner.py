@@ -666,7 +666,7 @@ def _partition_members_by_owner_namespace(
 ) -> list[tuple[Any, list[Any]]]:
     """Split a cluster's members into per-(owner_id, namespace) sub-groups.
 
-    F01 (MORPHEUS cross-owner privacy isolation, adbeeb63): each cluster
+    F01 (MORPHEUS cross-owner privacy isolation, b5ca7829): each cluster
     produced by ``phase_cluster`` is split into per-(owner_id, namespace)
     sub-clusters before synthesis. The synthesized memory is owned by
     the unanimous owner_id of its sub-cluster, so the new
