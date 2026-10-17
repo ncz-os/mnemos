@@ -118,6 +118,10 @@ _PW_KV_RE = re.compile(r"(?i)\b(?:root[ \t]+pw|pw|sudo[ \t]+pw)\b[ \t]*[:=]?[ \t
 #   * the left side must start at a non-path/non-URL boundary
 #   * the password segment cannot contain path/URL separators
 #   * the password is validated by _record_password_is_credential()
+#   * git refs / branch names ("live/server-snapshot-20261017") are rejected
+#     by _record_password_is_credential(), which checks the LEFT half for a
+#     common ref prefix and the right half for a slug shape (a branch name
+#     is not a credential record).
 _CRED_RECORD_TOKEN_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9._%+/:@-])"
     r"([A-Za-z][A-Za-z0-9._-]{0,31})"
@@ -432,17 +436,122 @@ def _prose_value_is_credential(value: str) -> bool:
     return False
 
 
-def _record_password_is_credential(value: str) -> bool:
+# Common git ref / branch-namespace prefixes. These appear on the LEFT side of
+# the "/" in a branch name ("live/server-snapshot-20261017") — i.e. in the
+# record's *user* half, not its password half (review finding:
+# checking the prefix inside the slug alone never matched, so prefixed
+# branches still tripped the record detector).
+_GIT_REF_PREFIX_RE = re.compile(
+    r"(?i)(?:fix|feat|chore|docs|live|wip|review|release|hotfix|deploy|"
+    r"canonical|audit|refs|origin)"
+)
+
+# Branch/ref slugs are lowercase [a-z0-9._-] segments separated by "-". Real
+# passwords in the user/password shorthand essentially never look like this
+# (they carry upper case or symbols), and a slug always carries a structural
+# digit or path-ish segment, so short segments ("a", "b", "v1") are fine:
+# "fix/a-b-c" is a branch, not a credential.
+_REF_SLUG_TOKEN_RE = re.compile(r"[a-z0-9._-]+")
+_REF_SLUG_SEGMENT_RE = re.compile(r"[a-z0-9._]+")
+
+# Structural markers that real branch names / handoff slugs carry and real
+# passphrase-style passwords do not: a full date or issue id segment
+# ("20261017"; "409" alone is not enough) or a version segment
+# ("v1.2.3", "7.0.5"). Passphrases such as "correct-horse-battery-staple"
+# or "blue-river-lamp" are pure dictionary words and never match either
+# (review: the unprefixed shape alone let those through CLEAN).
+_REF_STRUCTURAL_SEGMENT_RE = re.compile(
+    r"(?:\d{4,}|v?\d+(?:\.\d+)+)", re.IGNORECASE
+)
+# Stricter marker for unprefixed records: a date or long issue id
+# ("20261017", "12345") or a version ("v1.2.3"), never a bare year.
+_REF_STRONG_MARKER_RE = re.compile(r"(?:\d{5,}|v?\d+(?:\.\d+)+)", re.IGNORECASE)
+_REF_VERSION_SEGMENT_RE = re.compile(r"v\d+(?:\.\d+)*|\d+(?:\.\d+)+", re.IGNORECASE)
+
+# A diceware/passphrase credential: >=3 hyphen-joined lowercase alpha words
+# ("correct-horse-battery-staple", "blue-river-lamp"). Real passphrases are
+# deliberately word-shaped, which is exactly what a marker-free unprefixed
+# slug looks like -- so this shape stays flagged unless the slug proves
+# itself a branch via _REF_STRUCTURAL_SEGMENT_RE (review: shape 2
+# must not exempt it). Single-word / short two-word slugs ("docs/api",
+# "snapshot") are NOT passphrase-shaped and stay exempt.
+_PASSPHRASE_SLUG_RE = re.compile(r"[a-z]{2,}(?:-[a-z]{2,}){2,}")
+
+# Prefixed refs may carry such a slug too ("fix/a-b-c") -- there the prefix
+# on the LEFT half is the structural signal, so shape 1 keeps its latitude.
+
+
+def _record_password_is_git_ref(user: str | None, value: str) -> bool:
+    """True when a user/password record is really a git ref / branch name.
+
+    False positive: progress notes whose prose carried git branch names such
+    as ``live/server-snapshot-20261017`` or
+    ``feat/phase6-model-router-registry-20261016-clean`` were parsed as
+    ``live`` / ``server-snapshot-20261017`` credential records. With
+    ``multi_span`` two such names VAULTED the whole (plain prose) memory.
+
+    The record qualifies as a branch name only when ``user`` (the half left
+    of the separator) and ``value`` (the half right of it) together look like
+    a ref, and every character of both is ``[a-z0-9._-]`` — so any upper case
+    or symbol (every real password in this family) excludes it.
+
+    Two shapes count:
+
+    * the LEFT half is a common git ref prefix (``fix/...``, ``live/...``,
+      ``origin/...``) and the right half is a slug — the branch-name case;
+    * the right half is itself hyphenated with at least two segments AND
+      carries a structural marker (a >=4-digit all-digit segment such as a
+      date ``20261017``, or a version segment ``v1.2.3``/``7.0.5``) — covers
+      unprefixed branch names quoted in notes (``alice/server-snapshot-20261017``)
+      while leaving diceware/passphrase credentials
+      (``alice/correct-horse-battery-staple``, ``admin:blue-river-lamp``)
+      flagged: those are dictionary words with no structural segment
+      (review — the marker-free shape 2 was a security regression).
+    """
+    if not value or not _REF_SLUG_TOKEN_RE.fullmatch(value):
+        return False
+    segments = [s for s in value.split("-") if s]
+    if not segments or not all(_REF_SLUG_SEGMENT_RE.fullmatch(s) for s in segments):
+        return False
+    # A segment mixing letters and digits ("hunter2", "x9q", "phase6") is
+    # only branch-like next to a structural marker; without one it is the
+    # shape of a password and must stay detectable. Version segments
+    # ("v2", "v1.2.3") are branch-shaped and do not count as mixed.
+    mixed = any(
+        re.search(r"[a-z]", s) and re.search(r"\d", s) and not _REF_VERSION_SEGMENT_RE.fullmatch(s)
+        for s in segments
+    )
+    left = (user or "").strip()
+    if left and _REF_SLUG_TOKEN_RE.fullmatch(left) and _GIT_REF_PREFIX_RE.fullmatch(left):
+        if not mixed:
+            return True
+        return any(_REF_STRUCTURAL_SEGMENT_RE.fullmatch(s) for s in segments)
+    # Unprefixed: needs at least two segments, a long numeric id (>= 5
+    # digits, e.g. a date or issue number) or a version, and no letter+digit
+    # segment. A 4-digit year in a password ("hunter2-2024-secret") is not
+    # enough.
+    if len(segments) < 2 or mixed:
+        return False
+    return any(_REF_STRONG_MARKER_RE.fullmatch(s) for s in segments)
+
+
+def _record_password_is_credential(value: str, user: str | None = None) -> bool:
     """True for password-looking RHS in a bare user/password record token.
 
     This must be stricter than prose/assignment values because the token
-    shape also resembles ordinary relative paths (``src/AliceBeta``).
+    shape also resembles ordinary relative paths (``src/AliceBeta``) and git
+    branch names (``live/server-snapshot-20261017``). ``user`` is the record's
+    left half; it is consulted only to recognise a git ref prefix.
     """
     v = value.strip()
     if not v or len(v) < 6 or _PLACEHOLDER_RE.match(v):
         return False
     if _is_denylisted(v):
         return True
+    # Git refs / branch slugs ("fix/api-unknown-agent-409-20261016") are
+    # handoff prose, not credentials (false-positive fix).
+    if _record_password_is_git_ref(user, v):
+        return False
     # Dates and version-ish path segments are common in notes and paths.
     if re.fullmatch(r"\d{1,4}[-/]\d{1,2}[-/]\d{1,4}", v):
         return False
@@ -474,7 +583,13 @@ def _record_password_is_credential(value: str) -> bool:
     # numbers do not become credential spans.
     classes = sum((has_lower, has_upper, has_digit, has_symbol))
     longest_alpha_run = max((len(m.group(0)) for m in re.finditer(r"[A-Za-z]+", v)), default=0)
-    return len(v) >= 12 and classes >= 3 and longest_alpha_run <= 4
+    if len(v) >= 12 and classes >= 3 and longest_alpha_run <= 4:
+        return True
+    # Dictionary-word passphrases carry no digit or symbol, so the ladder
+    # above clears them -- but "user/<three+ hyphenated words>" is exactly
+    # how a diceware credential is recorded (review regression).
+    # The git-ref exemption has already run, so branch names are unaffected.
+    return bool(_PASSPHRASE_SLUG_RE.fullmatch(v))
 
 
 @dataclass
@@ -703,8 +818,10 @@ def classify(content: str | None) -> SecretFinding:
     # "alice:Tr0ub4dor&3". On its own this is a redactable credential span;
     # when paired with a credential-record header it escalates below.
     for mo in _CRED_RECORD_TOKEN_RE.finditer(text):
-        value = mo.group(3)
-        if not _record_password_is_credential(value):
+        # Group 1 = left half ("live", "alice"), group 2 = separator, group 3
+        # = the password/slug. The left half matters: a git ref prefix lives
+        # THERE (review finding).
+        if not _record_password_is_credential(mo.group(3), user=mo.group(1)):
             continue
         _escalate(finding, SecretClass.REDACT)
         finding.reasons.append("cred_record_token")
