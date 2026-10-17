@@ -18,6 +18,7 @@ skipped. CI without the model file still exercises the surface.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 
@@ -458,6 +459,7 @@ class _NonReentrantFakeBackend:
         try:
             # Hold long enough that any overlap would be visible.
             import time as _t
+
             _t.sleep(0.1)
             return [0.1, 0.2, 0.3, 0.4]
         finally:
@@ -502,9 +504,7 @@ async def test_cancel_then_reembed_never_enters_backend_concurrently():
     # no concurrent entry was ever observed.
     assert second == [0.1, 0.2, 0.3, 0.4]
     # And the maximum concurrent-entries recorded by the fake is 1.
-    assert fake._max_overlap == 1, (
-        f"expected max concurrent backend entries = 1, got {fake._max_overlap}"
-    )
+    assert fake._max_overlap == 1, f"expected max concurrent backend entries = 1, got {fake._max_overlap}"
 
 
 @pytest.mark.asyncio
@@ -651,15 +651,15 @@ async def test_http_embed_runs_concurrently_not_serialized():
     serial_lower_bound = (n // 10) * delay  # = 1 * delay if concurrency >= n
     serial_upper_bound = (n // 10 + 1) * delay * 3.0  # generous ceiling
     assert elapsed < n * delay, (
-        f"10 concurrent 50ms embeds took {elapsed*1000:.1f}ms — close to the serialized 500ms. "
+        f"10 concurrent 50ms embeds took {elapsed * 1000:.1f}ms — close to the serialized 500ms. "
         f"HTTP path is still being serialized through _lock instead of _http_semaphore."
     )
     # And it should NOT be 0 — they actually had to do some work.
     assert elapsed >= serial_lower_bound * 0.5, (
-        f"elapsed {elapsed*1000:.1f}ms suspiciously short for {n} x {delay*1000:.0f}ms HTTP calls"
+        f"elapsed {elapsed * 1000:.1f}ms suspiciously short for {n} x {delay * 1000:.0f}ms HTTP calls"
     )
     assert elapsed < serial_upper_bound, (
-        f"elapsed {elapsed*1000:.1f}ms exceeds expected ceiling {serial_upper_bound*1000:.1f}ms"
+        f"elapsed {elapsed * 1000:.1f}ms exceeds expected ceiling {serial_upper_bound * 1000:.1f}ms"
     )
 
 
@@ -688,9 +688,7 @@ async def test_http_embed_bounded_by_semaphore_size():
     assert all(len(v) > 0 for v in results)
     assert fake.call_count == n
     # Concurrency cap holds: no more than http_concurrency=3 simultaneous.
-    assert fake._max_in_flight <= 3, (
-        f"semaphore did not cap concurrency: max_in_flight={fake._max_in_flight} > 3"
-    )
+    assert fake._max_in_flight <= 3, f"semaphore did not cap concurrency: max_in_flight={fake._max_in_flight} > 3"
     # And concurrency did happen — at least 2 in flight at peak. If
     # max_in_flight==1 we serialized (regression).
     assert fake._max_in_flight >= 2, (
@@ -699,11 +697,11 @@ async def test_http_embed_bounded_by_semaphore_size():
     # Wall time scales with ceil(10/3) * 50ms ≈ 200ms. Allow 3x slack for CI.
     expected_min_batches = (n + 3 - 1) // 3  # 4
     assert elapsed >= expected_min_batches * delay * 0.7, (
-        f"elapsed {elapsed*1000:.1f}ms shorter than expected ceil(10/3)*50ms={expected_min_batches*delay*1000:.1f}ms"
+        f"elapsed {elapsed * 1000:.1f}ms shorter than expected ceil(10/3)*50ms={expected_min_batches * delay * 1000:.1f}ms"
     )
     # And it should NOT have serialized to 10*50ms = 500ms (regression guard).
     assert elapsed < n * delay * 1.2, (
-        f"elapsed {elapsed*1000:.1f}ms ≈ serialized 500ms; semaphore not actually parallelizing"
+        f"elapsed {elapsed * 1000:.1f}ms ≈ serialized 500ms; semaphore not actually parallelizing"
     )
 
 
@@ -770,13 +768,11 @@ async def test_http_embed_batch_runs_concurrently_not_serialized():
     assert len(results) == n
     assert all(len(r) == 4 and all(len(v) > 0 for v in r) for r in results)
     # At least 2 in flight concurrently — proves we didn't serialize.
-    assert fake._max_in_flight > 1, (
-        f"http embed_batch serialized: max_in_flight={fake._max_in_flight}"
-    )
+    assert fake._max_in_flight > 1, f"http embed_batch serialized: max_in_flight={fake._max_in_flight}"
     # Each batch call sleeps `delay * 4` = 200ms. Serialized: 2000ms. With
     # http_concurrency=10 they all overlap → ~200ms. Assert < 1000ms.
     assert elapsed < 1.0, (
-        f"10 concurrent 200ms batches took {elapsed*1000:.0f}ms — close to serialized 2000ms; "
+        f"10 concurrent 200ms batches took {elapsed * 1000:.0f}ms — close to serialized 2000ms; "
         f"embed_batch still serializing HTTP calls through _lock"
     )
 
@@ -845,9 +841,7 @@ async def test_local_backend_unchanged_concurrent_embeds_never_overlap():
     )
     # Wall time should reflect serialization: 10 * 20ms ≈ 200ms (or more
     # on slow CI). Allow generous slack: must be > 10 * 5ms and < 10 * 200ms.
-    assert 0.05 <= elapsed <= 2.0, (
-        f"unexpected wall time {elapsed*1000:.0f}ms for 10 serialized 20ms embeds"
-    )
+    assert 0.05 <= elapsed <= 2.0, f"unexpected wall time {elapsed * 1000:.0f}ms for 10 serialized 20ms embeds"
 
 
 # ─── _ensure_loaded double-checked lock: safe under concurrent HTTP-first callers
@@ -916,3 +910,326 @@ async def test_ensure_loaded_double_checked_lock_under_concurrent_calls():
         f"_build_backend invoked {build_count['n']} times (>2) under concurrent "
         f"first-time calls; some race is escaping both guards"
     )
+
+
+# ── Empty-URL guards (no HTTP calls when URL is empty) ──────────────────────
+
+
+@pytest.mark.asyncio
+async def test_http_embed_empty_url_returns_empty_without_http():
+    """_HttpBackend with an empty URL must return [] from embed_async
+    without building the client or making any HTTP call."""
+    from mnemos.runtime.embedder import _HttpBackend
+
+    backend = _HttpBackend(url="", model="test", timeout=5.0, max_chars=8000)
+    result = await backend.embed_async("some text")
+    assert result == []
+    assert backend._client is None, "empty-URL _HttpBackend must not build an HTTP client"
+
+
+@pytest.mark.asyncio
+async def test_http_embed_batch_empty_url_returns_empty_without_http():
+    """_HttpBackend.embed_batch_async with an empty URL must return per-text
+    [] without building the client or making any HTTP call."""
+    from mnemos.runtime.embedder import _HttpBackend
+
+    backend = _HttpBackend(url="", model="test", timeout=5.0, max_chars=8000)
+    result = await backend.embed_batch_async(["text-a", "text-b"])
+    assert result == [[], []]
+    assert backend._client is None, "empty-URL _HttpBackend must not build an HTTP client for batch"
+
+
+@pytest.mark.asyncio
+async def test_http_embed_empty_url_logs_once(caplog):
+    """The disabled-backend notice must fire exactly once, not per call.
+
+    Counts emitted records so a regression that logs on every call cannot
+    pass by leaving the _disabled_logged latch set.
+    """
+    import logging
+
+    from mnemos.runtime.embedder import _HttpBackend
+
+    backend = _HttpBackend(url="", model="test", timeout=5.0, max_chars=8000)
+    with caplog.at_level(logging.INFO, logger="mnemos.runtime.embedder"):
+        await backend.embed_async("a")
+        await backend.embed_async("b")
+        await backend.embed_batch_async(["c", "d"])
+
+    notices = [rec.message for rec in caplog.records if "backend disabled" in rec.message]
+    assert len(notices) == 1, f"expected exactly one disabled notice, got {len(notices)}"
+    assert "MNEMOS_EMBED_HTTP_URL" in notices[0]
+
+
+def test_http_backend_load_with_empty_url_does_not_instantiate_client():
+    """_load_sync() must not build a client for an unconfigured backend.
+
+    `loaded` is derived from `_client is not None`, so building a client
+    here would report the backend ready and make callers skip the local
+    fall-through — silent empty embeddings rather than a clean fall-back.
+    """
+    from mnemos.runtime.embedder import _HttpBackend
+
+    backend = _HttpBackend(url="", model="test", timeout=5.0, max_chars=8000)
+    backend._load_sync()
+
+    assert backend._client is None, "unconfigured backend must not instantiate an httpx client"
+    assert backend.loaded is False, "an unconfigured backend must not report itself as loaded"
+
+
+def test_http_backend_load_with_url_instantiates_client():
+    """Positive control: a configured backend still loads normally."""
+    from mnemos.runtime.embedder import _HttpBackend
+
+    backend = _HttpBackend(url="http://ollama:11434", model="test", timeout=5.0, max_chars=8000)
+    backend._load_sync()
+
+    assert backend._client is not None
+    assert backend.loaded is True
+
+
+def test_http_backend_is_disabled_property():
+    """``is_disabled`` exposes the empty-URL state without triggering the
+    disabled-notice log or invoking ``embed_async``.
+
+    Distinct from ``not loaded``: a backend can be unconfigured (URL empty)
+    before ``_load_sync()`` has been called. Health probes and admin tools
+    use this to query the backend's configuration state cheaply.
+    """
+    from mnemos.runtime.embedder import _HttpBackend
+
+    # Empty URL → disabled.
+    backend_empty = _HttpBackend(url="", model="test", timeout=5.0, max_chars=8000)
+    assert backend_empty.is_disabled is True
+    # Configured URL → enabled, even before _load_sync() runs.
+    backend_set = _HttpBackend(url="http://ollama:11434", model="test", timeout=5.0, max_chars=8000)
+    assert backend_set.is_disabled is False
+    assert backend_set._client is None  # not loaded until first embed call
+    # The property is queryable without firing the disabled-notice log.
+    # (No assertion needed — the call would log if _log_disabled were invoked,
+    # and the caplog would catch it; here we just confirm no exception is raised.)
+
+
+@pytest.mark.asyncio
+async def test_http_embed_async_short_circuits_before_httpx_post(monkeypatch):
+    """_HttpBackend.embed_async() with an empty URL must return []
+    WITHOUT making any HTTP request — not even a connect attempt, not
+    even an httpx.AsyncClient instantiation.
+
+    This test patches ``httpx.AsyncClient`` directly (not just
+    ``_client``) so a regression that builds the client but then calls
+    .post() on it will still fail.
+
+    Note: embedder.py does ``import httpx`` inside ``_build_client_sync``
+    (a lazy import for fast startup), so we patch ``httpx.AsyncClient``
+    directly in the httpx module.
+    """
+    import httpx
+
+    from mnemos.runtime.embedder import _HttpBackend
+
+    class _AsyncClientSentinel:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError(
+                f"embed_async() with empty URL must NOT instantiate httpx.AsyncClient "
+                f"(got args={args!r}, kwargs={kwargs!r})"
+            )
+
+        async def post(self, *args, **kwargs):
+            raise AssertionError("embed_async() with empty URL must NOT call httpx.AsyncClient.post")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClientSentinel)
+
+    backend = _HttpBackend(url="", model="test", timeout=5.0, max_chars=8000)
+    result = await backend.embed_async("some text")
+    assert result == [], f"empty-URL embed_async() must return [], got {result!r}"
+    assert backend._client is None, "empty-URL embed_async() must not build an httpx.AsyncClient"
+    assert backend.is_disabled is True, "is_disabled must reflect the empty-URL state"
+
+
+@pytest.mark.asyncio
+async def test_http_embed_batch_async_short_circuits_before_httpx_post(monkeypatch):
+    """Same as test_http_embed_async_short_circuits_before_httpx_post but
+    for the batch path: embed_batch_async() with an empty URL must return
+    per-text [] without instantiating or calling httpx.AsyncClient."""
+    import httpx
+
+    from mnemos.runtime.embedder import _HttpBackend
+
+    class _AsyncClientSentinel:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError(
+                f"embed_batch_async() with empty URL must NOT instantiate httpx.AsyncClient "
+                f"(got args={args!r}, kwargs={kwargs!r})"
+            )
+
+        async def post(self, *args, **kwargs):
+            raise AssertionError("embed_batch_async() with empty URL must NOT call httpx.AsyncClient.post")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClientSentinel)
+
+    backend = _HttpBackend(url="", model="test", timeout=5.0, max_chars=8000)
+    result = await backend.embed_batch_async(["text-a", "text-b"])
+    assert result == [[], []], f"empty-URL embed_batch_async() must return [[], []], got {result!r}"
+    assert backend._client is None, "empty-URL embed_batch_async() must not build an httpx.AsyncClient"
+    assert backend.is_disabled is True, "is_disabled must reflect the empty-URL state"
+
+
+def test_http_embed_public_call_sites_have_inline_empty_url_guards():
+    """The empty-URL guard must be the FIRST line of defence in the public
+    call sites of _HttpBackend (``embed_async``, ``embed_batch_async``,
+    ``_load_sync``), not just defense-in-depth inside the client
+    builder. This static check locks in that all three public methods
+    contain the ``if not self.url`` short-circuit at the public call
+    site, so a future refactor that quietly removes the inline guard
+    (and relies only on ``_build_client_sync``'s defense-in-depth)
+    fails this test.
+
+    The guard must (a) be a statement in each method body (not just
+    a docstring mention), (b) use the literal ``if not self.url``
+    pattern, and (c) appear before any call to ``_build_client_sync``
+    (the defense-in-depth site, which is not sufficient on its own).
+
+    The test deliberately also covers ``_load_sync`` (not just the
+    async methods), because the guard applies to every public call
+    site, and ``_load_sync`` is the synchronous entry point that
+    callers reach via ``HybridHttpEmbedder.ensure_loaded``.
+    """
+    import inspect
+    from mnemos.runtime.embedder import _HttpBackend
+
+    for method_name in ("embed_async", "embed_batch_async", "_load_sync"):
+        method = getattr(_HttpBackend, method_name)
+        src = inspect.getsource(method)
+        # (a) The guard must be a statement (not just a docstring).
+        assert "if not self.url:" in src, (
+            f"_HttpBackend.{method_name}() must contain the inline "
+            f"``if not self.url:`` guard; the empty-URL log spam can "
+            f"ONLY be prevented by short-circuiting at the public call "
+            f"site, BEFORE any client construction."
+        )
+        # (b) and (c) The guard must appear before any
+        # _build_client_sync call.
+        guard_idx = src.index("if not self.url:")
+        build_idx = src.find("self._build_client_sync()")
+        assert build_idx == -1 or guard_idx < build_idx, (
+            f"_HttpBackend.{method_name}()'s ``if not self.url:`` guard "
+            f"must fire BEFORE any _build_client_sync() call, not after — "
+            f"defense-in-depth inside _build_client_sync is NOT a "
+            f"substitute for the public-call-site guard."
+        )
+
+
+# ── Dead-endpoint spin: both embed URLs empty ───────────────────────────────
+
+
+def test_http_url_constructor_arg_is_honoured_verbatim():
+    """``http_url=""`` means "no HTTP endpoint" — it must NOT be rewritten to
+    the module/env default.
+
+    The bug: ``self.http_url = http_url or embed_http_url_env()`` plus a
+    ``_make_backend`` that read the module-level DEFAULT_HTTP_URL meant an
+    explicitly blank URL silently became the baked-in default host, so the
+    "no endpoint configured" state was unreachable from the Hybrid
+    embedder.
+    """
+    from mnemos.runtime.embedder import _HttpBackend
+
+    blank = InProcessEmbedder(backend="http", http_url="", http_url_fallback="")
+    assert blank.http_url == ""
+    blank._build_backend()
+    assert isinstance(blank._backend, _HttpBackend)
+    assert blank._backend.url == "", "explicit empty URL must reach _HttpBackend unchanged"
+    assert blank._backend.is_disabled is True
+
+    configured = InProcessEmbedder(backend="http", http_url="http://fake/embeddings", http_url_fallback="")
+    configured._build_backend()
+    assert configured._backend.url == "http://fake/embeddings"
+
+
+@pytest.mark.asyncio
+async def test_http_embed_all_urls_empty_short_circuits_with_error(monkeypatch, caplog):
+    """Positive control for no-spin: with BOTH URLs empty and no local GGUF
+    fallback, ``embed()`` must not re-enter the fallback chain on every call.
+
+    Before the fix this path logged a connect-failure warning (and the
+    "primary failed" / "" url warnings) on EVERY call — a hot loop of
+    dead-endpoint attempts with no signal that configuration was missing.
+    Now: zero HTTP attempts, zero per-call warnings, exactly one ERROR
+    naming the env var, and ``[]`` returned.
+    """
+    import httpx
+
+    from mnemos.runtime.embedder import _HttpBackend
+
+    calls = {"post": 0, "client": 0}
+
+    class _AsyncClientSentinel:
+        def __init__(self, *args, **kwargs):
+            calls["client"] += 1
+            raise AssertionError("no HTTP client may be built when no URL is configured")
+
+        async def post(self, *args, **kwargs):
+            calls["post"] += 1
+            raise AssertionError("no HTTP POST may be issued when no URL is configured")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClientSentinel)
+
+    e = InProcessEmbedder(
+        backend="http",
+        http_url="",
+        http_url_fallback="",
+        model_path="/nonexistent/path/never-loaded.gguf",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="mnemos.runtime.embedder"):
+        for _ in range(5):
+            assert await e.embed("hello world") == []
+
+    assert isinstance(e._backend, _HttpBackend)
+    assert e._http_fallback is None
+    assert e._http_fallback_remote is None
+    assert calls == {"post": 0, "client": 0}
+
+    per_call_warnings = [r.message for r in caplog.records if "primary failed" in r.message]
+    assert per_call_warnings == [], f"no per-call fallback warnings may be emitted, got {per_call_warnings!r}"
+
+    errors = [
+        r.message
+        for r in caplog.records
+        if r.levelno >= logging.ERROR and "no embedding endpoint configured" in r.message
+    ]
+    assert len(errors) == 1, f"expected exactly one ERROR, got {len(errors)}"
+    assert "MNEMOS_EMBED_HTTP_URL" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_http_embed_batch_all_urls_empty_does_not_spin(monkeypatch, caplog):
+    """The batch path routes each row through ``embed()``; with no endpoint
+    at all it must stay silent after the single ERROR and make no HTTP call."""
+    import httpx
+
+    class _AsyncClientSentinel:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("no HTTP client may be built when no URL is configured")
+
+        async def post(self, *args, **kwargs):
+            raise AssertionError("no HTTP POST may be issued when no URL is configured")
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClientSentinel)
+
+    e = InProcessEmbedder(
+        backend="http",
+        http_url="",
+        http_url_fallback="",
+        model_path="/nonexistent/path/never-loaded.gguf",
+    )
+
+    with caplog.at_level(logging.ERROR, logger="mnemos.runtime.embedder"):
+        vecs = await e.embed_batch(["a", "b", "c"])
+        vecs_again = await e.embed_batch(["d"])
+
+    assert vecs == [[], [], []]
+    assert vecs_again == [[]]
+    errors = [r.message for r in caplog.records if "no embedding endpoint configured" in r.message]
+    assert len(errors) == 1, f"the unconfigured ERROR must fire once, got {len(errors)}"

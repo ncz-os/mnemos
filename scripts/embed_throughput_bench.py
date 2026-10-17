@@ -1,8 +1,9 @@
 """Embedding throughput bench — measures /v1/embeddings + /api/embeddings.
 
-Compares latency and throughput of embedding endpoints across hosts
-(CERBERUS RTX 4500 ADA today; TYPHON RTX 5060 once Ollama is
-installed). Emits an HMAC-signed JSON artifact under docs/proof/.
+Compares latency and throughput of embedding endpoints across hosts.
+Target hosts are supplied via the EMBED_BENCH_EXTRA environment variable
+(comma-separated; ``URL`` or ``URL|model``). Emits an HMAC-signed JSON
+artifact under docs/proof/.
 """
 
 from __future__ import annotations
@@ -95,20 +96,10 @@ async def _bench_endpoint(name: str, base_url: str, model: str, n: int) -> dict[
 
 
 async def main_async(n: int) -> dict[str, Any]:
-    endpoints = [
-        {
-            "name": "cerberus-rtx-4500-ada",
-            "base_url": "http://192.168.207.96:11434",
-            "model": "nomic-embed-text:latest",
-            "hardware": "NVIDIA RTX 4500 ADA, 24 GB",
-        },
-        {
-            "name": "typhon-rtx-5060",
-            "base_url": "http://192.168.207.61:11435",
-            "model": "nomic-embed-text:latest",
-            "hardware": "NVIDIA RTX 5060, 8 GB",
-        },
-    ]
+    # No endpoint is baked in: point EMBED_BENCH_EXTRA at the servers you
+    # want to bench, e.g.
+    #   EMBED_BENCH_EXTRA='http://localhost:11434|nomic-embed-text'
+    endpoints: list[dict[str, str]] = []
     extra = os.environ.get("EMBED_BENCH_EXTRA")
     if extra:
         for entry in extra.split(","):

@@ -1,15 +1,18 @@
 """Cross-encoder reranker HTTP client (v6.2 M-2.2.3).
 
-Talks to llama.cpp `--rerank` endpoint (default: a fallback host :8091 running
-bge-reranker-v2-m3 on AMD NAVI14 Vulkan; see
-docs/v6.2-nexus-pattern-adoption.md § Reranker service).
+Talks to a llama.cpp `--rerank` endpoint (e.g. a host running
+bge-reranker-v2-m3; see docs/v6.2-nexus-pattern-adoption.md § Reranker
+service). There is no default — the previous default pointed at a host
+that no longer exists, so the default is now empty. With no URL
+configured, rerank() short-circuits to ``[]`` and makes no HTTP call;
+see `MNEMOS_RERANKER_URL` below.
 
 Circuit-breaker semantics mirror `mnemos/runtime/embedder.py::_HttpBackend`:
 - on 5 consecutive failures, open breaker for 60s
 - breaker-open returns ``[]`` so caller falls through to no-rerank
   (the un-reranked order is still a valid result set, never block
   search on a missing reranker — matches v6.2 acceptance criterion
-  "failover to FTS-only ranking if a fallback host :8091 down 30s+")
+  "failover to FTS-only ranking if the reranker host is down 30s+")
 """
 
 from __future__ import annotations
@@ -28,7 +31,10 @@ logger = logging.getLogger(__name__)
 #   {"model": "bge-reranker-v2-m3", "query": "...", "documents": ["...", ...]}
 # Response:
 #   {"results": [{"index": 0, "relevance_score": 0.87}, ...]}
-DEFAULT_RERANKER_URL = "http://192.168.207.64:8091/v1/rerank"
+# No default: the previous default pointed at a host that no longer
+# exists, so the default is now empty. Set MNEMOS_RERANKER_URL to a
+# trusted llama.cpp --rerank endpoint you configure.
+DEFAULT_RERANKER_URL = ""
 DEFAULT_RERANKER_MODEL = "bge-reranker-v2-m3"
 DEFAULT_RERANKER_TIMEOUT = 5.0
 DEFAULT_CB_THRESHOLD = 5
@@ -63,9 +69,28 @@ class Reranker:
         self._consecutive_failures = 0
         self._breaker_opened_at: float | None = None
         self._client: Any = None
+        self._disabled_logged = False
+
+    @property
+    def is_disabled(self) -> bool:
+        """True iff the reranker has no URL configured.
+
+        Lets health probes and admin tools query the state without
+        triggering ``rerank()``'s INFO-disabled log line. Distinct from a
+        breaker-open state: is_disabled is permanent (until
+        MNEMOS_RERANKER_URL is set and the process restarts); the breaker
+        is a transient circuit-break on transient failures.
+        """
+        return not self.url
 
     def _build_client(self) -> None:
         if self._client is not None:
+            return
+        # Defense in depth: ``rerank()`` already guards ``if not self.url``
+        # before calling here, so this should never fire in practice. Belt
+        # and braces so a future caller that forgets the outer guard cannot
+        # silently build an httpx client with an empty base URL.
+        if not self.url:
             return
         import httpx
 
@@ -111,8 +136,39 @@ class Reranker:
 
         On any error or open breaker, returns ``[]`` — caller MUST treat
         empty return as "rerank unavailable, keep original order".
+
+        Short-circuit order (cheapest first):
+
+        1. ``not query or not documents`` → return ``[]`` (no work to do).
+        2. ``if not self.url`` (the public-call-site guard; see the
+           inline block at the top of this method) → log once at INFO that
+           ``MNEMOS_RERANKER_URL`` is unset and return ``[]``.
+           Without this guard, every call would build an httpx client
+           with an empty base URL and POST to it, generating a
+           continuous stream of connect-failure warnings until the
+           circuit breaker opened. This short-circuit is the
+           **public call site** guard: it fires BEFORE any client
+           construction, BEFORE any breaker accounting, and BEFORE any
+           network I/O. Verified by
+           ``tests/test_reranker_empty_url.py::test_rerank_empty_url_short_circuits_before_httpx_post``.
+        3. ``self._breaker_open()`` → return ``[]`` (transient outage).
         """
         if not query or not documents:
+            return []
+        # Public-call-site empty-URL guard. MUST run before any client
+        # construction, before
+        # any breaker accounting, and before any network I/O. Without
+        # this, the empty URL would build an httpx client and POST to
+        # it on every call, spamming connect-failure warnings until
+        # the breaker opened. The flag (``_disabled_logged``) makes the
+        # INFO line fire exactly once; subsequent calls skip the log.
+        if not self.url:
+            if not self._disabled_logged:
+                logger.info(
+                    "[RERANK] rerank disabled: MNEMOS_RERANKER_URL is unset; "
+                    "returning empty scores (no HTTP calls will be made)"
+                )
+                self._disabled_logged = True
             return []
         if self._client is None:
             self._build_client()

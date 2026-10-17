@@ -268,6 +268,10 @@ services:
       # MNEMOS_DATABASE_DSN: postgres://mnemos_user:${POSTGRES_PASSWORD:-mnemos_local}@postgres:5432/mnemos
       # MNEMOS_DATABASE_DSN: oracle://MNEMOS:${ORACLE_PASSWORD:-changeme}@oracle-ee:1521/ORCLPDB1
       # MNEMOS_DATABASE_DSN: db2://MNEMOS:${DB2_PASSWORD:-changeme}@db2-eap:50000/MNEMOS
+      # INFERENCE_EMBED_HOST must address the `ollama` compose service
+      # below — `localhost` here is the mnemos container's own loopback,
+      # not the host running Ollama. Locked in by
+      # tests/test_no_private_default_endpoints.py::test_compose_embed_host_points_at_compose_ollama_service.
       INFERENCE_EMBED_HOST: http://ollama:11434
       # On Linux: use http://172.17.0.1:5001 or add --add-host=host.docker.internal:host-gateway
       GRAEAE_URL: ${GRAEAE_URL:-http://host.docker.internal:5001}

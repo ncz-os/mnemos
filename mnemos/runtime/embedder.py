@@ -78,12 +78,15 @@ DEFAULT_HYBRID = False
 DEFAULT_NPU_THRESHOLD_CHARS = 1000  # ~256 tokens at 4 chars/token
 DEFAULT_MODEL_PATH = "/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf"
 # HTTP backend (mem_1779334716543_f8ebd4 EXCEPTION clause 2026-05-23):
-# operator-authorized a fallback host llama.cpp Vulkan endpoint at
-# http://192.168.207.64:8090/v1/embeddings. Same memo forbids ollama or
-# any other HTTP embed provider; a fallback host is the sole exception. Must
-# circuit-break + fall through to llamacpp on >30s outage.
-DEFAULT_HTTP_URL = "http://192.168.207.61:8090/v1/embeddings"  # a GPU host RTX 5060 CUDA
-DEFAULT_HTTP_URL_FALLBACK = "http://192.168.207.64:8090/v1/embeddings"  # a fallback host AMD NAVI14 Vulkan
+# A llama.cpp endpoint is the sanctioned HTTP embed backend.
+# The previous default pointed at a host that no longer exists, so the
+# default is now empty: set MNEMOS_EMBED_HTTP_URL (and optionally
+# MNEMOS_EMBED_HTTP_URL_FALLBACK) to a trusted endpoint you configure.
+# The same memo forbids ollama or any other HTTP embed provider; a trusted
+# llama-server endpoint is the sole exception. Must circuit-break + fall
+# through to llamacpp on >30s outage.
+DEFAULT_HTTP_URL = ""
+DEFAULT_HTTP_URL_FALLBACK = ""
 DEFAULT_HTTP_MODEL = "bge-m3"
 DEFAULT_HTTP_TIMEOUT = 30.0
 DEFAULT_HTTP_CB_THRESHOLD = 5  # consecutive failures before opening breaker
@@ -396,12 +399,13 @@ class _HttpBackend:
     """OpenAI-compatible /v1/embeddings HTTP backend.
 
     Operator-locked decision (mem_1779334716543_f8ebd4 EXCEPTION clause
-    2026-05-23) restricts this backend to the a fallback host llama.cpp Vulkan
-    endpoint at http://192.168.207.64:8090/v1/embeddings (or another
-    operator-vetted local-LAN llama-server). ollama at any host remains
-    forbidden — the 2026-05-21 90-day silent-stall incident was caused
-    by a stale podman-compose service alias and this backend MUST guard
-    against the same failure mode.
+    2026-05-23) restricts this backend to a trusted llama-server endpoint
+    (an OpenAI-compatible ``/v1/embeddings`` URL). The previous default
+    pointed at a host that no longer exists, so no endpoint is hardcoded
+    here — set MNEMOS_EMBED_HTTP_URL to the endpoint you configure.
+    ollama at any host remains forbidden — the 2026-05-21 90-day silent-stall
+    incident was caused by a stale podman-compose service alias and this
+    backend MUST guard against the same failure mode.
 
     Defenses:
       * Per-call timeout (DEFAULT_HTTP_TIMEOUT, 30s).
@@ -433,9 +437,40 @@ class _HttpBackend:
         self._breaker_opened_at: float | None = None
         self._embed_dim: int | None = None
         self._client = None  # lazy httpx.AsyncClient
+        self._disabled_logged = False
+
+    def _log_disabled(self) -> None:
+        """Report an unconfigured HTTP backend once.
+
+        Without this the empty-URL guard returned ``[]`` silently on every
+        call, which is indistinguishable from a genuine embed failure. The
+        INFO line names the env var the operator has to set, so a
+        misconfigured deployment is diagnosable from the log alone instead
+        of from empty vectors.
+        """
+        if not self._disabled_logged:
+            logger.info(
+                "[EMBED][http] backend disabled: no URL configured (set "
+                "MNEMOS_EMBED_HTTP_URL, or MNEMOS_EMBED_HTTP_URL_FALLBACK for "
+                "the fallback backend); returning empty embeddings so the "
+                "caller falls through to the local backend"
+            )
+            self._disabled_logged = True
+
+    def _disabled(self, result: list[list[float]]) -> list[list[float]]:
+        """Log the disabled-backend notice once and pass ``result`` through."""
+        self._log_disabled()
+        return result
 
     def _build_client_sync(self) -> None:
         if self._client is not None:
+            return
+        # Defense in depth: embed_async, embed_batch_async, and _load_sync
+        # all guard ``if not self.url`` before calling here, so this should
+        # never fire in practice. Belt and braces so a future caller that
+        # forgets the outer guard cannot silently build an httpx client
+        # with an empty base URL.
+        if not self.url:
             return
         import httpx
 
@@ -450,11 +485,42 @@ class _HttpBackend:
     def _load_sync(self) -> None:
         # No model file to load; just instantiate the client. Dim is
         # discovered on the first successful embed call.
+        #
+        # An unconfigured backend must NOT build a client: `loaded` is
+        # derived from `_client is not None`, so instantiating one would
+        # report the backend as ready and make callers skip the local
+        # fall-through, leaving them with empty embeddings and no signal.
+        #
+        # =====================================================================
+        # PUBLIC-CALL-SITE EMPTY-URL GUARD. MUST run before any client
+        # construction. The INFO line fires exactly once via the
+        # ``_disabled_logged`` flag; subsequent calls skip the log. The
+        # empty fallback (``MNEMOS_EMBED_HTTP_URL_FALLBACK``) is already
+        # skipped at the HybridHttpEmbedder construction site, so only the
+        # primary needs this guard. This guard is the FIRST line of
+        # defence at the public call site — the defense-in-depth
+        # check in _build_client_sync() below is a belt-and-braces
+        # backup, NOT a substitute for this guard.
+        # =====================================================================
+        if not self.url:
+            self._log_disabled()
+            return
         self._build_client_sync()
 
     @property
     def loaded(self) -> bool:
         return self._client is not None
+
+    @property
+    def is_disabled(self) -> bool:
+        """True iff the HTTP backend has no URL configured.
+
+        Distinct from ``not loaded`` — a backend can be unconfigured (URL
+        empty) before ``_load_sync()`` has been called. Callers that want
+        to avoid even logging the disabled-notice (e.g. health probes) can
+        check this without triggering ``_log_disabled``.
+        """
+        return not self.url
 
     @property
     def embed_dim(self) -> int | None:
@@ -493,8 +559,35 @@ class _HttpBackend:
 
     async def embed_async(self, text: str) -> list[float]:
         """Async embed; respects breaker. Returns [] on failure (caller falls
-        through to the wrapping HybridHttpEmbedder's local backend)."""
+        through to the wrapping HybridHttpEmbedder's local backend).
+
+        Short-circuit order (cheapest first):
+
+        1. ``not text`` → return ``[]`` (no work to do).
+        2. ``if not self.url`` (the public-call-site guard; see the
+           inline block at the top of this method) → log once at INFO
+           that ``MNEMOS_EMBED_HTTP_URL`` is unset and return ``[]``.
+           Without this guard, every call would build an httpx client
+           with an empty base URL and POST to it, generating a
+           continuous stream of connect-failure warnings until the
+           circuit breaker opened. This short-circuit is the
+           **public call site** guard: it fires BEFORE any client
+           construction, BEFORE any breaker accounting, and BEFORE any
+           network I/O. Verified by
+           ``tests/test_inprocess_embedder.py::test_http_embed_async_short_circuits_before_httpx_post``.
+        3. ``self._breaker_open()`` → return ``[]`` (transient outage).
+        """
         if not text or not text.strip():
+            return []
+        # Public-call-site empty-URL guard. MUST run before any client
+        # construction, before any breaker accounting, and before any
+        # network I/O. The ``_disabled_logged`` flag makes the INFO line
+        # fire exactly once; subsequent calls skip the log. The empty
+        # fallback (``MNEMOS_EMBED_HTTP_URL_FALLBACK``) is already skipped
+        # at the HybridHttpEmbedder construction site, so only the primary
+        # needs this guard.
+        if not self.url:
+            self._log_disabled()
             return []
         if self._client is None:
             self._build_client_sync()
@@ -540,10 +633,38 @@ class _HttpBackend:
 
     async def embed_batch_async(self, texts: list[str]) -> list[list[float]]:
         """Batch embed; one POST per call with `input` as a list. Returns
-        per-text [] on partial failure modes (length mismatch)."""
+        per-text [] on partial failure modes (length mismatch).
+
+        Short-circuit order (cheapest first):
+
+        1. No nonempty inputs → return ``[[] for _ in texts]`` (no work to do).
+        2. ``if not self.url`` (the public-call-site guard; see the
+           inline block at the top of this method) → log once at INFO
+           that ``MNEMOS_EMBED_HTTP_URL`` is unset and return per-text ``[]``.
+           Without this guard, every call would build an httpx client
+           with an empty base URL and POST to it, generating a
+           continuous stream of connect-failure warnings until the
+           circuit breaker opened. This short-circuit is the
+           **public call site** guard: it fires BEFORE any client
+           construction, BEFORE any breaker accounting, and BEFORE any
+           network I/O. Verified by
+           ``tests/test_inprocess_embedder.py::test_http_embed_batch_async_short_circuits_before_httpx_post``.
+        3. ``self._breaker_open()`` → return ``[[] for _ in texts]``
+           (transient outage).
+        """
         cleaned = [(t or "")[: self.max_chars] for t in texts]
         nonempty = [c for c in cleaned if c.strip()]
         if not nonempty:
+            return [[] for _ in texts]
+        # Public-call-site empty-URL guard. MUST run before any client
+        # construction, before any breaker accounting, and before any
+        # network I/O. The ``_disabled_logged`` flag makes the INFO line
+        # fire exactly once; subsequent calls skip the log. The empty
+        # fallback (``MNEMOS_EMBED_HTTP_URL_FALLBACK``) is already skipped
+        # at the HybridHttpEmbedder construction site, so only the primary
+        # needs this guard.
+        if not self.url:
+            self._log_disabled()
             return [[] for _ in texts]
         if self._client is None:
             self._build_client_sync()
@@ -698,15 +819,17 @@ class InProcessEmbedder:
         self.n_ctx = int(n_ctx if n_ctx is not None else embed_n_ctx_env())
         self.n_threads = int(n_threads if n_threads is not None else embed_threads_env())
         self.n_gpu_layers = int(n_gpu_layers if n_gpu_layers is not None else embed_gpu_layers_env())
-        self.http_url = http_url or embed_http_url_env()
+        # ``http_url`` is honoured verbatim when supplied (including "" to
+        # mean "no HTTP endpoint configured"); the env is consulted only when
+        # the argument is omitted. ``or`` would turn an explicit "" back into
+        # the env default and make the empty-URL state unreachable.
+        self.http_url = embed_http_url_env() if http_url is None else http_url
         # Fallback URL: empty string disables; default = a fallback host so the primary
         # a GPU host outage path falls to a fallback host before in-process llamacpp.
         self.http_url_fallback = http_url_fallback if http_url_fallback is not None else embed_http_url_fallback_env()
         self.http_model = http_model or embed_http_model_env()
         self.http_timeout = float(http_timeout if http_timeout is not None else embed_http_timeout_env())
-        self.http_concurrency = int(
-            http_concurrency if http_concurrency is not None else embed_http_concurrency_env()
-        )
+        self.http_concurrency = int(http_concurrency if http_concurrency is not None else embed_http_concurrency_env())
         if self.http_concurrency < 1:
             self.http_concurrency = 1
         self.max_text_chars = int(max_text_chars if max_text_chars is not None else embed_max_chars_env())
@@ -733,6 +856,9 @@ class InProcessEmbedder:
         # default-pool threads and hit the non-reentrant backend
         # concurrently.
         self._serial_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        # One-shot latch for the "http backend with no endpoint at all"
+        # ERROR line emitted by embed() (see its HTTP short-circuit).
+        self._http_unconfigured_logged = False
 
     def _make_backend(self, name: str):
         if name == "openvino":
@@ -751,6 +877,17 @@ class InProcessEmbedder:
                 trust_remote_code=self.trust_remote_code,
             )
         if name == "http":
+            # Use the RESOLVED URL (env + constructor arg), never the
+            # module-level DEFAULT_HTTP_URL. Reading the module constant
+            # here ignored ``InProcessEmbedder(http_url="")`` and every
+            # MNEMOS_EMBED_HTTP_URL change made after import: a deliberately
+            # blank primary URL silently became the baked-in default host,
+            # and with no local fallback the embed() chain (primary ->
+            # remote-fallback -> local) re-POSTed to that host, logging a
+            # connect-failure warning, returning [], and repeating on every
+            # call — exactly the dead-endpoint spin the previous default
+            # caused. With both URLs empty, _HttpBackend.embed_async now
+            # short-circuits and embed() surfaces a single clear error.
             return _HttpBackend(
                 url=self.http_url,
                 model=self.http_model,
@@ -854,9 +991,7 @@ class InProcessEmbedder:
         # race past the ``self._backend is None`` check and double-init.
         # We re-check inside the lock so already-loaded embedders skip
         # the lock acquisition entirely on the hot path.
-        if self._backend and self._backend.loaded and (
-            self._npu_sidecar is None or self._npu_sidecar.loaded
-        ):
+        if self._backend and self._backend.loaded and (self._npu_sidecar is None or self._npu_sidecar.loaded):
             return
         async with self._lock:
             if not (self._backend and self._backend.loaded):
@@ -970,6 +1105,27 @@ class InProcessEmbedder:
         try:
             await self._ensure_loaded()
             if isinstance(self._backend, _HttpBackend):
+                # Nothing configured at all: primary URL empty AND no remote
+                # fallback AND no in-process GGUF fallback. Every tier would
+                # return [] without doing any work, so skip the chain (and
+                # the warning-per-call logging) and report once at ERROR.
+                # Without this, a caller that opts into ``http`` with no
+                # URL gets an empty vector for every row and an identical
+                # "primary failed -> ..." warning on every call, which is
+                # the dead-endpoint spin signature. See
+                # tests/test_inprocess_embedder.py::
+                # test_http_embed_all_urls_empty_short_circuits_with_error.
+                if self._backend.is_disabled and self._http_fallback_remote is None and self._http_fallback is None:
+                    if not self._http_unconfigured_logged:
+                        logger.error(
+                            "[EMBED][http] no embedding endpoint configured: "
+                            "MNEMOS_EMBED_HTTP_URL and MNEMOS_EMBED_HTTP_URL_FALLBACK "
+                            "are both unset and no local GGUF fallback exists at %s; "
+                            "returning empty embeddings (set MNEMOS_EMBED_HTTP_URL)",
+                            self.model_path,
+                        )
+                        self._http_unconfigured_logged = True
+                    return []
                 # HTTP primary + remote-fallback: bounded concurrency via
                 # the semaphore. The semaphore is independent of ``_lock``
                 # so we don't serialize these calls to one-at-a-time.
@@ -1045,6 +1201,22 @@ class InProcessEmbedder:
             try:
                 await self._ensure_loaded()
                 if isinstance(self._backend, _HttpBackend):
+                    if self._backend.is_disabled and self._http_fallback_remote is None and self._http_fallback is None:
+                        # Same no-endpoint-at-all condition embed() handles:
+                        # skip the batch chain, log the configuration ERROR
+                        # once, and return per-text [] (never POST). One
+                        # shared latch so the message fires once no matter
+                        # which entry point is called first.
+                        if not self._http_unconfigured_logged:
+                            logger.error(
+                                "[EMBED][http] no embedding endpoint configured: "
+                                "MNEMOS_EMBED_HTTP_URL and MNEMOS_EMBED_HTTP_URL_FALLBACK "
+                                "are both unset and no local GGUF fallback exists at %s; "
+                                "returning empty embeddings (set MNEMOS_EMBED_HTTP_URL)",
+                                self.model_path,
+                            )
+                            self._http_unconfigured_logged = True
+                        return [[] for _ in texts_list]
                     # HTTP batch: bounded concurrency, NOT serialized to
                     # one-at-a-time. Two concurrent embed_batch() callers
                     # run in parallel up to ``http_concurrency``.

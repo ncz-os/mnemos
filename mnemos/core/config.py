@@ -1633,7 +1633,10 @@ def embed_http_url_env() -> str:
 
 
 def embed_http_url_fallback_env() -> str:
-    return runtime_env_value("MNEMOS_EMBED_HTTP_URL_FALLBACK", "http://192.168.207.64:8090/v1/embeddings")
+    # No default: the previous default pointed at a host that no longer
+    # exists, so the default is now empty. Set MNEMOS_EMBED_HTTP_URL_FALLBACK
+    # to a trusted llama.cpp endpoint you configure.
+    return runtime_env_value("MNEMOS_EMBED_HTTP_URL_FALLBACK", "")
 
 
 def embed_http_model_env() -> str:
@@ -1670,7 +1673,11 @@ def embed_max_chars_env() -> int:
 
 
 def reranker_url_env() -> str:
-    return runtime_env_value("MNEMOS_RERANKER_URL", "http://192.168.207.64:8091/v1/rerank")
+    # No default: the previous default pointed at a host that no longer
+    # exists, so the default is now empty. Set MNEMOS_RERANKER_URL to a
+    # trusted llama.cpp --rerank endpoint you configure; empty means rerank
+    # is disabled (caller falls back to no-rerank).
+    return runtime_env_value("MNEMOS_RERANKER_URL", "")
 
 
 def reranker_model_env() -> str:

@@ -25,7 +25,10 @@ import httpx
 
 # ── Config ────────────────────────────────────────────────────────────────
 DSN = os.environ.get("MNEMOS_DATABASE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1")
-EMBED_URL = os.environ.get("MNEMOS_EMBED_HTTP_URL", "http://192.168.207.64:8090/v1/embeddings")
+# No default: the previous default pointed at a host that no longer
+# exists, so the default is now empty. Point MNEMOS_EMBED_HTTP_URL at a
+# trusted llama.cpp /v1/embeddings endpoint you configure.
+EMBED_URL = os.environ.get("MNEMOS_EMBED_HTTP_URL", "")
 EMBED_MODEL = os.environ.get("MNEMOS_EMBED_HTTP_MODEL", "bge-m3")
 BATCH_SIZE = int(os.environ.get("BACKFILL_BATCH_SIZE", "32"))
 MAX_TEXT_CHARS = 6000  # ~1500 tokens safe under bge-m3 n_ctx=8192 with margin
@@ -175,6 +178,43 @@ class _Db2Backend:
         cur.close()
 
 
+def _validate_embed_url(url: str) -> str:
+    """Fail fast when no embedding endpoint is configured.
+
+    The script previously carried a default for ``MNEMOS_EMBED_HTTP_URL``.
+    That default pointed at a host that no longer exists, so the default is
+    now empty — which means a run with no env var would otherwise connect to
+    the database, fetch a batch, and then hit ``embed_batch()`` with a blank
+    URL. ``httpx`` raises
+    on that POST, ``embed_batch`` returns ``None``, and the script exits 1 with
+    a generic "embed endpoint failing" message that blames the endpoint instead
+    of naming the missing configuration.
+
+    Returns the stripped URL on success; writes a diagnostic to stderr and
+    raises ``SystemExit(2)`` when the URL is empty or not an http(s) URL.
+    """
+    cleaned = (url or "").strip()
+    if not cleaned:
+        print(
+            "[backfill] ERROR: no embedding endpoint configured. Set "
+            "MNEMOS_EMBED_HTTP_URL to a trusted OpenAI-compatible "
+            "/v1/embeddings URL (e.g. http://HOST:PORT/v1/embeddings); "
+            "there is no default, so this must be set explicitly.",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(2)
+    scheme = cleaned.split("://", 1)[0].lower() if "://" in cleaned else ""
+    if scheme not in ("http", "https"):
+        print(
+            f"[backfill] ERROR: MNEMOS_EMBED_HTTP_URL must be an http(s) URL, got {cleaned!r}.",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(2)
+    return cleaned
+
+
 def _make_backend(dsn: str):
     scheme = dsn.split("://", 1)[0].lower() if "://" in dsn else ""
     if scheme == "oracle":
@@ -188,10 +228,16 @@ def _make_backend(dsn: str):
 
 
 # ── Embed ─────────────────────────────────────────────────────────────────
-async def embed_batch(client, texts):
-    """POST batch to the embed server; returns (vectors, elapsed_seconds)."""
+async def embed_batch(client, texts, url: str | None = None):
+    """POST batch to the embed server; returns (vectors, elapsed_seconds).
+
+    ``url`` defaults to the module-level ``EMBED_URL`` (read at import time
+    from ``MNEMOS_EMBED_HTTP_URL``); ``main()`` passes its validated URL
+    explicitly so a caller can never reach the POST with an empty URL.
+    """
+    embed_url = url if url is not None else EMBED_URL
     t0 = time.monotonic()
-    r = await client.post(EMBED_URL, json={"model": EMBED_MODEL, "input": texts}, timeout=60.0)
+    r = await client.post(embed_url, json={"model": EMBED_MODEL, "input": texts}, timeout=60.0)
     dt = time.monotonic() - t0
     if r.status_code != 200:
         print(f"  EMBED FAIL status={r.status_code} body={r.text[:200]}", flush=True)
@@ -207,8 +253,15 @@ async def embed_batch(client, texts):
 
 
 async def main():
+    # Fail fast, before touching the database, when no embedding endpoint is
+    # configured. See _validate_embed_url() for why the empty-URL case is a
+    # hard error rather than a "try and see" POST.
+    embed_url = _validate_embed_url(EMBED_URL)
     backend = _make_backend(DSN)
-    print(f"[backfill] backend={backend.scheme} EMBED_URL={EMBED_URL} MODEL={EMBED_MODEL} BATCH={BATCH_SIZE}", flush=True)
+    print(
+        f"[backfill] backend={backend.scheme} EMBED_URL={embed_url} MODEL={EMBED_MODEL} BATCH={BATCH_SIZE}",
+        flush=True,
+    )
     conn = backend.connect()
 
     total_remaining = backend.count_remaining(conn)
@@ -226,7 +279,7 @@ async def main():
                 break
             ids = [x[0] for x in batch]
             texts = [x[1] for x in batch]
-            vecs, dt = await embed_batch(client, texts)
+            vecs, dt = await embed_batch(client, texts, embed_url)
             if vecs is None:
                 # Without persistence the same rows come back; bail to avoid a hot loop.
                 print(f"  skip batch (embed fail), batch_ids[0]={ids[0]}", flush=True)
@@ -242,7 +295,7 @@ async def main():
             eta = (total_remaining - done) / rate if rate > 0 else float("inf")
             print(
                 f"  batch ok: +{n} rows ({done}/{total_remaining}) "
-                f"embed={dt*1000:.0f}ms rate={rate:.1f} rows/s eta={eta:.0f}s",
+                f"embed={dt * 1000:.0f}ms rate={rate:.1f} rows/s eta={eta:.0f}s",
                 flush=True,
             )
     conn.close()
