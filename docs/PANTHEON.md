@@ -559,9 +559,8 @@ gunicorn mnemos.api.pantheon_shadow:app \
 
 `deploy/pantheon/` carries the ops artifacts for that topology:
 `pantheon-gunicorn.sh` (validated launcher), `pantheon-gunicorn.env.example`
-(environment template), `pantheon-gateway.service` (systemd unit), a
-review-only reverse-proxy site snippet, and a README with the VIP-stable
-cutover and one-line rollback.
+(environment template), `pantheon-gateway.service` (systemd unit), and a
+README with the endpoint-stable cutover and one-line rollback.
 
 **Shared state is a precondition for a multi-worker pool.** Cooldown, breaker,
 and request-limit state are process-local by default, which is wrong the moment

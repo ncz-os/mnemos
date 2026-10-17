@@ -101,9 +101,9 @@ the console-script shim named above.
 **Shadow gateway.** The OpenAI-compatible gateway runs as
 `mnemos.api.pantheon_shadow:app` — single-process on a shadow port for dev,
 and as a gunicorn/uvicorn worker pool bound to loopback for production, with
-the reverse proxy keeping the public VIP stable. `deploy/pantheon/` carries the
-validated launcher, the environment template, the systemd unit, a review-only
-proxy site snippet, and the cutover/rollback README.
+the reverse proxy keeping the public endpoint stable. `deploy/pantheon/`
+carries the validated launcher, the environment template, the systemd unit,
+and the cutover/rollback README.
 `scripts/pantheon_shadow_smoke.py` exercises health, chat, tool-call
 passthrough, and `/responses` routing against a running gateway.
 `MNEMOS_PANTHEON_GATEWAY_RATE_LIMIT` is a first-class setting in

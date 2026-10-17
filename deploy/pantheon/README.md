@@ -1,8 +1,8 @@
 # PANTHEON production worker-pool cutover
 
-This directory contains **ops artifacts only** for moving the stable `:4100`
-VIP from the single-process shadow/dev launch to a production PANTHEON worker
-pool behind Caddy.
+This directory contains **ops artifacts only** for moving the public gateway
+endpoint from the single-process shadow/dev launch to a production PANTHEON
+worker pool behind a reverse proxy.
 
 Current dev launch:
 
@@ -19,9 +19,9 @@ gunicorn mnemos.api.pantheon_shadow:app \
   -b 127.0.0.1:4110
 ```
 
-Caddy remains the public `:4100` VIP. Gunicorn listens on loopback
-`127.0.0.1:4110`, so the VIP address and client endpoint stay stable during
-cutover and rollback.
+Caddy (or your reverse proxy) remains the public endpoint. Gunicorn listens
+on loopback `127.0.0.1:4110`, so the client-facing address stays stable
+during cutover and rollback.
 
 ## Files
 
@@ -29,8 +29,6 @@ cutover and rollback.
 - `pantheon-gunicorn.env.example` — environment template for
   `/etc/mnemos/pantheon-gateway.env`.
 - `pantheon-gateway.service` — systemd unit for the worker pool.
-- `Caddyfile.pantheon-vip-4100.snippet` — review-only Caddy site snippet for
-  the `:4100` VIP. It is intentionally not the live Caddy config.
 
 ## Shared state requirements
 
@@ -72,21 +70,21 @@ Tune `/etc/mnemos/pantheon-gateway.env` before enabling the service, especially
 `WEB_CONCURRENCY`, `MNEMOS_NATS_URL`, auth settings, and the shared rate-limit
 storage URI.
 
-## VIP-stable cutover
+## Endpoint-stable cutover
 
 1. Start and health-check `pantheon-gateway.service` on `127.0.0.1:4110`.
 2. Confirm NATS shared state and the configured rate limit are present in every
    worker environment.
-3. Review `Caddyfile.pantheon-vip-4100.snippet` against the live Caddy site.
-4. During the window, change only the live `:4100` upstream to
-   `127.0.0.1:4110`, then reload Caddy.
-5. Validate `curl -fsS http://127.0.0.1:4100/health` and an OpenAI-compatible
-   `/v1/models` request through the VIP.
+3. During the window, change only the live reverse-proxy upstream to
+   `127.0.0.1:4110`, then reload the proxy.
+4. Validate `curl -fsS http://127.0.0.1:4110/health` and an OpenAI-compatible
+   `/v1/models` request through the endpoint.
 
 ## Rollback
 
-One-line rollback: point the live Caddy `reverse_proxy` upstream back to
-`inference-api` (the pre-cutover upstream) and reload Caddy.
+One-line rollback: point the live reverse-proxy upstream back to its
+pre-cutover upstream and reload the proxy.
 
 Leave `pantheon-gateway.service` running during rollback if you want a fast
-re-attempt; stop it only after the VIP is confirmed back on the old upstream.
+re-attempt; stop it only after the endpoint is confirmed back on the old
+upstream.

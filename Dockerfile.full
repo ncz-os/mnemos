@@ -59,10 +59,12 @@ RUN python -m pip install --no-deps --no-build-isolation .
 #   MNEMOS_EMBED_OV_DEVICE=AUTO   # OpenVINO device hint: AUTO | CPU | GPU | NPU
 #   OV_CACHE_DIR=/opt/mnemos/ov_cache
 # (plus the GGUF download step from the canonical Dockerfile).
+# Legacy-embedding deployments set INFERENCE_EMBED_HOST to their own
+# reachable Ollama endpoint (e.g. http://localhost:11434). No default
+# endpoint is baked in.
 ENV PG_USER=mnemos_user \
     PG_DATABASE=mnemos \
     PG_HOST=postgres \
-    INFERENCE_EMBED_HOST=http://ollama:11434 \
     MNEMOS_BIND=0.0.0.0 \
     MNEMOS_PORT=5002 \
     PYTHONUNBUFFERED=1

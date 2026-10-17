@@ -689,7 +689,8 @@ class MemorySearchRequest(BaseModel):
     recency_weight: float = Field(0.15, ge=0.0, le=1.0)
     # v6.2 M-2.2.3: retrieval profile dispatcher.
     # fast = semantic-only no rerank; balanced = current behavior (default);
-    # deep = semantic + cross-encoder rerank via a fallback host :8091.
+    # deep = semantic + cross-encoder rerank via a configured reranker host
+    # (MNEMOS_RERANKER_URL; no default).
     # Unknown values → 400 in route handler.
     profile: Optional[str] = None
     # v6.2 M-2.2.4: per-category temporal-decay override map.
