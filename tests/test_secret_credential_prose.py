@@ -199,6 +199,195 @@ def test_quoted_multiword_passphrase_redacted():
     assert "correct horse battery staple" not in masked
 
 
+# ── git branch names in handoff prose are NOT credential records ──────
+# False positive: progress notes mentioning branch names such as
+# "live/server-snapshot-20261017" were parsed as "user/password" records;
+# with multi_span two of them VAULTED the whole memory (mem_1792203811772_2aeb26,
+# mem_1792205082552_b1244a).
+BRANCH_NAMES = [
+    "live/server-snapshot-20261017",
+    "fix/api-unknown-agent-409-20261016",
+    "fix/workers-reconcile-timer-20261016",
+    "feat/phase6-model-router-registry-20261016-clean",
+    # unprefixed branch names quoted in notes (hyphen-joined slug on RHS
+    # carrying a date-like structural segment — review)
+    "alice/server-snapshot-20261017",
+    "alice/rollback-v1.2.3",
+]
+
+# Unprefixed hyphen-joined names WITHOUT a structural marker are NOT
+# exemptible by shape 2 alone: passphrase/diceware credentials use exactly
+# that shape (review — that was a security regression), so they
+# stay flagged as cred_record_token.
+PASSPHRASE_RECORDS = [
+    "alice/correct-horse-battery-staple",
+    "admin:blue-river-lamp",
+]
+
+# The common ref prefix sits on the LEFT of the "/" (the record's "user"
+# half), not inside the slug — review finding. Every prefix
+# must exempt, including one-segment right halves and short segments.
+# Only shape 1 gets this latitude; the unprefixed shape needs a structural
+# marker (see PASSPHRASE_RECORDS / NON_BRANCH_SLUGS).
+PREFIXED_BRANCH_NAMES = [
+    "fix/abc",
+    "feat/v1-update",
+    "chore/bump-deps",
+    "docs/api-v2",
+    "live/snapshot",
+    "wip/x-y",
+    "review/pr-12",
+    "release/7-0-5",
+    "hotfix/urgent-patch",
+    "deploy/prod-20261017",
+    "canonical/stamp",
+    "audit/lo-gs",
+    "refs/heads-ab",
+    "origin/main-abc",
+    "fix/a-b-c",
+]
+
+# real user/password records that MUST stay flagged
+REAL_RECORDS = [
+    "alice/Tr0ub4dor&3",
+    "root:Xk9#mixedCase!7",
+    "admin/P@ssw0rd123",
+    # structural-marker-free slugs must never be a blanket exemption
+    "alice/correct-horse-battery-staple",
+    "admin:blue-river-lamp",
+]
+
+# unprefixed branch names whose ONLY structural marker is a date / version.
+UNPREFIXED_BRANCH_NAMES = [
+    # bare slug (no separator): the record must be CLEAN either way
+    "server-snapshot-20261017",
+    "alice/server-snapshot-20261017",
+    "alice/api-unknown-agent-409-20261016",
+    "alice/rollback-v1.2.3",
+    "alice/rollback-7.0.5-release",
+]
+
+# slugs that DO look like passphrases (no date/version/id segment); "409"
+# alone is a plain word-ish segment and is not a structural marker.
+NON_BRANCH_SLUGS = [
+    "correct-horse-battery-staple",
+    "blue-river-lamp",
+    "horse-battery-staple",
+    "server-snapshot-409",
+]
+
+
+@pytest.mark.parametrize(
+    "branch", BRANCH_NAMES + PREFIXED_BRANCH_NAMES + UNPREFIXED_BRANCH_NAMES
+)
+def test_branch_name_is_not_a_credential_record(branch):
+    finding = classify(branch)
+    assert finding.cls is SecretClass.CLEAN, (branch, finding.reasons)
+    assert "cred_record_token" not in finding.reasons
+    assert redact_content(branch) == branch
+
+
+@pytest.mark.parametrize("record", PASSPHRASE_RECORDS)
+def test_passphrase_record_is_still_a_credential(record):
+    """Shape 2 (unprefixed hyphen-joined slug) must not exempt diceware
+    passphrases: no date/version segment means no branch-name marker."""
+    finding = classify(record)
+    assert finding.cls is SecretClass.REDACT, (record, finding.reasons)
+    assert "cred_record_token" in finding.reasons
+    masked = redact_content(record)
+    assert masked != record
+    password = record.replace(":", "/").partition("/")[2]
+    assert password not in masked
+
+
+@pytest.mark.parametrize(
+    "user,slug",
+    [
+        # prefix on the LEFT half exempts even a single-segment, short slug
+        ("live", "snapshot"),
+        ("fix", "a-b-c"),
+        ("feat", "v1-update"),
+        ("origin", "main"),
+        # a non-prefix user does not make a slug one... unless the slug
+        # carries a structural marker (date id / version)
+        ("alice", "Tr0ub4dor&3"),
+        ("alice", "correct-horse-battery-staple"),
+        ("admin", "blue-river-lamp"),
+        ("alice", "horse-battery-staple"),
+        ("alice", "server-snapshot-409"),
+    ],
+)
+def test_record_helper_sees_the_left_half(user, slug):
+    """The git-ref prefix lives in the record's user half, so the helper
+    must consult it — checking the slug alone never matches 'live/...'."""
+    from mnemos.core.secret_detection import _record_password_is_git_ref
+
+    if user in {"live", "fix", "feat", "origin"}:
+        assert _record_password_is_git_ref(user, slug) is True, (user, slug)
+    else:
+        assert _record_password_is_git_ref(user, slug) is False, (user, slug)
+
+
+@pytest.mark.parametrize(
+    "user,slug",
+    [
+        ("alice", "server-snapshot-20261017"),
+        ("alice", "server-snapshot-12345"),
+        ("alice", "rollback-v1.2.3"),
+        ("alice", "rollback-7.0.5"),
+        ("alice", "api-unknown-agent-409-20261016"),
+    ],
+)
+def test_unprefixed_slug_with_structural_marker_is_a_branch(user, slug):
+    """Shape 2 needs a structural marker (>=4-digit id/date or a version)."""
+    from mnemos.core.secret_detection import _record_password_is_git_ref
+
+    assert _record_password_is_git_ref(user, slug) is True, (user, slug)
+
+
+@pytest.mark.parametrize("slug", NON_BRANCH_SLUGS)
+def test_unprefixed_passphrase_slug_is_not_a_branch(slug):
+    from mnemos.core.secret_detection import _record_password_is_git_ref
+
+    assert _record_password_is_git_ref("alice", slug) is False, slug
+
+
+@pytest.mark.parametrize("record", REAL_RECORDS)
+def test_real_user_password_record_still_flagged(record):
+    finding = classify(record)
+    assert finding.cls is SecretClass.REDACT, (record, finding.reasons)
+    assert "cred_record_token" in finding.reasons
+    masked = redact_content(record)
+    assert masked != record
+    # the password half never survives retrieval
+    user, _, password = record.replace(":", "/").partition("/")
+    assert password not in masked
+
+
+def test_branch_names_in_progress_prose_stay_clean():
+    """Two branch names in one handoff note must not trip multi_span/VAULT."""
+    notes = [
+        "Pushed live/server-snapshot-20261017 and "
+        "fix/api-unknown-agent-409-20261016, both green on CI.",
+        "branches: fix/workers-reconcile-timer-20261016 vs "
+        "feat/phase6-model-router-registry-20261016-clean",
+        "Handoff: fix/abc-20261016 // live/server-snapshot-20261017 // "
+        "feat/phase6-model-router-registry-20261016-clean",
+        "Live: canonical/deploy-stamp-20261017 "
+        "(see origin/live/server-snapshot-20261017)",
+    ]
+    for text in notes:
+        finding = classify(text)
+        assert finding.cls is SecretClass.CLEAN, (text, finding.reasons)
+        assert redact_content(text) == text
+
+
+def test_multiple_real_records_still_vault():
+    """The branch-name exemption must not weaken multi_span on real records."""
+    finding = classify("creds admin/P@ssw0rd123 and root:Xk9#mixedCase!7")
+    assert finding.cls is SecretClass.VAULT, finding.reasons
+
+
 def test_uri_redaction_preserves_trailing_punctuation():
     t = "see (postgres://u:secretpass@h/db) for details."
     masked = redact_content(t)
@@ -496,3 +685,23 @@ class _AliceUser:
     namespace = "alice-ns"
     role = "user"
     group_ids: list = []
+
+
+# Credential-shaped records that merely look a little like branch names must
+# stay detectable: a letter+digit segment ("hunter2", "x9q") without a date or
+# version marker, or a bare 4-digit year in an unprefixed record.
+BRANCH_SHAPED_CREDENTIALS = [
+    "fix/hunter2-x9q",
+    "fix/pass2-v3",
+    "alice/hunter2-2024-secret",
+]
+
+
+@pytest.mark.parametrize("record", BRANCH_SHAPED_CREDENTIALS)
+def test_branch_shaped_credential_is_not_exempt(record):
+    from mnemos.core.secret_detection import _record_password_is_git_ref
+
+    user, _, slug = record.partition("/")
+    assert _record_password_is_git_ref(user, slug) is False, record
+    finding = classify(record)
+    assert finding.cls is SecretClass.REDACT, (record, finding.reasons)
