@@ -1,6 +1,22 @@
 {
   "schema_version": "1.0",
-  "updated_at": "2026-05-25T08:30:00Z",
+  "updated_at": "2026-10-17T00:00:00Z",
+  "_policy_audit": {
+    "last_review": "2026-10-17",
+    "reviewer": "policy-review",
+    "decisions": [
+      "embeddings and rerank task routes are NOT in use_case_routing — memory text must not be sent to a third-party cloud by default; cloud models are opt-in only via the B_embedding and B_rerank tier lists",
+      "vision_reasoning is allowed to use siliconflow because the input is an image, not memory text",
+      "all other use_case_routing primaries are either self-hosted endpoints or first-party cloud providers with normal rate-limit agreements"
+    ],
+    "rationale": "The embeddings and rerank use_case_routing entries had been repointed to siliconflow, which would send MNEMOS memory text to a third-party cloud. The review removed those two task-route entries and added tests that lock in the policy: tests/test_no_private_default_endpoints.py::test_provider_registry_has_no_cloud_default_for_embeddings_rerank and test_llm_pick_loader_tolerates_absent_embeddings_rerank_keys. The same review corrected a docker-compose service-name confusion (INFERENCE_EMBED_HOST pointing at container-localhost) and added empty-URL guards to the cross-encoder reranker and HTTP embed backend at the PUBLIC CALL SITES (Reranker.rerank and _HttpBackend.{embed_async, embed_batch_async, _load_sync}).",
+    "defects_fixed": [
+      "HIGH  data/llm_provider_registry.json — removed the embeddings and rerank task-route entries from use_case_routing; a cloud provider would have sent MNEMOS memory text to a third party. Pre-existing B_embedding / B_rerank tier lists kept intact as the sanctioned opt-in.",
+      "HIGH  docker-compose.yml — INFERENCE_EMBED_HOST pinned to http://ollama:11434 (the compose service, NOT localhost, which resolves to the container's own loopback). Guarded by tests/test_no_private_default_endpoints.py::test_compose_embed_host_points_at_compose_ollama_service.",
+      "MEDIUM mnemos/domain/search/reranker.py — public-call-site empty-URL guard in Reranker.rerank() runs BEFORE any client construction, BEFORE any breaker accounting, and BEFORE any network I/O; logs once at INFO when MNEMOS_RERANKER_URL is unset. Without this guard every call would build an httpx client with an empty base URL and POST to it, spamming connect-failure warnings until the breaker opened. Verified by tests/test_reranker_empty_url.py::test_rerank_empty_url_short_circuits_before_httpx_post and test_rerank_empty_url_logs_once.",
+      "MEDIUM mnemos/runtime/embedder.py _HttpBackend — public-call-site empty-URL guard in _HttpBackend.embed_async, _HttpBackend.embed_batch_async, and _HttpBackend._load_sync runs BEFORE any client construction, BEFORE any breaker accounting, and BEFORE any network I/O; logs once at INFO when MNEMOS_EMBED_HTTP_URL is unset. Empty MNEMOS_EMBED_HTTP_URL_FALLBACK is already skipped at the HybridHttpEmbedder construction site. Verified by the empty-URL short-circuit and one-shot disabled-notice tests in tests/test_inprocess_embedder.py."
+    ]
+  },
   "authoritative_source": "mnemos-prod-working/data/llm_provider_registry.json",
   "served_at": "http://192.168.207.67:5002/state/llm_registry",
   "promo_deadlines": {
@@ -38,14 +54,6 @@
       "models": {
         "gemma4-consult": {"cost_in_per_m": 0, "cost_out_per_m": 0, "quality": 0.78, "p50_latency_s": 3, "tier": "S_free", "tags": ["always-on","surgical"], "notes": "llama.cpp gemma-4-31B-it-UD-Q4_K_XL; ctx 16384 fixed for VRAM fit"},
         "qwen2.5-coder:14b-instruct-q6_K": {"cost_in_per_m": 0, "cost_out_per_m": 0, "quality": 0.74, "p50_latency_s": 26, "tier": "S_free", "tags": ["surgical-coder","load-on-demand"], "notes": "Ollama keep_alive=0"}
-      }
-    },
-    "local_medusa": {
-      "base_url": "http://192.168.207.64:8090/v1",
-      "auth_env": null,
-      "models": {
-        "bge-m3-embedding": {"cost_in_per_m": 0, "cost_out_per_m": 0, "ctx": 8192, "tier": "S_free", "tags": ["embedding","fleet"], "notes": "1024d, Vulkan"},
-        "bge-rerank": {"cost_in_per_m": 0, "cost_out_per_m": 0, "tier": "S_free", "tags": ["rerank","v6.2-m223"]}
       }
     },
     "groq": {
@@ -189,11 +197,9 @@
       "gemini.gemini-2.5-flash"
     ],
     "B_embedding": [
-      "local_medusa.bge-m3-embedding",
       "siliconflow.Qwen/Qwen3-Embedding-8B"
     ],
     "B_rerank": [
-      "local_medusa.bge-rerank",
       "siliconflow.Qwen/Qwen3-Reranker-8B"
     ],
     "C_g1_critical": [
@@ -212,8 +218,6 @@
     "architecture_audit": {"primary": "ngc_integrate.nvidia/nemotron-3-super-120b-a12b", "params": {"thinking": false}},
     "long_context_500k_plus": {"primary": "ngc_integrate.minimaxai/minimax-m2.7", "secondary": "deepseek-direct.deepseek-v4-pro"},
     "agent_loop_speed": {"primary": "groq.llama-3.3-70b-versatile", "secondary": "groq.llama-3.1-8b-instant"},
-    "embeddings": {"primary": "local_medusa.bge-m3-embedding"},
-    "rerank": {"primary": "local_medusa.bge-rerank"},
     "transcription": {"primary": "groq.whisper-large-v3-turbo"},
     "vision_reasoning": {"primary": "siliconflow.Qwen/Qwen3.6-27B"}
   },
@@ -230,7 +234,6 @@
     "ngc_integrate": 999999,
     "ngc_inference": 999999,
     "local_cerberus": 999999,
-    "local_medusa": 999999,
     "TOTAL_TARGET": 200
   }
 }

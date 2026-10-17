@@ -565,7 +565,7 @@ async def _main() -> None:
     ap.add_argument(
         "--embed-url",
         default="",
-        help="Ollama base URL for real embeddings, e.g. http://192.168.207.67:11434. "
+        help="Ollama base URL for real embeddings, e.g. http://localhost:11434. "
         "If omitted, random unit vectors are used.",
     )
     ap.add_argument(

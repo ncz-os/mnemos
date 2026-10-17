@@ -12,8 +12,10 @@ class SearchProfile(str, Enum):
       skills (portfolio_ask etc).
     - ``balanced``: current behavior — semantic + FTS union,
       recency-weighted. Default for interactive callers.
-    - ``deep``: semantic + cross-encoder rerank top-100 → top-30 via
-      a fallback host :8091 bge-reranker-v2-m3. p99 ≤ 5s for `synthesize` /
+    - ``deep``: semantic + cross-encoder rerank top-100 → top-30 via a
+      configured reranker host (bge-reranker-v2-m3; see
+      ``MNEMOS_RERANKER_URL`` — there is no default, so with none
+      configured this degrades to no-rerank). p99 ≤ 5s for `synthesize` /
       `narrate` consumers.
     """
 

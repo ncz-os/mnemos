@@ -11,7 +11,7 @@ Usage::
     PG_STANDBY_DSN="postgresql://mnemos_user:mnemos_local@localhost:5434/mnemos" \
     BENCH_HMAC_KEY="mnemos-bench-v2" \
     .venv/bin/python scripts/bench_ha_pg.py \
-      --embed-url http://192.168.207.67:11434 \
+      --embed-url http://localhost:11434 \
       --n-records 2000 --repeat 50
 
 The script inserts n-records into the PRIMARY, waits for replication lag to
@@ -30,7 +30,7 @@ import uuid
 import asyncpg
 import httpx
 
-_EMBED_URL = os.environ.get("EMBED_URL", "http://192.168.207.67:11434")
+_EMBED_URL = os.environ.get("EMBED_URL", "http://localhost:11434")
 _EMBED_MODEL = "nomic-embed-text"
 _POOL: list[list[float]] = []
 
@@ -190,7 +190,7 @@ async def _main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--primary-dsn", default=os.environ.get("PG_PRIMARY_DSN", "postgresql://mnemos_user:mnemos_local@localhost:5433/mnemos"))
     ap.add_argument("--standby-dsn", default=os.environ.get("PG_STANDBY_DSN", "postgresql://mnemos_user:mnemos_local@localhost:5434/mnemos"))
-    ap.add_argument("--embed-url", default=os.environ.get("EMBED_URL", "http://192.168.207.67:11434"))
+    ap.add_argument("--embed-url", default=os.environ.get("EMBED_URL", "http://localhost:11434"))
     ap.add_argument("--n-records", type=int, default=2000)
     ap.add_argument("--repeat", type=int, default=50)
     ap.add_argument("--pool-size", type=int, default=256)
