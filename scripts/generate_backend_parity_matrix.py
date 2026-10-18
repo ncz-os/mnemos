@@ -126,6 +126,55 @@ BACKEND_CLASSES: dict[str, tuple[str, str]] = {
     "db2": ("mnemos.persistence.db2", "Db2Backend"),
 }
 
+# ---------------------------------------------------------------------------
+# Hand-verified split of the 34 "no surface, no test" cells (backlog section
+# 6, 2026-10-17). These two frozensets are the *authoritative* enumeration
+# and are hard-asserted against the live matrix in :func:`_render_markdown`,
+# so any future change that moves a correctly-absent cell into the surface
+# (or drops a real-backlog cell) fails the build. This is the mechanism that
+# stops the matrix from producing false work again.
+# ---------------------------------------------------------------------------
+
+_NON_PG = frozenset({"sqlite", "mysql", "mariadb", "oracle", "db2"})
+
+# Postgres-only rows: each non-Postgres backend is correctly absent.
+# RLS / LISTEN-NOTIFY / advisory locks are Postgres server features; the
+# HTTP-trigger and kronos routes both call require_postgres_pool_or_503.
+_PG_ONLY_ROWS = (
+    "row_level_security",
+    "listen_notify",
+    "advisory_locks",
+    "morpheus_http_trigger",
+    "kronos_routes",
+)
+
+_CORRECTLY_ABSENT_CELLS: frozenset[tuple[str, str]] = frozenset(
+    (row, backend) for row in _PG_ONLY_ROWS for backend in _NON_PG
+)
+
+# Real backlog: surface should exist but does not.
+_REAL_BACKLOG_CELLS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("sessions", "mysql"),
+        ("sessions", "mariadb"),
+        ("consultations", "mariadb"),
+        ("acl", "mysql"),
+        ("acl", "mariadb"),
+        ("journal", "mysql"),
+        ("journal", "mariadb"),
+        ("ledger", "mysql"),
+        ("ledger", "mariadb"),
+    }
+)
+
+assert not (_CORRECTLY_ABSENT_CELLS & _REAL_BACKLOG_CELLS), (
+    "correctly-absent and real-backlog cells must be disjoint"
+)
+assert len(_CORRECTLY_ABSENT_CELLS) + len(_REAL_BACKLOG_CELLS) == 34, (
+    f"34-cell split must sum to 34, got "
+    f"{len(_CORRECTLY_ABSENT_CELLS)} + {len(_REAL_BACKLOG_CELLS)}"
+)
+
 
 # ---------------------------------------------------------------------------
 # Capability rows.
@@ -141,7 +190,7 @@ class Capability:
     # Logical key used to grep tests. Lower-case, ASCII.
     test_keyword: str
     # Where the implementation lives.
-    impl_kind: str  # one of: "repo_property", "capability_details", "route_gate", "federation_journal"
+    impl_kind: str  # one of: "repo_property", "capability_details", "route_gate", "federation_journal", "webhook_repo", "flag"
     # The facade property or attribute name to inspect for ``implemented``.
     # Multiple names are tried in order; the first that resolves wins.
     impl_property: tuple[str, ...]
@@ -231,13 +280,19 @@ def _capabilities() -> tuple[Capability, ...]:
         ),
         Capability(
             id="webhooks",
-            label="webhooks (end-to-end delivery)",
+            label="webhooks (WebhookRepository: CRUD + delivery lifecycle)",
             test_keyword="webhook",
-            impl_kind="flag",
-            impl_property=("supports_webhooks",),
+            impl_kind="webhook_repo",
+            impl_property=("webhooks",),
             note=(
-                "End-to-end delivery (claim/send/finalize worker required); "
-                "the WebhookRepository CRUD accessor is intentionally broader."
+                "Detected via the facade's ``.webhooks`` WebhookRepository "
+                "accessor (claim_due_deliveries / finalize_delivery / "
+                "dispatch_event / repair), NOT via the runtime "
+                "``supports_webhooks`` flag — every backend that implements "
+                "the ABC exposes the accessor, and that is the surface this "
+                "matrix inventories. The delivery worker still refuses to "
+                "dispatch on backends whose flag is False (see "
+                "docs/BACKEND_PARITY.md, 'Webhook surface vs delivery flag')."
             ),
         ),
         Capability(
@@ -1825,6 +1880,16 @@ def _build_matrix() -> list[Cell]:
                 view = _get_backend_view(backend)
                 if cap.impl_kind == "repo_property":
                     impl = _property_implemented(view, cap.impl_property)
+                elif cap.impl_kind == "webhook_repo":
+                    # Facade surface for the WebhookRepository: the `.webhooks`
+                    # accessor must exist and return a real repository
+                    # instance (not raise / not return None). This is
+                    # intentionally *wider* than the runtime
+                    # ``supports_webhooks`` flag so that backends which
+                    # implement the ABC without a dedicated flag (sqlite,
+                    # mysql, mariadb, oracle, db2) are not silently dropped
+                    # from the matrix (regression: f5352a6c, backlog section 6).
+                    impl = _property_implemented(view, cap.impl_property)
                 elif cap.impl_kind == "flag":
                     impl = _class_attr_implemented(view, cap.impl_property)
                 elif cap.impl_kind == "capability_details":
@@ -1876,6 +1941,29 @@ def _render_markdown(cells: list[Cell]) -> str:
     # would be silently undercounting one of the categories — fail loudly
     # so the matrix never lies about itself.
     assert full_count + impl_only + stub_with_test + gaps == len(cells), f"category counts do not sum to {len(cells)}"
+
+    # Hand-verified 34-cell split (backlog section 6): every cell in
+    # _CORRECTLY_ABSENT_CELLS / _REAL_BACKLOG_CELLS must be a live "neither"
+    # cell right now. If the detector regresses (a Postgres-only cell gains
+    # surface, or a real-backlog cell gets a facade) the count changes and
+    # this assert fails the build — that is the guard that stops the matrix
+    # from producing false work again.
+    # (Skipped when cells is empty, e.g. the renderer test that calls
+    # _render_markdown([]) to exercise legend text only.)
+    if cells:
+        live_neither = {(c.capability, c.backend) for c in cells if not c.implemented and not c.tested}
+        missing_correctly_absent = _CORRECTLY_ABSENT_CELLS - live_neither
+        missing_real_backlog = _REAL_BACKLOG_CELLS - live_neither
+        assert not missing_correctly_absent, (
+            "correctly-absent cells no longer read 'neither' — a Postgres-only "
+            f"feature gained surface on a non-Postgres backend (or lost its "
+            f"route gate): {sorted(missing_correctly_absent)}"
+        )
+        assert not missing_real_backlog, (
+            "real-backlog cells no longer read 'neither' — a facade was added "
+            f"or a test landed (re-classify the cell in _REAL_BACKLOG_CELLS): "
+            f"{sorted(missing_real_backlog)}"
+        )
     # The header carries NO wall-clock timestamp and NO HEAD SHA on
     # purpose. Either would make the file a non-pure function of the
     # input tree (the timestamp ticks each second, the SHA changes
@@ -1930,6 +2018,130 @@ def _render_markdown(cells: list[Cell]) -> str:
         f"## Legend\n"
         f"\n"
         f"{legend}\n"
+        f"\n"
+        f"## Webhook surface vs delivery flag\n"
+        f"\n"
+        f"The ``webhooks`` row is keyed on the facade's ``.webhooks``\n"
+        f"``WebhookRepository`` accessor, not on the runtime\n"
+        f"``supports_webhooks`` flag. The flag gates whether the\n"
+        f"``dispatch_event`` *worker* actually fires end-to-end; the\n"
+        f"accessor exposes the repository (subscription CRUD,\n"
+        f"``claim_due_deliveries``, ``finalize_delivery``,\n"
+        f"``repair_delivery_chains``) and is implemented on every\n"
+        f"backend (verified 2026-10-17, backlog section 6). Before\n"
+        f"this fix the row was keyed on the flag, so sqlite/mysql/\n"
+        f"mariadb/oracle/db2 — all of which implement the ABC — read\n"
+        f"'test candidate, no surface' despite a fully wired facade\n"
+        f"accessor. The two signals are now reconciled: the matrix\n"
+        f"reflects the surface; the flag still controls delivery.\n"
+        f"\n"
+        f"## 34 'no surface, no test' cells — hand-verified split\n"
+        f"\n"
+        f"All 34 cells were hand-verified 2026-10-17. They fall into\n"
+        f"two disjoint classes: **correctly absent** (25) and **real\n"
+        f"backlog** (9). The split is recorded in the module-level\n"
+        f"constants ``_CORRECTLY_ABSENT_CELLS`` / ``_REAL_BACKLOG_CELLS``\n"
+        f"and is hard-asserted against the live matrix below, so any\n"
+        f"future change that moves a correctly-absent cell into the\n"
+        f"surface fails the build. That assertion is what stops the\n"
+        f"matrix from producing false work again.\n"
+        f"\n"
+        f"### Correctly absent (25) — MUST stay absent\n"
+        f"\n"
+        f"Postgres-only features that other backends cannot and must not\n"
+        f"claim. RLS / LISTEN-NOTIFY / advisory locks are Postgres\n"
+        f"server features; the ``morpheus_http_trigger`` and\n"
+        f"``kronos_routes`` rows both call ``require_postgres_pool_or_503``.\n"
+        f"Each of the five non-Postgres backends (sqlite, mysql, mariadb,\n"
+        f"oracle, db2) is correctly absent for all five of these rows.\n"
+        f"Blanket-closing these would write Postgres features onto\n"
+        f"backends that do not have them.\n"
+        f"\n"
+        f"* ``row_level_security`` (Postgres RLS) — sqlite, mysql, mariadb, oracle, db2\n"
+        f"* ``listen_notify`` (Postgres LISTEN/NOTIFY) — sqlite, mysql, mariadb, oracle, db2\n"
+        f"* ``advisory_locks`` (Postgres advisory locks) — sqlite, mysql, mariadb, oracle, db2\n"
+        f"* ``morpheus_http_trigger`` — sqlite, mysql, mariadb, oracle, db2\n"
+        f"* ``kronos_routes`` — sqlite, mysql, mariadb, oracle, db2\n"
+        f"\n"
+        f"(25 cells: 5 Postgres-only rows × 5 non-Postgres backends.)\n"
+        f"\n"
+        f"### Real backlog (9) — surface should exist but does not\n"
+        f"\n"
+        f"* ``sessions`` on mysql, mariadb — the ``.sessions`` facade\n"
+        f"  property is missing; the ABC declares it. Add a\n"
+        f"  ``SessionsRepository`` implementation + facade property.\n"
+        f"* ``consultations`` on mariadb — the facade property is missing;\n"
+        f"  the ABC declares it. Add a ``ConsultationsRepository``\n"
+        f"  implementation + facade property.\n"
+        f"* ``acl`` on mysql, mariadb — no facade property and no\n"
+        f"  ``AclRepository`` implementation for the MySQL family.\n"
+        f"  (SQLite's ``acl`` cell is in the 9-stub class, not here — it\n"
+        f"  has a test candidate but no surface.)\n"
+        f"* ``journal`` + ``ledger`` on mysql, mariadb — KNEMON\n"
+        f"  ``CorePersistence`` extras the MySQL family does not advertise\n"
+        f"  in ``capability_details``. Add the journal + ledger tables\n"
+        f"  and queries for the MySQL dialect.\n"
+        f"\n"
+        f"## 9 'test candidate for a stub' cells — disposition\n"
+        f"\n"
+        f"Before this fix the matrix reported 9 such cells. 5 of them were\n"
+        f"false (``webhooks`` on the five non-Postgres backends — see\n"
+        f"'Webhook surface vs delivery flag'); the fix re-keys that row on\n"
+        f"the facade accessor, so they now read 'surface + test\n"
+        f"candidate'. 4 are genuine stubs and are dispositioned here.\n"
+        f"The regenerated matrix therefore reports 4 cells in this class.\n"
+        f"\n"
+        f"* ``webhooks`` on sqlite, mysql, mariadb, oracle, db2 (5 cells) —\n"
+        f"  **RESOLVED by this fix.** The facade ``.webhooks`` property is\n"
+        f"  now detected, so these cells flip to 'surface + test\n"
+        f"  candidate'. No xfail needed.\n"
+        f"* ``consultations`` on mysql (1 cell) — **xfail** (reason:\n"
+        f"  'MysqlBackend has no ConsultationsRepository implementation;\n"
+        f"  the facade property is absent').\n"
+        f"* ``audit_chain`` on mysql + mariadb (2 cells) — **xfail**\n"
+        f"  (reason: 'MySQL family audit_chain returns None by contract;\n"
+        f"  the test exercises the None-contract, not a live stub').\n"
+        f"* ``acl`` on sqlite (1 cell) — **xfail** (reason:\n"
+        f"  'SqliteBackend has no AclRepository implementation; SQLite is\n"
+        f"  the single-user tier and the ACL grant/revoke/list management\n"
+        f"  surface is not wired — the read predicate still works via the\n"
+        f"  memory_acl EXISTS-clause').\n"
+        f"\n"
+        f"## 44 'surface, no test candidate' — production-risk priority\n"
+        f"\n"
+        f"Production runs ``OracleBackend``. The Oracle rows in the 44\n"
+        f"that read 'surface, no test candidate' are the highest risk\n"
+        f"because a silent regression on a backend we actually deploy\n"
+        f"would not be caught. Priority order (highest first), Oracle\n"
+        f"cells only:\n"
+        f"\n"
+        f"1. **oracle / kg** — knowledge-graph triple persistence; a\n"
+        f"   regression silently breaks KG reads on the production backend.\n"
+        f"2. **oracle / versions** — per-memory version history (HEAD/\n"
+        f"   branches); a regression silently corrupts version lineage.\n"
+        f"3. **oracle / compression** — compressed-variant repository;\n"
+        f"   a regression silently breaks the compression path.\n"
+        f"4. **oracle / compression_queue** — v3.1 distillation work queue;\n"
+        f"   a regression silently stalls distillation.\n"
+        f"5. **oracle / branches** — memory branch persistence;\n"
+        f"   a regression silently breaks branch creation.\n"
+        f"6. **oracle / federation** — federation peers/sync/feed;\n"
+        f"   a regression silently breaks federation.\n"
+        f"7. **oracle / oauth** — OAuth provider/identity/token/session;\n"
+        f"   a regression silently breaks authentication.\n"
+        f"8. **oracle / nats_dispatch_log** — idempotency dedupe;\n"
+        f"   a regression silently allows duplicate NATS dispatch.\n"
+        f"9. **oracle / fts_search** — full-text search;\n"
+        f"   a regression silently breaks search.\n"
+        f"10. **oracle / morpheus** — MORPHEUS run-lifecycle ABC;\n"
+        f"    a regression silently breaks the morpheus run path.\n"
+        f"11. **oracle / consultations_audit** — gateway audit log; lower\n"
+        f"    risk (audit is best-effort), but still an Oracle-only gap.\n"
+        f"12. **oracle / state** — state key-value; lower risk (simple KV).\n"
+        f"\n"
+        f"Non-Oracle cells in the 44 are lower priority (production does\n"
+        f"not run them), but the same logic applies: any backend in\n"
+        f"active use should have test candidates for its surface cells.\n"
         f"\n"
         f"## How cells are decided\n"
         f"\n"

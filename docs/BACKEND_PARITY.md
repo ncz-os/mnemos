@@ -28,11 +28,11 @@ mariadb, oracle, db2) and answers two questions for every cell:
    over the backend name or via a file named
    `test_<capability>_<backend>*.py`?
 
-Summary: **75/162** cells have a surface and a test candidate
+Summary: **80/162** cells have a surface and a test candidate
 (◐ surface + test candidate), **44** cells expose a surface
-without a test candidate, **9** cells have a test candidate for a
+without a test candidate, **4** cells have a test candidate for a
 stub backend implementation, and **34** cells have neither
-implementation nor test. (Categories sum to 162: 75 + 44 + 9 + 34 = 162.)
+implementation nor test. (Categories sum to 162: 80 + 44 + 4 + 34 = 162.)
 
 ## Matrix
 
@@ -47,7 +47,7 @@ implementation nor test. (Categories sum to 162: 75 + 44 + 9 + 34 = 162.)
 | compression (CompressionRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
 | compression_queue (CompressionQueueRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface, no test candidate |
 | morpheus (MorpheusRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
-| webhooks (end-to-end delivery) | ? test candidate, no surface | ◐ surface + test candidate | ? test candidate, no surface | ? test candidate, no surface | ? test candidate, no surface | ? test candidate, no surface |
+| webhooks (WebhookRepository: CRUD + delivery lifecycle) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | nats_dispatch_log (idempotency dedupe) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate |
 | consultations_audit (model recommendation) | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | oauth (OAuthRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
@@ -78,6 +78,130 @@ Cell legend:
 | ? test candidate, no surface | A possible test was found but no supported facade surface was detected. |
 | — no surface or test candidate | Neither a supported facade surface nor a test candidate was detected. |
 
+
+## Webhook surface vs delivery flag
+
+The ``webhooks`` row is keyed on the facade's ``.webhooks``
+``WebhookRepository`` accessor, not on the runtime
+``supports_webhooks`` flag. The flag gates whether the
+``dispatch_event`` *worker* actually fires end-to-end; the
+accessor exposes the repository (subscription CRUD,
+``claim_due_deliveries``, ``finalize_delivery``,
+``repair_delivery_chains``) and is implemented on every
+backend (verified 2026-10-17, backlog section 6). Before
+this fix the row was keyed on the flag, so sqlite/mysql/
+mariadb/oracle/db2 — all of which implement the ABC — read
+'test candidate, no surface' despite a fully wired facade
+accessor. The two signals are now reconciled: the matrix
+reflects the surface; the flag still controls delivery.
+
+## 34 'no surface, no test' cells — hand-verified split
+
+All 34 cells were hand-verified 2026-10-17. They fall into
+two disjoint classes: **correctly absent** (25) and **real
+backlog** (9). The split is recorded in the module-level
+constants ``_CORRECTLY_ABSENT_CELLS`` / ``_REAL_BACKLOG_CELLS``
+and is hard-asserted against the live matrix below, so any
+future change that moves a correctly-absent cell into the
+surface fails the build. That assertion is what stops the
+matrix from producing false work again.
+
+### Correctly absent (25) — MUST stay absent
+
+Postgres-only features that other backends cannot and must not
+claim. RLS / LISTEN-NOTIFY / advisory locks are Postgres
+server features; the ``morpheus_http_trigger`` and
+``kronos_routes`` rows both call ``require_postgres_pool_or_503``.
+Each of the five non-Postgres backends (sqlite, mysql, mariadb,
+oracle, db2) is correctly absent for all five of these rows.
+Blanket-closing these would write Postgres features onto
+backends that do not have them.
+
+* ``row_level_security`` (Postgres RLS) — sqlite, mysql, mariadb, oracle, db2
+* ``listen_notify`` (Postgres LISTEN/NOTIFY) — sqlite, mysql, mariadb, oracle, db2
+* ``advisory_locks`` (Postgres advisory locks) — sqlite, mysql, mariadb, oracle, db2
+* ``morpheus_http_trigger`` — sqlite, mysql, mariadb, oracle, db2
+* ``kronos_routes`` — sqlite, mysql, mariadb, oracle, db2
+
+(25 cells: 5 Postgres-only rows × 5 non-Postgres backends.)
+
+### Real backlog (9) — surface should exist but does not
+
+* ``sessions`` on mysql, mariadb — the ``.sessions`` facade
+  property is missing; the ABC declares it. Add a
+  ``SessionsRepository`` implementation + facade property.
+* ``consultations`` on mariadb — the facade property is missing;
+  the ABC declares it. Add a ``ConsultationsRepository``
+  implementation + facade property.
+* ``acl`` on mysql, mariadb — no facade property and no
+  ``AclRepository`` implementation for the MySQL family.
+  (SQLite's ``acl`` cell is in the 9-stub class, not here — it
+  has a test candidate but no surface.)
+* ``journal`` + ``ledger`` on mysql, mariadb — KNEMON
+  ``CorePersistence`` extras the MySQL family does not advertise
+  in ``capability_details``. Add the journal + ledger tables
+  and queries for the MySQL dialect.
+
+## 9 'test candidate for a stub' cells — disposition
+
+Before this fix the matrix reported 9 such cells. 5 of them were
+false (``webhooks`` on the five non-Postgres backends — see
+'Webhook surface vs delivery flag'); the fix re-keys that row on
+the facade accessor, so they now read 'surface + test
+candidate'. 4 are genuine stubs and are dispositioned here.
+The regenerated matrix therefore reports 4 cells in this class.
+
+* ``webhooks`` on sqlite, mysql, mariadb, oracle, db2 (5 cells) —
+  **RESOLVED by this fix.** The facade ``.webhooks`` property is
+  now detected, so these cells flip to 'surface + test
+  candidate'. No xfail needed.
+* ``consultations`` on mysql (1 cell) — **xfail** (reason:
+  'MysqlBackend has no ConsultationsRepository implementation;
+  the facade property is absent').
+* ``audit_chain`` on mysql + mariadb (2 cells) — **xfail**
+  (reason: 'MySQL family audit_chain returns None by contract;
+  the test exercises the None-contract, not a live stub').
+* ``acl`` on sqlite (1 cell) — **xfail** (reason:
+  'SqliteBackend has no AclRepository implementation; SQLite is
+  the single-user tier and the ACL grant/revoke/list management
+  surface is not wired — the read predicate still works via the
+  memory_acl EXISTS-clause').
+
+## 44 'surface, no test candidate' — production-risk priority
+
+Production runs ``OracleBackend``. The Oracle rows in the 44
+that read 'surface, no test candidate' are the highest risk
+because a silent regression on a backend we actually deploy
+would not be caught. Priority order (highest first), Oracle
+cells only:
+
+1. **oracle / kg** — knowledge-graph triple persistence; a
+   regression silently breaks KG reads on the production backend.
+2. **oracle / versions** — per-memory version history (HEAD/
+   branches); a regression silently corrupts version lineage.
+3. **oracle / compression** — compressed-variant repository;
+   a regression silently breaks the compression path.
+4. **oracle / compression_queue** — v3.1 distillation work queue;
+   a regression silently stalls distillation.
+5. **oracle / branches** — memory branch persistence;
+   a regression silently breaks branch creation.
+6. **oracle / federation** — federation peers/sync/feed;
+   a regression silently breaks federation.
+7. **oracle / oauth** — OAuth provider/identity/token/session;
+   a regression silently breaks authentication.
+8. **oracle / nats_dispatch_log** — idempotency dedupe;
+   a regression silently allows duplicate NATS dispatch.
+9. **oracle / fts_search** — full-text search;
+   a regression silently breaks search.
+10. **oracle / morpheus** — MORPHEUS run-lifecycle ABC;
+    a regression silently breaks the morpheus run path.
+11. **oracle / consultations_audit** — gateway audit log; lower
+    risk (audit is best-effort), but still an Oracle-only gap.
+12. **oracle / state** — state key-value; lower risk (simple KV).
+
+Non-Oracle cells in the 44 are lower priority (production does
+not run them), but the same logic applies: any backend in
+active use should have test candidates for its surface cells.
 
 ## How cells are decided
 

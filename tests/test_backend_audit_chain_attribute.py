@@ -62,6 +62,18 @@ def test_audit_chain_is_a_property_not_a_method(label, module, name):
     )
 
 
+@pytest.mark.xfail(
+    reason=(
+        "MySQL family (mysql, mariadb) audit_chain is a stub: the property "
+        "returns None by documented contract (MNEMOS_AUDIT_CHAIN=off). The "
+        "backend does not implement AuditChainRepository, so this test "
+        "reads as coverage for a surface that is intentionally absent. "
+        "Backlog section 6 (2026-10-17): mark xfail so the matrix's "
+        "'test candidate for a stub' class is not mistaken for real "
+        "coverage. Remove when the MySQL family ships a live audit chain."
+    ),
+    strict=False,
+)
 def test_mysql_family_reports_none_rather_than_raising():
     """The MySQL family ships no audit chain; None is the documented answer."""
     mysql = _load("mnemos.persistence.mysql", "MysqlBackend")

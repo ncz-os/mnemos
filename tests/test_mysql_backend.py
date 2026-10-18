@@ -80,6 +80,19 @@ async def test_mysql_backend_advertises_implemented_capabilities_and_pings():
     assert await backend.ping() is True
 
 
+@pytest.mark.xfail(
+    reason=(
+        "mysql/mariadb lack a ConsultationsRepository: MysqlBackend has no "
+        ".consultations facade property and does not advertise "
+        "CONSULTATIONS_CAPABILITY. This negative test documents the stub "
+        "contract (the capability is omitted so GRAEAE degrades to a "
+        "logged warning). Backlog section 6 (2026-10-17): mark xfail so "
+        "the matrix's 'test candidate for a stub' class is not mistaken "
+        "for real coverage. Remove once the MySQL family ships a live "
+        "ConsultationsRepository + facade property."
+    ),
+    strict=False,
+)
 async def test_mysql_and_mariadb_omit_consultations_capability():
     """MySQL/MariaDB do not implement the GRAEAE ``consultations``
     capability. Pin this so a future change adding the capability

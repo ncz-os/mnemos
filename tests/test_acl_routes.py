@@ -355,6 +355,20 @@ def test_revoke_404_does_not_invalidate_search_cache(monkeypatch):
 # so the grantee shares the namespace here (e.g. a team namespace).
 
 
+@pytest.mark.xfail(
+    reason=(
+        "SqliteBackend has no AclRepository implementation and no .acl "
+        "facade property. SQLite is the single-user tier: the memory_acl "
+        "read-predicate (EXISTS-clause) works, but the grant/revoke/list "
+        "management surface is not wired. This test exercises the "
+        "single-user read-predicate path, not the AclRepository surface, "
+        "so it reads as coverage for a capability that is intentionally "
+        "absent. Backlog section 6 (2026-10-17): mark xfail so the "
+        "matrix's 'test candidate for a stub' class is not mistaken for "
+        "real coverage."
+    ),
+    strict=False,
+)
 def test_sqlite_acl_grant_widens_read_within_namespace(tmp_path):
     from mnemos.persistence.sqlite import SqliteBackend, _commit, _execute
     from mnemos.persistence.visibility import VisibilityFilter

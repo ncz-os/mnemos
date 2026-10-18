@@ -109,6 +109,96 @@ def test_parity_accessor_body_not_docstrings(tmp_path, body, supported):
     assert parity._property_implemented(parity._view_for_class(path, "Backend"), ("memories",)) is supported
 
 
+# ---------------------------------------------------------------------------
+# Backlog section 6 (2026-10-17): the webhooks row was keyed on the runtime
+# ``supports_webhooks`` flag, so every backend that implements
+# WebhookRepository *without* a dedicated flag (sqlite, mysql, mariadb,
+# oracle, db2) read "test candidate, no surface". The fix re-keys the row
+# on the facade's ``.webhooks`` accessor. These negative tests pin the
+# detector so the regression cannot silently return: a facade with the
+# property must be detected; a facade whose property returns None / raises
+# (the stub contract) must NOT be detected; a facade with no property at
+# all must NOT be detected.
+# ---------------------------------------------------------------------------
+
+
+def test_webhook_detector_detects_facade_with_real_repo(tmp_path):
+    """A facade exposing a working ``.webhooks`` repo counts as surface —
+    even when the backend has NO ``supports_webhooks`` class attribute
+    (the facade-less direct-ABC shape that the old flag-keyed row missed).
+    """
+    path = tmp_path / "backend.py"
+    path.write_text(
+        "class Backend:\n"
+        "    supports_webhooks = False\n"
+        "    @property\n"
+        "    def webhooks(self):\n"
+        "        return self._webhooks\n"
+    )
+    view = parity._view_for_class(path, "Backend")
+    assert parity._property_implemented(view, ("webhooks",)) is True
+
+
+def test_webhook_detector_rejects_none_stub(tmp_path):
+    """A ``.webhooks`` property that returns None is the documented stub
+    contract (no repository wired) — it must NOT count as surface.
+    """
+    path = tmp_path / "backend.py"
+    path.write_text(
+        "class Backend:\n"
+        "    @property\n"
+        "    def webhooks(self):\n"
+        "        return None\n"
+    )
+    view = parity._view_for_class(path, "Backend")
+    assert parity._property_implemented(view, ("webhooks",)) is False
+
+
+def test_webhook_detector_rejects_raising_stub(tmp_path):
+    """A ``.webhooks`` property that unconditionally raises
+    NotImplementedError / BackendCapabilityMissing is a stub — must NOT
+    count as surface.
+    """
+    path = tmp_path / "backend.py"
+    path.write_text(
+        "class Backend:\n"
+        "    @property\n"
+        "    def webhooks(self):\n"
+        "        raise NotImplementedError('no webhooks here')\n"
+    )
+    view = parity._view_for_class(path, "Backend")
+    assert parity._property_implemented(view, ("webhooks",)) is False
+
+
+def test_webhook_detector_rejects_absent_property(tmp_path):
+    """A facade that defines no ``.webhooks`` property at all must NOT
+    count as surface — the detector must not invent coverage.
+    """
+    path = tmp_path / "backend.py"
+    path.write_text(
+        "class Backend:\n"
+        "    supports_webhooks = False\n"
+        "    @property\n"
+        "    def memories(self):\n"
+        "        return self._memories\n"
+    )
+    view = parity._view_for_class(path, "Backend")
+    assert parity._property_implemented(view, ("webhooks",)) is False
+
+
+def test_webhooks_row_is_facade_keyed_not_flag_keyed():
+    """Regression pin for the backlog-section-6 false-negative: the
+    webhooks capability must be keyed on the facade ``webhooks`` accessor,
+    not on the ``supports_webhooks`` flag. If this drifts back to
+    ``flag`` / ``supports_webhooks`` the four facade-backed repositories
+    silently disappear from the matrix again.
+    """
+    webhooks = next(c for c in parity._capabilities() if c.id == "webhooks")
+    assert webhooks.impl_kind == "webhook_repo"
+    assert "webhooks" in webhooks.impl_property
+    assert "supports_webhooks" not in webhooks.impl_property
+
+
 @pytest.mark.asyncio
 async def test_benchmark_cancels_workers_and_removes_db_on_insert_failure(monkeypatch, tmp_path):
     from scripts import bench_sqlite_throughput_phase1 as bench
