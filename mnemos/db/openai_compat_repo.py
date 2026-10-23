@@ -28,6 +28,10 @@ unchanged so ``mnemos.domain.openai_compat`` needs no changes.
 import logging
 from typing import Any, Dict, List, Optional
 
+from mnemos.core.injection_defense import defend
+from mnemos.core.secret_detection import redact_content
+from mnemos.persistence.base import ModelRegistryUnavailable  # noqa: F401 — re-export
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -41,9 +45,6 @@ __all__ = [
 ]
 
 
-from mnemos.persistence.base import ModelRegistryUnavailable  # noqa: F401 — re-export
-
-
 def format_memory_for_system_prompt(content: Any) -> str:
     """Return one memory as redacted, framed untrusted data.
 
@@ -52,9 +53,6 @@ def format_memory_for_system_prompt(content: Any) -> str:
     always redact first, then defend() so embedded delimiters/instructions are
     escaped and the entire value is wrapped as untrusted DATA.
     """
-    from mnemos.core.injection_defense import defend
-    from mnemos.core.secret_detection import redact_content
-
     return defend(redact_content("" if content is None else str(content)))
 
 
@@ -137,7 +135,7 @@ async def fetch_model_recommendation(
     async def _leaf(tx: Any, backend: Any) -> Optional[Dict[str, Any]]:
         try:
             model, _required = await backend.consultations_audit.fetch_recommended_model(
-                tx, task_type, cost_budget, quality_floor
+                tx, task_type=task_type, cost_budget=cost_budget, quality_floor=quality_floor
             )
         except Exception as e:
             logger.warning("[OPTIMIZER] Recommendation failed: %s, using default", e)
@@ -160,7 +158,7 @@ async def fetch_model_recommendation(
 async def lookup_provider_for_model(model: str) -> Optional[str]:
     async def _leaf(tx: Any, backend: Any) -> Optional[str]:
         try:
-            return await backend.consultations_audit.lookup_provider_for_model(tx, model)
+            return await backend.consultations_audit.lookup_provider_for_model(tx, model=model)
         except Exception as exc:
             logger.warning("[MNEMOS] model_registry lookup failed for model=%s: %s", model, exc)
             return None

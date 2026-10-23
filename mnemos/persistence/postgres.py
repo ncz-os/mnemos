@@ -3961,6 +3961,11 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
             # The exception class is canonical on mnemos.persistence.base;
             # mnemos.db.openai_compat_repo re-exports it for the gateway's
             # historical import path.
+            #
+            # Catch Exception (not just asyncpg.PostgresError) because the
+            # pool connection can also fail with ConnectionError /
+            # InterfaceError when the server is unreachable or the pool is
+            # draining -- the gateway must still see a 503, not a 500.
             from mnemos.persistence.base import ModelRegistryUnavailable
 
             logger.warning("[/v1/models/%s] registry lookup failed: %s", model_id, exc)

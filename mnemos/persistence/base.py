@@ -1291,7 +1291,20 @@ class ConsultationAuditRepository(ABC):
         task_type: str,
         cost_budget: float,
         quality_floor: float,
-    ) -> tuple[dict[str, Any] | None, list[str]]: ...
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """Return the best model for ``task_type`` within budget/quality.
+
+        Returns a ``(model, required_caps)`` tuple. ``model`` is a dict with
+        keys ``provider``, ``model_id``, ``display_name``, ``cost_per_mtok``
+        (average of input+output, or None when either is unknown),
+        ``quality_score``, and ``context_window``; or ``None`` when no
+        available, non-deprecated model satisfies the constraints.
+        ``required_caps`` is the canonical capability list the policy
+        applied, for audit/debugging. All backends delegate to
+        ``mnemos.core.recommendation.choose_recommended_model`` so the
+        selection policy is identical regardless of backend.
+        """
+        ...
 
     @abstractmethod
     async def fetch_model_recommendation(
