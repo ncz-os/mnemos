@@ -94,6 +94,24 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   queue snapshot's own `variants` field keeps its pre-F-15
   non-negative contract (a missing variants table reports `0`
   there), so distillation-worker monitoring is unaffected.
+- **OpenAI-compat gateway routes through the persistence ABC (F-06 slice 1).**
+  `mnemos/db/openai_compat_repo.py` no longer references `_lc._pool` directly:
+  `fetch_memory_context` routes through
+  `MemoryRepository.fts_search` (all six backends) with the caller's
+  `VisibilityFilter` carrying tenancy, and the four `model_registry`
+  lookups (`fetch_model_recommendation`, `lookup_provider_for_model`,
+  `fetch_available_models`, `fetch_model_provider`) route through
+  `ConsultationAuditRepository` (all six backends). On SQLite the
+  repository was previously a dead code path (it only saw a raw asyncpg
+  pool); it now serves every call through the ABC. The
+  `ModelRegistryUnavailable` exception stays on
+  `openai_compat_repo` as the gateway's 503 signal: Postgres raises it
+  out of `fetch_model_provider` on a *query failure* (pre-ABC behaviour
+  preserved), the other five backends report `None` with a logged reason
+  per the null-with-reason contract. The contract is now declared on the
+  ABC base method's docstring so a subclass raising is not a Liskov
+  surprise. A backend that cannot supply a value reports `null` with a
+  reason, never a fabricated default.
 
 ### Fixed
 

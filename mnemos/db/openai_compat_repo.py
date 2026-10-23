@@ -1,16 +1,70 @@
+"""OpenAI-compatible gateway repository — ABC-routed (F-06 slice 1).
+
+Historically this module hand-rolled raw ``asyncpg`` queries against
+``_lc._pool``: memory context for prompt injection plus four
+``model_registry`` lookups. That bypassed the persistence ABC, so it only
+worked on a raw asyncpg pool (in practice: Postgres) and silently returned
+nothing on every other backend.
+
+It now routes each call through the backend facade:
+
+* ``fetch_memory_context``      -> ``MemoryRepository.fts_search``
+  (all six backends; ``VisibilityFilter`` carries the tenancy).
+* ``fetch_model_recommendation`` -> ``ConsultationAuditRepository.fetch_recommended_model``
+  (all six backends, shared ``choose_recommended_model`` policy).
+* ``lookup_provider_for_model``  -> ``ConsultationAuditRepository.lookup_provider_for_model``
+  (all six backends).
+* ``fetch_available_models``     -> ``ConsultationAuditRepository.fetch_available_models``
+  (all six backends).
+* ``fetch_model_provider``       -> ``ConsultationAuditRepository.fetch_model_provider``
+  (all six backends; Postgres raises ``ModelRegistryUnavailable`` on a
+  failed query, preserving the pre-ABC gateway 503 behaviour).
+
+The module no longer references ``_lc._pool``; the single bridge to storage
+is one ``transactional()`` per call. Public function signatures are
+unchanged so ``mnemos.domain.openai_compat`` needs no changes.
+"""
+
 import logging
 from typing import Any, Dict, List, Optional
 
-import mnemos.core.lifecycle as _lc
-from mnemos.core.injection_defense import defend
-from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
-from mnemos.core.secret_detection import redact_content
-
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "ModelRegistryUnavailable",
+    "format_memory_for_system_prompt",
+    "fetch_memory_context",
+    "fetch_model_recommendation",
+    "lookup_provider_for_model",
+    "fetch_available_models",
+    "fetch_model_provider",
+]
 
 
 class ModelRegistryUnavailable(Exception):
-    pass
+    """The model_registry query failed on a backend that reports errors.
+
+    Declared here (rather than on the persistence ABC) so the OpenAI-compat
+    gateway keeps its historical ``openai_compat_repo.ModelRegistryUnavailable``
+    import path. Postgres raises it out of
+    ``ConsultationAuditRepository.fetch_model_provider``; the other five
+    backends swallow query errors and return None, matching the pre-ABC
+    hand-rolled repository's behaviour on non-Postgres pools.
+    """
+
+
+def format_memory_for_system_prompt(content: Any) -> str:
+    """Return one memory as redacted, framed untrusted data.
+
+    This path consumes raw database rows, so apparent MNEMOS frame delimiters
+    in content are attacker-controlled data. Never trust is_framed() here:
+    always redact first, then defend() so embedded delimiters/instructions are
+    escaped and the entire value is wrapped as untrusted DATA.
+    """
+    from mnemos.core.injection_defense import defend
+    from mnemos.core.secret_detection import redact_content
+
+    return defend(redact_content("" if content is None else str(content)))
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
@@ -22,95 +76,62 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
         return default
 
 
-def _secure_agent_context(content: Any) -> str:
-    """Return DB memory content as redacted, framed untrusted data.
+def _backend():
+    import mnemos.core.lifecycle as _lc
 
-    This path consumes raw database rows, so apparent MNEMOS frame delimiters in
-    content are attacker-controlled data.  Never trust is_framed() here: always
-    redact first, then defend() so embedded delimiters/instructions are escaped
-    and the entire value is wrapped as untrusted DATA.
+    # Read the module global directly (not via get_persistence_backend, which
+    # 503s) so a backend-less caller degrades to the null-with-reason contract
+    # instead of an exception.
+    return _lc._persistence_backend
+
+
+async def _run_on_persistence(leaf, empty_result):
+    """Run ``leaf(tx)`` inside one backend ``transactional()`` scope.
+
+    The only storage bridge this module keeps: a single
+    ``transactional()`` entry point instead of a raw asyncpg ``_pool.acquire``.
+    With no persistence backend there is nothing to query: report the
+    ``empty_result`` with a reason rather than a fabricated value.
     """
-    return defend(redact_content("" if content is None else str(content)))
+    backend = _backend()
+    if backend is None:
+        logger.debug("[MNEMOS] No persistence backend available")
+        return empty_result
+    async with backend.transactional() as tx:
+        return await leaf(tx)
 
 
 async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Dict[str, Any]]:
-    if not _lc._pool:
-        logger.debug("[MNEMOS] No DB pool available")
-        return []
+    async def _leaf(tx: Any) -> List[Dict[str, Any]]:
+        from mnemos.core.security import is_root
+        from mnemos.persistence.visibility import VisibilityFilter
 
-    try:
-        async with _lc._pool.acquire() as conn:
-            if user.role == "root":
-                memories = await conn.fetch(
-                    """
-                    SELECT m.id, m.category, m.namespace,
-                           COALESCE(v.compressed_content, m.content) AS content
-                    FROM memories m
-                    LEFT JOIN memory_compressed_variants v
-                        ON v.memory_id = m.id
-                    WHERE
-                        m.deleted_at IS NULL
-                        AND m.archived_at IS NULL
-                        AND m.namespace <> 'vault'
-                        AND (
-                            to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)
-                            OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
-                        )
-                    ORDER BY m.updated DESC NULLS LAST
-                    LIMIT $2
-                    """,
-                    query,
-                    limit,
-                )
-            else:
-                from mnemos.core.visibility import read_visibility_predicate
+        # The v4.1 read path: full memory rows through the ABC, so every
+        # backend (not just a raw asyncpg pool) serves this call. Root gets
+        # the cross-tenant read bypass (the vault subtraction still applies);
+        # non-root is pinned to its namespace with the READABLE envelope —
+        # the same predicate the other memory read surfaces use.
+        if is_root(user):
+            visibility = VisibilityFilter.for_read(user, namespace=None)
+        else:
+            visibility = VisibilityFilter.for_read(user, namespace=getattr(user, "namespace", None) or "default")
+        try:
+            rows = await _backend().memories.fts_search(tx, query=query, limit=limit, visibility=visibility)
+        except Exception as e:
+            logger.warning("[MNEMOS] Search failed for '%s...': %s", query[:50], e)
+            return []
+        logger.info("[MNEMOS] Found %s memories for query '%s...'", len(rows), query[:30])
+        return [
+            {
+                "id": _row_get(row, "id"),
+                "content": format_memory_for_system_prompt(_row_get(row, "content")),
+                "namespace": _row_get(row, "namespace"),
+            }
+            for row in rows
+            if _row_get(row, "namespace") != "vault"
+        ]
 
-                vis_clause, vis_params = read_visibility_predicate(
-                    user.user_id,
-                    list(user.group_ids),
-                    start_param_idx=1,
-                    table_alias="m",
-                )
-                ns_ph = f"${len(vis_params) + 1}"
-                q_ph = f"${len(vis_params) + 2}"
-                lim_ph = f"${len(vis_params) + 3}"
-                memories = await conn.fetch(
-                    f"""
-                    SELECT m.id, m.category, m.namespace,
-                           COALESCE(v.compressed_content, m.content) AS content
-                    FROM memories m
-                    LEFT JOIN memory_compressed_variants v
-                        ON v.memory_id = m.id
-                    WHERE m.deleted_at IS NULL
-                      AND m.archived_at IS NULL
-                      AND {vis_clause}
-                      AND m.namespace = {ns_ph}
-                      AND m.namespace <> 'vault'
-                      AND (
-                          to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})
-                          OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
-                      )
-                    ORDER BY m.updated DESC NULLS LAST
-                    LIMIT {lim_ph}
-                    """,
-                    *vis_params,
-                    user.namespace,
-                    query,
-                    limit,
-                )
-            logger.info("[MNEMOS] Found %s memories for query '%s...'", len(memories), query[:30])
-            return [
-                {
-                    "id": m["id"],
-                    "content": _secure_agent_context(m["content"]),
-                    "namespace": _row_get(m, "namespace"),
-                }
-                for m in memories
-                if _row_get(m, "namespace") != "vault"
-            ]
-    except Exception as e:
-        logger.warning("[MNEMOS] Search failed for '%s...': %s", query[:50], e)
-        return []
+    return await _run_on_persistence(_leaf, [])
 
 
 async def fetch_model_recommendation(
@@ -118,190 +139,57 @@ async def fetch_model_recommendation(
     cost_budget: float = 10.0,
     quality_floor: float = 0.85,
 ) -> Optional[Dict[str, Any]]:
-    pool = _lc._pool
-    if not pool:
-        logger.warning("[OPTIMIZER] No DB pool available")
-        return None
-
-    try:
-        async with pool.acquire() as conn:
-            capability_map = {
-                "code_generation": ["coding"],
-                "reasoning": ["reasoning", "logic"],
-                "architecture_design": ["reasoning"],
-                "summarization": ["reasoning"],
-                "web_search": ["online", "search"],
-            }
-            required_caps = capability_map.get(task_type, ["reasoning"])
-
-            # Budgeted selection EXCLUDES rows with NULL costs.
-            # COALESCEing them to 0 would silently bypass the budget
-            # and rank partially-synced rows ahead of priced models.
-            # Same invariant in mnemos/db/mcp_repo.py and
-            # mnemos/api/routes/providers.py.
-            models = await conn.fetch(
-                """
-                SELECT
-                    provider, model_id, display_name,
-                    input_cost_per_mtok, output_cost_per_mtok,
-                    capabilities,
-                    COALESCE(graeae_weight, 0) AS graeae_weight,
-                    context_window
-                FROM model_registry
-                WHERE available = true
-                AND deprecated = false
-                AND input_cost_per_mtok IS NOT NULL
-                AND output_cost_per_mtok IS NOT NULL
-                AND COALESCE(graeae_weight, 0) >= $1
-                AND (input_cost_per_mtok + output_cost_per_mtok) / 2.0 <= $2
-                AND capabilities @> $3
-                ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
-                LIMIT 1
-                """,
-                quality_floor,
-                cost_budget,
-                required_caps,
+    async def _leaf(tx: Any) -> Optional[Dict[str, Any]]:
+        try:
+            model, _required = await _backend().consultations_audit.fetch_recommended_model(
+                tx, task_type, cost_budget, quality_floor
             )
+        except Exception as e:
+            logger.warning("[OPTIMIZER] Recommendation failed: %s, using default", e)
+            return None
+        if model is None:
+            logger.warning("[OPTIMIZER] No models available, using default gpt-4o")
+            return None
+        logger.info(
+            "[OPTIMIZER] Recommended %s/%s for %s (cost=%s)",
+            model.get("provider"),
+            model.get("model_id"),
+            task_type,
+            model.get("cost_per_mtok"),
+        )
+        return model
 
-            if not models:
-                logger.info(
-                    "[OPTIMIZER] No priced model met %s budget "
-                    "(budget=$%s/MTok, quality>=%s), trying degraded fallback",
-                    task_type,
-                    cost_budget,
-                    quality_floor,
-                )
-                models = await conn.fetch(
-                    """
-                    SELECT
-                        provider, model_id, display_name,
-                        input_cost_per_mtok, output_cost_per_mtok,
-                        capabilities,
-                        COALESCE(graeae_weight, 0) AS graeae_weight,
-                        context_window
-                    FROM model_registry
-                    WHERE available = true AND deprecated = false
-                    ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC NULLS LAST
-                    LIMIT 1
-                    """
-                )
-
-            if not models:
-                logger.warning("[OPTIMIZER] No models available, using default gpt-4o")
-                return None
-
-            model = models[0]
-            # cost_per_mtok is None when EITHER cost column is NULL —
-            # only reachable via the degraded fallback. Surface the
-            # unknown cost honestly rather than fabricate 0.0 which
-            # would silently lie about pricing semantics.
-            from mnemos.core.numeric import safe_float
-
-            in_cost = _row_get(model, "input_cost_per_mtok")
-            out_cost = _row_get(model, "output_cost_per_mtok")
-            if in_cost is None or out_cost is None:
-                avg_cost: float | None = None
-            else:
-                avg_cost = (safe_float(in_cost) + safe_float(out_cost)) / 2.0
-
-            cost_label = f"${avg_cost:.2f}/MTok" if avg_cost is not None else "unknown"
-            logger.info(
-                "[OPTIMIZER] Recommended %s/%s for %s (cost=%s)",
-                _row_get(model, "provider"),
-                _row_get(model, "model_id"),
-                task_type,
-                cost_label,
-            )
-
-            return {
-                "provider": _row_get(model, "provider"),
-                "model_id": _row_get(model, "model_id"),
-                "display_name": _row_get(model, "display_name"),
-                "cost_per_mtok": avg_cost,
-                "quality_score": safe_float(_row_get(model, "graeae_weight")),
-                "context_window": _row_get(model, "context_window"),
-            }
-
-    except Exception as e:
-        logger.warning("[OPTIMIZER] Recommendation failed: %s, using default", e)
-        return None
+    return await _run_on_persistence(_leaf, None)
 
 
 async def lookup_provider_for_model(model: str) -> Optional[str]:
-    if _lc._pool is None:
-        return None
+    async def _leaf(tx: Any) -> Optional[str]:
+        try:
+            return await _backend().consultations_audit.lookup_provider_for_model(tx, model)
+        except Exception as exc:
+            logger.warning("[MNEMOS] model_registry lookup failed for model=%s: %s", model, exc)
+            return None
 
-    try:
-        async with _lc._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT provider FROM model_registry "
-                "WHERE model_id = $1 "
-                "  AND available = true AND deprecated = false",
-                model,
-            )
-            if row is not None:
-                return row["provider"]
-
-            if "/" in model:
-                head, tail = model.split("/", 1)
-                head_registry = GRAEAE_REGISTRY_MAP.get(head, {"registry_provider": head})["registry_provider"]
-                row = await conn.fetchrow(
-                    "SELECT provider FROM model_registry "
-                    "WHERE provider = $1 AND model_id = $2 "
-                    "  AND available = true AND deprecated = false",
-                    head_registry,
-                    tail,
-                )
-                if row is not None:
-                    return row["provider"]
-    except Exception as exc:
-        logger.warning("[MNEMOS] model_registry lookup failed for model=%s: %s", model, exc)
-    return None
+    return await _run_on_persistence(_leaf, None)
 
 
 async def fetch_available_models() -> list[Any]:
-    rows: list[Any] = []
-    if _lc._pool is not None:
+    async def _leaf(tx: Any) -> list[Any]:
         try:
-            async with _lc._pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT provider, model_id, display_name
-                    FROM model_registry
-                    WHERE available = true AND deprecated = false
-                    ORDER BY graeae_weight DESC NULLS LAST, model_id ASC
-                    """
-                )
+            rows = await _backend().consultations_audit.fetch_available_models(tx)
         except Exception as exc:
             logger.warning(
                 "[/v1/models] model_registry query failed, " "returning an empty discovery list: %s",
                 exc,
             )
             rows = []
-    return rows
+        return list(rows)
+
+    return await _run_on_persistence(_leaf, [])
 
 
 async def fetch_model_provider(model_id: str) -> Optional[str]:
-    if _lc._pool is None:
-        return None
+    async def _leaf(tx: Any) -> Optional[str]:
+        return await _backend().consultations_audit.fetch_model_provider(tx, model_id)
 
-    try:
-        async with _lc._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT provider
-                FROM model_registry
-                WHERE model_id = $1
-                  AND available = true
-                  AND deprecated = false
-                LIMIT 1
-                """,
-                model_id,
-            )
-            if row is not None:
-                return row["provider"]
-    except Exception as exc:
-        logger.warning("[/v1/models/%s] registry lookup failed: %s", model_id, exc)
-        raise ModelRegistryUnavailable from exc
-
-    return None
+    return await _run_on_persistence(_leaf, None)

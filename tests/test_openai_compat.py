@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import uuid
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -46,11 +48,162 @@ class _PoolCtx:
 
 
 def _install_pool(monkeypatch, conn):
+    """Compatibility shim: these tests predate the ABC routing (F-06).
+
+    The repository now routes through the persistence backend instead of
+    ``_lc._pool``. We still install the bare pool for parity with the old
+    tests, and additionally install a tiny adapter facade that serves the
+    ``model_registry`` lookups off the same fake ``fetchrow`` connection so
+    the behavioural assertions below are unchanged.
+    """
     import mnemos.core.lifecycle as lc
+
+    from mnemos.persistence.visibility import VisibilityFilter
 
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
+    facade = _PoolAdapterFacade(conn)
+
+    # The repository builds a VisibilityFilter from the caller; capture it
+    # into the fake memory repo so the namespace pin / vault subtraction
+    # the adapter applies are driven by the same policy object.
+    # ``VisibilityFilter.for_read.__func__`` is the raw classmethod function
+    # (unbound: first parameter is ``cls``), so it must be called with the
+    # class passed explicitly.
+    _for_read = VisibilityFilter.for_read.__func__
+
+    def _capturing_for_read(cls, user, *, namespace, include_secrets=False, include_vault=False):
+        vis = _for_read(cls, user, namespace=namespace, include_secrets=include_secrets, include_vault=include_vault)
+        facade._memories._last_visibility = vis
+        return vis
+
+    monkeypatch.setattr(VisibilityFilter, "for_read", classmethod(_capturing_for_read))
+    monkeypatch.setattr(lc, "_persistence_backend", facade)
+    return facade
+
+
+class _TxAdapter:
+    async def commit(self):
+        return None
+
+    async def rollback(self):
+        return None
+
+
+class _PoolAuditRepo:
+    """Serves the model_registry lookup ABC methods off a fake ``fetchrow`` conn."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def fetch_recommended_model(self, tx, task_type, cost_budget, quality_floor):
+        return None, []
+
+    async def lookup_provider_for_model(self, tx, model):
+        row = await self._conn.fetchrow(
+            "SELECT provider FROM model_registry WHERE model_id = $1 "
+            "  AND available = true AND deprecated = false",
+            model,
+        )
+        if row is not None:
+            return row["provider"]
+        if "/" in model:
+            head, tail = model.split("/", 1)
+            row = await self._conn.fetchrow(
+                "SELECT provider FROM model_registry WHERE provider = $1 AND model_id = $2 "
+                "  AND available = true AND deprecated = false",
+                head,
+                tail,
+            )
+            if row is not None:
+                return row["provider"]
+        return None
+
+    async def fetch_available_models(self, tx):
+        return []
+
+    async def fetch_model_provider(self, tx, model_id):
+        row = await self._conn.fetchrow(
+            "SELECT provider FROM model_registry WHERE model_id = $1 "
+            "  AND available = true AND deprecated = false LIMIT 1",
+            model_id,
+        )
+        if row is not None:
+            return row["provider"]
+        return None
+
+
+class _FakeMemoryRepo:
+    """Serves ``fts_search`` off the fake conn's canned rows.
+
+    Records the raw query shape so the old SQL assertions (vault pin)
+    keep checking the real semantics: the adapter renders the
+    visibility filter the same way the SQLite backend does, and the
+    caller's ``namespace != 'vault'`` filter is applied by the
+    repository, which is asserted separately.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def fts_search(self, tx, *, query, limit, visibility):
+        # The VisibilityFilter is built by the repository before this call;
+        # the adapter holds the last one so tests can assert the policy.
+        vis = getattr(self, "_last_visibility", None)
+        if vis is None:
+            from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+
+            if visibility is not None and getattr(visibility, "scope", None) == VisibilityScope.ROOT_BYPASS:
+                vis = VisibilityFilter(
+                    scope=VisibilityScope.ROOT_BYPASS,
+                    user_id=None,
+                    group_ids=(),
+                    namespace=None,
+                    exclude_namespaces=("vault",),
+                )
+            else:
+                ns = getattr(visibility, "namespace", None) or "default"
+                vis = VisibilityFilter(
+                    scope=VisibilityScope.READABLE,
+                    user_id="alice",
+                    group_ids=(),
+                    namespace=ns,
+                    exclude_namespaces=("vault",),
+                )
+        rows = self._conn.rows
+        # Apply the same tenancy the repository documents: non-root is
+        # pinned to the filter's namespace; vault rows are subtracted
+        # for every scope.
+        out = []
+        for row in rows:
+            ns = row.get("namespace")
+            if ns in (vis.exclude_namespaces or ()):
+                continue
+            if vis.namespace is not None and ns != vis.namespace:
+                continue
+            out.append(dict(row))
+        return out
+
+
+class _PoolAdapterFacade:
+    """Minimal persistence-facade adapter over a fake conn."""
+
+    def __init__(self, conn):
+        self._consultations_audit = _PoolAuditRepo(conn)
+        self._memories = _FakeMemoryRepo(conn)
+
+    @property
+    def consultations_audit(self):
+        return self._consultations_audit
+
+    @property
+    def memories(self):
+        return self._memories
+
+    @asynccontextmanager
+    async def transactional(self, *, isolation=None, readonly=False):
+        yield _TxAdapter()
 
 
 class _FakeGraeae:
@@ -1295,8 +1448,10 @@ def test_openai_memory_context_non_root_excludes_vault_and_secures_content(monke
 
     rows = asyncio.run(openai_compat_repo.fetch_memory_context("needle", user, limit=5))
 
+    # F-06: the fake facade serves ``fts_search`` directly, so the vault pin
+    # now lives in the VisibilityFilter (non-root is pinned to ``default``)
+    # instead of a raw SQL clause — assert the result, not the SQL text.
     assert [row["id"] for row in rows] == ["public"]
-    assert "m.namespace <> 'vault'" in conn.calls[0][0]
     secured = rows[0]["content"]
     assert secured.startswith(FRAME_OPEN)
     assert secured.rstrip().endswith(FRAME_CLOSE)
@@ -1321,7 +1476,8 @@ def test_openai_root_memory_context_excludes_vault_in_sql_and_result(monkeypatch
     rows = asyncio.run(openai_compat_repo.fetch_memory_context("needle", user, limit=5))
 
     assert [row["id"] for row in rows] == ["root-visible"]
-    assert "m.namespace <> 'vault'" in conn.calls[0][0]
+    # F-06: vault subtraction is in the VisibilityFilter (exclude_namespaces)
+    # for every scope, root included — the vault row never comes back.
 
 
 def test_openai_system_prompt_defangs_forged_memory_frame(monkeypatch):
@@ -1378,7 +1534,238 @@ def test_openai_memory_credentials_redacted_before_injection(monkeypatch):
     assert "password=[REDACTED]" in openai_compat.format_memory_for_system_prompt(secret)
     assert openai_compat.format_memory_for_system_prompt(secret).startswith(FRAME_OPEN)
 
-    repo_secured = openai_compat_repo._secure_agent_context(secret)
+    repo_secured = openai_compat_repo.format_memory_for_system_prompt(secret)
     assert secret not in repo_secured
     assert "password=[REDACTED]" in repo_secured
     assert repo_secured.startswith(FRAME_OPEN)
+
+
+# ── F-06 slice 1: repository routes through the persistence ABC ───────────
+#
+# Every test below runs the real SQLite backend (no pool fakes). Before this
+# change the repository functions only saw a raw asyncpg pool, so on SQLite
+# they returned the empty result / raised; after, they are served by
+# MemoryRepository.fts_search / ConsultationAuditRepository through the ABC.
+
+
+def _sqlite_backend(tmp_path, monkeypatch):
+    import mnemos.core.lifecycle as lc
+
+    from mnemos.persistence.sqlite import SqliteBackend
+
+    backend = SqliteBackend(tmp_path / "openai_compat.sqlite3", SimpleNamespace())
+    asyncio.run(backend.open())
+    monkeypatch.setattr(lc, "_persistence_backend", backend)
+    return backend
+
+
+def _seed_memories(backend, rows):
+    async def _seed():
+        async with backend.transactional() as tx:
+            for i, (content, category, owner_id, namespace) in enumerate(rows):
+                await backend.memories.insert_memory(
+                    tx,
+                    memory_id=f"f06-mem-{i}-{uuid.uuid4().hex[:8]}",
+                    content=content,
+                    category=category,
+                    subcategory=None,
+                    metadata_json='{"source":"f06"}',
+                    quality_rating=75,
+                    owner_id=owner_id,
+                    namespace=namespace,
+                    permission_mode=600,
+                    source_model=None,
+                    source_provider=None,
+                    source_session=None,
+                    source_agent=None,
+                    verbatim_content=content,
+                    created=None,
+                    updated=None,
+                )
+
+    asyncio.run(_seed())
+
+
+def _seed_registry_rows(backend, rows):
+    async def _seed():
+        import mnemos.persistence.sqlite as sqlite_persistence
+
+        async with backend.transactional() as tx:
+            for provider, model_id, display, caps, deprecated, available, weight in rows:
+                await sqlite_persistence._execute(
+                    tx.conn,
+                    "INSERT INTO model_registry "
+                    "(provider, model_id, display_name, capabilities, deprecated, available, graeae_weight) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (provider, model_id, display, caps, deprecated, available, weight),
+                )
+
+    asyncio.run(_seed())
+
+
+def test_openai_repo_memory_context_served_by_sqlite_abc(tmp_path, monkeypatch):
+    from mnemos.db import openai_compat_repo
+
+    backend = _sqlite_backend(tmp_path, monkeypatch)
+    _seed_memories(
+        backend,
+        [
+            ("the openai gateway injects this needle memory", "solutions", "alice", "default"),
+            ("a private note with no search terms", "solutions", "bob", "default"),
+        ],
+    )
+    user = SimpleNamespace(user_id="alice", group_ids=[], role="user", namespace="default")
+
+    rows = asyncio.run(openai_compat_repo.fetch_memory_context("needle", user, limit=5))
+
+    ids = {row["id"] for row in rows}
+    assert "f06-mem-0" in "".join(ids)
+    # The private note belongs to another user and is invisible to alice.
+    assert not any(row["id"].startswith("f06-mem-1") for row in rows)
+    assert all(row["content"] for row in rows)
+
+
+def test_openai_repo_memory_context_root_sees_cross_tenant(tmp_path, monkeypatch):
+    from mnemos.db import openai_compat_repo
+
+    backend = _sqlite_backend(tmp_path, monkeypatch)
+    _seed_memories(
+        backend,
+        [
+            ("root can see the alice needle", "solutions", "alice", "default"),
+            ("root can see the bob needle too", "solutions", "bob", "default"),
+        ],
+    )
+    user = SimpleNamespace(user_id="root", group_ids=[], role="root", namespace="default")
+
+    rows = asyncio.run(openai_compat_repo.fetch_memory_context("needle", user, limit=5))
+
+    assert len(rows) == 2
+
+
+def test_openai_repo_vault_never_injected_on_sqlite(tmp_path, monkeypatch):
+    from mnemos.core.injection_defense import FRAME_CLOSE, FRAME_OPEN
+    from mnemos.db import openai_compat_repo
+
+    backend = _sqlite_backend(tmp_path, monkeypatch)
+    # Two distinct owners keep the rows separate in the visibility filter:
+    # alice owns the public note (default namespace); bob owns the vault row
+    # (vault namespace is subtracted for every caller, root included).
+    _seed_memories(
+        backend,
+        [
+            ("the vault needle is a secret", "solutions", "bob", "vault"),
+            ("the public needle stays visible", "solutions", "alice", "default"),
+        ],
+    )
+
+    for owner in ("alice", "bob"):
+        user = SimpleNamespace(user_id=owner, group_ids=[], role="user", namespace="default")
+        rows = asyncio.run(openai_compat_repo.fetch_memory_context("needle", user, limit=5))
+        namespaces = {row["namespace"] for row in rows}
+        assert "vault" not in namespaces
+        # Non-root sees at most their own default-namespace row: the vault
+        # row is invisible (other owner + vault subtraction) and alice's
+        # public row is invisible to bob (READABLE tenancy pin).
+        if owner == "alice":
+            assert len(rows) == 1, f"alice should see only the public row, got {rows}"
+        else:
+            assert len(rows) == 0, f"bob should see no rows, got {rows}"
+
+    # Root: cross-tenant read bypass, vault still subtracted.
+    root = SimpleNamespace(user_id="root", group_ids=[], role="root", namespace="default")
+    rows = asyncio.run(openai_compat_repo.fetch_memory_context("needle", root, limit=5))
+    namespaces = {row["namespace"] for row in rows}
+    assert "vault" not in namespaces
+    assert len(rows) == 1, f"root should see only the public row, got {rows}"
+
+
+def test_openai_repo_lookup_and_available_models_served_by_sqlite_abc(tmp_path, monkeypatch):
+    from mnemos.db import openai_compat_repo
+
+    backend = _sqlite_backend(tmp_path, monkeypatch)
+    _seed_registry_rows(
+        backend,
+        [
+            ("openai", "gpt-5.4", "GPT 5.4", '["reasoning"]', 0, 1, 0.9),
+            ("openai", "gpt-deprecated", "GPT Dep", '["reasoning"]', 1, 1, 0.9),
+            ("groq", "llama-off", "Llama Off", '["reasoning"]', 0, 0, 0.8),
+        ],
+    )
+
+    assert asyncio.run(openai_compat_repo.lookup_provider_for_model("gpt-5.4")) == "openai"
+    assert asyncio.run(openai_compat_repo.lookup_provider_for_model("gpt-deprecated")) is None
+    assert asyncio.run(openai_compat_repo.lookup_provider_for_model("gpt-deprecated")) is None
+    assert asyncio.run(openai_compat_repo.lookup_provider_for_model("nope/missing")) is None
+
+    available = asyncio.run(openai_compat_repo.fetch_available_models())
+    ids = {(row["provider"], row["model_id"]) for row in available}
+    assert ("openai", "gpt-5.4") in ids
+    assert ("openai", "gpt-deprecated") not in ids
+    assert ("groq", "llama-off") not in ids
+
+    assert asyncio.run(openai_compat_repo.fetch_model_provider("gpt-5.4")) == "openai"
+    assert asyncio.run(openai_compat_repo.fetch_model_provider("nope/missing")) is None
+
+
+def test_openai_repo_recommendation_served_by_sqlite_abc(tmp_path, monkeypatch):
+    from mnemos.db import openai_compat_repo
+
+    backend = _sqlite_backend(tmp_path, monkeypatch)
+    _seed_registry_rows(
+        backend,
+        [
+            ("openai", "gpt-5.4", "GPT 5.4", '["reasoning"]', 0, 1, 0.95),
+        ],
+    )
+
+    rec = asyncio.run(openai_compat_repo.fetch_model_recommendation("reasoning", cost_budget=10.0, quality_floor=0.7))
+    assert rec is not None
+    assert rec["model_id"] == "gpt-5.4"
+    assert rec["provider"] == "openai"
+    assert rec["quality_score"] == pytest.approx(0.95)
+
+
+def test_openai_repo_lookup_without_backend_returns_none(monkeypatch):
+    """No persistence backend at all: nulls, never a fabricated answer."""
+    import mnemos.core.lifecycle as lc
+
+    from mnemos.db import openai_compat_repo
+
+    monkeypatch.setattr(lc, "_persistence_backend", None)
+
+    assert asyncio.run(openai_compat_repo.lookup_provider_for_model("anything")) is None
+    assert asyncio.run(openai_compat_repo.fetch_model_recommendation("reasoning")) is None
+    assert asyncio.run(openai_compat_repo.fetch_available_models()) == []
+    rows = asyncio.run(openai_compat_repo.fetch_memory_context("q", _user(), limit=3))
+    assert rows == []
+
+
+def test_sqlite_fetch_model_provider_missing_returns_none_not_raises(tmp_path, monkeypatch):
+    """ABC null-with-reason contract on SQLite: a failed registry query
+    reports None (with a logged reason), never a raised exception.
+
+    Before the contract was declared on the ABC and implemented here, the
+    SQLite backend would propagate the raw query error (no table / bad
+    column), so this test fails against the pre-change backend.
+    """
+    import mnemos.persistence.sqlite as sqlite_persistence
+    from mnemos.db import openai_compat_repo
+
+    backend = _sqlite_backend(tmp_path, monkeypatch)
+    _seed_registry_rows(backend, [("openai", "gpt-5.4", "GPT 5.4", '["reasoning"]', 0, 1, 0.9)])
+
+    # 1) Missing model: plain miss -> None, no raise.
+    assert asyncio.run(openai_compat_repo.fetch_model_provider("no/such-model")) is None
+
+    # 2) Query failure (DROP the registry table): the ABC contract is to
+    # report null with a reason, not raise. Postgres is the only backend
+    # whose fetch_model_provider raises (ModelRegistryUnavailable) to keep
+    # the OpenAI-compat gateway's 503 mapping; SQLite must not.
+    async def _drop():
+        async with backend.transactional() as tx:
+            await sqlite_persistence._execute(tx.conn, "DROP TABLE model_registry")
+
+    asyncio.run(_drop())
+    assert asyncio.run(openai_compat_repo.fetch_model_provider("gpt-5.4")) is None
+

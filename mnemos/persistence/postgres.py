@@ -3941,17 +3941,28 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
 
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
         conn = _postgres_tx(tx).conn
-        row = await conn.fetchrow(
-            """
-            SELECT provider
-            FROM model_registry
-            WHERE model_id = $1
-              AND available = true
-              AND deprecated = false
-            LIMIT 1
-            """,
-            model_id,
-        )
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT provider
+                FROM model_registry
+                WHERE model_id = $1
+                  AND available = true
+                  AND deprecated = false
+                LIMIT 1
+                """,
+                model_id,
+            )
+        except Exception as exc:
+            # The OpenAI-compat gateway maps a failed registry query to a 503
+            # (pre-ABC behaviour on the raw asyncpg pool); the other five
+            # backends report None instead, so only Postgres raises here --
+            # the contract the ABC ``fetch_model_provider`` docstring declares.
+            # The import is local: this package has no static edge on mnemos.db.
+            from mnemos.db.openai_compat_repo import ModelRegistryUnavailable
+
+            logger.warning("[/v1/models/%s] registry lookup failed: %s", model_id, exc)
+            raise ModelRegistryUnavailable from exc
         if row is not None:
             return row["provider"]
         return None

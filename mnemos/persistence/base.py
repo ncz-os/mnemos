@@ -1294,7 +1294,18 @@ class ConsultationAuditRepository(ABC):
     async def fetch_available_models(self, tx: Transaction) -> list[Row]: ...
 
     @abstractmethod
-    async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None: ...
+    async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
+        """Return the registry provider for ``model_id``, or None if absent.
+
+        Backends that cannot supply a value report ``None`` with a logged
+        reason (SQLite, Oracle, DB2, MySQL) — never a fabricated default.
+        Postgres is the one backend that raises ``ModelRegistryUnavailable``
+        (imported from ``mnemos.db.openai_compat_repo`` to keep that module's
+        public exception path) on a *query failure*, preserving the
+        OpenAI-compat gateway's historical 503 mapping. Callers that only
+        care about the value must handle both ``None`` and that exception.
+        """
+        ...
 
     # ── model-registry WRITES (daily provider sync; backend-overridable) ───────
     # Non-abstract so existing backends keep instantiating; backends that own a

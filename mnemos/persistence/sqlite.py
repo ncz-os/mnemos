@@ -4720,11 +4720,17 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
         )
 
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
-        row = await _fetch_one(
-            self._conn(tx),
-            "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0 LIMIT 1",
-            (model_id,),
-        )
+        # Null-with-reason contract (ABC): a missing row or a failed query
+        # both report None with a logged reason; only Postgres raises.
+        try:
+            row = await _fetch_one(
+                self._conn(tx),
+                "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0 LIMIT 1",
+                (model_id,),
+            )
+        except Exception as exc:
+            logger.warning("[/v1/models/%s] registry lookup failed: %s", model_id, exc)
+            return None
         return row["provider"] if row is not None else None
 
 
