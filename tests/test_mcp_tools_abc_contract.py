@@ -86,7 +86,15 @@ def test_abc_methods_exist_on_all_six_backends():
             member = getattr(repo, method, None)
             if not callable(member):
                 missing.append(f"base: {repo.__name__}.{method} (not callable)")
-            if getattr(repo, "__abstractmethods__", None) and method not in repo.__abstractmethods__:
+            # The contract requires the method to be *abstract* on the base
+            # ABC: that is what forces every concrete backend to implement it.
+            # An empty or missing `__abstractmethods__` means the class is a
+            # plain class (not an ABC) or all methods are concrete — both
+            # would silently let a backend skip the method.
+            abstract = getattr(repo, "__abstractmethods__", None)
+            if abstract is None:
+                missing.append(f"base: {repo.__name__} (not an ABC)")
+            elif method not in abstract:
                 missing.append(f"base: {repo.__name__}.{method} (not abstract)")
 
     assert missing == [], "\n".join(missing)
