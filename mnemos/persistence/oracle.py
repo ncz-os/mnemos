@@ -3940,8 +3940,9 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
         failure, not a silently-returned "missing table".
         """
         conn = _conn_from_tx(tx)
-        cur = await _call(conn.cursor)
+        cur = None
         try:
+            cur = await _call(conn.cursor)
             await _call(
                 cur.execute,
                 "SELECT COUNT(*) AS variants FROM memory_compressed_variants",
@@ -3954,7 +3955,8 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
                 raise
             return -1
         finally:
-            await _call(cur.close)
+            if cur is not None:
+                await _call(cur.close)
         return int(row.get("variants") or 0)
 
     async def get_queue_stats(self, tx: Transaction) -> dict[str, int]:
