@@ -4728,7 +4728,7 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
                 "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0 LIMIT 1",
                 (model_id,),
             )
-        except Exception as exc:
+        except (sqlite3.Error, OSError) as exc:
             logger.warning("[/v1/models/%s] registry lookup failed: %s", model_id, exc)
             return None
         return row["provider"] if row is not None else None
