@@ -13,8 +13,6 @@ without needing live databases.
 
 from __future__ import annotations
 
-import inspect
-
 
 def _facade_classes() -> dict[str, type]:
     from mnemos.persistence.db2 import Db2Backend
@@ -86,7 +84,9 @@ def test_abc_methods_exist_on_all_six_backends():
     ):
         for method in methods:
             member = getattr(repo, method, None)
-            if not (inspect.isfunction(member) or inspect.ismethod(member)):
-                missing.append(f"base: {repo.__name__}.{method}")
+            if not callable(member):
+                missing.append(f"base: {repo.__name__}.{method} (not callable)")
+            if getattr(repo, "__abstractmethods__", None) and method not in repo.__abstractmethods__:
+                missing.append(f"base: {repo.__name__}.{method} (not abstract)")
 
     assert missing == [], "\n".join(missing)
