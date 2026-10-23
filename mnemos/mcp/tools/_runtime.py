@@ -308,23 +308,30 @@ def _get_persistence_backend():
     The backend facade (``mnemos.persistence.base``) owns the transaction
     surface: tools open work through ``backend.transactional()`` and the
     repository ABCs it exposes, never through ``lifecycle._pool``.
+
+    Returns ``None`` when no backend is active (startup race / edge profile
+    before ``lifespan`` / shutdown) instead of raising: MCP tools shape a
+    ``{"success": False, "error": ...}`` result rather than an HTTP
+    framework exception, and this module must stay importable outside a
+    running app (stdio transport, tests).
     """
-    from mnemos.core.lifecycle import get_persistence_backend
+    import mnemos.core.lifecycle as _lifecycle
 
-    return get_persistence_backend()
+    return _lifecycle._persistence_backend
 
 
-async def _mcp_assert_memory_readable(tx: Any, memory_id: str, user: UserContext) -> None:
+async def _mcp_assert_memory_readable(
+    backend: Any, tx: Any, memory_id: str, user: UserContext
+) -> None:
     """Read-visibility gate for MCP DAG tools, via the persistence ABC.
 
     ``tx`` is the backend ``Transaction`` from ``backend.transactional()``;
     the call goes through ``MemoryRepository.assert_memory_readable`` so the
     visibility predicate is the same one the REST routes enforce, on every
-    backend.
+    backend. The backend is passed in (the facade that owns the transaction)
+    rather than re-resolved from global state, so the assert always runs
+    against the same backend the tool already resolved.
     """
-    from mnemos.core.lifecycle import get_persistence_backend
-
-    backend = get_persistence_backend()
     await backend.memories.assert_memory_readable(tx, memory_id, user)
 
 

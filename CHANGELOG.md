@@ -104,11 +104,16 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   `fetch_checkout_commit`, `BranchRepository.create_memory_branch`,
   and `ConsultationAuditRepository.fetch_recommended_model`
   (classification (a) per `docs/POSTGRES_ONLY_SURFACE.md` §2 rows 6 and
-  10 — unwire, no new ABC surface needed). The DAG tools' read gate now
-  goes through `MemoryRepository.assert_memory_readable`, so the MCP
-  and REST paths enforce the same visibility predicate on every
-  backend. The tools also work on the SQLite edge profile, where the
-  raw-pool code returned "Database unavailable" (or fell back to REST).
+  10 — unwire, no new ABC surface needed). The DAG tools' read gate
+  also classifies (a): it goes through the pre-existing
+  `MemoryRepository.assert_memory_readable` (already abstract on the
+  ABC and implemented on all six backends before this slice), so the
+  MCP and REST paths enforce the same visibility predicate on every
+  backend — the new `_mcp_assert_memory_readable` runtime helper is a
+  thin wrapper over that existing ABC method, passed the backend that
+  owns the transaction (no new ABC method was added). The tools also
+  work on the SQLite edge profile, where the raw-pool code returned
+  "Database unavailable" (or fell back to REST).
   `mnemos/mcp/tools/kronos.py` (2 refs) is classified (c) — **genuinely
   Postgres-only** and documented as such: the KRONOS domain SQL is
   Postgres-specific (`date_trunc`, `AT TIME ZONE`,
@@ -118,7 +123,12 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   backends the tools now return a reason-bearing
   "requires the Postgres backend" error instead of
   `{"success": False, "error": "Database unavailable"}` — never a
-  fabricated 0-count success. New tests:
+  fabricated 0-count success. Classification is backend-based
+  (`isinstance(backend, PostgresBackend)` via the lifecycle-owned
+  facade), not pool-based, so a transiently-None pool or a pool object
+  on a non-Postgres deployment cannot flip the error message; the
+  transiently-dead-pool case on a Postgres deployment still reports the
+  original actionable "Database unavailable". New tests:
   `tests/test_mcp_tools_persistence_abc.py` (SQLite end-to-end, fails
   pre-change), `tests/test_mcp_tools_abc_contract.py` (six-backend
   ABC surface contract), `tests/test_mcp_kronos_postgres_only.py`

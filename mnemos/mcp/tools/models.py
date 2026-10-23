@@ -99,10 +99,8 @@ async def tool_recommend_model(
             "budget_met": budget_met,
         }
 
-    try:
-        backend = _get_persistence_backend()
-    except Exception as e:
-        logger.error(f"[MCP] recommend_model backend unavailable: {e}", exc_info=True)
+    backend = _get_persistence_backend()
+    if backend is None:
         return {"success": False, "error": "Database unavailable"}
 
     try:

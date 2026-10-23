@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import difflib
 import logging
+from datetime import date, datetime
 from typing import Any
 
 from mnemos.core.auth_context import UserContext
@@ -40,7 +41,9 @@ def _memory_log_timestamp(value: Any) -> str | None:
     """
     if value is None:
         return None
-    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
 
 
 async def tool_log_memory(
@@ -83,16 +86,14 @@ async def tool_log_memory(
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
-    try:
-        backend = _get_persistence_backend()
-    except Exception as e:
-        logger.error(f"[MCP] log_memory backend unavailable: {e}", exc_info=True)
+    backend = _get_persistence_backend()
+    if backend is None:
         return {"success": False, "error": "Database unavailable"}
 
     try:
         async with backend.transactional() as tx:
             try:
-                await _mcp_assert_memory_readable(tx, memory_id, user)
+                await _mcp_assert_memory_readable(backend, tx, memory_id, user)
             except PermissionError as e:
                 return {"success": False, "error": str(e)}
 
@@ -154,10 +155,8 @@ async def tool_branch_memory(
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
-    try:
-        backend = _get_persistence_backend()
-    except Exception as e:
-        logger.error(f"[MCP] branch_memory backend unavailable: {e}", exc_info=True)
+    backend = _get_persistence_backend()
+    if backend is None:
         return {"success": False, "error": "Database unavailable"}
 
     try:
@@ -204,16 +203,14 @@ async def tool_diff_memory_commits(
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
-    try:
-        backend = _get_persistence_backend()
-    except Exception as e:
-        logger.error(f"[MCP] diff_memory_commits backend unavailable: {e}", exc_info=True)
+    backend = _get_persistence_backend()
+    if backend is None:
         return {"success": False, "error": "Database unavailable"}
 
     try:
         async with backend.transactional() as tx:
             try:
-                await _mcp_assert_memory_readable(tx, memory_id, user)
+                await _mcp_assert_memory_readable(backend, tx, memory_id, user)
             except PermissionError as e:
                 return {"success": False, "error": str(e)}
 
@@ -279,16 +276,14 @@ async def tool_checkout_memory(
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
-    try:
-        backend = _get_persistence_backend()
-    except Exception as e:
-        logger.error(f"[MCP] checkout_memory backend unavailable: {e}", exc_info=True)
+    backend = _get_persistence_backend()
+    if backend is None:
         return {"success": False, "error": "Database unavailable"}
 
     try:
         async with backend.transactional() as tx:
             try:
-                await _mcp_assert_memory_readable(tx, memory_id, user)
+                await _mcp_assert_memory_readable(backend, tx, memory_id, user)
             except PermissionError as e:
                 return {"success": False, "error": str(e)}
 

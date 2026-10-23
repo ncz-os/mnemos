@@ -101,13 +101,24 @@ async def sqlite_backend(tmp_path):
 
 
 class _FakeAssertMemoryReadable:
-    """Stand-in for the ABC's assert_memory_readable: counts calls, never blocks."""
+    """Counts ``assert_memory_readable`` calls; never blocks."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, UserContext]] = []
+        self.calls: list[tuple[object, str, UserContext]] = []
 
-    async def __call__(self, tx, memory_id: str, user: UserContext) -> None:
-        self.calls.append((memory_id, user))
+
+def _fake_assert_memory_readable(repo, fake: "_FakeAssertMemoryReadable"):
+    """Bind the fake as a real method on the SQLite repository instance.
+
+    ``monkeypatch.setattr(instance, name, fake)`` on an instance would be
+    called *unbound* (no ``self``); the closure below is a real function
+    bound to the repository, so it is invoked exactly like the production
+    method: ``repo.assert_memory_readable(tx, memory_id, user)``.
+    """
+    async def _bound(self_, tx, memory_id: str, user: UserContext) -> None:
+        fake.calls.append((self_, memory_id, user))
+
+    return _bound.__get__(repo)
 
 
 class _NoRestFallback:
@@ -118,7 +129,12 @@ class _NoRestFallback:
 async def test_tool_log_memory_routes_through_persistence_abc(sqlite_backend, monkeypatch):
     _install_backend_for_tools(monkeypatch, sqlite_backend)
     fake_assert = _FakeAssertMemoryReadable()
-    monkeypatch.setattr(mcp_dag, "_mcp_assert_memory_readable", fake_assert)
+    # The read gate resolves ``memories.assert_memory_readable`` on the
+    # transaction-owning facade, so patch it on the real SQLite repository.
+    monkeypatch.setattr(
+        sqlite_backend.memories, "assert_memory_readable",
+        _fake_assert_memory_readable(sqlite_backend.memories, fake_assert),
+    )
 
     result = await mcp_dag.tool_log_memory("m1", user=ROOT)
 
@@ -127,8 +143,9 @@ async def test_tool_log_memory_routes_through_persistence_abc(sqlite_backend, mo
     assert result["count"] == 2
     hashes = {c["hash"] for c in result["commits"]}
     assert hashes == {"abc123", "def456"}
-    # The read-assert ran through the ABC, not a hand-rolled conn.
-    assert fake_assert.calls == [("m1", ROOT)]
+    # The read-assert ran through the ABC on the backend's own repository,
+    # not a hand-rolled conn.
+    assert fake_assert.calls == [(sqlite_backend.memories, "m1", ROOT)]
 
 
 async def test_tool_branch_memory_routes_through_persistence_abc(sqlite_backend, monkeypatch):
@@ -151,19 +168,25 @@ async def test_tool_branch_memory_routes_through_persistence_abc(sqlite_backend,
 async def test_tool_diff_memory_commits_routes_through_persistence_abc(sqlite_backend, monkeypatch):
     _install_backend_for_tools(monkeypatch, sqlite_backend)
     fake_assert = _FakeAssertMemoryReadable()
-    monkeypatch.setattr(mcp_dag, "_mcp_assert_memory_readable", fake_assert)
+    monkeypatch.setattr(
+        sqlite_backend.memories, "assert_memory_readable",
+        _fake_assert_memory_readable(sqlite_backend.memories, fake_assert),
+    )
 
     result = await mcp_dag.tool_diff_memory_commits("m1", "abc123", "def456", user=ROOT)
 
     assert result["success"] is True, result
     assert "+hello v2" in result["diff"]
-    assert fake_assert.calls == [("m1", ROOT)]
+    assert fake_assert.calls == [(sqlite_backend.memories, "m1", ROOT)]
 
 
 async def test_tool_checkout_memory_routes_through_persistence_abc(sqlite_backend, monkeypatch):
     _install_backend_for_tools(monkeypatch, sqlite_backend)
     fake_assert = _FakeAssertMemoryReadable()
-    monkeypatch.setattr(mcp_dag, "_mcp_assert_memory_readable", fake_assert)
+    monkeypatch.setattr(
+        sqlite_backend.memories, "assert_memory_readable",
+        _fake_assert_memory_readable(sqlite_backend.memories, fake_assert),
+    )
 
     result = await mcp_dag.tool_checkout_memory("m1", "abc123", user=ROOT)
 
@@ -171,7 +194,7 @@ async def test_tool_checkout_memory_routes_through_persistence_abc(sqlite_backen
     assert result["commit"]["hash"] == "abc123"
     assert result["commit"]["version"] == 1
     assert result["content"] == "hello v1"
-    assert fake_assert.calls == [("m1", ROOT)]
+    assert fake_assert.calls == [(sqlite_backend.memories, "m1", ROOT)]
 
 
 async def test_tool_recommend_model_routes_through_persistence_abc(sqlite_backend, monkeypatch):
