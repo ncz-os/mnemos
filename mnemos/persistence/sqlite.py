@@ -3785,8 +3785,9 @@ class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueReposi
             count = await _fetch_val(
                 conn, "SELECT COUNT(*) FROM memory_compressed_variants"
             )
-        except Exception:
-            # sqlite3.OperationalError: no such table.
+        except Exception as exc:
+            if "no such table" not in str(exc):
+                raise
             return -1
         return int(count or 0)
 

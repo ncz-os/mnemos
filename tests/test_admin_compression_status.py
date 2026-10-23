@@ -548,3 +548,61 @@ async def test_fake_compression_queue_status_honours_count_faults(
     with pytest.raises(RuntimeError, match="count fault"):
         async with fake.transactional() as tx:
             await fake.compression_queue.get_compression_queue_status(tx)
+
+
+# ── infra-error propagation (not swallowed as "missing table") ─────────────
+
+
+@pytest.mark.asyncio
+async def test_compressed_variants_count_infra_error_propagates(
+    sqlite_backend, monkeypatch,
+):
+    """A non-table-not-found error (e.g. lock timeout, connection loss)
+    must propagate from ``get_compressed_variants_count`` — NOT be
+    silently mapped to the -1 sentinel. The -1 sentinel is reserved
+    for the specific "table absent" condition; masking a dead DB as
+    "missing table" would hide a genuine infrastructure failure from
+    the operator.
+
+    Pinned on SQLite: inject a generic RuntimeError through the
+    repository's ``_fetch_val`` helper (the same module-level global
+    the read-only spy test uses). The helper must see a message that
+    does NOT match "no such table", so the except branch re-raises.
+    """
+    from mnemos.persistence import sqlite as sq
+
+    async def _boom_fetch_val(conn, sql, params=()):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(sq, "_fetch_val", _boom_fetch_val)
+
+    repo = sqlite_backend.compression_queue
+    with pytest.raises(RuntimeError, match="database is locked"):
+        async with sqlite_backend.transactional() as tx:
+            await repo.get_compressed_variants_count(tx)
+
+
+@pytest.mark.asyncio
+async def test_compressed_variants_count_missing_table_returns_sentinel(
+    tmp_path, monkeypatch,
+):
+    """The specific "no such table" condition maps to -1 (the absence
+    sentinel) on SQLite — the complement of the infra-error-propagation
+    test above. Pinned with a real DROP TABLE, not a monkeypatch, so
+    the actual sqlite3 error path is exercised."""
+    from mnemos.persistence.sqlite import SqliteBackend, _execute
+
+    backend = SqliteBackend(tmp_path / "sentinel.sqlite3", SimpleNamespace())
+    await backend.open()
+    old_backend = lifecycle._persistence_backend
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+    try:
+        async with backend.transactional() as tx:
+            await _execute(tx.conn, "DROP TABLE memory_compressed_variants")
+
+        async with backend.transactional() as tx:
+            count = await backend.compression_queue.get_compressed_variants_count(tx)
+        assert count == -1
+    finally:
+        lifecycle._persistence_backend = old_backend
+        await backend.close()
