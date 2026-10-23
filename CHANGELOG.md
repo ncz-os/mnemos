@@ -67,6 +67,28 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   use the same tool registry, bearer/OAuth authorization, role, namespace,
   and backend context. `/mcp` is the preferred endpoint for Codex and modern
   remote MCP clients.
+- **`GET /admin/compression/status` — read-only compression/contest
+  introspection (backlog F-15).** The only ways to learn the effective
+  `MNEMOS_CONTEST_ENABLED` setting, the compression queue depth, or the
+  variant count were the *mutating* enqueue routes or log scraping. The new
+  admin route (same admin scope as the other `/admin` routes) reports:
+  the effective contest + Apollo settings, the contest engines
+  (`installed` = importable, `enabled` = installed AND the contest gate
+  that starts the distillation worker is on — Apollo additionally gates
+  on `MNEMOS_APOLLO_ENABLED`; Artemis has no separate toggle), the queue
+  depth snapshot, and the variant count. It is strictly read-only: it
+  issues only aggregate SELECTs and never calls the enqueue routes.
+  Per the §0b governing rule the route calls the persistence ABC —
+  `CompressionQueueRepository.get_compressed_variants_count` (new
+  abstract method, implemented on all six backends: sqlite, postgres,
+  mysql, mariadb, oracle, db2-inherited) and the new
+  `get_compression_queue_status` bundle (default implementation delegates
+  to the two ABC primitives) — no raw `_lc._pool` access. A backend that
+  cannot supply the variant count returns the `-1` absence sentinel
+  through the ABC and the route surfaces it as `null` with a reason,
+  never a fabricated zero; the queue snapshot's own `variants` field
+  keeps its pre-F-15 non-negative contract (a missing variants table
+  reports `0` there), so distillation-worker monitoring is unaffected.
 
 ### Fixed
 

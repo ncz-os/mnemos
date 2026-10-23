@@ -4846,6 +4846,22 @@ class MysqlCompressionQueueRepository(CompressionQueueRepository):
                     )
         return len(stale_rows)
 
+    async def _count_compressed_variants(self, conn: Any) -> int:
+        """Shared read-only COUNT over ``memory_compressed_variants``.
+
+        ``-1`` when the table is absent (pre-v3.1 schema) — the ABC
+        contract says report inability, never a fabricated zero.
+        """
+        try:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT COUNT(*) AS variants FROM memory_compressed_variants"
+                )
+                row = await _fetchone_dict(cursor)
+        except Exception:
+            return -1
+        return int((row or {}).get("variants") or 0)
+
     async def get_queue_stats(self, tx: Transaction) -> dict[str, int]:
         """MySQL/MariaDB stats snapshot for the v3.5 distillation worker.
 
@@ -4872,18 +4888,36 @@ class MysqlCompressionQueueRepository(CompressionQueueRepository):
                 """
             )
             row = await _fetchone_dict(cursor)
-            await cursor.execute("SELECT COUNT(*) AS variants FROM memory_compressed_variants")
-            variants_row = await _fetchone_dict(cursor)
 
-        variants = (variants_row or {}).get("variants", 0)
+        # The snapshot's ``variants`` field keeps the pre-F-15 contract:
+        # a non-negative int consumed by distillation-worker monitoring.
+        # A missing ``memory_compressed_variants`` table (pre-v3.1
+        # schema) is indistinguishable from an empty one for monitoring
+        # purposes, so it reports 0 here. The ``-1`` absence sentinel is
+        # reserved for the dedicated ``get_compressed_variants_count``
+        # ABC read (F-15), which MUST report inability instead of
+        # fabricating a zero.
+        variants = max(await self._count_compressed_variants(conn), 0)
         return {
             "total": int(row.get("total") or 0),
             "pending": int(row.get("pending") or 0),
             "running": int(row.get("running") or 0),
             "done": int(row.get("done") or 0),
             "failed": int(row.get("failed") or 0),
-            "variants": int(variants or 0),
+            "variants": variants,
         }
+
+    async def get_compressed_variants_count(self, tx: Transaction) -> int:
+        """F-15 read-only variant count for the admin status route.
+
+        Single SELECT; no write path. MariaDB inherits this
+        implementation via ``MariadbCompressionQueueRepository`` —
+        identical SQL on both dialects (same as ``get_queue_stats``).
+        Returns ``-1`` when the ``memory_compressed_variants`` table is
+        absent (pre-v3.1 schema) instead of fabricating a zero — the
+        route maps that to ``null`` with a reason per the ABC contract.
+        """
+        return await self._count_compressed_variants(tx.conn)
 
 
 class MysqlWebhookRepository(WebhookRepository):

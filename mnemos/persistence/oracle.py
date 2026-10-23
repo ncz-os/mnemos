@@ -3926,6 +3926,31 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
         finally:
             await _call(cursor.close)
 
+    async def _count_compressed_variants(self, tx: Transaction) -> int:
+        """Shared read-only COUNT over ``memory_compressed_variants``.
+
+        Opens its own cursor (the caller's may be in flight) so the
+        helper is reusable from ``get_queue_stats`` and
+        ``get_compressed_variants_count``. ``-1`` when the table is
+        absent (pre-v3.1 schema) — the ABC contract says report
+        inability, never a fabricated zero.
+        """
+        conn = _conn_from_tx(tx)
+        cur = await _call(conn.cursor)
+        try:
+            await _call(
+                cur.execute,
+                "SELECT COUNT(*) AS variants FROM memory_compressed_variants",
+            )
+            raw = await _call(cur.fetchone)
+            cols = [d[0].lower() for d in cur.description]
+            row = dict(zip(cols, raw)) if raw is not None else {}
+        except Exception:
+            return -1
+        finally:
+            await _call(cur.close)
+        return int(row.get("variants") or 0)
+
     async def get_queue_stats(self, tx: Transaction) -> dict[str, int]:
         """Oracle 26ai stats snapshot for the v3.5 distillation worker.
 
@@ -3960,24 +3985,39 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
             raw = await _call(cursor.fetchone)
             cols = [d[0].lower() for d in cursor.description]
             row = dict(zip(cols, raw)) if raw is not None else {}
-            await _call(
-                cursor.execute,
-                "SELECT COUNT(*) AS variants FROM memory_compressed_variants",
-            )
-            v_raw = await _call(cursor.fetchone)
-            v_cols = [d[0].lower() for d in cursor.description]
-            v_row = dict(zip(v_cols, v_raw)) if v_raw is not None else {}
         finally:
             await _call(cursor.close)
 
+        # The snapshot's ``variants`` field keeps the pre-F-15 contract:
+        # a non-negative int consumed by distillation-worker monitoring.
+        # A missing ``memory_compressed_variants`` table (pre-v3.1
+        # schema) is indistinguishable from an empty one for monitoring
+        # purposes, so it reports 0 here. The ``-1`` absence sentinel is
+        # reserved for the dedicated ``get_compressed_variants_count``
+        # ABC read (F-15), which MUST report inability instead of
+        # fabricating a zero.
+        variants = max(await self._count_compressed_variants(tx), 0)
         return {
             "total": int(row.get("total") or 0),
             "pending": int(row.get("pending") or 0),
             "running": int(row.get("running") or 0),
             "done": int(row.get("done") or 0),
             "failed": int(row.get("failed") or 0),
-            "variants": int(v_row.get("variants") or 0),
+            "variants": variants,
         }
+
+    async def get_compressed_variants_count(self, tx: Transaction) -> int:
+        """F-15 read-only variant count for the admin status route.
+
+        Single SELECT; no write path. Oracle's aggregate SELECT is
+        dialect-clean for the ``_Db2AsyncCursor.execute`` rewrite hook,
+        so Db2 inherits this implementation unchanged (same as
+        ``get_queue_stats``). Returns ``-1`` when the
+        ``memory_compressed_variants`` table is absent (pre-v3.1
+        schema) instead of fabricating a zero — the route maps that
+        to ``null`` with a reason per the ABC contract.
+        """
+        return await self._count_compressed_variants(tx)
 
 
 class OracleWebhookRepository(WebhookRepository):

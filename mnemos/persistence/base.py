@@ -2473,7 +2473,11 @@ class CompressionQueueRepository(ABC):
         * ``running`` — rows whose ``status = 'running'``.
         * ``done`` — rows whose ``status = 'done'``.
         * ``failed`` — rows whose ``status = 'failed'``.
-        * ``variants`` — total rows in ``memory_compressed_variants``.
+        * ``variants`` — total rows in ``memory_compressed_variants``
+          (non-negative; a missing variants table reports ``0`` — the
+          snapshot is consumed by monitoring as a depth number, and a
+          missing table is indistinguishable from an empty one for
+          that purpose).
 
         Implementations MUST compute the status counts and the variant
         count in a single round-trip pair (or one query that joins
@@ -2486,6 +2490,53 @@ class CompressionQueueRepository(ABC):
         can issue two SELECTs inside the supplied ``tx``.
         """
         ...
+
+    @abstractmethod
+    async def get_compressed_variants_count(self, tx: Transaction) -> int:
+        """Return the row count of ``memory_compressed_variants``.
+
+        F-15 read-only introspection surface: the admin compression
+        status route reports the variant count through this method so
+        the route calls the ABC rather than hand-rolled SQL. MUST be a
+        read-only aggregate — the route that exposes it is documented
+        as read-only and MUST NOT mutate anything.
+
+        A backend that cannot supply the count (e.g. the
+        ``memory_compressed_variants`` table is absent on a pre-v3.1
+        schema) MUST return ``-1`` rather than fabricating a zero: a
+        fabricated zero is indistinguishable from "compression has
+        never run", which is the exact ambiguity F-03/F-15 exist to
+        close. The route maps ``-1`` to ``null`` with a reason.
+        """
+        ...
+
+    async def get_compression_queue_status(self, tx: Transaction) -> dict:
+        """F-15 read-only compression introspection bundle.
+
+        Returns a backend-neutral dict with exactly two keys:
+
+        * ``"queue"`` — the ``get_queue_stats`` snapshot (total /
+          pending / running / done / failed / variants).
+        * ``"variant_count"`` — the
+          ``get_compressed_variants_count`` result; ``-1`` when the
+          backend cannot supply the count (the route maps that to
+          ``null`` with a reason — never a fabricated zero).
+
+        Both values are plain aggregates read inside the supplied
+        read transaction. MUST NOT mutate anything and MUST NOT call
+        the enqueue primitives — the admin status route that exposes
+        this is documented read-only, and calling the enqueue routes
+        from an introspection endpoint is the exact defect this method
+        exists to avoid (backlog F-15).
+
+        The default implementation delegates to the two ABC
+        primitives. Backends with a genuinely cheaper combined
+        round-trip may override this and return the same two keys —
+        the contract is the shape, not the query plan.
+        """
+        queue_stats = await self.get_queue_stats(tx)
+        variant_count = await self.get_compressed_variants_count(tx)
+        return {"queue": queue_stats, "variant_count": variant_count}
 
 
 class MorpheusRepository(ABC):

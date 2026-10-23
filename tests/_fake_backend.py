@@ -425,22 +425,32 @@ class _FakeCompressionQueueRepo:
     """Fake CompressionQueueRepository (job 019e7049). Concrete defaults
     so route handlers calling ``backend.compression_queue.*`` get typed
     return values (list/int/None) instead of AsyncMock objects that fail
-    Pydantic response validation. ``configure_return`` stubs a method."""
+    Pydantic response validation. ``configure_return`` /
+    ``configure_raise`` stub or fault a method."""
 
     def __init__(self) -> None:
         self._returns: dict[str, Any] = {}
+        self._raises: dict[str, BaseException] = {}
 
     def configure_return(self, method: str, value: Any) -> None:
         self._returns[method] = value
 
+    def configure_raise(self, method: str, exc: BaseException) -> None:
+        self._raises[method] = exc
+
+    def _resolve(self, method: str, default: Any) -> Any:
+        if method in self._raises:
+            raise self._raises[method]
+        return self._returns.get(method, default)
+
     async def enqueue_compression(self, tx, **kwargs) -> list:
-        return self._returns.get("enqueue_compression", [])
+        return self._resolve("enqueue_compression", [])
 
     async def enqueue_all_compression(self, tx, **kwargs) -> int:
-        return self._returns.get("enqueue_all_compression", 0)
+        return self._resolve("enqueue_all_compression", 0)
 
     async def dequeue_compression(self, tx, **kwargs) -> list:
-        return self._returns.get("dequeue_compression", [])
+        return self._resolve("dequeue_compression", [])
 
     async def mark_compression_done(self, tx, **kwargs) -> None:
         return None
@@ -449,12 +459,41 @@ class _FakeCompressionQueueRepo:
         return None
 
     async def sweep_stale_compression(self, tx, **kwargs) -> int:
-        return self._returns.get("sweep_stale_compression", 0)
+        return self._resolve("sweep_stale_compression", 0)
 
     async def get_queue_stats(self, tx) -> dict:
-        return self._returns.get(
+        return self._resolve(
             "get_queue_stats",
             {"total": 0, "pending": 0, "running": 0, "done": 0, "failed": 0, "variants": 0},
+        )
+
+    async def get_compressed_variants_count(self, tx) -> int:
+        return self._resolve("get_compressed_variants_count", 0)
+
+    async def get_compression_queue_status(self, tx) -> dict:
+        """F-15 read-only bundle; configurable via ``configure_return`` /
+        ``configure_raise``.
+
+        Mirrors the ABC default: both values flow through
+        ``_resolve`` so a ``configure_raise`` / ``configure_return`` on
+        ``get_compressed_variants_count`` (or ``get_queue_stats``) is
+        honoured here exactly as on a real backend.
+        """
+        queue = self._resolve(
+            "get_queue_stats",
+            {
+                "total": 0,
+                "pending": 0,
+                "running": 0,
+                "done": 0,
+                "failed": 0,
+                "variants": 0,
+            },
+        )
+        variant_count = self._resolve("get_compressed_variants_count", 0)
+        return self._resolve(
+            "get_compression_queue_status",
+            {"queue": queue, "variant_count": variant_count},
         )
 
 
