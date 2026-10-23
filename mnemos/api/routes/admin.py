@@ -458,6 +458,169 @@ class PersephoneMemoryResponse(BaseModel):
     restored: bool = False
 
 
+class CompressionEnginesStatus(BaseModel):
+    """F-15: which contest engines are installed and enabled.
+
+    ``installed`` = the extra is importable on this host; ``enabled`` =
+    installed AND the contest setting that gates it is on. The route is
+    read-only: it reflects configuration, it never constructs or starts
+    an engine.
+    """
+
+    apollo: Optional[dict] = None
+    artemis: Optional[dict] = None
+    apollo_reason: Optional[str] = None
+    artemis_reason: Optional[str] = None
+
+
+class CompressionQueueStatus(BaseModel):
+    """F-15: the backends' compression queue stats, ABC shape.
+
+    ``stats`` is exactly the dict the distillation worker logs via
+    ``CompressionQueueRepository.get_queue_stats`` (total / pending /
+    running / done / failed / variants). A backend that cannot supply
+    the snapshot reports ``null`` with a ``reason`` — never a
+    fabricated zero (backlog governing rule, §0b).
+    """
+
+    stats: Optional[dict] = None
+    reason: Optional[str] = None
+
+
+class CompressionStatusResponse(BaseModel):
+    """F-15: read-only compression/contest introspection.
+
+    Same shape discipline as ``GET /v1/federation/status``:
+    top-level counts + a detail object; every field a backend cannot
+    supply is ``null`` with a reason instead of a fabricated zero.
+    This route MUST NOT mutate anything and MUST NOT call the enqueue
+    routes — it only reads the effective config and two ABC reads
+    (``get_queue_stats`` / ``get_compressed_variants_count``).
+    """
+
+    contest_enabled: bool
+    apollo_enabled: bool
+    engines: CompressionEnginesStatus
+    queue: CompressionQueueStatus
+    variant_count: Optional[int] = None
+    variant_count_reason: Optional[str] = None
+
+
+def _engine_extra_installed(extra: str, import_probe: str) -> bool:
+    """Whether contest-engine ``extra`` is importable on this host.
+
+    The engine extras (``apollo`` is an empty extra; ``artemis`` pulls
+    networkx/scipy) are NOT in ``EXTERNAL_EXTRA_DISTS``, so
+    ``is_extra_installed`` cannot see them. Probe the real engine
+    module instead — same read-only posture, no engine constructed.
+    A failing import (missing extra deps) is reported as
+    ``installed=False``; it is never an exception. Uses the plain
+    ``__import__`` builtin — never a module-cached reference — so a
+    test that swaps out ``builtins.__import__`` to simulate a missing
+    engine sees the simulated absence.
+    """
+    try:
+        __import__(import_probe)
+        return True
+    except Exception:
+        return False
+
+
+def _installed_engine_flags() -> tuple[dict, dict, Optional[str], Optional[str]]:
+    """Installed + enabled state of the two built-in contest engines.
+
+    Pure read of engine-module importability + the effective
+    compression settings. Never constructs an engine instance, so it
+    is safe on any backend and on hosts where the engine deps are only
+    partially present.
+    """
+    settings = get_settings().compression
+    apollo_installed = _engine_extra_installed(
+        "apollo", "mnemos.domain.compression.apollo"
+    )
+    artemis_installed = _engine_extra_installed(
+        "artemis", "mnemos.domain.compression.artemis"
+    )
+    apollo_flags = {
+        "installed": apollo_installed,
+        "enabled": bool(settings.contest_enabled and settings.apollo_enabled
+                       and apollo_installed),
+    }
+    # ARTEMIS is the default contest engine: the distillation worker
+    # adds it when the contest is on and the extra is installed, and
+    # it has no separate per-engine toggle of its own (unlike APOLLO,
+    # which additionally gates on ``apollo_enabled``).
+    artemis_flags = {
+        "installed": artemis_installed,
+        "enabled": bool(settings.contest_enabled and artemis_installed),
+    }
+    apollo_reason = None if apollo_installed else "apollo engine not importable"
+    artemis_reason = None if artemis_installed else "artemis engine not importable"
+    return apollo_flags, artemis_flags, apollo_reason, artemis_reason
+
+
+@router.get("/compression/status", response_model=CompressionStatusResponse)
+async def compression_status(_: UserContext = Depends(require_root)):
+    """Read-only compression/contest state (F-15).
+
+    Reports the effective ``MNEMOS_CONTEST_ENABLED`` setting, the
+    compression queue depth (the backends' ``get_queue_stats()``), the
+    engines installed, and the variant count — the same shape
+    ``GET /v1/federation/status`` already uses for federation.
+
+    Strictly read-only: it issues no writes and never calls the
+    enqueue routes. The route calls the persistence ABC
+    (``CompressionQueueRepository.get_compression_queue_status``) per
+    the §0b governing rule — no raw ``_lc._pool`` access. A backend
+    that cannot supply a field reports it as ``null`` with a reason,
+    never a fabricated zero.
+    """
+    settings = get_settings().compression
+    apollo_flags, artemis_flags, apollo_reason, artemis_reason = _installed_engine_flags()
+
+    queue_stats: Optional[dict] = None
+    queue_reason: Optional[str] = None
+    variant_count: Optional[int] = None
+    variant_count_reason: Optional[str] = None
+    try:
+        backend = backend_or_503()
+        async with backend.transactional() as tx:
+            bundle = await backend.compression_queue.get_compression_queue_status(tx)
+            queue_stats = bundle.get("queue")
+            variant_count = bundle.get("variant_count")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        queue_reason = f"compression queue stats unavailable: {type(exc).__name__}: {exc}"
+        variant_count_reason = queue_reason
+
+    if variant_count == -1:
+        # ABC contract: -1 = the backend cannot supply the count
+        # (e.g. pre-v3.1 schema without the variants table). Report
+        # null with a reason, never a fabricated zero.
+        variant_count = None
+        variant_count_reason = (
+            "variant count unavailable: memory_compressed_variants table not present"
+        )
+
+    return CompressionStatusResponse(
+        contest_enabled=bool(settings.contest_enabled),
+        apollo_enabled=bool(settings.apollo_enabled),
+        engines=CompressionEnginesStatus(
+            apollo=apollo_flags,
+            artemis=artemis_flags,
+            apollo_reason=apollo_reason,
+            artemis_reason=artemis_reason,
+        ),
+        queue=CompressionQueueStatus(
+            stats=queue_stats,
+            reason=queue_reason,
+        ),
+        variant_count=variant_count,
+        variant_count_reason=variant_count_reason,
+    )
+
+
 class PersephoneStatusResponse(BaseModel):
     enabled: bool
     archived_count: int

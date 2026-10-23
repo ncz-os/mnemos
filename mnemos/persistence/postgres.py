@@ -2637,6 +2637,20 @@ class PostgresCompressionQueueRepository(CompressionQueueRepository):
         rows = await _postgres_tx(tx).conn.fetch(_PG_SWEEP_STALE_SQL, int(stale_threshold_secs), int(max_attempts))
         return len(rows)
 
+    async def _count_compressed_variants(self, conn: Any) -> int:
+        """Shared read-only COUNT over ``memory_compressed_variants``.
+
+        ``-1`` when the table is absent (pre-v3.1 schema) — the ABC
+        contract says report inability, never a fabricated zero.
+        """
+        try:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM memory_compressed_variants"
+            )
+        except Exception:
+            return -1
+        return int(count or 0)
+
     async def get_queue_stats(self, tx: Transaction) -> dict[str, int]:
         """Postgres stats snapshot for the v3.5 distillation worker.
 
@@ -2657,15 +2671,33 @@ class PostgresCompressionQueueRepository(CompressionQueueRepository):
             FROM memory_compression_queue
             """
         )
-        variants = await conn.fetchval("SELECT COUNT(*) FROM memory_compressed_variants")
+        # The snapshot's ``variants`` field keeps the pre-F-15 contract:
+        # a non-negative int consumed by distillation-worker monitoring.
+        # A missing ``memory_compressed_variants`` table (pre-v3.1
+        # schema) is indistinguishable from an empty one for monitoring
+        # purposes, so it reports 0 here. The ``-1`` absence sentinel is
+        # reserved for the dedicated ``get_compressed_variants_count``
+        # ABC read (F-15), which MUST report inability instead of
+        # fabricating a zero.
+        variants = max(await self._count_compressed_variants(conn), 0)
         return {
             "total": int(row["total"] or 0),
             "pending": int(row["pending"] or 0),
             "running": int(row["running"] or 0),
             "done": int(row["done"] or 0),
             "failed": int(row["failed"] or 0),
-            "variants": int(variants or 0),
+            "variants": variants,
         }
+
+    async def get_compressed_variants_count(self, tx: Transaction) -> int:
+        """F-15 read-only variant count for the admin status route.
+
+        Single SELECT; no write path. Returns ``-1`` when the
+        ``memory_compressed_variants`` table is absent (pre-v3.1
+        schema) instead of fabricating a zero — the route maps that
+        to ``null`` with a reason per the ABC contract.
+        """
+        return await self._count_compressed_variants(_postgres_tx(tx).conn)
 
 
 class PostgresWebhookRepository(WebhookRepository):
