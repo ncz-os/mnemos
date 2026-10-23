@@ -110,7 +110,11 @@ async def _recover_due_deliveries(_pool_or_backend: Any = None, *, limit: int = 
 
     backend = _lc._persistence_backend
     if backend is None:
-        pool = _lc._pool if _pool_or_backend is None else _pool_or_backend
+        # F-06 slice 3: raw-pool fallback through the facade accessor — no
+        # direct lifecycle-pool read here. With any persistence backend
+        # installed this whole branch is unreachable (the ABC owns the
+        # batch claim).
+        pool = _pool_or_backend if _pool_or_backend is not None else _lc.get_legacy_webhook_pool()
         if pool is None:
             return 0
         async with pool.acquire() as conn:

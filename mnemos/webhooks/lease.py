@@ -103,9 +103,15 @@ def _as_mapping(record: Any) -> Mapping[str, Any]:
 class _RecordView:
     """Subscript-style proxy over ``WebhookDeliveryRecord`` (and any
     raw asyncpg-Record shape during the test migration window).
-    """
 
-    __slots__ = ("_record",)
+    No ``__slots__`` on purpose: the ABC claim path (item 7) attaches
+    ``lease_expires_at`` / ``claim_db_now`` here — database-clock values
+    that live on the ``WebhookDeliveryClaim`` wrapper, not on the
+    ``WebhookDeliveryRecord`` they decorate — and a slotted class
+    rejects the assignment (AttributeError) while the legacy
+    asyncpg-Record path works, which would turn every ABC claim on
+    every backend into a delivery crash.
+    """
 
     def __init__(self, record: Any) -> None:
         self._record = record
@@ -171,7 +177,11 @@ async def _claim_delivery(
             pre_claim_monotonic=pre_claim_monotonic,
         )
 
-    pool = pool_or_backend or _lc._pool
+    # F-06 slice 3: the raw-pool fallback comes through the facade accessor,
+    # which returns None once any of the six persistence backends is
+    # installed (the ABC owns the claim on those arms) — no direct
+    # lifecycle-pool read here.
+    pool = pool_or_backend or _lc.get_legacy_webhook_pool()
     if pool is None:
         raise RuntimeError(
             f"webhook delivery {delivery_id} cannot run without a supported persistence handle"
@@ -200,7 +210,9 @@ async def _guard_preclaimed_delivery_before_send(
                     lease_token=lease_token,
                 )
             )
-    pool = pool_or_backend or _lc._pool
+    # F-06 slice 3: raw-pool fallback through the facade accessor (see
+    # ``_claim_delivery`` above) — no direct lifecycle-pool read here.
+    pool = pool_or_backend or _lc.get_legacy_webhook_pool()
     if pool is None:
         raise RuntimeError(
             f"webhook delivery {delivery_id} cannot run without a supported persistence handle"

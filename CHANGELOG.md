@@ -97,6 +97,35 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
 
 ### Fixed
 
+- **Webhook worker no longer reads the raw lifecycle pool (F-06, slice 3
+  of 4).** The three remaining `_lc._pool` references outside the
+  repository layer in the webhook worker runtime —
+  `mnemos/webhooks/finalize.py` (3), `mnemos/webhooks/lease.py` (2) and
+  `mnemos/webhooks/workers.py` (1) — were leftovers from the pre-item-7
+  asyncpg migration, not needs: the ABC `WebhookRepository` already
+  covers every one of those call paths (claim, guard, finalize,
+  response-body store) on all six backends, and the webhooks subsystem
+  has been neutral across all of them since item 7. Each reference was
+  unwired through the new facade accessor
+  `mnemos.core.lifecycle.get_legacy_webhook_pool()`, which returns the
+  raw asyncpg pool only while the legacy migration window is open (no
+  persistence backend installed, pool present — the state
+  `test_webhook_retry_state.py` still runs in) and returns `None` the
+  moment any of the six backends is installed, so a backend that cannot
+  supply a value never gets a fabricated handle. Production behaviour on
+  Postgres is byte-for-byte unchanged (the accessor returns the very
+  pool the old reads returned); on the other five backends the fallback
+  branch was already unreachable because the backend was installed.
+  Three genuine defects found while wiring the slice through:
+  `lease._RecordView` declared `__slots__` while the item-7 ABC claim
+  path assigns `lease_expires_at` / `claim_db_now` onto it (every ABC
+  claim on every backend raised `AttributeError`);
+  `finalize._finalize_delivery` constructed
+  `webhook_types.WebhookDeliveryOutcome`, a name that exists only on
+  `mnemos.persistence` (the ABC path raised `AttributeError` before the
+  state machine could run); and the worker-claim path relied on the same
+  slots bug. All three are fixed with regression tests.
+  `_lc._pool` references in the slice files: **6 before, 0 after**.
 - **API-key creation is backend-neutral.** Minting a key was PostgreSQL-only in
   two places while *looking one up* had been backend-neutral since v6.3, so an
   operator on the SQLite edge profile could authenticate with a key but had no
