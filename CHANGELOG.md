@@ -74,8 +74,8 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   tree for raw `_lc._pool` / `_lc._raw_pool` references outside
   `mnemos/persistence/` (skipping comment/docstring mentions) and compares
   per-file counts against the committed baseline
-  `tests/abc_first_baseline.json` (21 references across 8 files at
-  master). It fails only when an in-baseline file's count goes **UP** or a
+  `tests/abc_first_baseline.json` (24 code references across 8 files at
+  master; docstring and comment mentions of the pattern do not count). It fails only when an in-baseline file's count goes **UP** or a
   **new** file gains a reference — never on a reduced count — so a stale
   baseline left by a parallel job that removes references first can never
   break a merge. The failure message names `file:line`. Wired as the

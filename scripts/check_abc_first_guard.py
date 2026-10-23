@@ -31,10 +31,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import re
 import sys
 from pathlib import Path
+from token import STRING
+from tokenize import tokenize
 
 REPO = Path(__file__).resolve().parents[1]
 BASELINE_PATH = REPO / "tests" / "abc_first_baseline.json"
@@ -102,25 +105,50 @@ def scan_repo(root: Path) -> dict[str, list[int]]:
 
 
 def _raw_pool_lines(text: str) -> list[int]:
-    """Line numbers (1-based) of every counted reference, with the same
-    prose-skipping rules as ``_count_raw_pool``."""
+    """Line numbers (1-based) of every counted raw reference.
+
+    A *reference* is a bare ``_lc._pool`` / ``_lc._raw_pool`` token in
+    code. Lines that merely *mention* the pattern are skipped: whole-line
+    ``#`` comments, and any line the tokenizer places inside a string or
+    docstring (this catches the F-15 docstrings that say "no raw
+    ``_lc._pool`` access"). The docstring state comes from the real
+    Python tokenizer, not a per-line quote-count heuristic, so nested or
+    multi-line docstrings cannot desync the scan.
+    """
+    in_string_lines = _docstring_line_spans(text)
     out: list[int] = []
-    in_docstring = 0
     for lineno, line in enumerate(text.splitlines(), start=1):
-        if in_docstring:
-            in_docstring -= line.count(TQD) + line.count(TQS)
+        if lineno in in_string_lines:
             continue
-        stripped = line.lstrip()
-        if stripped.startswith("#") or stripped.startswith(">>>"):
-            continue
-        code = line.split("#", 1)[0]
-        opens = code.count(TQD) + code.count(TQS)
-        if _DOCSTRING_LINE_RE.match(code):
-            in_docstring = opens
-            continue
+        code = _code_portion(line)
         out.extend(lineno for _ in RAW_POOL_RE.findall(code))
-        in_docstring = opens % 2
     return out
+
+
+def _code_portion(line: str) -> str:
+    """The code portion of a line. A whole-line ``#`` comment or ``>>>``
+    doctest prompt is prose; a trailing ``#`` comment after code
+    (x = 1  # see _lc._pool) is stripped so a doc mention does not
+    count."""
+    stripped = line.lstrip()
+    if stripped.startswith("#") or stripped.startswith(">>>"):
+        return ""
+    return line.split("#", 1)[0]
+
+
+def _docstring_line_spans(text: str) -> set[int]:
+    """Line numbers (1-based) that fall inside any string token, per the
+    real Python tokenizer (single-line strings, multi-line strings, and
+    docstrings alike)."""
+    spans: set[int] = set()
+    try:
+        for tok in tokenize(io.BytesIO(text.encode("utf-8")).readline):
+            if tok.type == STRING:
+                spans.update(range(tok.start[0], tok.end[0] + 1))
+    except Exception:
+        # Unparseable source: the tokenizer gave up; nothing to mark.
+        pass
+    return spans
 
 
 def check(repo: Path, baseline_path: Path) -> int:
