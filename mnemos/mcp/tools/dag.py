@@ -13,7 +13,6 @@ import logging
 from typing import Any
 
 from mnemos.core.auth_context import UserContext
-from mnemos.core.lifecycle import get_persistence_backend
 
 from ._runtime import (
     MCP_DEFAULT_LIMIT_MAX,
@@ -27,8 +26,6 @@ from ._runtime import (
     _tool,
 )
 from ._security import _mcp_enforce_write_rate_limit
-
-del get_persistence_backend  # _get_persistence_backend resolves it at call time
 
 logger = logging.getLogger(__name__)
 BRANCH_MEMORY_RATE_LIMIT_PER_MINUTE = 30
@@ -362,7 +359,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "memory_id": {"type": "string", "description": "Memory ID"},
             "commit_hash": {"type": "string", "description": "Commit hash to fetch", "maxLength": 128},
         },
-        ["memory_id"],
+        ["memory_id", "commit_hash"],
         tool_checkout_memory,
     ),
 }
