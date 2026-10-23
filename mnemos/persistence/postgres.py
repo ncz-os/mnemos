@@ -2642,12 +2642,16 @@ class PostgresCompressionQueueRepository(CompressionQueueRepository):
 
         ``-1`` when the table is absent (pre-v3.1 schema) — the ABC
         contract says report inability, never a fabricated zero.
+        Only asyncpg's ``UndefinedTableError`` (SQLSTATE 42P01)
+        maps to the sentinel; every other error (connection loss,
+        timeout) propagates so the caller sees a genuine
+        infrastructure failure.
         """
         try:
             count = await conn.fetchval(
                 "SELECT COUNT(*) FROM memory_compressed_variants"
             )
-        except Exception:
+        except asyncpg.UndefinedTableError:
             return -1
         return int(count or 0)
 

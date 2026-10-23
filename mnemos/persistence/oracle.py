@@ -3934,6 +3934,10 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
         ``get_compressed_variants_count``. ``-1`` when the table is
         absent (pre-v3.1 schema) — the ABC contract says report
         inability, never a fabricated zero.
+        Only ORA-00942 ("table or view does not exist") maps to the
+        sentinel; every other error (connection loss, timeout)
+        propagates so the caller sees a genuine infrastructure
+        failure, not a silently-returned "missing table".
         """
         conn = _conn_from_tx(tx)
         cur = await _call(conn.cursor)
@@ -3945,7 +3949,9 @@ class OracleCompressionQueueRepository(CompressionQueueRepository):
             raw = await _call(cur.fetchone)
             cols = [d[0].lower() for d in cur.description]
             row = dict(zip(cols, raw)) if raw is not None else {}
-        except Exception:
+        except Exception as exc:
+            if "ORA-00942" not in str(exc):
+                raise
             return -1
         finally:
             await _call(cur.close)

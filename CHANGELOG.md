@@ -86,9 +86,14 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   to the two ABC primitives) — no raw `_lc._pool` access. A backend that
   cannot supply the variant count returns the `-1` absence sentinel
   through the ABC and the route surfaces it as `null` with a reason,
-  never a fabricated zero; the queue snapshot's own `variants` field
-  keeps its pre-F-15 non-negative contract (a missing variants table
-  reports `0` there), so distillation-worker monitoring is unaffected.
+  never a fabricated zero. The sentinel is mapped only from the
+  specific missing-table condition (MySQL/MariaDB errno 1146,
+  asyncpg `UndefinedTableError`, Oracle ORA-00942, SQLite
+  "no such table"); every other error (connection loss, lock timeout)
+  propagates so a dead DB is never masked as "missing table". The
+  queue snapshot's own `variants` field keeps its pre-F-15
+  non-negative contract (a missing variants table reports `0`
+  there), so distillation-worker monitoring is unaffected.
 
 ### Fixed
 

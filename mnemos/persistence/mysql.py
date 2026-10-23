@@ -4851,6 +4851,11 @@ class MysqlCompressionQueueRepository(CompressionQueueRepository):
 
         ``-1`` when the table is absent (pre-v3.1 schema) — the ABC
         contract says report inability, never a fabricated zero.
+        Only the missing-table condition (MySQL/MariaDB errno 1146)
+        maps to the sentinel; every other error (connection loss,
+        timeout, syntax) propagates so the caller sees a genuine
+        infrastructure failure, not a silently-returned "missing
+        table".
         """
         try:
             async with conn.cursor() as cursor:
@@ -4858,7 +4863,13 @@ class MysqlCompressionQueueRepository(CompressionQueueRepository):
                     "SELECT COUNT(*) AS variants FROM memory_compressed_variants"
                 )
                 row = await _fetchone_dict(cursor)
-        except Exception:
+        except Exception as exc:
+            # errno 1146 = "Table doesn't exist" (MySQL/MariaDB).
+            # Same pattern as the subscription_plans fallback above.
+            args = getattr(exc, "args", ())
+            errno = getattr(args[0], "errno", None) if args else None
+            if errno != 1146 and "1146" not in str(exc) and "doesn't exist" not in str(exc):
+                raise
             return -1
         return int((row or {}).get("variants") or 0)
 
