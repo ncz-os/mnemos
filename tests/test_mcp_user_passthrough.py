@@ -156,8 +156,12 @@ async def test_dag_log_memory_uses_persistence_abc_path_when_backend_exists(monk
     )
 
     mcp_dag._rest_get.assert_not_awaited()
-    backend.memories._assert_memory_readable.assert_awaited_once()
-    backend.memories._fetch_memory_log.assert_awaited_once()
+    # Assert on the public ABC surface the tool actually calls. The
+    # properties return the SAME AsyncMock instances the tool awaited,
+    # so this is the same assertion — just stated against the contract
+    # rather than against the fake's private storage.
+    backend.memories.assert_memory_readable.assert_awaited_once()
+    backend.memories.fetch_memory_log.assert_awaited_once()
     assert result["success"] is True
     assert result["commits"][0]["hash"] == "abc123"
 
