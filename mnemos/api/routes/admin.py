@@ -571,7 +571,8 @@ async def compression_status(_: UserContext = Depends(require_root)):
     Strictly read-only: it issues no writes and never calls the
     enqueue routes. The route calls the persistence ABC
     (``CompressionQueueRepository.get_compression_queue_status``) per
-    the §0b governing rule — no raw ``_lc._pool`` access. A backend
+    the §0b governing rule — no raw ``_lc._pool`` access (the
+    string here is docstring prose, not a call site — F-06). A backend
     that cannot supply a field reports it as ``null`` with a reason,
     never a fabricated zero.
     """

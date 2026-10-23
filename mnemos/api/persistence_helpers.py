@@ -114,15 +114,18 @@ def capability_exception_to_503(exc: BackendCapabilityMissing) -> HTTPException:
 
 
 def require_postgres_pool_or_503(*, route_label: str = "this endpoint"):
-    """Return the asyncpg pool or raise a 503 with profile-aware
+    """Return the raw database pool or raise a 503 with profile-aware
     detail.
 
-    Many legacy routes use raw asyncpg SQL and hard-require
-    ``_lc._pool``. On SQLite/edge profiles the lifecycle sets
-    ``_pool = None`` deliberately — those routes are
-    Postgres-only-by-design, not transiently down. Distinguishing
-    the two failure modes in the 503 detail saves operators on
-    edge profiles from chasing a phantom outage.
+    Per the §0b governing rule the pool is resolved through the
+    persistence FACADE (``backend.pool``), never the lifecycle
+    module global: the facade owns the pool on every backend that has
+    one, and backends that genuinely cannot supply a raw pool surface
+    one as ``None``. On SQLite/edge profiles that facade surface is
+    deliberately absent — those routes are Postgres-only-by-design,
+    not transiently down. Distinguishing the two failure modes in the
+    503 detail saves operators on edge profiles from chasing a
+    phantom outage.
 
     Returns the pool for caller use. Raises HTTPException(503) with:
       * "endpoint requires Postgres backend ..." when any non-Postgres
@@ -132,6 +135,18 @@ def require_postgres_pool_or_503(*, route_label: str = "this endpoint"):
         but the pool isn't (transient — startup race or pool
         terminated mid-request).
     """
+    backend = _lc._persistence_backend
+    if backend is not None:
+        pool = getattr(backend, "pool", None)
+        if pool is not None:
+            return pool
+    # Last-resort legacy fallback (F-06 (c)): the lifecycle IS the
+    # pool's owner — it constructs the asyncpg pool and holds the
+    # module-global. No facade is registered yet when this path runs
+    # (e.g. the transient startup race the "Database pool not
+    # available" branch below exists for); reading the owner's
+    # own global here is owner access, not a route bypassing the
+    # persistence ABC.
     pool = _lc._pool
     if pool is not None:
         return pool

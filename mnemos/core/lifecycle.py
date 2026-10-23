@@ -835,8 +835,18 @@ async def lifespan(app):
             # call sites inherit the configured acquire timeout
             # uniformly. PoolManager already applies the timeout on
             # its ``.acquire()`` method; the wrap closes the gap for
-            # the 86+ legacy paths that still touch ``_lc._pool``
-            # directly. See mnemos.core.pool.TimeoutPool docstring.
+            # the legacy paths that still acquire directly off the
+            # lifecycle pool (the direct ``._pool`` access documented
+            # in mnemos.core.pool's TimeoutPool docstring).
+            # Recounted 2026-10-23 against master 0073bb49 with
+            # ``grep -rc '_lc\\._pool' mnemos --include=*.py``
+            # (outside mnemos/persistence/): 27 references (this
+            # file's only contribution is this comment, phrased so it
+            # does not match the pattern). The F-06 table in
+            # docs/FEATURES_TO_BE_DONE.md, counted 2026-10-18, reads
+            # 28. The count that doc tracks converges further under
+            # F-06, so the number is stated there, not repeated in
+            # code. See mnemos.core.pool.TimeoutPool docstring.
             from mnemos.core.pool import wrap_pool_with_timeout
 
             _pool = wrap_pool_with_timeout(_raw_pool)
@@ -1093,7 +1103,12 @@ def _get_cache_key(prefix: str, *args) -> str:
 
 
 def get_pool_manager() -> PoolManager:
-    """Return the lifecycle-owned pool manager singleton."""
+    """Return the lifecycle-owned pool manager singleton.
+
+    F-06 (c): the lifecycle is the raw-pool OWNER — it constructs the
+    asyncpg pool and owns this module-global. Legitimate owner access,
+    not a route bypassing the persistence ABC (§0b).
+    """
     global _pool_manager
     if _pool_manager is None or (_pool is not None and _pool_manager.pool is not _pool):
         if not _pool:

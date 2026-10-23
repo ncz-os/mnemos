@@ -300,6 +300,24 @@ class NestableTransaction(Transaction, Protocol):
         """
         ...
 
+    def raw_connection(self) -> Any:
+        """Return the driver-level connection this transaction runs on.
+
+        The escape hatch the §0b rule exists to make nearly
+        unnecessary: everything reachable from this handle stays
+        backend-neutral, so callers reach the raw driver only when the
+        capability genuinely has no repository surface yet. All six
+        shipped backends implement this (the same "optional
+        capabilities modelled separately" discipline as
+        :meth:`savepoint` — a test double that does not need it simply
+        omits it).
+
+        F-06: added so the last ``_lc._pool`` reference outside
+        ``mnemos/persistence/`` (the API-layer pool guard) can be routed
+        through the facade instead of the lifecycle module global.
+        """
+        ...
+
 
 class MemoryRepository(ABC):
     """Memory row, memory export, and memory DAG read operations."""

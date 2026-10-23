@@ -655,6 +655,11 @@ class SqliteTransaction:
     def conn(self) -> Any:
         return self._conn
 
+    def raw_connection(self) -> Any:
+        """Driver-level connection for capabilities with no repository
+        surface yet (NestableTransaction contract, F-06)."""
+        return self._conn
+
     @property
     def closed(self) -> bool:
         return self._closed
