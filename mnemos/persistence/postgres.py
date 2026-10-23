@@ -3958,8 +3958,10 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
             # (pre-ABC behaviour on the raw asyncpg pool); the other five
             # backends report None instead, so only Postgres raises here --
             # the contract the ABC ``fetch_model_provider`` docstring declares.
-            # The import is local: this package has no static edge on mnemos.db.
-            from mnemos.db.openai_compat_repo import ModelRegistryUnavailable
+            # The exception class is canonical on mnemos.persistence.base;
+            # mnemos.db.openai_compat_repo re-exports it for the gateway's
+            # historical import path.
+            from mnemos.persistence.base import ModelRegistryUnavailable
 
             logger.warning("[/v1/models/%s] registry lookup failed: %s", model_id, exc)
             raise ModelRegistryUnavailable from exc

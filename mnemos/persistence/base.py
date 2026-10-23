@@ -34,6 +34,21 @@ class DuplicateMemoryError(ValueError):
     """Raised when an explicit memory id already exists."""
 
 
+class ModelRegistryUnavailable(Exception):
+    """The model_registry query failed on a backend that reports errors.
+
+    Postgres raises this out of ``ConsultationAuditRepository.fetch_model_provider``
+    on a query failure, preserving the OpenAI-compat gateway's historical
+    503 mapping. The other five backends swallow query errors and return
+    ``None`` with a logged reason (the null-with-reason contract).
+
+    ``mnemos.db.openai_compat_repo`` re-exports this class so the gateway's
+    public import path (``openai_compat_repo.ModelRegistryUnavailable``) is
+    unchanged; the canonical definition lives here so the persistence layer
+    does not import from the db layer.
+    """
+
+
 def is_duplicate_memory_error(exc: BaseException) -> bool:
     """Best-effort "this row already exists" detection across backends.
 

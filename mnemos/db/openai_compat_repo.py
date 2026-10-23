@@ -41,16 +41,7 @@ __all__ = [
 ]
 
 
-class ModelRegistryUnavailable(Exception):
-    """The model_registry query failed on a backend that reports errors.
-
-    Declared here (rather than on the persistence ABC) so the OpenAI-compat
-    gateway keeps its historical ``openai_compat_repo.ModelRegistryUnavailable``
-    import path. Postgres raises it out of
-    ``ConsultationAuditRepository.fetch_model_provider``; the other five
-    backends swallow query errors and return None, matching the pre-ABC
-    hand-rolled repository's behaviour on non-Postgres pools.
-    """
+from mnemos.persistence.base import ModelRegistryUnavailable  # noqa: F401 — re-export
 
 
 def format_memory_for_system_prompt(content: Any) -> str:
@@ -116,6 +107,9 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
         else:
             visibility = VisibilityFilter.for_read(user, namespace=getattr(user, "namespace", None) or "default")
         try:
+            # ``tx`` is the backend-scoped transaction handed in by
+            # ``_run_on_persistence``; the repository methods take it as
+            # their first argument and derive the connection from it.
             rows = await _backend().memories.fts_search(tx, query=query, limit=limit, visibility=visibility)
         except Exception as e:
             logger.warning("[MNEMOS] Search failed for '%s...': %s", query[:50], e)

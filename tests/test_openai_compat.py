@@ -148,29 +148,25 @@ class _FakeMemoryRepo:
         self._conn = conn
 
     async def fts_search(self, tx, *, query, limit, visibility):
-        # The VisibilityFilter is built by the repository before this call;
-        # the adapter holds the last one so tests can assert the policy.
-        vis = getattr(self, "_last_visibility", None)
+        # The ``visibility`` argument is the source of truth for filtering;
+        # it is also captured so tests can assert the policy the repository
+        # built (namespace pin / vault subtraction).
+        self._last_visibility = visibility
+        vis = visibility
         if vis is None:
+            # Defensive fallback: the repository always passes a filter, so
+            # this only runs if a future call path omits it. Use the caller's
+            # identity rather than a hardcoded one.
             from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
-            if visibility is not None and getattr(visibility, "scope", None) == VisibilityScope.ROOT_BYPASS:
-                vis = VisibilityFilter(
-                    scope=VisibilityScope.ROOT_BYPASS,
-                    user_id=None,
-                    group_ids=(),
-                    namespace=None,
-                    exclude_namespaces=("vault",),
-                )
-            else:
-                ns = getattr(visibility, "namespace", None) or "default"
-                vis = VisibilityFilter(
-                    scope=VisibilityScope.READABLE,
-                    user_id="alice",
-                    group_ids=(),
-                    namespace=ns,
-                    exclude_namespaces=("vault",),
-                )
+            user_id = getattr(tx, "user_id", None) or "alice"
+            vis = VisibilityFilter(
+                scope=VisibilityScope.READABLE,
+                user_id=user_id,
+                group_ids=(),
+                namespace=getattr(visibility, "namespace", None) or "default",
+                exclude_namespaces=("vault",),
+            )
         rows = self._conn.rows
         # Apply the same tenancy the repository documents: non-root is
         # pinned to the filter's namespace; vault rows are subtracted
@@ -1619,7 +1615,8 @@ def test_openai_repo_memory_context_served_by_sqlite_abc(tmp_path, monkeypatch):
     rows = asyncio.run(openai_compat_repo.fetch_memory_context("needle", user, limit=5))
 
     ids = {row["id"] for row in rows}
-    assert "f06-mem-0" in "".join(ids)
+    # The seeded id has the shape f06-mem-0-<hex>; assert by prefix.
+    assert any(i.startswith("f06-mem-0-") for i in ids)
     # The private note belongs to another user and is invisible to alice.
     assert not any(row["id"].startswith("f06-mem-1") for row in rows)
     assert all(row["content"] for row in rows)
@@ -1694,7 +1691,6 @@ def test_openai_repo_lookup_and_available_models_served_by_sqlite_abc(tmp_path, 
     )
 
     assert asyncio.run(openai_compat_repo.lookup_provider_for_model("gpt-5.4")) == "openai"
-    assert asyncio.run(openai_compat_repo.lookup_provider_for_model("gpt-deprecated")) is None
     assert asyncio.run(openai_compat_repo.lookup_provider_for_model("gpt-deprecated")) is None
     assert asyncio.run(openai_compat_repo.lookup_provider_for_model("nope/missing")) is None
 
