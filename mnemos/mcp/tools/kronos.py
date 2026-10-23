@@ -139,14 +139,13 @@ async def tool_kronos_forecast(
 def _active_backend():
     """Active backend facade, or None (startup race / no backend).
 
-    Reads the lifecycle-owned global directly instead of
-    ``get_persistence_backend()``: that helper raises an HTTP framework
-    exception when no backend is active, and the MCP tool layer must not
-    couple to it (stdio transport, CLI, and tests run without FastAPI).
+    Reads the module-level ``_lc`` binding of ``mnemos.core.lifecycle``
+    directly instead of ``get_persistence_backend()``: that helper raises
+    an HTTP framework exception when no backend is active, and the MCP
+    tool layer must not couple to it (stdio transport, CLI, and tests
+    run without FastAPI).
     """
-    import mnemos.core.lifecycle as _lifecycle
-
-    return _lifecycle._persistence_backend
+    return _lc._persistence_backend
 
 
 def _backend_is_postgres(backend: Any) -> bool:

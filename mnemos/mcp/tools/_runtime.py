@@ -315,9 +315,9 @@ def _get_persistence_backend():
     framework exception, and this module must stay importable outside a
     running app (stdio transport, tests).
     """
-    import mnemos.core.lifecycle as _lifecycle
+    import mnemos.core.lifecycle as _lc
 
-    return _lifecycle._persistence_backend
+    return _lc._persistence_backend
 
 
 async def _mcp_assert_memory_readable(
