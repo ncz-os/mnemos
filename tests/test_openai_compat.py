@@ -164,7 +164,7 @@ class _FakeMemoryRepo:
                 scope=VisibilityScope.READABLE,
                 user_id=user_id,
                 group_ids=(),
-                namespace=getattr(visibility, "namespace", None) or "default",
+                namespace="default",
                 exclude_namespaces=("vault",),
             )
         rows = self._conn.rows

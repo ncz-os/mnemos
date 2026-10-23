@@ -1315,10 +1315,11 @@ class ConsultationAuditRepository(ABC):
         Backends that cannot supply a value report ``None`` with a logged
         reason (SQLite, Oracle, DB2, MySQL) — never a fabricated default.
         Postgres is the one backend that raises ``ModelRegistryUnavailable``
-        (imported from ``mnemos.db.openai_compat_repo`` to keep that module's
-        public exception path) on a *query failure*, preserving the
-        OpenAI-compat gateway's historical 503 mapping. Callers that only
-        care about the value must handle both ``None`` and that exception.
+        (defined in this module, re-exported by ``mnemos.db.openai_compat_repo``
+        for the gateway's historical import path) on a *query failure*,
+        preserving the OpenAI-compat gateway's historical 503 mapping.
+        Callers that only care about the value must handle both ``None``
+        and that exception.
         """
         ...
 

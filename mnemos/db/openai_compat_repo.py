@@ -77,7 +77,7 @@ def _backend():
 
 
 async def _run_on_persistence(leaf, empty_result):
-    """Run ``leaf(tx)`` inside one backend ``transactional()`` scope.
+    """Run ``leaf(tx, backend)`` inside one backend ``transactional()`` scope.
 
     The only storage bridge this module keeps: a single
     ``transactional()`` entry point instead of a raw asyncpg ``_pool.acquire``.
@@ -89,11 +89,11 @@ async def _run_on_persistence(leaf, empty_result):
         logger.debug("[MNEMOS] No persistence backend available")
         return empty_result
     async with backend.transactional() as tx:
-        return await leaf(tx)
+        return await leaf(tx, backend)
 
 
 async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Dict[str, Any]]:
-    async def _leaf(tx: Any) -> List[Dict[str, Any]]:
+    async def _leaf(tx: Any, backend: Any) -> List[Dict[str, Any]]:
         from mnemos.core.security import is_root
         from mnemos.persistence.visibility import VisibilityFilter
 
@@ -107,10 +107,11 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
         else:
             visibility = VisibilityFilter.for_read(user, namespace=getattr(user, "namespace", None) or "default")
         try:
-            # ``tx`` is the backend-scoped transaction handed in by
-            # ``_run_on_persistence``; the repository methods take it as
-            # their first argument and derive the connection from it.
-            rows = await _backend().memories.fts_search(tx, query=query, limit=limit, visibility=visibility)
+            # ``tx`` is the backend-scoped transaction; the repository
+            # method takes it as its first argument and derives the
+            # connection from it (the backend instance is passed in by
+            # ``_run_on_persistence`` so we do not re-resolve it here).
+            rows = await backend.memories.fts_search(tx, query=query, limit=limit, visibility=visibility)
         except Exception as e:
             logger.warning("[MNEMOS] Search failed for '%s...': %s", query[:50], e)
             return []
@@ -133,9 +134,9 @@ async def fetch_model_recommendation(
     cost_budget: float = 10.0,
     quality_floor: float = 0.85,
 ) -> Optional[Dict[str, Any]]:
-    async def _leaf(tx: Any) -> Optional[Dict[str, Any]]:
+    async def _leaf(tx: Any, backend: Any) -> Optional[Dict[str, Any]]:
         try:
-            model, _required = await _backend().consultations_audit.fetch_recommended_model(
+            model, _required = await backend.consultations_audit.fetch_recommended_model(
                 tx, task_type, cost_budget, quality_floor
             )
         except Exception as e:
@@ -157,9 +158,9 @@ async def fetch_model_recommendation(
 
 
 async def lookup_provider_for_model(model: str) -> Optional[str]:
-    async def _leaf(tx: Any) -> Optional[str]:
+    async def _leaf(tx: Any, backend: Any) -> Optional[str]:
         try:
-            return await _backend().consultations_audit.lookup_provider_for_model(tx, model)
+            return await backend.consultations_audit.lookup_provider_for_model(tx, model)
         except Exception as exc:
             logger.warning("[MNEMOS] model_registry lookup failed for model=%s: %s", model, exc)
             return None
@@ -168,9 +169,9 @@ async def lookup_provider_for_model(model: str) -> Optional[str]:
 
 
 async def fetch_available_models() -> list[Any]:
-    async def _leaf(tx: Any) -> list[Any]:
+    async def _leaf(tx: Any, backend: Any) -> list[Any]:
         try:
-            rows = await _backend().consultations_audit.fetch_available_models(tx)
+            rows = await backend.consultations_audit.fetch_available_models(tx)
         except Exception as exc:
             logger.warning(
                 "[/v1/models] model_registry query failed, " "returning an empty discovery list: %s",
@@ -183,7 +184,7 @@ async def fetch_available_models() -> list[Any]:
 
 
 async def fetch_model_provider(model_id: str) -> Optional[str]:
-    async def _leaf(tx: Any) -> Optional[str]:
-        return await _backend().consultations_audit.fetch_model_provider(tx, model_id)
+    async def _leaf(tx: Any, backend: Any) -> Optional[str]:
+        return await backend.consultations_audit.fetch_model_provider(tx, model_id)
 
     return await _run_on_persistence(_leaf, None)
