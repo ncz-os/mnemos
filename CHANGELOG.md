@@ -145,6 +145,23 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   `_lc._pool` refs in the three files in scope: `dag.py` 4 -> 0,
   `models.py` 2 -> 0, `kronos.py` 2 -> 2 (retained, classification (c)).
 
+  Per-reference decisions (8 references):
+
+  | file:line (master) | tool | decision |
+  |---|---|---|
+  | `dag.py:69` | `tool_log_memory` | (a) ABC already covers it -> unwired to `MemoryRepository.fetch_memory_log` + `assert_memory_readable` |
+  | `dag.py:138` | `tool_branch_memory` | (a) -> unwired to `BranchRepository.create_memory_branch` |
+  | `dag.py:184` | `tool_diff_memory_commits` | (a) -> unwired to `MemoryRepository.fetch_diff_commit_pair` |
+  | `dag.py:257` | `tool_checkout_memory` | (a) -> unwired to `MemoryRepository.fetch_checkout_commit` |
+  | `models.py:65` | `tool_recommend_model` | (a) -> the guard now asks the facade whether a local persistence path exists |
+  | `models.py:93` | `tool_recommend_model` | (a) -> unwired to `ConsultationAuditRepository.fetch_recommended_model` |
+  | `kronos.py:44` | `tool_kronos_anomalies` | (c) genuinely Postgres-only (the KRONOS domain SQL is Postgres-specific) -> retained, with the reason in a comment |
+  | `kronos.py:100` | `tool_kronos_forecast` | (c) genuinely Postgres-only -> retained, with the reason in a comment |
+
+  No new ABC surface was needed (no (b) case): every method the tools
+  now call was already abstract on the ABC and implemented on all six
+  backends before this slice.
+
 ### Fixed
 
 - **API-key creation is backend-neutral.** Minting a key was PostgreSQL-only in
