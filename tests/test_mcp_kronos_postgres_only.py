@@ -11,14 +11,13 @@ excludes both.
 
 The honest contract is therefore:
 
-* on Postgres the tools take the direct pool path (unchanged behaviour), and
+* on Postgres the tools take the direct pool path (unchanged behaviour),
+  including the original "Database unavailable" error when the pool is
+  transiently None on a Postgres deployment (startup race / teardown), and
 * on every other backend they return a null-valued, reason-bearing error
   instead of a fabricated 0-count success.
 
-This file pins the non-Postgres half on the SQLite test backend: the tool
-must *not* report ``{"success": True, "count": 0, ...}`` (the pre-classification
-shape, which reads as "no anomalies — all quiet") when the backend simply
-cannot answer.
+This file pins both halves on the SQLite test backend.
 """
 
 from __future__ import annotations
@@ -35,7 +34,6 @@ from mnemos.persistence.sqlite import SqliteBackend
 
 pytestmark = pytest.mark.asyncio
 
-ALICE = UserContext(user_id="alice", group_ids=[], role="user", namespace="alice-ns", authenticated=True)
 ROOT = UserContext(user_id="root", group_ids=[], role="root", namespace="root", authenticated=True)
 
 
@@ -62,6 +60,11 @@ async def sqlite_backend_no_pool(monkeypatch, tmp_path):
     _reset_settings_for_tests()
 
 
+def _enable_kronos(monkeypatch) -> None:
+    os.environ["MNEMOS_KRONOS_ENABLED"] = "true"
+    _reset_settings_for_tests()
+
+
 async def test_kronos_anomalies_reports_unsupported_on_non_postgres_backend(sqlite_backend_no_pool, monkeypatch):
     result = await mcp_kronos.tool_kronos_anomalies("root", user=ROOT)
 
@@ -78,3 +81,42 @@ async def test_kronos_forecast_reports_unsupported_on_non_postgres_backend(sqlit
     assert result["success"] is False, result
     assert "Postgres" in result["error"], result
     assert "predicted_total_recalls" not in result, result
+
+
+class PostgresBackend:
+    """Name-accurate stand-in for the real PostgresBackend facade: the
+    classification walks the MRO, so the double must *be* a class named
+    PostgresBackend (or subclass it) to mirror production."""
+
+
+async def test_kronos_anomalies_transient_pool_loss_keeps_outage_error(monkeypatch):
+    """A Postgres deployment with the pool transiently None (startup race or
+    mid-flight teardown) keeps the original actionable "Database unavailable"
+    error rather than the capability-mismatch message."""
+    _enable_kronos(monkeypatch)
+    import mnemos.core.lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "_pool", None, raising=False)
+    monkeypatch.setattr(lifecycle, "_persistence_backend", PostgresBackend(), raising=False)
+
+    result = await mcp_kronos.tool_kronos_anomalies("root", user=ROOT)
+
+    assert result["success"] is False, result
+    assert result["error"] == "Database unavailable", result
+    os.environ.pop("MNEMOS_KRONOS_ENABLED", None)
+    _reset_settings_for_tests()
+
+
+async def test_kronos_forecast_transient_pool_loss_keeps_outage_error(monkeypatch):
+    _enable_kronos(monkeypatch)
+    import mnemos.core.lifecycle as lifecycle
+
+    monkeypatch.setattr(lifecycle, "_pool", None, raising=False)
+    monkeypatch.setattr(lifecycle, "_persistence_backend", PostgresBackend(), raising=False)
+
+    result = await mcp_kronos.tool_kronos_forecast("root", hours_ahead=12, user=ROOT)
+
+    assert result["success"] is False, result
+    assert result["error"] == "Database unavailable", result
+    os.environ.pop("MNEMOS_KRONOS_ENABLED", None)
+    _reset_settings_for_tests()

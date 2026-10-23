@@ -71,6 +71,11 @@ async def tool_kronos_anomalies(
             "count": len(anomalies),
             "anomalies": [asdict(item) for item in anomalies],
         }
+    if _backend_is_postgres():
+        # Postgres deployment with the pool transiently unavailable
+        # (startup race or mid-flight teardown): keep the original
+        # error, which is actionable as an outage.
+        return {"success": False, "error": "Database unavailable"}
     return _kronos_unsupported("kronos_anomalies")
 
 
@@ -118,7 +123,30 @@ async def tool_kronos_forecast(
     if pool is not None:
         result = await forecast_recall_load(pool, namespace, hours_ahead=hours_ahead)
         return {"success": True, **asdict(result)}
+    if _backend_is_postgres():
+        return {"success": False, "error": "Database unavailable"}
     return _kronos_unsupported("kronos_forecast")
+
+
+def _persistence_backend():
+    """Active backend facade, or None (startup race / no backend)."""
+    try:
+        return get_persistence_backend()
+    except HTTPException:
+        return None
+
+
+def _backend_is_postgres() -> bool:
+    """True when the active backend is Postgres (pool state is transient)."""
+    backend = _persistence_backend()
+    if backend is None:
+        return False
+    # Walk the MRO rather than the immediate class name: a test double or a
+    # subclass of PostgresBackend must classify the same way the real one does.
+    for cls in type(backend).__mro__:
+        if cls.__name__ == "PostgresBackend":
+            return True
+    return False
 
 
 def _kronos_unsupported(tool_name: str) -> dict[str, Any]:
@@ -129,10 +157,7 @@ def _kronos_unsupported(tool_name: str) -> dict[str, Any]:
     quiet" answer the backend cannot actually supply. A backend that cannot
     supply a value reports null with a reason, never a fabricated default.
     """
-    try:
-        backend = get_persistence_backend()
-    except HTTPException:
-        backend = None
+    backend = _persistence_backend()
     if backend is None:
         # No backend at all (startup race / edge profile): still report the
         # capability truth, not a fabricated answer.
