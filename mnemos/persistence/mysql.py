@@ -4864,11 +4864,13 @@ class MysqlCompressionQueueRepository(CompressionQueueRepository):
                 )
                 row = await _fetchone_dict(cursor)
         except Exception as exc:
-            # errno 1146 = "Table doesn't exist" (MySQL/MariaDB).
-            # Same pattern as the subscription_plans fallback above.
+            # aiomysql/pymysql errors carry the numeric server errno as
+            # args[0]; 1146 = ER_NO_SUCH_TABLE. Match on that alone: a text
+            # match on "doesn't exist" would also swallow unrelated errors
+            # (unknown column, unknown database) as an absent table.
             args = getattr(exc, "args", ())
-            errno = getattr(args[0], "errno", None) if args else None
-            if errno != 1146 and "1146" not in str(exc) and "doesn't exist" not in str(exc):
+            errno = args[0] if args and isinstance(args[0], int) else None
+            if errno != 1146:
                 raise
             return -1
         return int((row or {}).get("variants") or 0)

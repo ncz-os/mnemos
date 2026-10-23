@@ -192,21 +192,17 @@ def _with_effective_settings(monkeypatch, **overrides):
     which is exactly the operator-visible contract: what this
     process has loaded, not what the shell happened to export).
 
-    ``monkeypatch.setattr`` on the top-level ``Settings`` is safe:
-    it holds no fields (only ``_settings`` at module level) and the
-    assignment is reversed by monkeypatch after the test.
+    The override is applied through ``monkeypatch.setitem`` on the
+    sub-settings instance ``__dict__`` (where pydantic stores field
+    values), which bypasses any frozen/validator guards the same way a
+    direct ``object.__setattr__`` would, and is reverted by monkeypatch
+    at teardown so no test leaks a changed setting to the next.
     """
     import mnemos.core.config as config
 
     settings = config.get_settings()
     for key, value in overrides.items():
-        # Use object.__setattr__ to be explicit that we bypass any
-        # pydantic frozen/model_validator guards on the sub-settings.
-        object.__setattr__(
-            settings.compression,
-            key,
-            value,
-        )
+        monkeypatch.setitem(settings.compression.__dict__, key, value)
     return settings
 
 
@@ -468,12 +464,8 @@ async def test_compression_status_reports_missing_engine(
         builtins.__import__ = real_import
         real_import("mnemos.domain.compression.artemis", fromlist=["x"])
 
-    # Sanity: the route returned (no exception) AND the blocking hook
-    # was observed (artemis reported missing). The probe result comes
-    # from the import-time block above, not from the module cache.
-    assert resp is not None
-    assert "mnemos.domain.compression.artemis" in sys.modules
-
+    # The probe result comes from the import-time block above, not from
+    # the module cache: the route reports artemis missing.
     assert resp.engines.artemis["installed"] is False
     assert resp.engines.artemis["enabled"] is False
     assert resp.engines.artemis_reason is not None
@@ -632,3 +624,74 @@ async def test_compressed_variants_count_missing_table_returns_sentinel(
     finally:
         lifecycle._persistence_backend = old_backend
         await backend.close()
+
+
+# ── MySQL/MariaDB missing-table detection ──────────────────────────────────
+
+
+def _mysql_conn(*, exc=None, row=None):
+    """Minimal aiomysql-shaped connection for ``_count_compressed_variants``."""
+
+    class _Cursor:
+        description = [("variants",)]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, sql, params=None):
+            if exc is not None:
+                raise exc
+
+        async def fetchone(self):
+            return row
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    return _Conn()
+
+
+async def _mysql_count(conn):
+    from mnemos.persistence.mysql import MysqlCompressionQueueRepository
+
+    # The helper does not use ``self``; call it unbound so no pool is needed.
+    return await MysqlCompressionQueueRepository._count_compressed_variants(None, conn)
+
+
+@pytest.mark.asyncio
+async def test_mysql_variants_count_missing_table_errno_returns_sentinel():
+    exc = Exception(1146, "Table 'mnemos.memory_compressed_variants' doesn't exist")
+    assert await _mysql_count(_mysql_conn(exc=exc)) == -1
+
+
+@pytest.mark.asyncio
+async def test_mysql_variants_count_other_errno_with_doesnt_exist_text_propagates():
+    """Only errno 1146 means a missing table; a different server error whose
+    message happens to contain "doesn't exist" must not become the sentinel."""
+    exc = Exception(1054, "Column 'x' doesn't exist in field list")
+    with pytest.raises(Exception, match="doesn't exist in field list"):
+        await _mysql_count(_mysql_conn(exc=exc))
+
+
+@pytest.mark.asyncio
+async def test_mysql_variants_count_connection_loss_propagates():
+    exc = Exception(2013, "Lost connection to MySQL server during query")
+    with pytest.raises(Exception, match="Lost connection"):
+        await _mysql_count(_mysql_conn(exc=exc))
+
+
+@pytest.mark.asyncio
+async def test_mysql_variants_count_error_without_errno_propagates():
+    """No numeric errno -> not provably a missing table -> propagate, even if
+    the text says "doesn't exist" or contains "1146"."""
+    with pytest.raises(RuntimeError):
+        await _mysql_count(_mysql_conn(exc=RuntimeError("table doesn't exist (1146)")))
+
+
+@pytest.mark.asyncio
+async def test_mysql_variants_count_returns_count():
+    assert await _mysql_count(_mysql_conn(row=(7,))) == 7
