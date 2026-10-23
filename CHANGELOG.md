@@ -94,6 +94,35 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   queue snapshot's own `variants` field keeps its pre-F-15
   non-negative contract (a missing variants table reports `0`
   there), so distillation-worker monitoring is unaffected.
+- **MCP DAG + model tools route through the persistence ABC (backlog
+  F-06, slice 2 of 4).** `mnemos/mcp/tools/dag.py` (4 refs) and
+  `mnemos/mcp/tools/models.py` (2 refs) no longer read
+  `_lc._pool`: each tool now resolves the node's persistence backend
+  facade and runs inside `backend.transactional()` through the
+  repository ABCs that already exist on all six backends —
+  `MemoryRepository.fetch_memory_log` / `fetch_diff_commit_pair` /
+  `fetch_checkout_commit`, `BranchRepository.create_memory_branch`,
+  and `ConsultationAuditRepository.fetch_recommended_model`
+  (classification (a) per `docs/POSTGRES_ONLY_SURFACE.md` §2 rows 6 and
+  10 — unwire, no new ABC surface needed). The DAG tools' read gate now
+  goes through `MemoryRepository.assert_memory_readable`, so the MCP
+  and REST paths enforce the same visibility predicate on every
+  backend. The tools also work on the SQLite edge profile, where the
+  raw-pool code returned "Database unavailable" (or fell back to REST).
+  `mnemos/mcp/tools/kronos.py` (2 refs) is classified (c) — **genuinely
+  Postgres-only** and documented as such: the KRONOS domain SQL is
+  Postgres-specific (`date_trunc`, `AT TIME ZONE`,
+  `NOW() - n * INTERVAL`, two-stage `memory_recall_log` fallback), so
+  the pool is the pool's own owner, not a bypassed ABC. The direct pool
+  read is retained with that justification, and on non-Postgres
+  backends the tools now return a reason-bearing
+  "requires the Postgres backend" error instead of
+  `{"success": False, "error": "Database unavailable"}` — never a
+  fabricated 0-count success. New tests:
+  `tests/test_mcp_tools_persistence_abc.py` (SQLite end-to-end, fails
+  pre-change), `tests/test_mcp_tools_abc_contract.py` (six-backend
+  ABC surface contract), `tests/test_mcp_kronos_postgres_only.py`
+  (non-Postgres error contract, fails pre-change).
 
 ### Fixed
 

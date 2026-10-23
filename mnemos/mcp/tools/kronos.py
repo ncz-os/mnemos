@@ -1,4 +1,14 @@
-"""MCP KRONOS tool handlers."""
+"""MCP KRONOS tool handlers.
+
+F-06 slice 2 (§0b ABC-first): KRONOS is classified **Postgres-only**, not
+routed through the persistence ABC. The domain functions take a pool and
+their SQL is Postgres-specific (``date_trunc``, ``AT TIME ZONE``,
+``NOW() - n * INTERVAL``, and a two-stage ``memory_recall_log`` ->
+``memories`` fallback), so the pool is the pool's own owner here — not a
+bypassed ABC. The direct ``_lc._pool`` read below is retained with that
+justification; on non-Postgres backends the tools return a null-valued,
+reason-bearing error instead of a fabricated 0-count success.
+"""
 
 from __future__ import annotations
 
@@ -41,23 +51,25 @@ async def tool_kronos_anomalies(
     if not _mcp_is_root(user) and user.namespace != namespace:
         return {"success": True, "namespace": namespace, "count": 0, "anomalies": []}
 
+    # KRONOS is genuinely Postgres-only (see module docstring) — the pool is
+    # its own owner, not a bypassed ABC.
+    # F-06 slice 2 classification (c): permanently Postgres-only; retained.
     pool = _lc._pool
-    if pool is None:
-        return {"success": False, "error": "Database unavailable"}
-
-    settings = get_settings().kronos
-    anomalies = await detect_recall_anomalies(
-        pool,
-        namespace,
-        lookback_hours=settings.default_lookback_hours,
-        sensitivity=settings.default_sensitivity,
-    )
-    return {
-        "success": True,
-        "namespace": namespace,
-        "count": len(anomalies),
-        "anomalies": [asdict(item) for item in anomalies],
-    }
+    if pool is not None:
+        settings = get_settings().kronos
+        anomalies = await detect_recall_anomalies(
+            pool,
+            namespace,
+            lookback_hours=settings.default_lookback_hours,
+            sensitivity=settings.default_sensitivity,
+        )
+        return {
+            "success": True,
+            "namespace": namespace,
+            "count": len(anomalies),
+            "anomalies": [asdict(item) for item in anomalies],
+        }
+    return _kronos_unsupported("kronos_anomalies")
 
 
 async def tool_kronos_forecast(
@@ -97,12 +109,41 @@ async def tool_kronos_forecast(
             "ci_upper": 0.0,
         }
 
+    # KRONOS is genuinely Postgres-only (see module docstring) — the pool is
+    # its own owner, not a bypassed ABC.
+    # F-06 slice 2 classification (c): permanently Postgres-only; retained.
     pool = _lc._pool
-    if pool is None:
-        return {"success": False, "error": "Database unavailable"}
+    if pool is not None:
+        result = await forecast_recall_load(pool, namespace, hours_ahead=hours_ahead)
+        return {"success": True, **asdict(result)}
+    return _kronos_unsupported("kronos_forecast")
 
-    result = await forecast_recall_load(pool, namespace, hours_ahead=hours_ahead)
-    return {"success": True, **asdict(result)}
+
+def _kronos_unsupported(tool_name: str) -> dict[str, Any]:
+    """Null-valued, reason-bearing error for non-Postgres deployments.
+
+    The KRONOS domain SQL is Postgres-specific; reporting
+    ``{"success": True, "count": 0, ...}`` here would fabricate an "all
+    quiet" answer the backend cannot actually supply. A backend that cannot
+    supply a value reports null with a reason, never a fabricated default.
+    """
+    from fastapi import HTTPException
+
+    from mnemos.core.lifecycle import get_persistence_backend
+
+    try:
+        backend = get_persistence_backend()
+    except HTTPException:
+        backend = None
+    backend_name = type(backend).__name__ if backend is not None else "no backend"
+    return {
+        "success": False,
+        "error": (
+            f"{tool_name} requires the Postgres backend; "
+            f"this deployment is configured with {backend_name}. "
+            f"KRONOS recall analysis is Postgres-only."
+        ),
+    }
 
 
 TOOLS: dict[str, dict[str, Any]] = {

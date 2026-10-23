@@ -1,4 +1,10 @@
-"""MCP model recommendation tool handler."""
+"""MCP model recommendation tool handler.
+
+F-06 slice 2 (§0b ABC-first): ``tool_recommend_model`` no longer touches
+``_lc._pool``. It resolves the node's persistence backend facade and calls
+``ConsultationAuditRepository.fetch_recommended_model`` inside
+``backend.transactional()``.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +12,15 @@ import logging
 import re
 from typing import Any
 
-import mnemos.core.lifecycle as _lc
 from mnemos.core.auth_context import UserContext
 from mnemos.core.extras import is_extra_installed
-from mnemos.db import mcp_repo
 
-from ._runtime import _rest_get, _safe_path_segment, _tool
+from ._runtime import (
+    _get_persistence_backend,
+    _rest_get,
+    _safe_path_segment,
+    _tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +71,7 @@ async def tool_recommend_model(
 ) -> dict[str, Any]:
     """Query model optimizer for cost-aware recommendation."""
     _safe_path_segment(task_type, label="task_type")
-    if user is None and not _lc._pool:
+    if user is None:
         recommendation = await _rest_get(
             "/v1/providers/recommend",
             params={
@@ -90,14 +99,16 @@ async def tool_recommend_model(
             "budget_met": budget_met,
         }
 
-    pool = _lc._pool
-    if not pool:
+    try:
+        backend = _get_persistence_backend()
+    except Exception as e:
+        logger.error(f"[MCP] recommend_model backend unavailable: {e}", exc_info=True)
         return {"success": False, "error": "Database unavailable"}
 
     try:
-        async with pool.acquire() as conn:
-            model, required_caps = await mcp_repo.fetch_recommended_model(
-                conn,
+        async with backend.transactional() as tx:
+            model, required_caps = await backend.consultations_audit.fetch_recommended_model(
+                tx,
                 task_type,
                 cost_budget,
                 quality_floor,

@@ -13,7 +13,6 @@ import httpx
 
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import get_settings
-from mnemos.db.mcp_repo import assert_memory_readable
 
 HTTP_TIMEOUT = 30.0
 MCP_BULK_CREATE_MAX_ITEMS = 100
@@ -301,8 +300,32 @@ def _mcp_is_root(user: UserContext) -> bool:
     return user.role == "root"
 
 
-async def _mcp_assert_memory_readable(conn: Any, memory_id: str, user: UserContext) -> None:
-    await assert_memory_readable(conn, memory_id, user)
+def _get_persistence_backend():
+    """Resolve the node's active persistence backend facade for MCP tools.
+
+    Module-level helper (not an import) so tests can patch a single point —
+    each tool module re-exports this name and monkeypatches its own binding.
+    The backend facade (``mnemos.persistence.base``) owns the transaction
+    surface: tools open work through ``backend.transactional()`` and the
+    repository ABCs it exposes, never through ``lifecycle._pool``.
+    """
+    from mnemos.core.lifecycle import get_persistence_backend
+
+    return get_persistence_backend()
+
+
+async def _mcp_assert_memory_readable(tx: Any, memory_id: str, user: UserContext) -> None:
+    """Read-visibility gate for MCP DAG tools, via the persistence ABC.
+
+    ``tx`` is the backend ``Transaction`` from ``backend.transactional()``;
+    the call goes through ``MemoryRepository.assert_memory_readable`` so the
+    visibility predicate is the same one the REST routes enforce, on every
+    backend.
+    """
+    from mnemos.core.lifecycle import get_persistence_backend
+
+    backend = get_persistence_backend()
+    await backend.memories.assert_memory_readable(tx, memory_id, user)
 
 
 def _tool(

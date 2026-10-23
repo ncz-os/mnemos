@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
@@ -87,35 +88,45 @@ def test_http_sse_dispatch_passes_authenticated_context_user(monkeypatch):
     assert seen["user"].user_id == "alice"
 
 
-class _PoolContext:
-    async def __aenter__(self):
-        return object()
-
-    async def __aexit__(self, *_args):
-        return False
+class _FakeTransaction:
+    pass
 
 
-class _Pool:
-    def acquire(self):
-        return _PoolContext()
+class _FakeBackendFacade:
+    """ABC-shaped facade: transactional() + the repositories the DAG tools call."""
+
+    def __init__(self):
+        self._tx = _FakeTransaction()
+        self.memories = type("Mem", (), {
+            "fetch_memory_log": AsyncMock(return_value=[
+                {
+                    "commit_hash": "abc123",
+                    "version_num": 1,
+                    "change_type": "create",
+                    "category": "note",
+                    "snapshot_at": datetime(2026, 5, 2, tzinfo=timezone.utc),
+                    "snapshot_by": "alice",
+                },
+            ])
+        })()
+        self._fetch = self.memories.fetch_memory_log
+
+    @property
+    def fetch_memory_log(self):
+        return self._fetch
+
+    @asynccontextmanager
+    async def transactional(self):
+        yield self._tx
 
 
 @pytest.mark.asyncio
-async def test_dag_log_memory_uses_direct_db_path_when_user_and_pool_exist(monkeypatch):
-    import mnemos.core.lifecycle as lc
+async def test_dag_log_memory_uses_persistence_abc_path_when_backend_exists(monkeypatch):
     from mnemos.mcp.tools import dag as mcp_dag
 
-    row = {
-        "commit_hash": "abc123",
-        "version_num": 1,
-        "change_type": "create",
-        "category": "note",
-        "snapshot_at": datetime(2026, 5, 2, tzinfo=timezone.utc),
-        "snapshot_by": "alice",
-    }
-    monkeypatch.setattr(lc, "_pool", _Pool())
+    backend = _FakeBackendFacade()
+    monkeypatch.setattr(mcp_dag, "_get_persistence_backend", lambda: backend)
     monkeypatch.setattr(mcp_dag, "_mcp_assert_memory_readable", AsyncMock())
-    monkeypatch.setattr(mcp_dag.mcp_repo, "fetch_memory_log", AsyncMock(return_value=[row]))
     monkeypatch.setattr(mcp_dag, "_rest_get", AsyncMock())
 
     result = await mcp_dag.tool_log_memory(
@@ -125,7 +136,7 @@ async def test_dag_log_memory_uses_direct_db_path_when_user_and_pool_exist(monke
 
     mcp_dag._rest_get.assert_not_awaited()
     mcp_dag._mcp_assert_memory_readable.assert_awaited_once()
-    mcp_dag.mcp_repo.fetch_memory_log.assert_awaited_once()
+    backend.fetch_memory_log.assert_awaited_once()
     assert result["success"] is True
     assert result["commits"][0]["hash"] == "abc123"
 
