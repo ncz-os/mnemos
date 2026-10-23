@@ -16,8 +16,10 @@ from dataclasses import asdict
 from typing import Any
 
 import mnemos.core.lifecycle as _lc
+from fastapi import HTTPException
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import get_settings
+from mnemos.core.lifecycle import get_persistence_backend
 from mnemos.domain.kronos import detect_recall_anomalies, forecast_recall_load
 
 from ._runtime import (
@@ -127,15 +129,16 @@ def _kronos_unsupported(tool_name: str) -> dict[str, Any]:
     quiet" answer the backend cannot actually supply. A backend that cannot
     supply a value reports null with a reason, never a fabricated default.
     """
-    from fastapi import HTTPException
-
-    from mnemos.core.lifecycle import get_persistence_backend
-
     try:
         backend = get_persistence_backend()
     except HTTPException:
         backend = None
-    backend_name = type(backend).__name__ if backend is not None else "no backend"
+    if backend is None:
+        # No backend at all (startup race / edge profile): still report the
+        # capability truth, not a fabricated answer.
+        backend_name = "no backend"
+    else:
+        backend_name = type(backend).__name__
     return {
         "success": False,
         "error": (

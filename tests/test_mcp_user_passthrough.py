@@ -93,27 +93,26 @@ class _FakeTransaction:
 
 
 class _FakeBackendFacade:
-    """ABC-shaped facade: transactional() + the repositories the DAG tools call."""
+    """ABC-shaped facade: transactional() + the repositories the DAG tools call.
+
+    ``memories.fetch_memory_log`` is the single AsyncMock the tool calls and
+    the test asserts — no duplicate aliases that could be asserted on by
+    mistake.
+    """
 
     def __init__(self):
         self._tx = _FakeTransaction()
-        self.memories = type("Mem", (), {
-            "fetch_memory_log": AsyncMock(return_value=[
-                {
-                    "commit_hash": "abc123",
-                    "version_num": 1,
-                    "change_type": "create",
-                    "category": "note",
-                    "snapshot_at": datetime(2026, 5, 2, tzinfo=timezone.utc),
-                    "snapshot_by": "alice",
-                },
-            ])
-        })()
-        self._fetch = self.memories.fetch_memory_log
-
-    @property
-    def fetch_memory_log(self):
-        return self._fetch
+        self._fetch_memory_log = AsyncMock(return_value=[
+            {
+                "commit_hash": "abc123",
+                "version_num": 1,
+                "change_type": "create",
+                "category": "note",
+                "snapshot_at": datetime(2026, 5, 2, tzinfo=timezone.utc),
+                "snapshot_by": "alice",
+            },
+        ])
+        self.memories = type("Mem", (), {"fetch_memory_log": self._fetch_memory_log})()
 
     @asynccontextmanager
     async def transactional(self):
@@ -136,7 +135,7 @@ async def test_dag_log_memory_uses_persistence_abc_path_when_backend_exists(monk
 
     mcp_dag._rest_get.assert_not_awaited()
     mcp_dag._mcp_assert_memory_readable.assert_awaited_once()
-    backend.fetch_memory_log.assert_awaited_once()
+    backend.memories.fetch_memory_log.assert_awaited_once()
     assert result["success"] is True
     assert result["commits"][0]["hash"] == "abc123"
 
