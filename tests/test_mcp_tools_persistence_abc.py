@@ -209,3 +209,71 @@ async def test_tool_recommend_model_routes_through_persistence_abc(sqlite_backen
     # outcome — not "Database unavailable" and not a REST fallback.
     assert result["success"] is False, result
     assert result["error"] == "No models available"
+
+
+async def test_tool_recommend_model_unauthenticated_transport_uses_local_backend(
+    sqlite_backend, monkeypatch
+):
+    """An unauthenticated MCP transport with a live backend takes the
+    direct ABC path, not the REST loopback.
+
+    The pre-ABC guard was ``user is None and not _lc._pool``. ``lifecycle.
+    _pool`` is the *asyncpg* pool, so it was only ever non-None on a
+    Postgres deployment: the guard meant "no local Postgres pool -> proxy
+    through REST". The ABC's facade is the availability signal for the
+    direct-DB path and it exists on all six backends, so the transport
+    decision is made against the facade.
+
+    On Postgres the branch taken for every ``user`` value is unchanged
+    (live backend -> the direct DB path, the same SQL and the same
+    response shape); on the other five backends the direct path is now
+    available too instead of a self-HTTP round trip.
+    """
+    _install_backend_for_tools(monkeypatch, sqlite_backend)
+    # No REST fallback should fire: a backend exists and the tool must use it.
+    monkeypatch.setattr(mcp_models, "_rest_get", _NoRestFallback())
+
+    result = await mcp_models.tool_recommend_model("code_generation", user=None)
+
+    # Same honest "no priced model" outcome as the authenticated path —
+    # the empty SQLite model_registry, not a fabricated default and not
+    # the REST proxy.
+    assert result["success"] is False, result
+    assert result["error"] == "No models available"
+
+
+async def test_tool_recommend_model_without_backend_falls_back_to_rest(monkeypatch):
+    """With no persistence backend at all there is nothing to query, so the
+    unauthenticated transport proxies the recommendation through the REST
+    API (the pre-ABC behaviour on every non-Postgres deployment)."""
+    monkeypatch.setattr(mcp_models, "_get_persistence_backend", lambda: None)
+
+    seen = {}
+
+    async def _fake_rest_get(path, params=None):
+        seen["path"] = path
+        seen["params"] = params
+        return {"recommended": {"model_id": "m-x", "cost_per_mtok": 2.0}}
+
+    monkeypatch.setattr(mcp_models, "_rest_get", _fake_rest_get)
+
+    result = await mcp_models.tool_recommend_model("code_generation", user=None)
+
+    assert seen["path"] == "/v1/providers/recommend"
+    assert seen["params"]["task_type"] == "code_generation"
+    assert result["success"] is True, result
+    assert result["recommended"]["model_id"] == "m-x"
+    assert result["budget_met"] is True, result
+
+
+async def test_tool_recommend_model_without_backend_and_with_user_is_unavailable(
+    monkeypatch,
+):
+    """Authenticated caller + no backend -> the pre-ABC "Database
+    unavailable" error (not a REST proxy)."""
+    monkeypatch.setattr(mcp_models, "_get_persistence_backend", lambda: None)
+    monkeypatch.setattr(mcp_models, "_rest_get", _NoRestFallback())
+
+    result = await mcp_models.tool_recommend_model("code_generation", user=ROOT)
+
+    assert result == {"success": False, "error": "Database unavailable"}, result

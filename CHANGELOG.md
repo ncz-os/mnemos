@@ -114,6 +114,15 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   owns the transaction (no new ABC method was added). The tools also
   work on the SQLite edge profile, where the raw-pool code returned
   "Database unavailable" (or fell back to REST).
+  `mnemos/mcp/tools/models.py`'s transport fallback keeps its pre-ABC
+  semantics: the old guard was `user is None and not _lc._pool`, and
+  `lifecycle._pool` is the *asyncpg* pool, so it was only ever non-None
+  on a Postgres deployment — the guard really meant "no local Postgres
+  pool -> proxy the recommendation through the REST API". The decision
+  is now made against the ABC's facade instead of the raw pool, so on
+  Postgres every `user` value takes exactly the branch master took (the
+  same SQL, the same response shape), while on the other five backends
+  the direct path is available instead of a self-HTTP round trip.
   `mnemos/mcp/tools/kronos.py` (2 refs) is classified (c) — **genuinely
   Postgres-only** and documented as such: the KRONOS domain SQL is
   Postgres-specific (`date_trunc`, `AT TIME ZONE`,
@@ -133,6 +142,8 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   pre-change), `tests/test_mcp_tools_abc_contract.py` (six-backend
   ABC surface contract), `tests/test_mcp_kronos_postgres_only.py`
   (non-Postgres error contract, fails pre-change).
+  `_lc._pool` refs in the three files in scope: `dag.py` 4 -> 0,
+  `models.py` 2 -> 0, `kronos.py` 2 -> 2 (retained, classification (c)).
 
 ### Fixed
 

@@ -3,7 +3,9 @@
 F-06 slice 2 (§0b ABC-first): ``tool_recommend_model`` no longer touches
 ``_lc._pool``. It resolves the node's persistence backend facade and calls
 ``ConsultationAuditRepository.fetch_recommended_model`` inside
-``backend.transactional()``.
+``backend.transactional()``. The transport fallback (an unauthenticated MCP
+transport proxies the recommendation through the REST API) is now decided
+against that facade rather than against the raw pool.
 """
 
 from __future__ import annotations
@@ -71,7 +73,19 @@ async def tool_recommend_model(
 ) -> dict[str, Any]:
     """Query model optimizer for cost-aware recommendation."""
     _safe_path_segment(task_type, label="task_type")
-    if user is None:
+
+    # F-06 slice 2: the pre-ABC guard was ``user is None and not
+    # _lc._pool``. ``lifecycle._pool`` is the *asyncpg* pool, so it was
+    # only ever non-None on a Postgres deployment — the guard really
+    # meant "no local Postgres pool -> proxy the recommendation through
+    # the REST API". The ABC's facade is the availability signal for the
+    # direct-DB path, and it exists on all six backends, so the
+    # transport decision is now made against the facade instead of the
+    # pool. On Postgres the branch taken for every ``user`` value is
+    # exactly the one master took (a live backend -> the direct DB
+    # path, the same SQL and the same response shape).
+    backend = _get_persistence_backend()
+    if user is None and backend is None:
         recommendation = await _rest_get(
             "/v1/providers/recommend",
             params={
@@ -99,7 +113,6 @@ async def tool_recommend_model(
             "budget_met": budget_met,
         }
 
-    backend = _get_persistence_backend()
     if backend is None:
         return {"success": False, "error": "Database unavailable"}
 
