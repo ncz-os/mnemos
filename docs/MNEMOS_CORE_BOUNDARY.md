@@ -48,6 +48,20 @@ kronos/knossos/hot).
 Code signal at decision time: `EXTRA_PROBES` already gated `pantheon`; `knemon`,
 `graeae`, `hive` were loose in-tree (not gated) — an inconsistency this corrects.
 
+## The ABC-first persistence rule (governing — see AGENTS.md)
+
+This document is about the core/add-on **split**; the complementary governing
+rule for **how storage work is done** lives in [AGENTS.md](../AGENTS.md)
+("Governing rule — ABC-first persistence") and
+[FEATURES_TO_BE_DONE.md §0b](FEATURES_TO_BE_DONE.md): every new or repaired
+storage capability is delivered as **ABC method → implementation on all six
+backends → facade exposure → route calls the ABC**. Raw `_lc._pool` access
+outside `mnemos/persistence/` is the defect, not the shortcut. CI enforces
+it as a ratchet: the `lint:abc-first` job runs
+`scripts/check_abc_first_guard.py` against the committed per-file baseline
+`tests/abc_first_baseline.json` (fails on a count going up or a new file;
+never on a reduced count).
+
 ## Sequencing (strangler-fig — reversible first)
 
 1. **Phase 1 — in-tree decouple (reversible, do first):**

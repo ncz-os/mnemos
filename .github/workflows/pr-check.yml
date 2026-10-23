@@ -39,6 +39,16 @@ jobs:
       - name: Migration parity
         run: .venv/bin/python scripts/check_migration_parity.py --mode full
 
+      # Ratchet guard for the §0b governing rule (F-14): no NEW raw
+      # _lc._pool references outside mnemos/persistence/. Baseline:
+      # tests/abc_first_baseline.json. Fails only on an increased count
+      # or a new file — reduced counts pass, so a stale baseline from a
+      # parallel job can never break a merge.
+      - name: ABC-first persistence guard
+        run: |
+          .venv/bin/python scripts/check_abc_first_guard.py
+          .venv/bin/pytest tests/test_abc_first_guard.py --tb=short -q
+
       - name: Lint env discipline
         run: |
           # Runtime environment reads must route through mnemos/core/config.py.

@@ -62,6 +62,31 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
 
 ### Added
 
+- **ABC-first persistence rule: written and enforced (backlog F-14).**
+  The governing rule from `docs/FEATURES_TO_BE_DONE.md` §0b — "a new or
+  repaired storage capability is delivered as ABC method → implementation
+  on all six backends → facade exposure → route calls the ABC; raw
+  `_lc._pool` access outside `mnemos/persistence/` is the defect, not the
+  shortcut" — is now stated in the docs workers actually read
+  (`AGENTS.md`, "Governing rule — ABC-first persistence", and a pointer in
+  `docs/MNEMOS_CORE_BOUNDARY.md`) and protected by CI. New:
+  `scripts/check_abc_first_guard.py`, a **ratchet** guard that scans the
+  tree for raw `_lc._pool` / `_lc._raw_pool` references outside
+  `mnemos/persistence/` (skipping comment/docstring mentions) and compares
+  per-file counts against the committed baseline
+  `tests/abc_first_baseline.json` (21 references across 8 files at
+  master). It fails only when an in-baseline file's count goes **UP** or a
+  **new** file gains a reference — never on a reduced count — so a stale
+  baseline left by a parallel job that removes references first can never
+  break a merge. The failure message names `file:line`. Wired as the
+  `lint:abc-first` GitLab job and an "ABC-first persistence guard" step in
+  the GitHub PR check; unit tests live in
+  `tests/test_abc_first_guard.py` (clean tree passes, added reference in an
+  existing file fails, added reference in a new file fails, reduced count
+  passes, persistence-internal references ignored, regen round-trips,
+  missing baseline fails closed, prose mentions not counted). The sibling
+  residue-removal jobs lower counts in parallel; when they land, re-run the
+  script with `--regen` in their MR to record the lower counts.
 - **Streamable HTTP MCP at `/mcp`.** MNEMOS now exposes the current MCP
   transport alongside the OAuth-protected legacy `/sse` fallback. Both routes
   use the same tool registry, bearer/OAuth authorization, role, namespace,
