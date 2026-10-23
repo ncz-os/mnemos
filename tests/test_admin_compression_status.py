@@ -564,20 +564,46 @@ async def test_compressed_variants_count_infra_error_propagates(
     "missing table" would hide a genuine infrastructure failure from
     the operator.
 
-    Pinned on SQLite: inject a generic RuntimeError through the
-    repository's ``_fetch_val`` helper (the same module-level global
-    the read-only spy test uses). The helper must see a message that
-    does NOT match "no such table", so the except branch re-raises.
+    Pinned on SQLite: inject a ``sqlite3.OperationalError`` with a
+    "database is locked" message (the same driver error type a
+    genuine lock timeout raises, but a message that does NOT match
+    "no such table"). The helper must re-raise it, not swallow it
+    into the -1 sentinel.
     """
+    import sqlite3
+
     from mnemos.persistence import sqlite as sq
 
     async def _boom_fetch_val(conn, sql, params=()):
-        raise RuntimeError("database is locked")
+        raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(sq, "_fetch_val", _boom_fetch_val)
 
     repo = sqlite_backend.compression_queue
-    with pytest.raises(RuntimeError, match="database is locked"):
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        async with sqlite_backend.transactional() as tx:
+            await repo.get_compressed_variants_count(tx)
+
+
+@pytest.mark.asyncio
+async def test_compressed_variants_count_non_operational_error_propagates(
+    sqlite_backend, monkeypatch,
+):
+    """A non-OperationalError exception (e.g. a driver bug, a
+    programming error) must also propagate — the helper only catches
+    ``sqlite3.OperationalError`` specifically, not every Exception.
+    A broad ``except Exception`` would mask genuine bugs as
+    "missing table".
+    """
+    from mnemos.persistence import sqlite as sq
+
+    async def _boom_fetch_val(conn, sql, params=()):
+        raise ValueError("something unexpected")
+
+    monkeypatch.setattr(sq, "_fetch_val", _boom_fetch_val)
+
+    repo = sqlite_backend.compression_queue
+    with pytest.raises(ValueError, match="something unexpected"):
         async with sqlite_backend.transactional() as tx:
             await repo.get_compressed_variants_count(tx)
 

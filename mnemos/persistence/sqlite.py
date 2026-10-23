@@ -3780,12 +3780,20 @@ class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueReposi
 
         ``-1`` when the table is absent (pre-v3.1 schema) — the ABC
         contract says report inability, never a fabricated zero.
+
+        Detection: catch ``sqlite3.OperationalError`` specifically
+        (the driver's type for "no such table", constraint violations,
+        lock timeouts, etc.), then confirm the message contains
+        "no such table" to distinguish the missing-table condition
+        from other OperationalErrors (e.g. "database is locked").
+        Both conditions must hold; a bare string match on an untyped
+        Exception would swallow unrelated errors.
         """
         try:
             count = await _fetch_val(
                 conn, "SELECT COUNT(*) FROM memory_compressed_variants"
             )
-        except Exception as exc:
+        except sqlite3.OperationalError as exc:
             if "no such table" not in str(exc):
                 raise
             return -1

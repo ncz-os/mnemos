@@ -2474,10 +2474,21 @@ class CompressionQueueRepository(ABC):
         * ``done`` — rows whose ``status = 'done'``.
         * ``failed`` — rows whose ``status = 'failed'``.
         * ``variants`` — total rows in ``memory_compressed_variants``
-          (non-negative; a missing variants table reports ``0`` — the
-          snapshot is consumed by monitoring as a depth number, and a
-          missing table is indistinguishable from an empty one for
-          that purpose).
+          (non-negative int; a missing variants table reports ``0``).
+
+          This field is a **monitoring depth number** consumed by the
+          distillation worker's ``log_stats()`` every 30s; it is NOT
+          the F-15 admin-route variant count. A missing table is
+          indistinguishable from an empty one for monitoring purposes
+          (the worker logs the number unconditionally and has no
+          null/reason shape), so the snapshot clamps the helper's
+          ``-1`` absence sentinel to ``0``. The §0b "never a
+          fabricated zero" rule applies to fields the **admin route**
+          cannot supply — that is ``get_compressed_variants_count``
+          (below), which carries the ``-1`` sentinel and which the
+          route maps to ``null`` + reason. Do not confuse the two:
+          the snapshot's ``variants`` field and the ABC count are
+          different fields with different contracts.
 
         Implementations MUST compute the status counts and the variant
         count in a single round-trip pair (or one query that joins
