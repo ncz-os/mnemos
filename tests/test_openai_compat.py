@@ -88,8 +88,11 @@ def _install_pool(monkeypatch, conn):
     _fake_fetch = facade._memories.fetch_memory_context
 
     async def _fetch_with_repo_filter(tx, query, user, limit=5):
-        if facade._memories._last_visibility is None:
-            facade._memories._last_visibility = VisibilityFilter.for_caller(user)
+        # Derive the policy for *this* caller on every call. Caching the
+        # first caller's filter would evaluate later requests -- including a
+        # root read that should cross tenants -- against a stale, narrower
+        # one, which is the exact class of bug these tests exist to catch.
+        facade._memories._last_visibility = VisibilityFilter.for_caller(user)
         return await _fake_fetch(tx, query, user, limit)
 
     facade._memories.fetch_memory_context = _fetch_with_repo_filter  # type: ignore[method-assign]
@@ -2115,3 +2118,32 @@ def test_sqlite_abc_never_returns_vault_rows_for_any_caller(tmp_path, monkeypatc
     assert {row["namespace"] for row in alice_rows} == {"default"}, alice_rows
     for rows in (root_rows, alice_rows):
         assert all("vault needle" not in row["content"] for row in rows)
+
+
+def test_facade_fixture_rebuilds_filter_per_caller(monkeypatch):
+    """The facade must not reuse one caller's visibility filter for another.
+
+    Regression: the wrapper cached the first filter it built, so a root read
+    issued after a non-root read was evaluated with the non-root pin and lost
+    its cross-tenant rows. The fake is a passive provider, so the fixture is
+    the only place that policy can go stale.
+    """
+    from mnemos.db import openai_compat_repo
+
+    conn = _FetchConn(
+        [
+            {"id": "mine", "namespace": "default", "content": "needle"},
+            {"id": "other", "namespace": "other-ns", "content": "needle"},
+        ]
+    )
+    _install_pool(monkeypatch, conn)
+
+    alice = SimpleNamespace(user_id="alice", group_ids=[], role="user", namespace="default")
+    root = SimpleNamespace(user_id="root", group_ids=[], role="root", namespace="default")
+
+    alice_rows = asyncio.run(openai_compat_repo.fetch_memory_context("needle", alice, limit=5))
+    root_rows = asyncio.run(openai_compat_repo.fetch_memory_context("needle", root, limit=5))
+
+    assert {row["namespace"] for row in alice_rows} == {"default"}
+    # Root crosses tenants: a stale cached filter would yield {"default"}.
+    assert {row["namespace"] for row in root_rows} == {"default", "other-ns"}
