@@ -26,7 +26,7 @@ from mnemos.core import lifecycle as _lc  # noqa: WPS433
 
 from . import repair as webhook_repair
 from . import types as webhook_types
-from .lease import _RecordView
+from .lease import _ClaimedRecordView
 from .types import _ClaimedDelivery, _get_send_semaphore
 
 logger = logging.getLogger(__name__)
@@ -153,7 +153,7 @@ async def _recover_due_deliveries(_pool_or_backend: Any = None, *, limit: int = 
     from .sender import _attempt_delivery
 
     for claim in claimed:
-        record_view = _RecordView(claim.delivery)
+        record_view = _ClaimedRecordView(claim.delivery)
         record_view.lease_expires_at = claim.lease_expires_at  # type: ignore[attr-defined]
         record_view.claim_db_now = claim.claim_db_now  # type: ignore[attr-defined]
         wrapped = _ClaimedDelivery(
