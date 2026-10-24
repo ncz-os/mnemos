@@ -2422,8 +2422,9 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
             return []
 
         from mnemos.core.security import is_root
+        from mnemos.persistence.visibility import VisibilityFilter
 
-        namespace = None if is_root(user) else user.namespace
+        namespace = None if is_root(user) else (getattr(user, "namespace", None) or "default")
         vis = VisibilityFilter.for_read(user, namespace=namespace)
         rows = await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=vis)
         return [

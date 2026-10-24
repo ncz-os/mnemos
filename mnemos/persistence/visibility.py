@@ -185,3 +185,51 @@ class VisibilityFilter:
             group_ids=(),
             namespace=namespace,
         )
+
+    @classmethod
+    def for_system(cls, *, include_vault: bool = False) -> "VisibilityFilter":
+        """Build the read filter for a system caller with no user context.
+
+        This is the root-equivalent read: a cross-tenant ``ROOT_BYPASS``
+        envelope for callers that hold no ``UserContext`` at all (a
+        lifecycle/webhook/agent code path, or a bare ``SimpleNamespace``
+        test double). It is deliberately the *same* construction
+        ``for_read`` emits for a root user, so the two "root-like" paths
+        cannot drift apart -- a divergence here is a security bug, not a
+        style choice. In particular the secret vault is subtracted by
+        default; the ``for_read`` opt-ins that clear it (``include_secrets``
+        or targeting ``namespace="vault"``) are root-only escape hatches
+        that do not exist for a userless caller, so only
+        ``include_vault=True`` (the discovery path: vault rows returned,
+        content still redacted by the route) is honoured.
+        """
+        return cls(
+            scope=VisibilityScope.ROOT_BYPASS,
+            user_id=None,
+            group_ids=(),
+            namespace=None,
+            exclude_namespaces=() if include_vault else DEFAULT_EXCLUDED_NAMESPACES,
+        )
+
+    @classmethod
+    def for_caller(cls, user: object, *, namespace: str | None = None) -> "VisibilityFilter":
+        """Read filter for a caller that may or may not carry a user context.
+
+        Routers the "is there a user?" decision through one place:
+        ``for_read`` when ``user`` looks like a ``UserContext`` (has a
+        ``user_id``), else :meth:`for_system`. ``namespace`` is only ever
+        used for the authenticated branch -- a system caller reads
+        cross-tenant, so pinning it to a namespace would be a silent
+        narrowing of a root-equivalent read.
+
+        ``namespace=None`` on the authenticated branch means "derive it":
+        root reads cross-tenant, non-root is pinned to its own namespace
+        (``getattr`` because callers are typed ``Any`` here and some test
+        doubles omit the field).
+        """
+        if not hasattr(user, "user_id"):
+            return cls.for_system()
+        resolved = namespace
+        if resolved is None and not is_root(user):  # type: ignore[arg-type]
+            resolved = getattr(user, "namespace", None) or "default"
+        return cls.for_read(user, namespace=resolved)  # type: ignore[arg-type]

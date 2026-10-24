@@ -62,6 +62,22 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
 
 ### Added
 
+- **One factory for root-equivalent reads (F-06 slice 1 follow-up).**
+  `VisibilityFilter` gains `for_system()` and `for_caller()`, and
+  `Db2MemoryRepository.fetch_memory_context` /
+  `OracleMemoryRepository.fetch_memory_context` now build their filter
+  with `for_caller` instead of hand-constructing a `ROOT_BYPASS` filter
+  next to the `for_read` call for authenticated root users. Those two
+  root-like paths were two separate constructions of one concept, so the
+  vault subtraction had to be remembered independently in each — the
+  exact drift that previously produced a vault leak. `for_system()`
+  emits byte-for-byte what `for_read` emits for a root user and is
+  pinned as such by `tests/test_visibility_system_caller.py`.
+  Separately, `MysqlMemoryRepository.fetch_memory_context` no longer
+  dereferences `user.namespace` on a non-root caller: the method is typed
+  `user: Any`, and a duck-typed caller omitting the field raised
+  `AttributeError` where the Db2/Oracle siblings already fell back to
+  `"default"`; it now uses the same `getattr(...) or "default"` form.
 - **`MemoryRepository.fetch_memory_context` is the sole gateway context
   read (F-06 slice 1).** The OpenAI-compat gateway no longer acquires the
   raw asyncpg pool: `mnemos/db/openai_compat_repo.py` calls the persistence
