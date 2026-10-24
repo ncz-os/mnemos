@@ -79,6 +79,20 @@ def _install_pool(monkeypatch, conn):
         return vis
 
     monkeypatch.setattr(VisibilityFilter, "for_read", classmethod(_capturing_for_read))
+
+    # Tests that reach the ABC through this facade never run a real
+    # repository, so nothing in production builds a filter for them. The
+    # fixture -- not the fake -- supplies the policy the repository *would*
+    # build, so the fake stays a passive data provider and a real bug in the
+    # caller still shows up.
+    _fake_fetch = facade._memories.fetch_memory_context
+
+    async def _fetch_with_repo_filter(tx, query, user, limit=5):
+        if facade._memories._last_visibility is None:
+            facade._memories._last_visibility = VisibilityFilter.for_caller(user)
+        return await _fake_fetch(tx, query, user, limit)
+
+    facade._memories.fetch_memory_context = _fetch_with_repo_filter  # type: ignore[method-assign]
     monkeypatch.setattr(lc, "_persistence_backend", facade)
     return facade
 
@@ -149,19 +163,22 @@ class _FakeMemoryRepo:
         self._last_visibility = None
 
     async def fetch_memory_context(self, tx, query, user, limit=5):
-        # Mirror the production repository: build the read filter from the
-        # caller and capture it so tests can assert the policy.
-        from mnemos.persistence.visibility import VisibilityFilter
-
-        visibility = VisibilityFilter.for_read(
-            user,
-            namespace=None if getattr(user, "role", None) == "root" else (getattr(user, "namespace", None) or "default"),
+        # Passive data provider: this fake must NOT build the filter itself.
+        # Doing so would let a bug in the production caller -- e.g. a missing
+        # namespace pin or a dropped vault exclusion -- go undetected, because
+        # the fake would be filtering with its own "correct" copy of the
+        # policy. The filter observed by the fixture spy (installed on
+        # ``VisibilityFilter.for_read``) is the one the *repository* built;
+        # apply exactly that, and fail loudly if the caller never built one.
+        visibility = self._last_visibility
+        assert visibility is not None, (
+            "fetch_memory_context called without the caller building a "
+            "VisibilityFilter -- the production path must construct one"
         )
-        self._last_visibility = visibility
         out = []
         for row in self._conn.rows:
             ns = row.get("namespace")
-            if ns in (visibility.exclude_namespaces or ()):
+            if ns is not None and ns in (visibility.exclude_namespaces or ()):
                 continue
             if visibility.namespace is not None and ns != visibility.namespace:
                 continue
@@ -1929,13 +1946,172 @@ def test_every_backend_implements_vault_subtracting_memory_context(module_name):
         assert "namespace" in source, (
             f"{cls.__name__}.fetch_memory_context must return the row namespace"
         )
-        # The vault subtraction may be written inline, or inherited from
-        # ``VisibilityFilter.for_read`` / ``for_caller`` (which routes a
-        # user through ``for_read`` and a userless caller through
-        # ``for_system``); accept any of them, but require one.
-        assert (
-            "vault" in source
-            or "for_read" in source
-            or "for_caller" in source
-            or "for_system" in source
-        ), f"{cls.__name__}.fetch_memory_context must apply the secret-vault subtraction"
+
+
+def _filter_built_by_backend(module_name: str, cls_name: str, user):
+    """Run a backend's ``fetch_memory_context`` and capture the filter it builds.
+
+    The statement itself is not executed -- the connection layer is replaced
+    with one that records the ``VisibilityFilter`` handed to it and then
+    raises, so the assertion is about the *policy object* the backend
+    constructed, not about SQL text or source strings. A backend that drops
+    the vault subtraction, or that builds no filter at all, fails here.
+    """
+    import importlib
+
+    module = importlib.import_module(f"mnemos.persistence.{module_name}")
+    cls = getattr(module, cls_name)
+    captured: list[object] = []
+    applied: list[object] = []
+
+    from mnemos.persistence.visibility import VisibilityFilter
+
+    # Backends import ``VisibilityFilter`` into their own module namespace and
+    # call the class attribute, so patch the class itself -- not a module
+    # alias, which the backend never looks at.
+    real_for_caller = VisibilityFilter.for_caller.__func__
+
+    def _spy(cls_, u, **kw):
+        v = real_for_caller(cls_, u, **kw)
+        captured.append(v)
+        applied.append(v)
+        return v
+
+    repo = cls.__new__(cls)
+    # Backends touch the connection before building the filter (``_conn(tx)``
+    # / ``_postgres_tx(tx).conn``), so the stub must be permissive enough to
+    # get past that and fail only once the statement is actually executed.
+    _conn_stub = SimpleNamespace(
+        execute=_raise_stop,
+        executemany=_raise_stop,
+        fetch=_raise_stop,
+        fetchrow=_raise_stop,
+        fetchall=_raise_stop,
+        cursor=_raise_stop,
+    )
+    repo._conn = lambda tx: _conn_stub
+    repo._tx_adapter = _conn_stub
+
+    # Postgres type-checks the transaction wrapper, so hand it a real one
+    # around the stub connection rather than relying on duck typing.
+    if module_name == "postgres":
+        from unittest.mock import MagicMock
+
+        from mnemos.persistence.postgres import PostgresTransaction
+
+        tx_arg = PostgresTransaction(_conn_stub, MagicMock())
+    else:
+        tx_arg = None
+
+    # MySQL derives its filter from an embedding, so make the embedder
+    # deterministic instead of depending on a live model in the test env.
+    import mnemos.core.lifecycle as _lc
+
+    async def _embed(_q):
+        return [0.1, 0.2, 0.3]
+
+    orig_embed = getattr(_lc, "_get_embedding", None)
+    _lc._get_embedding = _embed
+
+    orig = VisibilityFilter.for_caller
+    VisibilityFilter.for_caller = classmethod(_spy)
+    try:
+        asyncio.run(cls.fetch_memory_context(repo, tx_arg, "needle", user, limit=5))
+    except Exception:
+        # The fake connection blows up once the query is attempted; the
+        # filter was built first, which is all this helper inspects.
+        pass
+    finally:
+        VisibilityFilter.for_caller = orig
+        if orig_embed is not None:
+            _lc._get_embedding = orig_embed
+        else:
+            delattr(_lc, "_get_embedding")
+
+    assert captured, (
+        f"{cls.__name__}.fetch_memory_context never built a VisibilityFilter -- "
+        "the read must route through the visibility factory"
+    )
+    return captured[-1]
+
+
+class _StopAfterFilter(Exception):
+    """Raised by the throwaway connection to end the call after filter build."""
+
+
+async def _raise_stop(*_a, **_kw):
+    raise _StopAfterFilter()
+
+
+@pytest.mark.parametrize(
+    "module_name,cls_name",
+    [
+        ("sqlite", "SqliteMemoryRepository"),
+        ("postgres", "PostgresMemoryRepository"),
+        ("mysql", "MysqlMemoryRepository"),
+        ("oracle", "OracleMemoryRepository"),
+        ("db2", "Db2MemoryRepository"),
+    ],
+)
+def test_each_backend_builds_a_vault_subtracting_filter(module_name, cls_name):
+    """Functional parity: every backend's read excludes the vault for root AND user.
+
+    Replaces a previous source-string scan ("is 'vault' mentioned in the
+    method body?"), which a comment or a rename could satisfy without the
+    policy actually being applied.
+    """
+    root = SimpleNamespace(user_id="root", group_ids=[], role="root", namespace="default")
+    plain = SimpleNamespace(user_id="alice", group_ids=[], role="user", namespace="default")
+
+    for user, label in ((root, "root"), (plain, "non-root")):
+        vis = _filter_built_by_backend(module_name, cls_name, user)
+        assert "vault" in tuple(vis.exclude_namespaces or ()), (
+            f"{cls_name} ({module_name}) {label} filter must subtract the vault, "
+            f"got exclude_namespaces={vis.exclude_namespaces!r}"
+        )
+        if label == "non-root":
+            assert vis.namespace == "default", (
+                f"{cls_name} ({module_name}) must pin a non-root caller to its namespace"
+            )
+        else:
+            assert vis.namespace is None, (
+                f"{cls_name} ({module_name}) must not pin a root caller to one namespace"
+            )
+
+
+def test_sqlite_abc_never_returns_vault_rows_for_any_caller(tmp_path, monkeypatch):
+    """End-to-end vault subtraction through the real SQLite backend.
+
+    This is the functional counterpart to the filter-object contract test:
+    a vault row is seeded alongside a visible one and the ABC read is
+    exercised for a root caller and a non-root caller. If a backend drops
+    the subtraction the row surfaces here, whatever its SQL or source looks
+    like.
+    """
+    from mnemos.core.auth_context import UserContext
+
+    backend = _sqlite_backend(tmp_path, monkeypatch)
+    _seed_memories(
+        backend,
+        [
+            ("the vault needle is a secret", "solutions", "bob", "vault"),
+            ("the public needle stays visible", "solutions", "alice", "default"),
+        ],
+    )
+
+    repo = backend.memories
+
+    async def _read(user) -> list[dict]:
+        async with backend.transactional() as tx:
+            return await repo.fetch_memory_context(tx, "needle", user, limit=5)
+
+    root = UserContext(user_id="root", group_ids=[], role="root", namespace="default", authenticated=True)
+    alice = UserContext(user_id="alice", group_ids=[], role="user", namespace="default", authenticated=True)
+
+    root_rows = asyncio.run(_read(root))
+    alice_rows = asyncio.run(_read(alice))
+
+    assert {row["namespace"] for row in root_rows} == {"default"}, root_rows
+    assert {row["namespace"] for row in alice_rows} == {"default"}, alice_rows
+    for rows in (root_rows, alice_rows):
+        assert all("vault needle" not in row["content"] for row in rows)
