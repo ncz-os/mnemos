@@ -1232,24 +1232,28 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         categories = ("solutions", "patterns", "decisions", "infrastructure")
         category_placeholders = _placeholders(categories)
         like_q = f"%{query}%"
-        # One VisibilityFilter for every scope: ``for_read`` pins non-root to
-        # its namespace and, crucially, subtracts the secret vault for root
-        # too -- the subtraction previously lived in the gateway's SQL and
-        # disappeared when the read moved behind the ABC.
-        visibility = VisibilityFilter.for_read(
-            user,
-            namespace=None if _is_root(user) else (getattr(user, "namespace", None) or "default"),
-        )
+        # One VisibilityFilter for every scope: ``for_caller`` routes a user
+        # through ``for_read`` (pinning non-root to its namespace and
+        # subtracting the secret vault for root too) and a userless caller
+        # through ``for_system``. The vault subtraction previously lived in
+        # the gateway's SQL and disappeared when the read moved behind the ABC.
+        visibility = VisibilityFilter.for_caller(user)
         params: list[Any] = []
+        # ``_render_sqlite_visibility`` returns "" or a complete boolean
+        # expression, never a dangling ``AND``; only join it when present so
+        # the WHERE clause is built from parts rather than string-concatenated.
+        clauses: list[str] = []
         vis_clause = _render_sqlite_visibility(visibility, params, table_alias="m")
+        if vis_clause:
+            clauses.append(vis_clause)
+        clauses.append(f"(lower(m.content) LIKE lower(?) OR m.category IN ({category_placeholders}))")
         params.extend([like_q, *categories, limit])
-        where = f"{vis_clause} AND " if vis_clause else ""
         rows = await _fetch_all(
             conn,
             "SELECT m.id, m.namespace, COALESCE(v.compressed_content, m.content) AS content "
             "FROM memories m "
             "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
-            f"WHERE {where}(lower(m.content) LIKE lower(?) OR m.category IN ({category_placeholders})) "
+            f"WHERE {' AND '.join(clauses)} "
             "ORDER BY m.updated DESC LIMIT ?",
             params,
         )

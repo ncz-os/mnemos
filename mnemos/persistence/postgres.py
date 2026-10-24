@@ -1036,65 +1036,42 @@ class PostgresMemoryRepository(MemoryRepository):
     ) -> list[dict[str, Any]]:
         conn = _postgres_tx(tx).conn
         try:
-            if user.role == "root":
-                # Root reads cross tenants but the secret vault is still
-                # subtracted -- the same predicate the raw gateway SQL used
-                # before this read moved behind the ABC.
-                memories = await conn.fetch(
-                    """
-                    SELECT m.id, m.category, m.namespace,
-                           COALESCE(v.compressed_content, m.content) AS content
-                    FROM memories m
-                    LEFT JOIN memory_compressed_variants v
-                        ON v.memory_id = m.id
-                    WHERE
-                        m.deleted_at IS NULL
-                        AND m.archived_at IS NULL
-                        AND m.namespace <> 'vault'
-                        AND (
-                            to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)
-                            OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
-                        )
-                    ORDER BY m.updated DESC NULLS LAST
-                    LIMIT $2
-                    """,
-                    query,
-                    limit,
-                )
-            else:
-                vis_clause, vis_params = _core_read_visibility_predicate(
-                    user.user_id,
-                    list(user.group_ids),
-                    start_param_idx=1,
-                    table_alias="m",
-                )
-                ns_ph = f"${len(vis_params) + 1}"
-                q_ph = f"${len(vis_params) + 2}"
-                lim_ph = f"${len(vis_params) + 3}"
-                memories = await conn.fetch(
-                    f"""
-                    SELECT m.id, m.category, m.namespace,
-                           COALESCE(v.compressed_content, m.content) AS content
-                    FROM memories m
-                    LEFT JOIN memory_compressed_variants v
-                        ON v.memory_id = m.id
-                    WHERE m.deleted_at IS NULL
-                      AND m.archived_at IS NULL
-                      AND {vis_clause}
-                      AND m.namespace = {ns_ph}
-                      AND m.namespace <> 'vault'
-                      AND (
-                          to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})
-                          OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
-                      )
-                    ORDER BY m.updated DESC NULLS LAST
-                    LIMIT {lim_ph}
-                    """,
-                    *vis_params,
-                    user.namespace,
-                    query,
-                    limit,
-                )
+            # One VisibilityFilter for every scope, rendered by the shared
+            # Postgres renderer -- the secret-vault subtraction is a property
+            # of the filter (``exclude_namespaces``), not a hardcoded
+            # predicate spliced into each branch. Root reads cross-tenant;
+            # the vault rows are still subtracted because ``for_read`` sets
+            # ``exclude_namespaces`` for root too.
+            visibility = VisibilityFilter.for_caller(user)
+            vis_clause, vis_params, next_idx = _render_postgres_visibility(
+                visibility, start_idx=1, table_alias="m"
+            )
+            q_ph = f"${next_idx}"
+            lim_ph = f"${next_idx + 1}"
+            where = (
+                "m.deleted_at IS NULL "
+                "AND m.archived_at IS NULL "
+                + (f"AND {vis_clause} " if vis_clause else "")
+                + f"AND ("
+                f"to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})"
+                " OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')"
+                ")"
+            )
+            memories = await conn.fetch(
+                f"""
+                SELECT m.id, m.category, m.namespace,
+                       COALESCE(v.compressed_content, m.content) AS content
+                FROM memories m
+                LEFT JOIN memory_compressed_variants v
+                    ON v.memory_id = m.id
+                WHERE {where}
+                ORDER BY m.updated DESC NULLS LAST
+                LIMIT {lim_ph}
+                """,
+                *vis_params,
+                query,
+                limit,
+            )
             logger.info("[MNEMOS] Found %s memories for query '%s...'", len(memories), query[:30])
             return [
                 {

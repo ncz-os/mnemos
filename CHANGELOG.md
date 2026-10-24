@@ -62,6 +62,30 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
 
 ### Added
 
+- **`fetch_memory_context`: one filter-driven statement per backend.**
+  Every backend now builds its read predicate from a
+  `VisibilityFilter` and renders it with that dialect's existing
+  renderer, instead of splicing `AND m.namespace <> 'vault'` into
+  hand-written SQL. On Postgres `fetch_memory_context` previously had
+  two branches (root / non-root) with the vault subtraction hardcoded in
+  both; both now go through `_render_postgres_visibility`. The
+  subtraction is a property of the filter (`exclude_namespaces`), so a
+  backend cannot forget it while editing its own SQL. Rendered
+  predicates are row-identical to the previous form on Postgres:
+  `memories.namespace` is `NOT NULL` (v1_multiuser migration,
+  `ALTER TABLE memories ALTER COLUMN namespace SET NOT NULL`), so the
+  renderer's `namespace IS NULL OR ...` arm is unreachable there — and
+  that `IS NULL` arm is the repo-wide convention already used by
+  `eligibility.py`, `api/routes/memories.py` and the SQLite renderer.
+  MySQL now resolves its filter with `VisibilityFilter.for_caller(user)`
+  rather than recomputing `getattr(user, "namespace", None) or
+  "default"` (the fallback lives in the factory, so it cannot drift from
+  Oracle/Db2). SQLite composes its WHERE clause from a list of
+  predicates rather than string concatenation with a
+  trailing-`AND` variable, so the statement stays well-formed for every
+  caller shape including a userless one. Postgres/MySQL/SQLite read
+  visibility is otherwise unchanged; no caller-observable behaviour
+  changes on any backend.
 - **One factory for root-equivalent reads (F-06 slice 1 follow-up).**
   `VisibilityFilter` gains `for_system()` and `for_caller()`, and
   `Db2MemoryRepository.fetch_memory_context` /

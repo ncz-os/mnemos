@@ -2421,11 +2421,12 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         if not embedding:
             return []
 
-        from mnemos.core.security import is_root
         from mnemos.persistence.visibility import VisibilityFilter
 
-        namespace = None if is_root(user) else (getattr(user, "namespace", None) or "default")
-        vis = VisibilityFilter.for_read(user, namespace=namespace)
+        # ``for_caller`` owns the "has a user?" decision and the non-root
+        # default-namespace fallback, so this backend cannot drift from
+        # Oracle/Db2/Postgres on either.
+        vis = VisibilityFilter.for_caller(user)
         rows = await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=vis)
         return [
             {"id": row["id"], "content": row["content"], "namespace": row["namespace"]}

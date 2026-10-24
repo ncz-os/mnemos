@@ -1628,7 +1628,6 @@ def test_openai_repo_memory_context_root_sees_cross_tenant(tmp_path, monkeypatch
 
 
 def test_openai_repo_vault_never_injected_on_sqlite(tmp_path, monkeypatch):
-    from mnemos.core.injection_defense import FRAME_CLOSE, FRAME_OPEN
     from mnemos.db import openai_compat_repo
 
     backend = _sqlite_backend(tmp_path, monkeypatch)
@@ -1792,9 +1791,14 @@ def test_postgres_repo_memory_context_queries_compressed_variant(monkeypatch):
     sql = " ".join(conn.fetch_calls[0][0].split())
     assert "LEFT JOIN memory_compressed_variants" in sql
     assert "COALESCE(v.compressed_content, m.content) AS content" in sql
-    # Tenancy is carried by the rendered visibility filter, namespace-pinned.
+    # Tenancy is carried by the rendered visibility filter, namespace-pinned,
+    # and the vault subtraction is bound as a parameter rather than spliced
+    # into the SQL as a literal. Assert both values are present and that the
+    # trailing query/limit binds still land in order.
     params = conn.fetch_calls[0][1]
-    assert params[-3:] == ("default", "needle", 5)
+    assert "default" in params, params
+    assert "vault" in params, params
+    assert params[-2:] == ("needle", 5)
 
 
 def test_postgres_repo_memory_context_maps_rows_and_drops_vault(monkeypatch):
@@ -1835,7 +1839,7 @@ def test_postgres_repo_available_models_and_lookup(monkeypatch):
     """Discovery through the real Postgres audit repository."""
     from mnemos.db import openai_compat_repo
 
-    conn = _pg_backend(
+    _pg_backend(
         monkeypatch,
         registry_rows=[
             {"provider": "openai", "model_id": "gpt-5", "display_name": "GPT-5", "graeae_weight": 0.9},
@@ -1925,8 +1929,13 @@ def test_every_backend_implements_vault_subtracting_memory_context(module_name):
         assert "namespace" in source, (
             f"{cls.__name__}.fetch_memory_context must return the row namespace"
         )
-        # The vault subtraction may be written inline or inherited from
-        # ``VisibilityFilter.for_read``; accept either, but require one.
-        assert "vault" in source or "for_read" in source, (
-            f"{cls.__name__}.fetch_memory_context must apply the secret-vault subtraction"
-        )
+        # The vault subtraction may be written inline, or inherited from
+        # ``VisibilityFilter.for_read`` / ``for_caller`` (which routes a
+        # user through ``for_read`` and a userless caller through
+        # ``for_system``); accept any of them, but require one.
+        assert (
+            "vault" in source
+            or "for_read" in source
+            or "for_caller" in source
+            or "for_system" in source
+        ), f"{cls.__name__}.fetch_memory_context must apply the secret-vault subtraction"

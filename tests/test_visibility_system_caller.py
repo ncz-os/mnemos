@@ -151,3 +151,67 @@ def test_fetch_memory_context_delegates_to_for_caller(monkeypatch, module_name):
     vis = captured["visibility"]
     assert vis.scope is VisibilityScope.READABLE
     assert vis.namespace == "alice-ns"
+
+
+# ── SQLite renderer: never returns a dangling boolean fragment ─────────────
+
+
+@pytest.mark.parametrize("caller", ["root", "user", "system"])
+def test_sqlite_renderer_returns_complete_expression_or_empty(caller):
+    """``_render_sqlite_visibility`` must be safe to join with ``AND``.
+
+    ``fetch_memory_context`` builds its WHERE clause from parts, so the
+    renderer's contract is "empty string, or a complete boolean
+    expression" -- never a fragment with a trailing/leading operator.
+    """
+    from mnemos.persistence.sqlite import _render_sqlite_visibility
+
+    callers = {
+        "root": _user(role="root"),
+        "user": _user(),
+        "system": SimpleNamespace(),
+    }
+    params: list[object] = []
+    clause = _render_sqlite_visibility(
+        VisibilityFilter.for_caller(callers[caller]), params, table_alias="m"
+    )
+
+    assert isinstance(clause, str)
+    if clause:
+        assert not clause.strip().upper().endswith(" AND")
+        assert not clause.strip().upper().startswith("AND ")
+        assert clause.count("?") == len(params)
+    # Every shape subtracts the vault.
+    assert "vault" in params
+
+
+def test_sqlite_fetch_memory_context_sql_is_wellformed_for_every_caller(monkeypatch):
+    """The composed statement always has a predicate after WHERE."""
+    import asyncio
+
+    from mnemos.core import lifecycle
+    from mnemos.persistence.sqlite import SqliteMemoryRepository
+
+    async def _embed(_q):
+        return [0.1] * 3
+
+    monkeypatch.setattr(lifecycle, "_get_embedding", _embed)
+    seen: dict[str, object] = {}
+
+    async def _fetch_all(conn, sql, params):
+        seen["sql"] = " ".join(sql.split())
+        return []
+
+    monkeypatch.setattr("mnemos.persistence.sqlite._fetch_all", _fetch_all)
+
+    repo = SqliteMemoryRepository.__new__(SqliteMemoryRepository)
+    repo._conn = lambda tx: None  # type: ignore[method-assign]
+
+    for caller in (_user(role="root"), _user(), SimpleNamespace()):
+        seen.clear()
+        asyncio.run(repo.fetch_memory_context(None, "needle", caller, limit=2))
+        sql = str(seen["sql"]).lower()
+        assert "where" in sql
+        after_where = sql.split("where", 1)[1].strip()
+        assert after_where, sql
+        assert not after_where.startswith("and ")
