@@ -194,7 +194,7 @@ async def _claim_delivery(
     # which returns None once any of the six persistence backends is
     # installed (the ABC owns the claim on those arms) — no direct
     # lifecycle-pool read here.
-    pool = pool_or_backend or _lc.get_legacy_webhook_pool()
+    pool = pool_or_backend or _lc.get_temporary_legacy_webhook_pool()
     if pool is None:
         raise RuntimeError(
             f"webhook delivery {delivery_id} cannot run without a supported persistence handle"
@@ -225,7 +225,7 @@ async def _guard_preclaimed_delivery_before_send(
             )
     # F-06 slice 3: raw-pool fallback through the facade accessor (see
     # ``_claim_delivery`` above) — no direct lifecycle-pool read here.
-    pool = pool_or_backend or _lc.get_legacy_webhook_pool()
+    pool = pool_or_backend or _lc.get_temporary_legacy_webhook_pool()
     if pool is None:
         raise RuntimeError(
             f"webhook delivery {delivery_id} cannot run without a supported persistence handle"

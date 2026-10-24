@@ -1109,10 +1109,12 @@ def get_persistence_backend() -> PersistenceBackend:
     return _persistence_backend
 
 
-def get_legacy_webhook_pool() -> Optional[asyncpg.Pool]:
-    """Facade accessor for the raw-asyncpg fallback pool the pre-item-7
-    webhook state machine still runs against while
-    ``test_webhook_retry_state.py`` migrates to the ABC.
+def get_temporary_legacy_webhook_pool() -> Optional[asyncpg.Pool]:
+    """Temporary Postgres-only bridge: the raw-asyncpg fallback pool the
+    pre-item-7 webhook state machine still runs against while
+    ``test_webhook_retry_state.py`` migrates to the ABC. It is not a
+    supported production handle and must not spread — it disappears with
+    the legacy migration window.
 
     The raw pool is only a valid webhook handle when *no* persistence
     backend is installed — with any of the six backends present, the

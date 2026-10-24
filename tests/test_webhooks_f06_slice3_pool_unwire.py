@@ -9,7 +9,7 @@ without a persistence backend — the F-06 class of defect §0b defines
 Every one of these call paths is already covered by the ``WebhookRepository``
 ABC on all six backends (item 7: claim / guard / finalize / store / release),
 so the fix is an *unwire*: each fallback routes through
-``lifecycle.get_legacy_webhook_pool()`` — the facade accessor for the
+``lifecycle.get_temporary_legacy_webhook_pool()`` — the facade accessor for the
 Postgres-only raw-asyncpg fallback window that ``test_webhook_retry_state.py``
 is still migrating on — instead of touching ``_lc._pool`` at module scope.
 
@@ -87,16 +87,16 @@ async def test_legacy_webhook_pool_accessor_survives_the_fallback_window(
     pool = _FakePool()
     monkeypatch.setattr(lifecycle, "_pool", pool)
     monkeypatch.setattr(lifecycle, "_persistence_backend", None)
-    assert lifecycle.get_legacy_webhook_pool() is pool
+    assert lifecycle.get_temporary_legacy_webhook_pool() is pool
 
     monkeypatch.setattr(lifecycle, "_pool", None)
-    assert lifecycle.get_legacy_webhook_pool() is None
+    assert lifecycle.get_temporary_legacy_webhook_pool() is None
 
     # A persistence backend (any of the six) closes the fallback window:
     # the raw pool is no longer a valid handle for the webhook worker.
     monkeypatch.setattr(lifecycle, "_pool", pool)
     monkeypatch.setattr(lifecycle, "_persistence_backend", SimpleNamespace())
-    assert lifecycle.get_legacy_webhook_pool() is None
+    assert lifecycle.get_temporary_legacy_webhook_pool() is None
 
 
 @pytest.mark.asyncio
@@ -111,7 +111,7 @@ async def test_sqlite_claim_guard_finalize_and_body_store_through_the_facade(
     ``pool_or_backend or _lc._pool`` (or the finalize equivalent), so an
     installed raw pool would have been read directly here; the post-slice
     code must get an *identity-equal* result on SQLite while the accessor is
-    observably consulted (spy on ``get_legacy_webhook_pool`` — if any call
+    observably consulted (spy on ``get_temporary_legacy_webhook_pool`` — if any call
     path still reads ``_lc._pool`` the test module's static scan above
     fails, and if a call path silently consults the accessor on the SQLite
     arm the spy count moves).
@@ -134,7 +134,7 @@ async def test_sqlite_claim_guard_finalize_and_body_store_through_the_facade(
 
         sentinel = _SentinelPool()
         monkeypatch.setattr(lifecycle, "_pool", sentinel)
-        assert lifecycle.get_legacy_webhook_pool() is None
+        assert lifecycle.get_temporary_legacy_webhook_pool() is None
 
         repo = backend.webhooks
         subscription_id = str(uuid.uuid4())

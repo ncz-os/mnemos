@@ -127,7 +127,7 @@ async def _finalize_delivery(
     # facade accessor, which is None once any persistence backend is
     # installed, so this branch is unreachable there. No direct
     # lifecycle-pool read here.
-    pool = pool_or_backend or _lc.get_legacy_webhook_pool()
+    pool = pool_or_backend or _lc.get_temporary_legacy_webhook_pool()
     if pool is None:
         raise RuntimeError(
             f"webhook delivery {delivery_id} cannot finalize without a backend or raw pool"
@@ -451,7 +451,7 @@ async def _persist_response_body_for_audit(
     # F-06 slice 3: raw-pool fallback through the facade accessor (no direct
     # lifecycle-pool read here); the accessor is None once any persistence
     # backend is installed, so this branch is the legacy arm only.
-    pool = pool_or_backend if pool_or_backend is not None else _lc.get_legacy_webhook_pool()
+    pool = pool_or_backend if pool_or_backend is not None else _lc.get_temporary_legacy_webhook_pool()
     if pool is None:
         return
     try:
