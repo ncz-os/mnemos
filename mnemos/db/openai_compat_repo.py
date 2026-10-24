@@ -76,20 +76,34 @@ def _backend():
     return _lc._persistence_backend
 
 
-async def _run_on_persistence(leaf, empty_result):
+async def _run_on_persistence(leaf, empty_result, *, what="persistence call", unavailable=None):
     """Run ``leaf(tx, backend)`` inside one backend ``transactional()`` scope.
 
     The only storage bridge this module keeps: a single
     ``transactional()`` entry point instead of a raw asyncpg ``_pool.acquire``.
     With no persistence backend there is nothing to query: report the
     ``empty_result`` with a reason rather than a fabricated value.
+
+    Failing to open (or close) the transaction degrades exactly like the old
+    pool acquisition did: it is logged and the caller gets ``empty_result``,
+    or ``unavailable`` is raised when the caller must not mistake a storage
+    outage for "not found" (the ``/v1/models/<id>`` 503 path). A
+    ``ModelRegistryUnavailable`` raised by the leaf passes through untouched.
     """
     backend = _backend()
     if backend is None:
         logger.debug("[MNEMOS] No persistence backend available")
         return empty_result
-    async with backend.transactional() as tx:
-        return await leaf(tx, backend)
+    try:
+        async with backend.transactional() as tx:
+            return await leaf(tx, backend)
+    except ModelRegistryUnavailable:
+        raise
+    except Exception as exc:
+        logger.warning("[MNEMOS] %s: persistence transaction failed: %s", what, exc)
+        if unavailable is not None:
+            raise unavailable from exc
+        return empty_result
 
 
 async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Dict[str, Any]]:
@@ -119,7 +133,7 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
             if _row_get(row, "namespace") != "vault"
         ]
 
-    return await _run_on_persistence(_leaf, [])
+    return await _run_on_persistence(_leaf, [], what="memory context")
 
 
 async def fetch_model_recommendation(
@@ -147,7 +161,7 @@ async def fetch_model_recommendation(
         )
         return model
 
-    return await _run_on_persistence(_leaf, None)
+    return await _run_on_persistence(_leaf, None, what="model recommendation")
 
 
 async def lookup_provider_for_model(model: str) -> Optional[str]:
@@ -158,7 +172,7 @@ async def lookup_provider_for_model(model: str) -> Optional[str]:
             logger.warning("[MNEMOS] model_registry lookup failed for model=%s: %s", model, exc)
             return None
 
-    return await _run_on_persistence(_leaf, None)
+    return await _run_on_persistence(_leaf, None, what="provider lookup")
 
 
 async def fetch_available_models() -> list[Any]:
@@ -173,11 +187,13 @@ async def fetch_available_models() -> list[Any]:
             rows = []
         return list(rows)
 
-    return await _run_on_persistence(_leaf, [])
+    return await _run_on_persistence(_leaf, [], what="available models")
 
 
 async def fetch_model_provider(model_id: str) -> Optional[str]:
     async def _leaf(tx: Any, backend: Any) -> Optional[str]:
         return await backend.consultations_audit.fetch_model_provider(tx, model_id)
 
-    return await _run_on_persistence(_leaf, None)
+    return await _run_on_persistence(
+        _leaf, None, what="model provider", unavailable=ModelRegistryUnavailable
+    )

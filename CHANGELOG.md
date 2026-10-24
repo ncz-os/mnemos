@@ -149,8 +149,8 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
 - **OpenAI-compat gateway routes through the persistence ABC (F-06 slice 1).**
   `mnemos/db/openai_compat_repo.py` no longer references `_lc._pool` directly:
   `fetch_memory_context` routes through
-  `MemoryRepository.fts_search` (all six backends) with the caller's
-  `VisibilityFilter` carrying tenancy, and the four `model_registry`
+  `MemoryRepository.fetch_memory_context` (all six backends), which owns the
+  caller's visibility and the secret-vault subtraction, and the four `model_registry`
   lookups (`fetch_model_recommendation`, `lookup_provider_for_model`,
   `fetch_available_models`, `fetch_model_provider`) route through
   `ConsultationAuditRepository` (all six backends). On SQLite the

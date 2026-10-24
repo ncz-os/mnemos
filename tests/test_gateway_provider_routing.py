@@ -111,10 +111,14 @@ def test_resolve_uses_registry_row_when_present(monkeypatch):
     registered'."""
     from mnemos.api.routes import openai_compat
 
-    conn = _registry_conn(row={"provider": "anthropic"})
+    # A model name the substring heuristic cannot map, so "claude" can only
+    # have come from the registry row (the heuristic maps claude-* to the
+    # same value and would make this assertion pass without any registry hit).
+    conn = _registry_conn(model="acme-opus-9", row={"provider": "anthropic"})
     _install(monkeypatch, conn)
 
-    result = asyncio.run(openai_compat._resolve_provider_for_model("claude-opus-4-6"))
+    result = asyncio.run(openai_compat._resolve_provider_for_model("acme-opus-9"))
+    assert conn.fetchrow_calls, "the registry was never consulted"
     assert result == "claude"
 
 
