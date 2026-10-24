@@ -548,7 +548,20 @@ class MemoryRepository(ABC):
         query: str,
         user: Any,
         limit: int = 5,
-    ) -> list[dict[str, Any]]: ...
+    ) -> list[dict[str, Any]]:
+        """Return up to ``limit`` prompt-ready memory rows for ``query``.
+
+        Each row carries at least ``id`` and ``content``, where ``content``
+        is the compression winner (``COALESCE(compressed_content, content)``).
+        Implementations also return ``namespace`` unchanged so callers can
+        apply the secret-vault subtraction without re-querying.
+
+        Vault rows are **never** returned: the subtraction applies to every
+        scope, root included, exactly as :meth:`VisibilityFilter.for_read`
+        renders ``exclude_namespaces``. A backend that cannot supply
+        ``namespace`` reports ``None`` rather than inventing a value.
+        """
+        ...
 
     # --- v4.1 handler-through-backend surface ---------------------------------
 

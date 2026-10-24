@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 from mnemos.api.dependencies import UserContext
+from tests._fake_backend import install_fake_postgres_backend
 
 
 def _alice() -> UserContext:
@@ -58,42 +59,109 @@ def _install(monkeypatch, conn):
     monkeypatch.setattr(lc, "_pool", pool)
 
 
+def _is_context_query(sql: str) -> bool:
+    """True only for the gateway's memory-context SELECT.
+
+    Identified by the variant JOIN *and* the COALESCE projection together:
+    either token alone also appears in the rehydrate statement, and matching
+    on a fragment alone would answer the wrong call.
+    """
+    normalized = " ".join(sql.split()).lower()
+    return "left join memory_compressed_variants" in normalized and "coalesce(v.compressed_content" in normalized
+
+
+class _GatewayContextConn(_Conn):
+    """Fake asyncpg connection that answers the gateway's memory-context query.
+
+    Serves the rows the real context statement returns — ``id`` and the
+    ``COALESCE(v.compressed_content, m.content) AS content`` winner — while
+    recording every statement so the JOIN itself stays asserted. This is what
+    an asyncpg connection looks like from the repository's side; the
+    production SQL is executed for real by ``fetch_memory_context``.
+
+    Any statement that is not the context query raises: an unrecognised call
+    means the repository changed, and answering it with ``[]`` would hide
+    that behind a green test.
+    """
+
+    async def fetch(self, sql, *args):
+        self.fetches.append((sql, args))
+        if not _is_context_query(sql):
+            raise AssertionError(
+                f"unexpected statement on the gateway context connection: {' '.join(sql.split())[:120]!r}"
+            )
+        return [
+            {
+                "id": row["id"],
+                "category": row.get("category"),
+                "content": row["content"],
+                "namespace": row.get("namespace"),
+            }
+            for row in self._rows
+        ]
+
+
+def _install_gateway(monkeypatch, conn):
+    """Wire ``conn`` underneath the REAL Postgres memory repository.
+
+    The gateway's context search goes through the persistence ABC (F-06), so
+    a fake pool on its own is never consulted. ``conn`` is asyncpg-shaped
+    while ``fetch_memory_context`` is the production implementation, so the
+    SQL asserted below is exactly the SQL the Postgres backend emits.
+    """
+    return install_fake_postgres_backend(monkeypatch, conn)
+
+
 # ─── gateway _search_mnemos_context ─────────────────────────────────────────
 
 
 def test_gateway_joins_variants_table(monkeypatch):
     from mnemos.api.routes import openai_compat
 
-    conn = _Conn()
-    _install(monkeypatch, conn)
+    conn = _GatewayContextConn()
+    _install_gateway(monkeypatch, conn)
     asyncio.run(openai_compat._search_mnemos_context("hello", _alice()))
 
-    sql = conn.fetches[-1][0]
+    # The gateway runs exactly one memory-context query; the fake raises on
+    # anything else, so this list is the whole conversation with storage.
+    context_sqls = [sql for sql, _args in conn.fetches if _is_context_query(sql)]
+    assert len(context_sqls) == 1, f"expected one context query, got {conn.fetches!r}"
+    sql = " ".join(context_sqls[0].split())
     assert "LEFT JOIN memory_compressed_variants" in sql
-    assert "COALESCE(v.compressed_content" in sql
+    assert "COALESCE(v.compressed_content, m.content) AS content" in sql
     assert "m.content" in sql  # fallback tier in the COALESCE chain
 
 
 def test_gateway_uses_variant_content_when_available(monkeypatch):
+    """The SQL COALESCEs (v.compressed_content, m.content) into a column
+    aliased as ``content``; the gateway must pass the winning value through
+    untouched (modulo the untrusted-data framing)."""
     from mnemos.api.routes import openai_compat
 
-    # The SQL COALESCEs (v.compressed_content, m.content) into a
-    # column aliased as `content`. The mock returns what the
-    # SQL WOULD produce for two rows — one with variant, one without.
-    conn = _Conn(rows=[
-        {"id": "mem_1", "category": "solutions",
-         "content": "short variant form"},  # imagine COALESCE picked variant
-        {"id": "mem_2", "category": "patterns",
-         "content": "very long raw content " * 40},
-    ])
-    _install(monkeypatch, conn)
+    compressed = "short variant form"
+    raw = "very long raw content " * 40
+    rows = [
+        # What the SQL COALESCE returns: the variant won for mem_1, the raw
+        # column won for mem_2 (no compressed variant for that memory).
+        {"id": "mem_1", "category": "solutions", "content": compressed, "namespace": "default"},
+        {"id": "mem_2", "category": "patterns", "content": raw, "namespace": "default"},
+    ]
+
+    conn = _GatewayContextConn(rows=rows)
+    _install_gateway(monkeypatch, conn)
 
     out = asyncio.run(openai_compat._search_mnemos_context("query", _alice(), limit=5))
+
+    context_sql = " ".join(
+        next(sql for sql, _args in conn.fetches if _is_context_query(sql)).split()
+    )
+    assert "LEFT JOIN memory_compressed_variants" in context_sql, (
+        "the served rows must come from a variant-joining query"
+    )
+    assert "COALESCE(v.compressed_content, m.content) AS content" in context_sql
     assert len(out) == 2
-    # Handler passes through whatever the SQL returned under `content`.
-    # The compression choice happens in the SQL COALESCE, which the
-    # JOIN test above validates.
-    assert out[0]["content"] == "short variant form"
+    assert compressed in out[0]["content"]
+    assert out[1]["content"].count("very long raw content") == 40
 
 
 # ─── search ─────────────────────────────────────────────────────────────────

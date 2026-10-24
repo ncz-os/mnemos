@@ -62,6 +62,18 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
 
 ### Added
 
+- **`MemoryRepository.fetch_memory_context` is the sole gateway context
+  read (F-06 slice 1).** The OpenAI-compat gateway no longer acquires the
+  raw asyncpg pool: `mnemos/db/openai_compat_repo.py` calls the persistence
+  ABC, so every backend serves the compiled `COALESCE(compressed_content,
+  content)` winner and the caller's tenancy from one place. The vault
+  subtraction that previously lived in the gateway's SQL is now part of the
+  ABC contract and is applied by all six backends — including for root
+  callers — and each row carries its `namespace` so callers need no second
+  query. `tests/test_fake_backend_sql_binding.py` pins the registry-statement
+  handling of the Postgres-over-fake-connection helper (pair lookups bind by
+  placeholder, not argument order, and unrecognised SQL raises instead of
+  silently returning every row).
 - **Streamable HTTP MCP at `/mcp`.** MNEMOS now exposes the current MCP
   transport alongside the OAuth-protected legacy `/sse` fallback. Both routes
   use the same tool registry, bearer/OAuth authorization, role, namespace,

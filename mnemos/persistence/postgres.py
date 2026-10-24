@@ -1037,9 +1037,12 @@ class PostgresMemoryRepository(MemoryRepository):
         conn = _postgres_tx(tx).conn
         try:
             if user.role == "root":
+                # Root reads cross tenants but the secret vault is still
+                # subtracted -- the same predicate the raw gateway SQL used
+                # before this read moved behind the ABC.
                 memories = await conn.fetch(
                     """
-                    SELECT m.id, m.category,
+                    SELECT m.id, m.category, m.namespace,
                            COALESCE(v.compressed_content, m.content) AS content
                     FROM memories m
                     LEFT JOIN memory_compressed_variants v
@@ -1047,6 +1050,7 @@ class PostgresMemoryRepository(MemoryRepository):
                     WHERE
                         m.deleted_at IS NULL
                         AND m.archived_at IS NULL
+                        AND m.namespace <> 'vault'
                         AND (
                             to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)
                             OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
@@ -1069,7 +1073,7 @@ class PostgresMemoryRepository(MemoryRepository):
                 lim_ph = f"${len(vis_params) + 3}"
                 memories = await conn.fetch(
                     f"""
-                    SELECT m.id, m.category,
+                    SELECT m.id, m.category, m.namespace,
                            COALESCE(v.compressed_content, m.content) AS content
                     FROM memories m
                     LEFT JOIN memory_compressed_variants v
@@ -1078,6 +1082,7 @@ class PostgresMemoryRepository(MemoryRepository):
                       AND m.archived_at IS NULL
                       AND {vis_clause}
                       AND m.namespace = {ns_ph}
+                      AND m.namespace <> 'vault'
                       AND (
                           to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})
                           OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
@@ -1091,7 +1096,14 @@ class PostgresMemoryRepository(MemoryRepository):
                     limit,
                 )
             logger.info("[MNEMOS] Found %s memories for query '%s...'", len(memories), query[:30])
-            return [{"id": memory["id"], "content": memory["content"]} for memory in memories]
+            return [
+                {
+                    "id": memory["id"],
+                    "content": memory["content"],
+                    "namespace": memory["namespace"],
+                }
+                for memory in memories
+            ]
         except Exception as exc:
             logger.warning("[MNEMOS] Search failed for '%s...': %s", query[:50], exc)
             return []

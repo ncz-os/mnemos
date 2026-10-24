@@ -17,7 +17,6 @@ Tests:
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -31,34 +30,72 @@ def _user() -> UserContext:
     )
 
 
-class _Conn:
-    def __init__(self, *, row=None, raise_on_query=False):
-        self._row = row
-        self._raise = raise_on_query
+def _registry_conn(*, model="__any__", row=None, raise_on_query=False):
+    """Fake asyncpg connection for the gateway's registry lookup.
+
+    ``row`` is the registry row the lookup for ``model`` should find; ``None``
+    means the registry has no such model, which drives the resolver's
+    substring-heuristic fallback. Registry reads since F-06 go through the
+    persistence ABC, so ``_install`` puts this connection underneath the REAL
+    ``PostgresConsultationAuditRepository`` rather than beside a fake pool the
+    repository no longer reads.
+    """
+    from tests._fake_backend import FakePostgresConnection
+
+    registry_rows = [] if row is None else [{"provider": row["provider"], "model_id": model}]
+    return FakePostgresConnection(registry_rows=registry_rows, fail=raise_on_query)
+
+
+class _NamespacedLookupConn:
+    """Fake connection for the namespaced ``<provider>/<model>`` resolve path.
+
+    The gateway form looks the whole id up first, then falls back to the
+    split ``(provider, model_id)`` pair query. This fake serves the pair
+    query — driven by its SQL shape and bound arguments, not by call order —
+    so a resolver that reorders or adds a probe still gets the right rows.
+
+    ``pair_rows`` are returned for ``WHERE provider = $N AND model_id = $M``.
+    The whole-id lookup (``WHERE model_id = $N`` with no provider filter)
+    always misses: that is what makes the namespaced fallback fire.
+    """
+
+    def __init__(self, pair_rows=None):
+        self.pair_rows = [dict(r) for r in (pair_rows or [])]
         self.fetchrow_calls: list[tuple[str, tuple]] = []
 
-    async def fetchrow(self, sql: str, *args):
+    async def fetchrow(self, sql, *args):
         self.fetchrow_calls.append((sql, args))
-        if self._raise:
-            raise RuntimeError("db blip")
-        return self._row
+        normalized = " ".join(sql.split()).lower()
+        if " from model_registry" not in normalized:
+            raise AssertionError(f"unexpected statement: {normalized[:120]!r}")
+        filters_provider = "provider = $" in normalized
+        filters_model = "model_id = $" in normalized
+        if filters_model and not filters_provider:
+            # Whole-id (possibly namespaced) lookup: never in the registry.
+            return None
+        if filters_provider and filters_model:
+            provider, model_id = args[0], args[1]
+            for row in self.pair_rows:
+                if row["provider"] == provider and row["model_id"] == model_id:
+                    return {"provider": row["provider"]}
+            return None
+        raise AssertionError(f"unhandled registry statement: {normalized[:120]!r}")
 
-
-class _PoolCtx:
-    def __init__(self, conn): self.conn = conn
-    async def __aenter__(self): return self.conn
-    async def __aexit__(self, *a): return False
+    async def fetch(self, sql, *args):
+        raise AssertionError(f"unexpected fetch on the resolve path: {' '.join(sql.split())[:120]!r}")
 
 
 def _install(monkeypatch, conn):
-    import mnemos.core.lifecycle as lc
-    pool = MagicMock()
-    pool.acquire = lambda: _PoolCtx(conn)
-    monkeypatch.setattr(lc, "_pool", pool)
+    """Install ``conn`` behind the real Postgres repository via the ABC."""
+    from tests._fake_backend import install_fake_postgres_backend
+
+    return install_fake_postgres_backend(monkeypatch, conn)
 
 
 def _install_no_pool(monkeypatch):
+    """Pre-lifespan / degenerate state: no persistence backend at all."""
     import mnemos.core.lifecycle as lc
+    monkeypatch.setattr(lc, "_persistence_backend", None)
     monkeypatch.setattr(lc, "_pool", None)
 
 
@@ -74,7 +111,7 @@ def test_resolve_uses_registry_row_when_present(monkeypatch):
     registered'."""
     from mnemos.api.routes import openai_compat
 
-    conn = _Conn(row={"provider": "anthropic"})
+    conn = _registry_conn(row={"provider": "anthropic"})
     _install(monkeypatch, conn)
 
     result = asyncio.run(openai_compat._resolve_provider_for_model("claude-opus-4-6"))
@@ -88,7 +125,7 @@ def test_resolve_normalises_registry_name_only_when_mapped(monkeypatch):
     GRAEAE-normalization step is additive, not a rename pass."""
     from mnemos.api.routes import openai_compat
 
-    conn = _Conn(row={"provider": "my-local-anthropic-proxy"})
+    conn = _registry_conn(model="claude-opus-4-6", row={"provider": "my-local-anthropic-proxy"})
     _install(monkeypatch, conn)
 
     result = asyncio.run(openai_compat._resolve_provider_for_model("claude-opus-4-6"))
@@ -104,31 +141,22 @@ def test_resolve_handles_gateway_namespaced_slash_id(monkeypatch):
     way as the bare upstream form."""
     from mnemos.api.routes import openai_compat
 
-    # First fetchrow (direct lookup of full 'together/Qwen/...') misses;
-    # second fetchrow (provider='together', model_id='Qwen/Qwen3-…') hits.
-    class _TwoStep:
-        def __init__(self):
-            self.calls = 0
-            self.fetchrow_calls = []
-        async def fetchrow(self, sql, *args):
-            self.calls += 1
-            self.fetchrow_calls.append((sql, args))
-            if self.calls == 1:
-                return None
-            return {"provider": "together"}
-
-    conn = _TwoStep()
+    conn = _NamespacedLookupConn(
+        pair_rows=[{"provider": "together", "model_id": "Qwen/Qwen3-235B-A22B-Instruct-2507-tput"}]
+    )
     _install(monkeypatch, conn)
 
     result = asyncio.run(openai_compat._resolve_provider_for_model(
         "together/Qwen/Qwen3-235B-A22B-Instruct-2507-tput"
     ))
     assert result == "together"
-    # Confirm the namespaced lookup actually fired with the split args.
-    assert conn.calls == 2
-    second_args = conn.fetchrow_calls[1][1]
-    assert second_args[0] == "together"
-    assert second_args[1] == "Qwen/Qwen3-235B-A22B-Instruct-2507-tput"
+    # The namespaced lookup fired as a (provider, model_id) pair query with
+    # the head and the tail split on the FIRST slash.
+    pair_calls = [
+        args for sql, args in conn.fetchrow_calls
+        if "provider = $" in sql and "model_id = $" in sql
+    ]
+    assert pair_calls == [("together", "Qwen/Qwen3-235B-A22B-Instruct-2507-tput")]
 
 
 def test_resolve_handles_registry_name_in_namespaced_head(monkeypatch):
@@ -139,19 +167,9 @@ def test_resolve_handles_registry_name_in_namespaced_head(monkeypatch):
     name for the caller."""
     from mnemos.api.routes import openai_compat
 
-    class _TwoStep:
-        def __init__(self):
-            self.calls = 0
-            self.fetchrow_calls = []
-        async def fetchrow(self, sql, *args):
-            self.calls += 1
-            self.fetchrow_calls.append((sql, args))
-            if self.calls == 1:
-                return None
-            # Registry stores it as provider='anthropic'.
-            return {"provider": "anthropic"}
-
-    conn = _TwoStep()
+    conn = _NamespacedLookupConn(
+        pair_rows=[{"provider": "anthropic", "model_id": "claude-opus-4-7"}]
+    )
     _install(monkeypatch, conn)
 
     result = asyncio.run(openai_compat._resolve_provider_for_model(
@@ -159,19 +177,19 @@ def test_resolve_handles_registry_name_in_namespaced_head(monkeypatch):
     ))
     # GRAEAE-normalised: 'anthropic' → 'claude'.
     assert result == "claude"
-    # Namespaced lookup fired with head re-mapped to its registry name
-    # (in this case identity — 'anthropic' isn't a GRAEAE provider key
-    # and so passes through unchanged for the WHERE clause).
-    assert conn.calls == 2
-    second_args = conn.fetchrow_calls[1][1]
-    assert second_args[0] == "anthropic"
-    assert second_args[1] == "claude-opus-4-7"
+    # The pair lookup fired with the head as the registry-provider filter
+    # ('anthropic' is not a GRAEAE provider key, so it passes through).
+    pair_calls = [
+        args for sql, args in conn.fetchrow_calls
+        if "provider = $" in sql and "model_id = $" in sql
+    ]
+    assert pair_calls == [("anthropic", "claude-opus-4-7")]
 
 
 def test_resolve_falls_back_to_heuristic_on_registry_miss(monkeypatch):
     from mnemos.api.routes import openai_compat
 
-    conn = _Conn(row=None)
+    conn = _registry_conn(row=None)
     _install(monkeypatch, conn)
 
     # "claude-*" is in _FALLBACK_PROVIDER_MAP
@@ -183,7 +201,7 @@ def test_resolve_returns_none_on_complete_miss(monkeypatch):
     """Registry miss + no substring match -> None. Caller raises 400."""
     from mnemos.api.routes import openai_compat
 
-    conn = _Conn(row=None)
+    conn = _registry_conn(row=None)
     _install(monkeypatch, conn)
 
     result = asyncio.run(openai_compat._resolve_provider_for_model("unknown-xyz-v9"))
@@ -195,7 +213,7 @@ def test_resolve_falls_back_when_db_query_raises(monkeypatch):
     to substring heuristic."""
     from mnemos.api.routes import openai_compat
 
-    conn = _Conn(raise_on_query=True)
+    conn = _registry_conn(raise_on_query=True)
     _install(monkeypatch, conn)
 
     # gpt-* hits the fallback heuristic
@@ -223,7 +241,7 @@ def test_route_unknown_model_raises_404(monkeypatch):
     getting garbage responses from the wrong provider."""
     from mnemos.api.routes import openai_compat
 
-    conn = _Conn(row=None)
+    conn = _registry_conn(row=None)
     _install(monkeypatch, conn)
 
     from fastapi import HTTPException
@@ -247,7 +265,7 @@ def test_route_uses_registry_hit_over_heuristic(monkeypatch):
     # Registry says "claude-*" is served by a custom provider
     # registered as "my-local-anthropic-proxy". The substring
     # heuristic would say "claude". Registry wins.
-    conn = _Conn(row={"provider": "my-local-anthropic-proxy"})
+    conn = _registry_conn(model="claude-opus-4-6", row={"provider": "my-local-anthropic-proxy"})
     _install(monkeypatch, conn)
 
     result = asyncio.run(openai_compat._resolve_provider_for_model("claude-opus-4-6"))

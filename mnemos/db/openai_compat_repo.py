@@ -8,8 +8,10 @@ nothing on every other backend.
 
 It now routes each call through the backend facade:
 
-* ``fetch_memory_context``      -> ``MemoryRepository.fts_search``
-  (all six backends; ``VisibilityFilter`` carries the tenancy).
+* ``fetch_memory_context``      -> ``MemoryRepository.fetch_memory_context``
+  (all six backends; the repository owns the visibility policy and the
+  compressed-variant JOIN, so the gateway cannot silently serve raw
+  content where a compression winner exists).
 * ``fetch_model_recommendation`` -> ``ConsultationAuditRepository.fetch_recommended_model``
   (all six backends, shared ``choose_recommended_model`` policy).
 * ``lookup_provider_for_model``  -> ``ConsultationAuditRepository.lookup_provider_for_model``
@@ -92,24 +94,17 @@ async def _run_on_persistence(leaf, empty_result):
 
 async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Dict[str, Any]]:
     async def _leaf(tx: Any, backend: Any) -> List[Dict[str, Any]]:
-        from mnemos.core.security import is_root
-        from mnemos.persistence.visibility import VisibilityFilter
-
-        # The v4.1 read path: full memory rows through the ABC, so every
-        # backend (not just a raw asyncpg pool) serves this call. Root gets
-        # the cross-tenant read bypass (the vault subtraction still applies);
-        # non-root is pinned to its namespace with the READABLE envelope —
-        # the same predicate the other memory read surfaces use.
-        if is_root(user):
-            visibility = VisibilityFilter.for_read(user, namespace=None)
-        else:
-            visibility = VisibilityFilter.for_read(user, namespace=getattr(user, "namespace", None) or "default")
         try:
-            # ``tx`` is the backend-scoped transaction; the repository
-            # method takes it as its first argument and derives the
-            # connection from it (the backend instance is passed in by
-            # ``_run_on_persistence`` so we do not re-resolve it here).
-            rows = await backend.memories.fts_search(tx, query=query, limit=limit, visibility=visibility)
+            # ``MemoryRepository.fetch_memory_context`` is the ABC method that
+            # owns this read: it applies the caller's visibility (root gets
+            # the cross-tenant bypass, everyone else the READABLE envelope
+            # pinned to their namespace), subtracts the secret vault, and
+            # COALESCEs the compressed winner over the raw content. Keeping
+            # that policy in the repository — instead of rebuilding a
+            # VisibilityFilter here over ``fts_search`` — means the gateway
+            # serves the same rows, in the same shape, as every other memory
+            # read surface, on every backend.
+            rows = await backend.memories.fetch_memory_context(tx, query, user, limit)
         except Exception as e:
             logger.warning("[MNEMOS] Search failed for '%s...': %s", query[:50], e)
             return []

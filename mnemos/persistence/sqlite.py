@@ -1232,32 +1232,31 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         categories = ("solutions", "patterns", "decisions", "infrastructure")
         category_placeholders = _placeholders(categories)
         like_q = f"%{query}%"
+        # One VisibilityFilter for every scope: ``for_read`` pins non-root to
+        # its namespace and, crucially, subtracts the secret vault for root
+        # too -- the subtraction previously lived in the gateway's SQL and
+        # disappeared when the read moved behind the ABC.
+        visibility = VisibilityFilter.for_read(
+            user,
+            namespace=None if _is_root(user) else (getattr(user, "namespace", None) or "default"),
+        )
         params: list[Any] = []
-        if getattr(user, "role", None) == "root":
-            params.extend([like_q, *categories, limit])
-            rows = await _fetch_all(
-                conn,
-                "SELECT m.id, COALESCE(v.compressed_content, m.content) AS content "
-                "FROM memories m "
-                "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
-                f"WHERE lower(m.content) LIKE lower(?) OR m.category IN ({category_placeholders}) "
-                "ORDER BY m.updated DESC LIMIT ?",
-                params,
-            )
-        else:
-            vis_clause = _read_visibility_clause(user, params, table_alias="m")
-            params.extend([user.namespace, like_q, *categories, limit])
-            rows = await _fetch_all(
-                conn,
-                "SELECT m.id, COALESCE(v.compressed_content, m.content) AS content "
-                "FROM memories m "
-                "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
-                f"WHERE {vis_clause} AND m.namespace = ? "
-                f"AND (lower(m.content) LIKE lower(?) OR m.category IN ({category_placeholders})) "
-                "ORDER BY m.updated DESC LIMIT ?",
-                params,
-            )
-        return [{"id": row["id"], "content": row["content"]} for row in rows]
+        vis_clause = _render_sqlite_visibility(visibility, params, table_alias="m")
+        params.extend([like_q, *categories, limit])
+        where = f"{vis_clause} AND " if vis_clause else ""
+        rows = await _fetch_all(
+            conn,
+            "SELECT m.id, m.namespace, COALESCE(v.compressed_content, m.content) AS content "
+            "FROM memories m "
+            "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
+            f"WHERE {where}(lower(m.content) LIKE lower(?) OR m.category IN ({category_placeholders})) "
+            "ORDER BY m.updated DESC LIMIT ?",
+            params,
+        )
+        return [
+            {"id": row["id"], "content": row["content"], "namespace": row["namespace"]}
+            for row in rows
+        ]
 
     async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
         self._require_dim(embedding, "upsert_memory_embedding")

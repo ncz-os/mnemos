@@ -73,7 +73,7 @@ from mnemos.persistence.oracle import (
 from mnemos.persistence.base import IsolationLevel, Transaction
 from mnemos.persistence.schema import ensure_db2_schema
 from mnemos.persistence.types import Row
-from mnemos.persistence.visibility import VisibilityFilter
+from mnemos.persistence.visibility import DEFAULT_EXCLUDED_NAMESPACES, VisibilityFilter
 from mnemos.persistence.base import WebhookDeliveryIntent
 
 _LOG = logging.getLogger(__name__)
@@ -2061,26 +2061,29 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             return []
 
         if hasattr(user, "user_id"):
-            if is_root(user):
-                visibility = VisibilityFilter(
-                    scope=VisibilityScope.ROOT_BYPASS,
-                    user_id=None,
-                    group_ids=(),
-                    namespace=None,
-                )
-            else:
-                ns = getattr(user, "namespace", None) or "default"
-                visibility = VisibilityFilter.for_read(user, namespace=ns)
+            # ``for_read`` carries the secret-vault subtraction for every
+            # scope, root included; a hand-built ROOT_BYPASS filter left
+            # ``exclude_namespaces`` empty and leaked vault rows.
+            visibility = VisibilityFilter.for_read(
+                user,
+                namespace=None if is_root(user) else (getattr(user, "namespace", None) or "default"),
+            )
         else:
+            # System caller with no user context: cross-tenant read, vault
+            # still subtracted.
             visibility = VisibilityFilter(
                 scope=VisibilityScope.ROOT_BYPASS,
                 user_id=None,
                 group_ids=(),
                 namespace=None,
+                exclude_namespaces=DEFAULT_EXCLUDED_NAMESPACES,
             )
 
         rows = await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=visibility)
-        return [dict(row) for row in rows]
+        return [
+            {"id": row["id"], "content": row["content"], "namespace": row["namespace"]}
+            for row in rows
+        ]
 
 
 class Db2KGRepository(_Db2OraCompatMixin, OracleKGRepository):

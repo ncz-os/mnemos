@@ -2425,7 +2425,11 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
 
         namespace = None if is_root(user) else user.namespace
         vis = VisibilityFilter.for_read(user, namespace=namespace)
-        return await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=vis)
+        rows = await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=vis)
+        return [
+            {"id": row["id"], "content": row["content"], "namespace": row["namespace"]}
+            for row in rows
+        ]
 
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
         # Mirror the Oracle backend: re-create the READABLE filter from the
