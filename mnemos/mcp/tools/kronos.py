@@ -1,4 +1,22 @@
-"""MCP KRONOS tool handlers."""
+"""MCP KRONOS tool handlers.
+
+F-06 slice 2 (§0b ABC-first): KRONOS is classified **Postgres-only**, not
+routed through the persistence ABC. The domain functions take a pool and
+their SQL is Postgres-specific (``date_trunc``, ``AT TIME ZONE``,
+``NOW() - n * INTERVAL``, and a two-stage ``memory_recall_log`` ->
+``memories`` fallback), so the pool is the pool's own owner here — not a
+bypassed ABC. The direct ``_lc._pool`` read below is retained with that
+justification.
+
+Backend *classification* goes through the persistence facade
+(``lifecycle._persistence_backend`` + ``isinstance``), not the pool: the
+backend is stable while the pool is transient (startup race / teardown can
+leave the pool briefly ``None`` on a Postgres deployment, and a pool object
+can exist while a non-Postgres backend is active). Classification is
+backend-based so those windows cannot flip the error message. On
+non-Postgres backends the tools return a null-valued, reason-bearing
+error instead of a fabricated 0-count success.
+"""
 
 from __future__ import annotations
 
@@ -41,23 +59,31 @@ async def tool_kronos_anomalies(
     if not _mcp_is_root(user) and user.namespace != namespace:
         return {"success": True, "namespace": namespace, "count": 0, "anomalies": []}
 
-    pool = _lc._pool
-    if pool is None:
-        return {"success": False, "error": "Database unavailable"}
-
-    settings = get_settings().kronos
-    anomalies = await detect_recall_anomalies(
-        pool,
-        namespace,
-        lookback_hours=settings.default_lookback_hours,
-        sensitivity=settings.default_sensitivity,
-    )
-    return {
-        "success": True,
-        "namespace": namespace,
-        "count": len(anomalies),
-        "anomalies": [asdict(item) for item in anomalies],
-    }
+    # KRONOS is genuinely Postgres-only (see module docstring) — the pool is
+    # its own owner, not a bypassed ABC.
+    # F-06 slice 2 classification (c): permanently Postgres-only; retained.
+    backend = _active_backend()
+    if _backend_is_postgres(backend):
+        pool = _lc._pool
+        if pool is None:
+            # Postgres deployment with the pool transiently unavailable
+            # (startup race or mid-flight teardown): keep the original
+            # error, which is actionable as an outage.
+            return {"success": False, "error": "Database unavailable"}
+        settings = get_settings().kronos
+        anomalies = await detect_recall_anomalies(
+            pool,
+            namespace,
+            lookback_hours=settings.default_lookback_hours,
+            sensitivity=settings.default_sensitivity,
+        )
+        return {
+            "success": True,
+            "namespace": namespace,
+            "count": len(anomalies),
+            "anomalies": [asdict(item) for item in anomalies],
+        }
+    return _kronos_unsupported("kronos_anomalies", backend)
 
 
 async def tool_kronos_forecast(
@@ -97,12 +123,67 @@ async def tool_kronos_forecast(
             "ci_upper": 0.0,
         }
 
-    pool = _lc._pool
-    if pool is None:
-        return {"success": False, "error": "Database unavailable"}
+    # KRONOS is genuinely Postgres-only (see module docstring) — the pool is
+    # its own owner, not a bypassed ABC.
+    # F-06 slice 2 classification (c): permanently Postgres-only; retained.
+    backend = _active_backend()
+    if _backend_is_postgres(backend):
+        pool = _lc._pool
+        if pool is None:
+            return {"success": False, "error": "Database unavailable"}
+        result = await forecast_recall_load(pool, namespace, hours_ahead=hours_ahead)
+        return {"success": True, **asdict(result)}
+    return _kronos_unsupported("kronos_forecast", backend)
 
-    result = await forecast_recall_load(pool, namespace, hours_ahead=hours_ahead)
-    return {"success": True, **asdict(result)}
+
+def _active_backend():
+    """Active backend facade, or None (startup race / no backend).
+
+    Reads the module-level ``_lc`` binding of ``mnemos.core.lifecycle``
+    directly instead of ``get_persistence_backend()``: that helper raises
+    an HTTP framework exception when no backend is active, and the MCP
+    tool layer must not couple to it (stdio transport, CLI, and tests
+    run without FastAPI).
+    """
+    return _lc._persistence_backend
+
+
+def _backend_is_postgres(backend: Any) -> bool:
+    """True when the backend is the Postgres facade (pool state is transient).
+
+    ``isinstance`` — not a class-name check — so a wrapper, subclass, or
+    test double that extends ``PostgresBackend`` classifies the same way
+    the real facade does.
+    """
+    if backend is None:
+        return False
+    from mnemos.persistence.postgres import PostgresBackend
+
+    return isinstance(backend, PostgresBackend)
+
+
+def _kronos_unsupported(tool_name: str, backend: Any = None) -> dict[str, Any]:
+    """Null-valued, reason-bearing error for non-Postgres deployments.
+
+    The KRONOS domain SQL is Postgres-specific; reporting
+    ``{"success": True, "count": 0, ...}`` here would fabricate an "all
+    quiet" answer the backend cannot actually supply. A backend that cannot
+    supply a value reports null with a reason, never a fabricated default.
+    """
+    if backend is None:
+        # No backend at all (startup race / edge profile): still report the
+        # capability truth, not a fabricated answer.
+        backend_name = "no backend"
+    else:
+        backend_name = type(backend).__name__
+    return {
+        "success": False,
+        "error": (
+            f"{tool_name} requires the Postgres backend; "
+            f"this deployment is configured with {backend_name}. "
+            f"KRONOS recall analysis is Postgres-only."
+        ),
+    }
 
 
 TOOLS: dict[str, dict[str, Any]] = {

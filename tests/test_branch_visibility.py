@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime
 from unittest.mock import MagicMock
 
@@ -42,10 +43,42 @@ class _PoolCtx:
 
 def _install(monkeypatch, conn):
     import mnemos.core.lifecycle as lc
+    from mnemos.mcp.tools import dag as mcp_dag
 
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
+    # F-06 slice 2: the MCP DAG tools resolve the persistence backend
+    # facade instead of the raw pool. This file exercises the raw pool
+    # surface (hidden-start-commit SQL), so give the tools a facade whose
+    # ``transactional()`` yields the same fake conn and whose
+    # ``memory_branches.create_memory_branch`` delegates to the pre-slice
+    # SQL helper ``mcp_repo.create_memory_branch``.
+    repo = MagicMock()
+    repo.create_memory_branch = _delegate_create_branch(conn, repo)
+    backend = MagicMock()
+    backend.memory_branches = repo
+    backend.memories = MagicMock()
+    backend.transactional = _fake_backend_transactional(conn)
+    monkeypatch.setattr(mcp_dag, "_get_persistence_backend", lambda: backend)
+
+
+def _delegate_create_branch(conn, repo):
+    from mnemos.db import mcp_repo
+
+    async def _create(self_, tx, memory_id: str, name: str, from_commit, user):
+        del self_, tx
+        return await mcp_repo.create_memory_branch(conn, memory_id, name, from_commit, user)
+
+    return _create.__get__(repo)
+
+
+def _fake_backend_transactional(conn):
+    @asynccontextmanager
+    async def _transactional(*_args, **_kwargs):
+        yield conn
+
+    return _transactional
 
 
 class _HiddenStartConn:

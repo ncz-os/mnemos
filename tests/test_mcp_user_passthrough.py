@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
@@ -87,35 +88,66 @@ def test_http_sse_dispatch_passes_authenticated_context_user(monkeypatch):
     assert seen["user"].user_id == "alice"
 
 
-class _PoolContext:
-    async def __aenter__(self):
-        return object()
-
-    async def __aexit__(self, *_args):
-        return False
+class _FakeTransaction:
+    pass
 
 
-class _Pool:
-    def acquire(self):
-        return _PoolContext()
+class _FakeMemoryRepository:
+    def __init__(self):
+        self._fetch_memory_log = AsyncMock(return_value=[
+            {
+                "commit_hash": "abc123",
+                "version_num": 1,
+                "change_type": "create",
+                "category": "note",
+                "snapshot_at": datetime(2026, 5, 2, tzinfo=timezone.utc),
+                "snapshot_by": "alice",
+            },
+        ])
+        self._assert_memory_readable = AsyncMock()
+
+    # The tool resolves ``memories.fetch_memory_log`` /
+    # ``memories.assert_memory_readable`` on the facade each call, so the
+    # repository exposes the SAME AsyncMock instance the test asserts on —
+    # no duplicate aliases that could be asserted on by mistake.
+    @property
+    def fetch_memory_log(self):
+        return self._fetch_memory_log
+
+    @property
+    def assert_memory_readable(self):
+        return self._assert_memory_readable
+
+
+class _FakeBackendFacade:
+    """ABC-shaped facade: ``memories`` repository + ``transactional()``.
+
+    The DAG tools call ``backend.memories.fetch_memory_log(tx, ...)`` and the
+    read gate goes through ``backend.memories.assert_memory_readable`` (the
+    same ABC surface the REST routes use), so the fake exposes one
+    repository object with both methods.
+    """
+
+    def __init__(self):
+        self._tx = _FakeTransaction()
+        self.memories = _FakeMemoryRepository()
+
+    @asynccontextmanager
+    async def transactional(self):
+        yield self._tx
 
 
 @pytest.mark.asyncio
-async def test_dag_log_memory_uses_direct_db_path_when_user_and_pool_exist(monkeypatch):
-    import mnemos.core.lifecycle as lc
+async def test_dag_log_memory_uses_persistence_abc_path_when_backend_exists(monkeypatch):
+    import mnemos.core.lifecycle as lifecycle
     from mnemos.mcp.tools import dag as mcp_dag
 
-    row = {
-        "commit_hash": "abc123",
-        "version_num": 1,
-        "change_type": "create",
-        "category": "note",
-        "snapshot_at": datetime(2026, 5, 2, tzinfo=timezone.utc),
-        "snapshot_by": "alice",
-    }
-    monkeypatch.setattr(lc, "_pool", _Pool())
-    monkeypatch.setattr(mcp_dag, "_mcp_assert_memory_readable", AsyncMock())
-    monkeypatch.setattr(mcp_dag.mcp_repo, "fetch_memory_log", AsyncMock(return_value=[row]))
+    backend = _FakeBackendFacade()
+    # The tool resolves the backend via the shared ``_get_persistence_backend``
+    # helper (bound in ``mnemos.mcp.tools._runtime`` and re-exported into the
+    # tool modules), which reads ``lifecycle._persistence_backend``. Patching
+    # the lifecycle global reaches every tool module at once.
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend, raising=False)
     monkeypatch.setattr(mcp_dag, "_rest_get", AsyncMock())
 
     result = await mcp_dag.tool_log_memory(
@@ -124,21 +156,33 @@ async def test_dag_log_memory_uses_direct_db_path_when_user_and_pool_exist(monke
     )
 
     mcp_dag._rest_get.assert_not_awaited()
-    mcp_dag._mcp_assert_memory_readable.assert_awaited_once()
-    mcp_dag.mcp_repo.fetch_memory_log.assert_awaited_once()
+    # Assert on the public ABC surface the tool actually calls. The
+    # properties return the SAME AsyncMock instances the tool awaited,
+    # so this is the same assertion — just stated against the contract
+    # rather than against the fake's private storage.
+    backend.memories.assert_memory_readable.assert_awaited_once()
+    backend.memories.fetch_memory_log.assert_awaited_once()
     assert result["success"] is True
     assert result["commits"][0]["hash"] == "abc123"
 
 
 @pytest.mark.asyncio
 async def test_kronos_anomalies_uses_direct_db_path_when_user_and_pool_exist(monkeypatch):
+    """A Postgres deployment with a live pool takes the direct pool path
+    (unchanged behaviour). The KRONOS domain functions are classified
+    (c) Postgres-only, so the tools gate on the *backend* — an
+    ``isinstance`` check — and only then read ``_lc._pool``; this test
+    sets both globals so that gate passes."""
     import mnemos.core.lifecycle as lc
     from mnemos.core.config import _reset_settings_for_tests
     from mnemos.mcp.tools import kronos as mcp_kronos
+    from mnemos.persistence.postgres import PostgresBackend
 
     monkeypatch.setenv("MNEMOS_KRONOS_ENABLED", "true")
     _reset_settings_for_tests()
     monkeypatch.setattr(lc, "_pool", object())
+    # Subclass with no __init__: classification only needs the type.
+    monkeypatch.setattr(lc, "_persistence_backend", type("PG", (PostgresBackend,), {"__init__": lambda self: None})(), raising=False)
     monkeypatch.setattr(mcp_kronos, "_rest_get", AsyncMock())
     monkeypatch.setattr(mcp_kronos, "detect_recall_anomalies", AsyncMock(return_value=[]))
     try:

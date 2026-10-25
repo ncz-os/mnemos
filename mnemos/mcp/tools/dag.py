@@ -1,18 +1,24 @@
-"""MCP DAG/versioning tool handlers."""
+"""MCP DAG/versioning tool handlers.
+
+F-06 slice 2 (§0b ABC-first): these tools no longer touch ``_lc._pool``.
+Every path resolves the node's persistence backend facade through
+``_get_persistence_backend`` and runs inside ``backend.transactional()``
+through the repository ABCs (``memories.*`` / ``memory_branches.*``).
+"""
 
 from __future__ import annotations
 
 import difflib
 import logging
+from datetime import date, datetime
 from typing import Any
 
-import mnemos.core.lifecycle as _lc
 from mnemos.core.auth_context import UserContext
-from mnemos.db import mcp_repo
 
 from ._runtime import (
     MCP_DEFAULT_LIMIT_MAX,
     _bounded_int,
+    _get_persistence_backend,
     _mcp_assert_memory_readable,
     _mcp_user_required,
     _rest_get,
@@ -24,6 +30,20 @@ from ._security import _mcp_enforce_write_rate_limit
 
 logger = logging.getLogger(__name__)
 BRANCH_MEMORY_RATE_LIMIT_PER_MINUTE = 30
+
+
+def _memory_log_timestamp(value: Any) -> str | None:
+    """Normalise ``snapshot_at`` across backends.
+
+    asyncpg hands back a ``datetime``; the column-backed backends store a
+    string. The pre-ABC path only saw datetimes, so the old shape breaks on
+    every other backend — normalise instead of guessing.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
 
 
 async def tool_log_memory(
@@ -66,18 +86,18 @@ async def tool_log_memory(
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
-    pool = _lc._pool
-    if not pool:
+    backend = _get_persistence_backend()
+    if backend is None:
         return {"success": False, "error": "Database unavailable"}
 
     try:
-        async with pool.acquire() as conn:
+        async with backend.transactional() as tx:
             try:
-                await _mcp_assert_memory_readable(conn, memory_id, user)
+                await _mcp_assert_memory_readable(backend, tx, memory_id, user)
             except PermissionError as e:
                 return {"success": False, "error": str(e)}
 
-            rows = await mcp_repo.fetch_memory_log(conn, memory_id, branch, limit, user)
+            rows = await backend.memories.fetch_memory_log(tx, memory_id, branch, limit, user)
             return {
                 "success": True,
                 "memory_id": memory_id,
@@ -88,7 +108,7 @@ async def tool_log_memory(
                         "version": r["version_num"],
                         "type": r["change_type"],
                         "category": r["category"],
-                        "timestamp": r["snapshot_at"].isoformat(),
+                        "timestamp": _memory_log_timestamp(r["snapshot_at"]),
                         "author": r["snapshot_by"],
                     }
                     for r in rows
@@ -135,13 +155,15 @@ async def tool_branch_memory(
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
-    pool = _lc._pool
-    if not pool:
+    backend = _get_persistence_backend()
+    if backend is None:
         return {"success": False, "error": "Database unavailable"}
 
     try:
-        async with pool.acquire() as conn:
-            return await mcp_repo.create_memory_branch(conn, memory_id, name, from_commit, user)
+        async with backend.transactional() as tx:
+            return await backend.memory_branches.create_memory_branch(
+                tx, memory_id, name, from_commit, user
+            )
 
     except Exception as e:
         logger.error(f"[MCP] branch_memory failed: {e}", exc_info=True)
@@ -181,19 +203,19 @@ async def tool_diff_memory_commits(
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
-    pool = _lc._pool
-    if not pool:
+    backend = _get_persistence_backend()
+    if backend is None:
         return {"success": False, "error": "Database unavailable"}
 
     try:
-        async with pool.acquire() as conn:
+        async with backend.transactional() as tx:
             try:
-                await _mcp_assert_memory_readable(conn, memory_id, user)
+                await _mcp_assert_memory_readable(backend, tx, memory_id, user)
             except PermissionError as e:
                 return {"success": False, "error": str(e)}
 
-            commit_a_row, commit_b_row = await mcp_repo.fetch_diff_commit_pair(
-                conn,
+            commit_a_row, commit_b_row = await backend.memories.fetch_diff_commit_pair(
+                tx,
                 memory_id,
                 commit_a,
                 commit_b,
@@ -254,18 +276,18 @@ async def tool_checkout_memory(
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
-    pool = _lc._pool
-    if not pool:
+    backend = _get_persistence_backend()
+    if backend is None:
         return {"success": False, "error": "Database unavailable"}
 
     try:
-        async with pool.acquire() as conn:
+        async with backend.transactional() as tx:
             try:
-                await _mcp_assert_memory_readable(conn, memory_id, user)
+                await _mcp_assert_memory_readable(backend, tx, memory_id, user)
             except PermissionError as e:
                 return {"success": False, "error": str(e)}
 
-            row = await mcp_repo.fetch_checkout_commit(conn, memory_id, commit_hash, user)
+            row = await backend.memories.fetch_checkout_commit(tx, memory_id, commit_hash, user)
             if not row:
                 return {"success": False, "error": "Commit not found"}
 
@@ -279,7 +301,7 @@ async def tool_checkout_memory(
                     "type": row["change_type"],
                     "category": row["category"],
                     "subcategory": row["subcategory"],
-                    "timestamp": row["snapshot_at"].isoformat(),
+                    "timestamp": _memory_log_timestamp(row["snapshot_at"]),
                     "author": row["snapshot_by"],
                 },
                 "content": row["content"],

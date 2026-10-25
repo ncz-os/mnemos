@@ -94,6 +94,73 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   queue snapshot's own `variants` field keeps its pre-F-15
   non-negative contract (a missing variants table reports `0`
   there), so distillation-worker monitoring is unaffected.
+- **MCP DAG + model tools route through the persistence ABC (backlog
+  F-06, slice 2 of 4).** `mnemos/mcp/tools/dag.py` (4 refs) and
+  `mnemos/mcp/tools/models.py` (2 refs) no longer read
+  `_lc._pool`: each tool now resolves the node's persistence backend
+  facade and runs inside `backend.transactional()` through the
+  repository ABCs that already exist on all six backends —
+  `MemoryRepository.fetch_memory_log` / `fetch_diff_commit_pair` /
+  `fetch_checkout_commit`, `BranchRepository.create_memory_branch`,
+  and `ConsultationAuditRepository.fetch_recommended_model`
+  (classification (a) per `docs/POSTGRES_ONLY_SURFACE.md` §2 rows 6 and
+  10 — unwire, no new ABC surface needed). The DAG tools' read gate
+  also classifies (a): it goes through the pre-existing
+  `MemoryRepository.assert_memory_readable` (already abstract on the
+  ABC and implemented on all six backends before this slice), so the
+  MCP and REST paths enforce the same visibility predicate on every
+  backend — the new `_mcp_assert_memory_readable` runtime helper is a
+  thin wrapper over that existing ABC method, passed the backend that
+  owns the transaction (no new ABC method was added). The tools also
+  work on the SQLite edge profile, where the raw-pool code returned
+  "Database unavailable" (or fell back to REST).
+  `mnemos/mcp/tools/models.py`'s transport fallback keeps its pre-ABC
+  semantics: the old guard was `user is None and not _lc._pool`, and
+  `lifecycle._pool` is the *asyncpg* pool, so it was only ever non-None
+  on a Postgres deployment — the guard really meant "no local Postgres
+  pool -> proxy the recommendation through the REST API". The decision
+  is now made against the ABC's facade instead of the raw pool, so on
+  Postgres every `user` value takes exactly the branch master took (the
+  same SQL, the same response shape), while on the other five backends
+  the direct path is available instead of a self-HTTP round trip.
+  `mnemos/mcp/tools/kronos.py` (2 refs) is classified (c) — **genuinely
+  Postgres-only** and documented as such: the KRONOS domain SQL is
+  Postgres-specific (`date_trunc`, `AT TIME ZONE`,
+  `NOW() - n * INTERVAL`, two-stage `memory_recall_log` fallback), so
+  the pool is the pool's own owner, not a bypassed ABC. The direct pool
+  read is retained with that justification, and on non-Postgres
+  backends the tools now return a reason-bearing
+  "requires the Postgres backend" error instead of
+  `{"success": False, "error": "Database unavailable"}` — never a
+  fabricated 0-count success. Classification is backend-based
+  (`isinstance(backend, PostgresBackend)` via the lifecycle-owned
+  facade), not pool-based, so a transiently-None pool or a pool object
+  on a non-Postgres deployment cannot flip the error message; the
+  transiently-dead-pool case on a Postgres deployment still reports the
+  original actionable "Database unavailable". New tests:
+  `tests/test_mcp_tools_persistence_abc.py` (SQLite end-to-end, fails
+  pre-change), `tests/test_mcp_tools_abc_contract.py` (six-backend
+  ABC surface contract), `tests/test_mcp_kronos_postgres_only.py`
+  (non-Postgres error contract, fails pre-change).
+  `_lc._pool` refs in the three files in scope: `dag.py` 4 -> 0,
+  `models.py` 2 -> 0, `kronos.py` 2 -> 2 (retained, classification (c)).
+
+  Per-reference decisions (8 references):
+
+  | file:line (master) | tool | decision |
+  |---|---|---|
+  | `dag.py:69` | `tool_log_memory` | (a) ABC already covers it -> unwired to `MemoryRepository.fetch_memory_log` + `assert_memory_readable` |
+  | `dag.py:138` | `tool_branch_memory` | (a) -> unwired to `BranchRepository.create_memory_branch` |
+  | `dag.py:184` | `tool_diff_memory_commits` | (a) -> unwired to `MemoryRepository.fetch_diff_commit_pair` |
+  | `dag.py:257` | `tool_checkout_memory` | (a) -> unwired to `MemoryRepository.fetch_checkout_commit` |
+  | `models.py:65` | `tool_recommend_model` | (a) -> the guard now asks the facade whether a local persistence path exists |
+  | `models.py:93` | `tool_recommend_model` | (a) -> unwired to `ConsultationAuditRepository.fetch_recommended_model` |
+  | `kronos.py:44` | `tool_kronos_anomalies` | (c) genuinely Postgres-only (the KRONOS domain SQL is Postgres-specific) -> retained, with the reason in a comment |
+  | `kronos.py:100` | `tool_kronos_forecast` | (c) genuinely Postgres-only -> retained, with the reason in a comment |
+
+  No new ABC surface was needed (no (b) case): every method the tools
+  now call was already abstract on the ABC and implemented on all six
+  backends before this slice.
 
 ### Fixed
 
