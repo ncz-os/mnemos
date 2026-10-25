@@ -133,6 +133,24 @@ lint:migration-parity:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
 
+# Ratchet guard for the §0b governing rule (F-14): no NEW raw
+# _lc._pool references outside mnemos/persistence/. The committed
+# baseline tests/abc_first_baseline.json holds the per-file counts of
+# the known residue; the job fails only when a file's count goes UP or
+# a new file appears — reduced counts pass, so a stale baseline (e.g.
+# left by a parallel job that removed references first) can never
+# break a merge. After removing a reference, re-run the script with
+# --regen to record the lower count in the same MR.
+lint:abc-first:
+  stage: lint
+  tags: [argos, ncz-os]
+  script:
+    - python3 scripts/check_abc_first_guard.py
+    - pytest tests/test_abc_first_guard.py --tb=short -q
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
 lint:env-discipline:
   stage: lint
   tags: [argos, ncz-os]

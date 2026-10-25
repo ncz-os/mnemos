@@ -8,6 +8,37 @@ package — never run `pip install mnemos` or `pip install mnemos-os`.
 
 ---
 
+## Governing rule — ABC-first persistence
+
+MNEMOS has an **ABC persistence layer** for storage. It is not a style
+preference; it is the contract that makes "six backends" a real claim instead
+of five backends plus one and a half. Work must respect both layers:
+
+1. **Repository ABCs** declared in `mnemos/persistence/base.py` (`MemoryRepository`,
+   `KGRepository`, `VersionRepository`, `CompressionRepository`, `WebhookRepository`,
+   and the rest — see the file).
+2. **A per-backend facade** — `SqliteBackend`, `PostgresBackend`, `OracleBackend`,
+   `Db2Backend`, `MysqlBackend`, `MariadbBackend` — which owns those
+   repositories and advertises capability through its `supports_*` flags.
+
+> A new or repaired storage capability is delivered as:
+> **ABC method → implementation on all six backends → facade exposure →
+> route calls the ABC.**
+>
+> Raw `_lc._pool` access outside `mnemos/persistence/` is the defect, not the
+> shortcut. `require_postgres_pool_or_503` is a symptom of the same mistake and
+> is removed **by routing through the ABC**, never by deleting the guard.
+
+This is enforced in CI by a ratchet guard — `lint:abc-first` runs
+`python3 scripts/check_abc_first_guard.py` against the committed per-file
+baseline `tests/abc_first_baseline.json`. The guard fails when an
+in-baseline file's raw `_lc._pool` count goes **UP** or a **new** file gains
+one; it never fails on a reduced count. Remove a reference, then re-run the
+script with `--regen` to record the lower count. Full rule text:
+[docs/FEATURES_TO_BE_DONE.md](docs/FEATURES_TO_BE_DONE.md) §0b (F-14).
+
+---
+
 ## Module registry
 
 ```yaml

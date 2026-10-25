@@ -1,0 +1,13 @@
+{
+  "_comment": "ABC-first guard (F-14) baseline: per-file raw _lc._pool / _lc._raw_pool reference counts OUTSIDE mnemos/persistence/. Ratchet \u2014 lower a count when a reference is removed; never raise one. Regenerate with: python3 scripts/check_abc_first_guard.py --regen",
+  "files": {
+    "mnemos/api/persistence_helpers.py": 1,
+    "mnemos/db/openai_compat_repo.py": 9,
+    "mnemos/mcp/tools/dag.py": 4,
+    "mnemos/mcp/tools/kronos.py": 2,
+    "mnemos/mcp/tools/models.py": 2,
+    "mnemos/webhooks/finalize.py": 3,
+    "mnemos/webhooks/lease.py": 2,
+    "mnemos/webhooks/workers.py": 1
+  }
+}
