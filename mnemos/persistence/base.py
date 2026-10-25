@@ -3189,7 +3189,10 @@ class PersistenceCapabilityBase(Protocol):
                      Db2's literal name for it) before BEGIN.
         SQLite       **Different mechanism, equivalent guarantee — see
                      below.** This is the one row that is NOT the same
-                     thing under a different name.
+                     thing under a different name. ``readonly`` is
+                     enforced here via ``PRAGMA query_only=1`` (backlog
+                     F-01); a write on a ``readonly=True`` SQLite
+                     transaction raises, like the other five backends.
         ===========  =====================================================
 
         SQLite, honestly stated
@@ -3214,13 +3217,15 @@ class PersistenceCapabilityBase(Protocol):
            ``transactional()`` entry, matching the other five backends. Without
            that, rows committed between BEGIN and the first real query would be
            visible and the guarantee would be silently weaker.
-        2. ``readonly=True`` is enforced by SQLite only to the extent that a
-           deferred transaction that never writes never escalates to a write
-           lock. There is no ``START TRANSACTION READ ONLY`` equivalent, so a
-           write issued on a ``readonly=True`` SQLite transaction would still
-           succeed rather than raise. Callers must not rely on SQLite to
-           *reject* writes; ``readonly`` is a snapshot/locking hint there, and
-           a genuine server-enforced prohibition on the other five.
+        2. ``readonly=True`` IS enforced on SQLite now (backlog F-01), though
+           not with a keyword: SQLite has no ``START TRANSACTION READ ONLY``,
+           so the implementation sets ``PRAGMA query_only=1`` for the
+           transaction and restores the prior value afterwards — on commit,
+           rollback, exception and all other exit paths. A write (or DDL)
+           issued on a ``readonly=True`` SQLite transaction now raises
+           ``sqlite3.OperationalError`` ("attempt to write a readonly
+           database") and rolls the transaction back, matching the other
+           five backends' native server-side rejection.
 
         Raises ``ValueError`` for an isolation level the backend cannot honor,
         rather than downgrading — a silently downgraded export snapshot is the

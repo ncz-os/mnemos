@@ -351,3 +351,222 @@ async def test_sqlite_export_rejects_write_isolation_request(sqlite_backend):
     with pytest.raises(ValueError, match="read-only"):
         async with sqlite_backend.transactional(isolation="repeatable_read"):
             pass
+
+
+# ---------------------------------------------------------------------------
+# F-01: readonly=True is ENFORCED on SQLite, not a documentation hint.
+#
+# Before F-01 a write issued on a readonly=True transaction silently
+# succeeded (and escalated to a write lock). Now the backend sets
+# PRAGMA query_only=1 for the duration of the scope and restores the
+# prior value afterwards, so writes raise sqlite3.OperationalError on
+# every exit path (commit, rollback, exception, abandoned generator).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sqlite_readonly_transaction_rejects_writes(sqlite_backend):
+    """A write on a readonly=True transaction MUST raise.
+
+    This is the F-01 regression test that fails before the fix: pre-fix,
+    the INSERT below committed successfully. The scope must also roll the
+    transaction back, not commit it.
+    """
+    import sqlite3
+
+    # _conn is the aiosqlite connection; its execute() returns a coroutine.
+    # _conn is the aiosqlite connection: execute() is a coroutine that
+    # yields a Cursor, so reads need an await in the middle.
+    async def _run(sql, *params):
+        return await sqlite_backend._conn.execute(sql, params)
+
+    async def _fetch(sql, *params):
+        cursor = await _run(sql, *params)
+        return await cursor.fetchall()
+
+    # content is NOT NULL, so use a real row shape for the post-scope write.
+    with pytest.raises(sqlite3.OperationalError, match="readonly database"):
+        async with sqlite_backend.transactional(
+            isolation="repeatable_read", readonly=True
+        ):
+            await _run(
+                "INSERT INTO memories (id, content) VALUES (?, ?)",
+                "mem_f01_w", "f01 probe",
+            )
+    # The failed write left the scope in rollback state. A plain write
+    # transaction must still work afterwards: the connection is clean.
+    async with sqlite_backend.transactional():
+        await _run(
+            "INSERT INTO memories (id, content) VALUES (?, ?)",
+            "mem_f01_ok", "f01 probe",
+        )
+    rows = await _fetch("SELECT id FROM memories ORDER BY id")
+    assert {"mem_f01_w"} - {r["id"] for r in rows} == {"mem_f01_w"}, (
+        "the rejected write must not have been committed"
+    )
+    assert "mem_f01_ok" in {r["id"] for r in rows}
+
+
+@pytest.mark.asyncio
+async def test_sqlite_readonly_default_isolation_rejects_writes(sqlite_backend):
+    """Enforcement holds on the default (BEGIN IMMEDIATE) path too."""
+    import sqlite3
+
+    async def _run(sql, *params):
+        return await sqlite_backend._conn.execute(sql, params)
+
+    async def _fetch(sql, *params):
+        cursor = await _run(sql, *params)
+        return await cursor.fetchall()
+
+    with pytest.raises(sqlite3.OperationalError, match="readonly database"):
+        async with sqlite_backend.transactional(readonly=True):
+            await _run("DELETE FROM memories")
+    # And DDL is a write too.
+    with pytest.raises(sqlite3.OperationalError, match="readonly database"):
+        async with sqlite_backend.transactional(
+            isolation="repeatable_read", readonly=True
+        ):
+            await _run("CREATE TABLE f01_probe (id INTEGER)")
+    rows = await _fetch(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='f01_probe'"
+    )
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_sqlite_readonly_still_serves_reads(sqlite_backend):
+    """Reads keep working inside a readonly scope, including the repo path."""
+    async def _fetch(sql, *params):
+        cursor = await sqlite_backend._conn.execute(sql, params)
+        return await cursor.fetchall()
+
+    async with sqlite_backend.transactional(
+        isolation="repeatable_read", readonly=True
+    ) as tx:
+        rows = await _fetch("SELECT id FROM memories ORDER BY id")
+        assert isinstance(rows, list)
+        repo_rows = await sqlite_backend.memories.fetch_memory_export(
+            tx, effective_owner=OWNER, effective_ns=NS, category=None,
+            limit=100, offset=0,
+        )
+        assert isinstance(repo_rows, list)
+
+
+@pytest.mark.asyncio
+async def test_sqlite_readonly_reset_after_normal_exit_and_exception(sqlite_backend):
+    """query_only must be restored after EVERY exit path.
+
+    The backend serializes all statements through ONE connection, so a
+    leaked query_only=1 would break every later write process-wide. We
+    probe by writing directly on the backend connection -- exactly what
+    a subsequent backend-owned write transaction does.
+    """
+
+    async def _assert_clean():
+        cursor = await sqlite_backend._conn.execute("PRAGMA query_only")
+        row = await cursor.fetchone()
+        # _dict_factory makes rows dicts keyed by column name.
+        return row["query_only"] == 0
+
+    # 1. Normal exit (implicit commit of the empty read-only tx).
+    async with sqlite_backend.transactional(
+        isolation="repeatable_read", readonly=True
+    ):
+        pass
+    assert await _assert_clean(), "query_only leaked after normal exit"
+
+    # 2. Exception path: the write that raised rolls the tx back.
+    import sqlite3
+
+    async def _run(sql, *params):
+        return await sqlite_backend._conn.execute(sql, params)
+
+    with pytest.raises(sqlite3.OperationalError, match="readonly database"):
+        async with sqlite_backend.transactional(readonly=True):
+            await _run(
+                "INSERT INTO memories (id, content) VALUES (?, ?)",
+                "mem_f01_e", "f01 probe",
+            )
+    assert await _assert_clean(), "query_only leaked after exception"
+
+    # 3. Exception path where the raise is NOT the blocked write (e.g. the
+    # body raises on its own after a successful read): rollback still runs,
+    # and the restore must survive it.
+    with pytest.raises(RuntimeError, match="body boom"):
+        async with sqlite_backend.transactional(
+            isolation="repeatable_read", readonly=True
+        ):
+            await _run("SELECT 1 FROM memories LIMIT 1")
+            raise RuntimeError("body boom")
+    assert await _assert_clean(), "query_only leaked after body exception"
+
+    # 4. Abandoned generator (async generator finalization = GeneratorExit):
+    # the finally block must still run.
+    async def _abandoned():
+        async with sqlite_backend.transactional(readonly=True) as body_tx:
+            yield body_tx
+
+    agen = _abandoned()
+    await anext(agen)
+    await agen.aclose()  # GeneratorExit inside the body
+    assert await _assert_clean(), "query_only leaked after abandoned generator"
+
+    # 4b. Same, on the DEFAULT (BEGIN IMMEDIATE) path: GeneratorExit skips
+    # both the except and else blocks, so the restore's finally is the only
+    # thing that can restore query_only here.
+    async def _abandoned_immediate():
+        async with sqlite_backend.transactional(readonly=True) as body_tx:
+            yield body_tx
+
+    agen2 = _abandoned_immediate()
+    await anext(agen2)
+    await agen2.aclose()
+    assert await _assert_clean(), (
+        "query_only leaked after abandoned generator (default isolation)"
+    )
+
+    # 5. The connection is genuinely usable for writes again, end to end.
+    async with sqlite_backend.transactional():
+        await _run(
+            "INSERT INTO memories (id, content) VALUES (?, ?)",
+            "mem_f01_clean", "f01 probe",
+        )
+    cursor = await sqlite_backend._conn.execute(
+        "SELECT 1 FROM memories WHERE id='mem_f01_clean'"
+    )
+    rows = await cursor.fetchall()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_sqlite_readonly_savepoint_nesting_still_works(sqlite_backend):
+    """Savepoint scopes stay usable inside a readonly transaction.
+
+    RELEASE / ROLLBACK TO are not write operations, so nesting must not
+    break under query_only=1 -- and a write inside the savepoint must be
+    rejected the same way.
+    """
+    import sqlite3
+
+    async def _fetch(sql, *params):
+        cursor = await sqlite_backend._conn.execute(sql, params)
+        return await cursor.fetchall()
+
+    async def _run(sql, *params):
+        return await sqlite_backend._conn.execute(sql, params)
+
+    async with sqlite_backend.transactional(
+        isolation="repeatable_read", readonly=True
+    ) as tx:
+        async with tx.savepoint() as inner:
+            rows = await _fetch("SELECT id FROM memories ORDER BY id")
+            assert isinstance(rows, list)
+            with pytest.raises(sqlite3.OperationalError, match="readonly database"):
+                await _run(
+                    "INSERT INTO memories (id, content) VALUES (?, ?)",
+                    "mem_f01_sp", "f01 probe",
+                )
+    # No residue: the savepoint's blocked write must not have landed.
+    rows = await _fetch("SELECT 1 FROM memories WHERE id='mem_f01_sp'")
+    assert rows == []

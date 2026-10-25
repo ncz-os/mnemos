@@ -97,6 +97,26 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
 
 ### Fixed
 
+- **SQLite `readonly=True` transactions are now enforced (backlog F-01).** A
+  write (or DDL) issued on a `SqliteBackend.transactional(..., readonly=True)`
+  scope used to *silently succeed* and escalate to a write lock — SQLite has
+  no `START TRANSACTION READ ONLY`, and the docstrings documented that the
+  promise was decorative. The scope now sets `PRAGMA query_only=1` immediately
+  after BEGIN and restores the connection's prior value in a `finally` block,
+  so writes raise `sqlite3.OperationalError` ("attempt to write a readonly
+  database") and the transaction rolls back — matching the server-side
+  rejection on the other five backends. The restore is unconditional (commit,
+  rollback, exception, abandoned generator), so the single serialized
+  connection is never left read-only after the scope ends; nested savepoint
+  scopes stay safe because `ROLLBACK TO`/`RELEASE` are not write operations.
+  `readonly=False` behaviour is unchanged. Both docstrings that previously
+  said readonly is not enforced (`persistence/sqlite.py` `transactional`,
+  `PersistenceCapabilityBase.transactional`) now describe the enforcement.
+  New regression tests in `tests/test_charon_sqlite_roundtrip.py` cover the
+  rejected write, surviving reads, the `query_only` reset on every exit path,
+  and savepoint nesting; the existing snapshot-read isolation tests
+  (stream + MPF export) pass unmodified.
+
 - **API-key creation is backend-neutral.** Minting a key was PostgreSQL-only in
   two places while *looking one up* had been backend-neutral since v6.3, so an
   operator on the SQLite edge profile could authenticate with a key but had no

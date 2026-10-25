@@ -7701,18 +7701,27 @@ class SqliteBackend:
           transaction, a stable snapshot IS serializable with respect to
           concurrent writers -- there are no writes of our own to order.
 
-        What this deliberately does NOT claim:
-
-        * ``readonly=True`` is not enforced. SQLite has no ``START
-          TRANSACTION READ ONLY``; a write issued inside this scope would
-          succeed (and escalate to a write lock) rather than raise. On the
-          other five backends the server rejects it. Callers must treat
-          ``readonly`` as a guarantee about what THEY do, and rely on the
-          snapshot -- not on SQLite policing them.
         * A write-intent transaction at ``repeatable_read`` is refused rather
           than silently downgraded, because DEFERRED + writes would escalate
           mid-transaction and could abort with SQLITE_BUSY partway through --
           strictly worse than telling the caller up front.
+
+        What ``readonly=True`` IS enforced (backlog F-01):
+
+        * SQLite has no ``START TRANSACTION READ ONLY`` keyword, so the
+          prohibition is enforced with the mechanism SQLite actually has:
+          ``PRAGMA query_only=1`` is set immediately after BEGIN and restored
+          to the connection's prior value in a ``finally`` block -- on commit,
+          on rollback, on any exception, and when the body is abandoned
+          (GeneratorExit) -- so a write or DDL statement issued inside a
+          ``readonly=True`` scope raises ``sqlite3.OperationalError`` ("attempt
+          to write a readonly database") and the transaction is rolled back,
+          matching what the other five backends' servers reject natively.
+          Nested savepoint scopes stay safe under it (a savepoint's ROLLBACK
+          TO/RELEASE are not write operations).
+        * The restore is unconditional: the single serialized connection this
+          backend funnels every statement through is never left with
+          ``query_only`` set after the transaction ends, in any exit path.
         """
         if self._closed:
             raise RuntimeError("SQLite backend is closed")
@@ -7740,6 +7749,16 @@ class SqliteBackend:
                 await _fetch_val(self._conn, "SELECT 1 FROM sqlite_schema LIMIT 1")
             else:
                 await _execute(self._conn, "BEGIN IMMEDIATE")
+            # F-01 enforcement (see docstring). Bound before the read so a
+            # failure between the check and the capture cannot reach the
+            # restore with an unbound name; the connection starts with
+            # query_only=0 at open and nothing else ever sets it, so 0 is
+            # also the correct value when the PRAGMA read yields nothing.
+            prior_query_only = 0
+            if readonly:
+                captured = await _fetch_val(self._conn, "PRAGMA query_only")
+                prior_query_only = int(captured) if captured is not None else 0
+                await _execute(self._conn, "PRAGMA query_only=1")
             tx = SqliteTransaction(self._conn)
             try:
                 yield tx
@@ -7750,6 +7769,16 @@ class SqliteBackend:
             else:
                 if not tx.closed:
                     await tx.commit()
+            finally:
+                if readonly:
+                    # Unconditional on every exit path: query_only must never
+                    # survive past the transaction on this shared connection.
+                    # prior_query_only is a plain int (0/1), so this cannot
+                    # inject anything other than that literal.
+                    await _execute(
+                        self._conn,
+                        "PRAGMA query_only={}".format(prior_query_only),
+                    )
 
     async def fetch_server_now(self, tx: Transaction) -> datetime:
         """SQLite's clock is the same process clock this code runs on.

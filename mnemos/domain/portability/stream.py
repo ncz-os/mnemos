@@ -5,6 +5,10 @@ Backend-neutral: the snapshot comes from
 every one of the six persistence backends honors (see that method for the
 per-backend mapping, including how SQLite reaches the same guarantee through
 WAL rather than through an isolation level).
+
+Every read this stream issues must therefore stay a SELECT: a write on a
+``readonly=True`` scope now raises on ALL six backends (SQLite enforces it
+with ``PRAGMA query_only=1``, backlog F-01), and this module contains none.
 """
 
 import asyncio
