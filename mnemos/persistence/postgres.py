@@ -339,6 +339,11 @@ class PostgresTransaction:
     def conn(self) -> asyncpg.Connection:
         return self._conn
 
+    def raw_connection(self) -> asyncpg.Connection:
+        """Driver-level connection for capabilities with no repository
+        surface yet (NestableTransaction contract, F-06)."""
+        return self._conn
+
     @property
     def closed(self) -> bool:
         return self._closed

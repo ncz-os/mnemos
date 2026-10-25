@@ -53,15 +53,20 @@ class TimeoutPool:
     ``timeout=DEFAULT_ACQUIRE_TIMEOUT`` so every code path that goes
     through ``get_pool_manager().acquire()`` is bounded under pool
     pressure. But many legacy hot paths still call
-    ``_lc._pool.acquire()`` directly; those calls inherit asyncpg's
+    ``_lc._pool.acquire()`` directly (the string here documents that
+    call shape — F-06 (c): mnemos.core.pool is the pool's OWN owner
+    module, which is where the direct-acquire pattern it is fixing
+    legitimately lives); those calls inherit asyncpg's
     default of ``None`` (wait forever) and pile up indefinitely
     when the pool is exhausted, snowballing latency across the
     fleet.
 
     Wrapping the raw pool at lifecycle creation with this proxy
     closes the gap uniformly — every ``.acquire()`` call on
-    ``_lc._pool`` now inherits the configured timeout — without
-    requiring a migration of the 86+ direct call sites. Callers
+    ``_lc._pool`` (recounted 2026-10-23 against master 0073bb49:
+    27 direct references remain outside mnemos/persistence/,
+    converging under F-06) now inherits the configured timeout —
+    without requiring a migration of each call site. Callers
     that DO need a different timeout still pass it explicitly and
     the proxy honours their value.
 

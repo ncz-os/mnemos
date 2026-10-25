@@ -335,7 +335,7 @@ def test_require_pg_pool_503_explains_sqlite_profile(monkeypatch):
     from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 
     class _FakeSqliteBackend:
-        pass
+        pool = None  # facade surface: no raw pool on this profile
 
     monkeypatch.setattr(_lc, "_pool", None)
     monkeypatch.setattr(_lc, "_persistence_backend", _FakeSqliteBackend())
@@ -356,7 +356,7 @@ def test_require_pg_pool_503_explains_enterprise_non_postgres_backend(monkeypatc
     from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 
     class OracleBackend:
-        pass
+        pool = None  # facade surface: no raw pool on this profile
 
     monkeypatch.setattr(_lc, "_pool", None)
     monkeypatch.setattr(_lc, "_persistence_backend", OracleBackend())
@@ -366,6 +366,52 @@ def test_require_pg_pool_503_explains_enterprise_non_postgres_backend(monkeypatc
     assert exc.value.status_code == 503
     assert "POST /v1/webhooks requires the Postgres backend" in exc.value.detail
     assert "configured with OracleBackend" in exc.value.detail
+
+
+def test_require_pg_pool_resolves_via_facade_not_module_global(monkeypatch):
+    """F-06 (b): the helper must resolve the pool THROUGH the
+    persistence facade (``backend.pool``), not straight off the
+    lifecycle module global.
+
+    Fails before the change (the helper read ``_lc._pool`` directly
+    and ignored the registered backend): with no module-global pool
+    set, a registered Postgres-shaped backend whose ``pool`` facade
+    surface holds a pool now serves that pool.
+    """
+    from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+
+    sentinel = object()
+
+    class _FakePostgresBackend:
+        pool = sentinel
+
+    monkeypatch.setattr(_lc, "_pool", None)
+    monkeypatch.setattr(_lc, "_persistence_backend", _FakePostgresBackend())
+
+    out = require_postgres_pool_or_503()
+    assert out is sentinel, (
+        "require_postgres_pool_or_503 must return the pool the PERSISTENCE "
+        "FACADE exposes (backend.pool), per the §0b governing rule — not "
+        "only the lifecycle module global"
+    )
+
+
+def test_require_pg_pool_facade_pool_beats_stale_global(monkeypatch):
+    """When both the facade surface and the module global hold pools,
+    the facade (the object the route layer is told to talk to) wins.
+    """
+    from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+
+    facade_pool = object()
+    stale_global = object()
+
+    class _FakePostgresBackend:
+        pool = facade_pool
+
+    monkeypatch.setattr(_lc, "_pool", stale_global)
+    monkeypatch.setattr(_lc, "_persistence_backend", _FakePostgresBackend())
+
+    assert require_postgres_pool_or_503() is facade_pool
 
 
 @pytest.mark.asyncio

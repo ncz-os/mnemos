@@ -117,6 +117,37 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   and savepoint nesting; the existing snapshot-read isolation tests
   (stream + MPF export) pass unmodified.
 
+- **Last raw-pool access in the API layer routed through the persistence
+  facade (backlog F-06, slice 4/4 + F-06a).** `require_postgres_pool_or_503`
+  in `mnemos/api/persistence_helpers.py` resolved the pool straight off the
+  lifecycle module global; it now resolves through the persistence facade
+  (`backend.pool`) first and keeps the module global only as a documented
+  owner fallback (the lifecycle is the pool's owner — class (c) under §0b:
+  left, and annotated). To make the facade path honest on every backend,
+  `NestableTransaction` gains a `raw_connection()` escape hatch
+  (ABC method → implemented on all six backends: postgres, sqlite, oracle,
+  mysql, db2-inherited, mariadb-inherited → the facade's existing `pool`
+  surface → callers resolve through the facade), with a six-backend
+  contract test (`tests/test_raw_connection_contract.py`) and
+  fail-before/pass-after tests pinning that the helper reads the facade,
+  not the global. Behaviour on Postgres is unchanged: on a healthy
+  Postgres profile the facade surface IS the wrapped pool the global
+  holds, so the same object is returned. F-06a: the stale "86+ legacy
+  paths" comment in `mnemos/core/lifecycle.py` (and the matching "86+"
+  in `mnemos/core/pool.py`'s `TimeoutPool` docstring) is replaced with a
+  recount — 27 references on master 0073bb49 (counted
+  `grep -rc '_lc\._pool' mnemos --include=*.py` outside
+  `mnemos/persistence/`), versus the 28 the 2026-10-18 F-06 table
+  recorded. `mnemos/core/pool.py`'s own two references are the pool's
+  owner module documenting the direct-acquire pattern it fixes and are
+  annotated as such (class (c), left); `mnemos/api/routes/admin.py`'s
+  remaining mention is F-15 docstring prose, now said so explicitly.
+  Post-F-06 slice-4 residue outside `mnemos/persistence/`: 26 references
+  across `db/openai_compat_repo.py` (9), `mcp/tools/dag.py` (4),
+  `webhooks/finalize.py` (3), `mcp/tools/models.py` (2),
+  `mcp/tools/kronos.py` (2), `webhooks/lease.py` (2),
+  `core/pool.py` (2, owner), `webhooks/workers.py` (1) — sibling
+  slices own those files.
 - **API-key creation is backend-neutral.** Minting a key was PostgreSQL-only in
   two places while *looking one up* had been backend-neutral since v6.3, so an
   operator on the SQLite edge profile could authenticate with a key but had no
