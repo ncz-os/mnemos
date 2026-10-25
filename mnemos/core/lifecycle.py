@@ -1124,6 +1124,29 @@ def get_persistence_backend() -> PersistenceBackend:
     return _persistence_backend
 
 
+def get_temporary_legacy_webhook_pool() -> Optional[asyncpg.Pool]:
+    """Temporary Postgres-only bridge: the raw-asyncpg fallback pool the
+    pre-item-7 webhook state machine still runs against while
+    ``test_webhook_retry_state.py`` migrates to the ABC. It is not a
+    supported production handle and must not spread — it disappears with
+    the legacy migration window.
+
+    The raw pool is only a valid webhook handle when *no* persistence
+    backend is installed — with any of the six backends present, the
+    ``WebhookRepository`` ABC owns claim / guard / finalize / store and the
+    raw asyncpg pool (Postgres-only) is not a handle those call paths may
+    consult. That rule used to live in three separate ``_lc._pool`` reads
+    inside ``mnemos/webhooks/{lease,finalize,workers}.py`` (F-06 residue);
+    it now lives here once, at the pool's own owner, and the webhooks
+    package calls this accessor instead of naming the attribute.
+    Returns ``None`` when the fallback window is closed — never a
+    fabricated handle.
+    """
+    if _persistence_backend is not None:
+        return None
+    return _pool
+
+
 # ── Visibility epoch ────────────────────────────────────────────────────────
 #
 # Monotonic counter bumped on every visibility-narrowing mutation (delete,

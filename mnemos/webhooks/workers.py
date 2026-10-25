@@ -26,7 +26,7 @@ from mnemos.core import lifecycle as _lc  # noqa: WPS433
 
 from . import repair as webhook_repair
 from . import types as webhook_types
-from .lease import _RecordView
+from .lease import _ClaimedRecordView
 from .types import _ClaimedDelivery, _get_send_semaphore
 
 logger = logging.getLogger(__name__)
@@ -110,7 +110,11 @@ async def _recover_due_deliveries(_pool_or_backend: Any = None, *, limit: int = 
 
     backend = _lc._persistence_backend
     if backend is None:
-        pool = _lc._pool if _pool_or_backend is None else _pool_or_backend
+        # F-06 slice 3: raw-pool fallback through the facade accessor — no
+        # direct lifecycle-pool read here. With any persistence backend
+        # installed this whole branch is unreachable (the ABC owns the
+        # batch claim).
+        pool = _pool_or_backend if _pool_or_backend is not None else _lc.get_temporary_legacy_webhook_pool()
         if pool is None:
             return 0
         async with pool.acquire() as conn:
@@ -149,7 +153,7 @@ async def _recover_due_deliveries(_pool_or_backend: Any = None, *, limit: int = 
     from .sender import _attempt_delivery
 
     for claim in claimed:
-        record_view = _RecordView(claim.delivery)
+        record_view = _ClaimedRecordView(claim.delivery)
         record_view.lease_expires_at = claim.lease_expires_at  # type: ignore[attr-defined]
         record_view.claim_db_now = claim.claim_db_now  # type: ignore[attr-defined]
         wrapped = _ClaimedDelivery(

@@ -23,6 +23,11 @@ import asyncpg
 
 from mnemos.core import lifecycle as _lc  # noqa: WPS433
 
+# The delivery-outcome value object lives in the persistence ABC, not in
+# the webhooks types module (item 7). Importing it through the persistence
+# package keeps this module independent of the ABC's re-export surface and
+# is what the legacy-branch callers below construct.
+from mnemos.persistence import WebhookDeliveryOutcome
 
 from . import chain as webhook_chain
 from . import lease as webhook_lease
@@ -82,9 +87,6 @@ async def _finalize_delivery(
     delivery_id = _delivery_id_str(delivery)
     finalized = False
     backend = _lc._persistence_backend
-    pool = pool_or_backend
-    if pool is _lc._pool or pool is None:
-        pool = _lc._pool
     if backend is not None:
         try:
             if isinstance(result, _LeaseExpiredBeforeSend):
@@ -96,7 +98,7 @@ async def _finalize_delivery(
                     )
                 finalized = bool(released)
             else:
-                outcome = webhook_types.WebhookDeliveryOutcome(
+                outcome = WebhookDeliveryOutcome(
                     succeeded=result.succeeded,
                     response_status=result.response_status,
                     response_body=result.response_body,
@@ -120,6 +122,12 @@ async def _finalize_delivery(
                     finalized=finalized,
                 )
 
+    # F-06 slice 3: legacy arm — the raw-pool fallback (the migration
+    # window where only ``lifecycle._pool`` is installed) comes through the
+    # facade accessor, which is None once any persistence backend is
+    # installed, so this branch is unreachable there. No direct
+    # lifecycle-pool read here.
+    pool = pool_or_backend or _lc.get_temporary_legacy_webhook_pool()
     if pool is None:
         raise RuntimeError(
             f"webhook delivery {delivery_id} cannot finalize without a backend or raw pool"
@@ -440,7 +448,10 @@ async def _persist_response_body_for_audit(
                 exc_info=True,
             )
         return
-    pool = pool_or_backend if pool_or_backend is not None else _lc._pool
+    # F-06 slice 3: raw-pool fallback through the facade accessor (no direct
+    # lifecycle-pool read here); the accessor is None once any persistence
+    # backend is installed, so this branch is the legacy arm only.
+    pool = pool_or_backend if pool_or_backend is not None else _lc.get_temporary_legacy_webhook_pool()
     if pool is None:
         return
     try:

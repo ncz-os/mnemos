@@ -103,6 +103,10 @@ def _as_mapping(record: Any) -> Mapping[str, Any]:
 class _RecordView:
     """Subscript-style proxy over ``WebhookDeliveryRecord`` (and any
     raw asyncpg-Record shape during the test migration window).
+
+    The view stays slotted: the ABC claim path (item 7) does not mutate
+    this class, it uses :class:`_ClaimedRecordView`, which carries the
+    two database-clock values the claim owns.
     """
 
     __slots__ = ("_record",)
@@ -124,6 +128,21 @@ class _RecordView:
 
     def __len__(self) -> int:
         return len(_as_mapping(self._record))
+
+
+class _ClaimedRecordView(_RecordView):
+    """A claimed delivery view carrying the claim's database-clock values.
+
+    ``lease_expires_at`` and ``claim_db_now`` live on the
+    ``WebhookDeliveryClaim`` wrapper, not on the ``WebhookDeliveryRecord``
+    it decorates, so the ABC claim path attaches them to the view it
+    hands to the sender. They get their own slotted subclass instead of
+    forcing ``_RecordView`` to give up ``__slots__``: a slotted class
+    rejects the assignment (AttributeError), and an unslotted one would
+    have made every ABC claim on every backend a delivery crash.
+    """
+
+    __slots__ = ("claim_db_now", "lease_expires_at")
 
 
 async def _claim_delivery(
@@ -162,7 +181,7 @@ async def _claim_delivery(
             )
         if claim is None:
             return None
-        record_view = _RecordView(claim.delivery)
+        record_view = _ClaimedRecordView(claim.delivery)
         record_view.lease_expires_at = claim.lease_expires_at  # type: ignore[attr-defined]
         record_view.claim_db_now = claim.claim_db_now  # type: ignore[attr-defined]
         return _ClaimedDelivery(
@@ -171,7 +190,11 @@ async def _claim_delivery(
             pre_claim_monotonic=pre_claim_monotonic,
         )
 
-    pool = pool_or_backend or _lc._pool
+    # F-06 slice 3: the raw-pool fallback comes through the facade accessor,
+    # which returns None once any of the six persistence backends is
+    # installed (the ABC owns the claim on those arms) — no direct
+    # lifecycle-pool read here.
+    pool = pool_or_backend or _lc.get_temporary_legacy_webhook_pool()
     if pool is None:
         raise RuntimeError(
             f"webhook delivery {delivery_id} cannot run without a supported persistence handle"
@@ -200,7 +223,9 @@ async def _guard_preclaimed_delivery_before_send(
                     lease_token=lease_token,
                 )
             )
-    pool = pool_or_backend or _lc._pool
+    # F-06 slice 3: raw-pool fallback through the facade accessor (see
+    # ``_claim_delivery`` above) — no direct lifecycle-pool read here.
+    pool = pool_or_backend or _lc.get_temporary_legacy_webhook_pool()
     if pool is None:
         raise RuntimeError(
             f"webhook delivery {delivery_id} cannot run without a supported persistence handle"
@@ -684,6 +709,7 @@ __all__ = (
     "_claim_remaining_send_window_seconds",
     "_as_aware_utc",
     "_ClaimedDelivery",
+    "_ClaimedRecordView",
     "_RecordView",
     "_preclaimed_delivery_is_live_and_owned",
     "_record_value",
