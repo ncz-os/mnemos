@@ -2369,29 +2369,17 @@ class OracleMemoryRepository(MemoryRepository):
         if not embedding:
             return []
 
-        if hasattr(user, "user_id"):
-            from mnemos.core.security import is_root
-
-            if is_root(user):
-                visibility = VisibilityFilter(
-                    scope=VisibilityScope.ROOT_BYPASS,
-                    user_id=None,
-                    group_ids=(),
-                    namespace=None,
-                )
-            else:
-                ns = getattr(user, "namespace", None) or "default"
-                visibility = VisibilityFilter.for_read(user, namespace=ns)
-        else:
-            visibility = VisibilityFilter(
-                scope=VisibilityScope.ROOT_BYPASS,
-                user_id=None,
-                group_ids=(),
-                namespace=None,
-            )
+        # One factory decides both shapes: ``for_caller`` uses ``for_read``
+        # for a real user and ``for_system`` for a userless caller, and
+        # both carry the secret-vault subtraction (a hand-built ROOT_BYPASS
+        # left ``exclude_namespaces`` empty and leaked vault rows).
+        visibility = VisibilityFilter.for_caller(user)
 
         rows = await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=visibility)
-        return [dict(row) for row in rows]
+        return [
+            {"id": row["id"], "content": row["content"], "namespace": row["namespace"]}
+            for row in rows
+        ]
 
 
 class OracleCompressionRepository(CompressionRepository):

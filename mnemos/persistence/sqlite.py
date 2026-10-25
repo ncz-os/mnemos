@@ -1237,32 +1237,35 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         categories = ("solutions", "patterns", "decisions", "infrastructure")
         category_placeholders = _placeholders(categories)
         like_q = f"%{query}%"
+        # One VisibilityFilter for every scope: ``for_caller`` routes a user
+        # through ``for_read`` (pinning non-root to its namespace and
+        # subtracting the secret vault for root too) and a userless caller
+        # through ``for_system``. The vault subtraction previously lived in
+        # the gateway's SQL and disappeared when the read moved behind the ABC.
+        visibility = VisibilityFilter.for_caller(user)
         params: list[Any] = []
-        if getattr(user, "role", None) == "root":
-            params.extend([like_q, *categories, limit])
-            rows = await _fetch_all(
-                conn,
-                "SELECT m.id, COALESCE(v.compressed_content, m.content) AS content "
-                "FROM memories m "
-                "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
-                f"WHERE lower(m.content) LIKE lower(?) OR m.category IN ({category_placeholders}) "
-                "ORDER BY m.updated DESC LIMIT ?",
-                params,
-            )
-        else:
-            vis_clause = _read_visibility_clause(user, params, table_alias="m")
-            params.extend([user.namespace, like_q, *categories, limit])
-            rows = await _fetch_all(
-                conn,
-                "SELECT m.id, COALESCE(v.compressed_content, m.content) AS content "
-                "FROM memories m "
-                "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
-                f"WHERE {vis_clause} AND m.namespace = ? "
-                f"AND (lower(m.content) LIKE lower(?) OR m.category IN ({category_placeholders})) "
-                "ORDER BY m.updated DESC LIMIT ?",
-                params,
-            )
-        return [{"id": row["id"], "content": row["content"]} for row in rows]
+        # ``_render_sqlite_visibility`` returns "" or a complete boolean
+        # expression, never a dangling ``AND``; only join it when present so
+        # the WHERE clause is built from parts rather than string-concatenated.
+        clauses: list[str] = []
+        vis_clause = _render_sqlite_visibility(visibility, params, table_alias="m")
+        if vis_clause:
+            clauses.append(vis_clause)
+        clauses.append(f"(lower(m.content) LIKE lower(?) OR m.category IN ({category_placeholders}))")
+        params.extend([like_q, *categories, limit])
+        rows = await _fetch_all(
+            conn,
+            "SELECT m.id, m.namespace, COALESCE(v.compressed_content, m.content) AS content "
+            "FROM memories m "
+            "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY m.updated DESC LIMIT ?",
+            params,
+        )
+        return [
+            {"id": row["id"], "content": row["content"], "namespace": row["namespace"]}
+            for row in rows
+        ]
 
     async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
         self._require_dim(embedding, "upsert_memory_embedding")
@@ -4725,11 +4728,17 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
         )
 
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
-        row = await _fetch_one(
-            self._conn(tx),
-            "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0 LIMIT 1",
-            (model_id,),
-        )
+        # Null-with-reason contract (ABC): a missing row or a failed query
+        # both report None with a logged reason; only Postgres raises.
+        try:
+            row = await _fetch_one(
+                self._conn(tx),
+                "SELECT provider FROM model_registry WHERE model_id = ? AND available = 1 AND deprecated = 0 LIMIT 1",
+                (model_id,),
+            )
+        except (sqlite3.Error, OSError) as exc:
+            logger.warning("[/v1/models/%s] registry lookup failed: %s", model_id, exc)
+            return None
         return row["provider"] if row is not None else None
 
 

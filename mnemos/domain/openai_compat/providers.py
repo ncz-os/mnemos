@@ -3,7 +3,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 from mnemos.core.extras import missing_extra_detail
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
-from mnemos.db import openai_compat_repo
 
 from .content import _flatten_messages_for_prompt, _has_content_blocks, _has_message_names, _plain_value
 from .schemas import ChatCompletionRequest
@@ -241,6 +240,8 @@ _FALLBACK_PROVIDER_MAP = {
 
 
 async def _resolve_provider_for_model(model: str) -> Optional[str]:
+    from mnemos.db import openai_compat_repo
+
     provider = await openai_compat_repo.lookup_provider_for_model(model)
     if provider is not None:
         return _REGISTRY_PROVIDER_TO_GRAEAE.get(provider, provider)

@@ -34,6 +34,21 @@ class DuplicateMemoryError(ValueError):
     """Raised when an explicit memory id already exists."""
 
 
+class ModelRegistryUnavailable(Exception):
+    """The model_registry query failed on a backend that reports errors.
+
+    Postgres raises this out of ``ConsultationAuditRepository.fetch_model_provider``
+    on a query failure, preserving the OpenAI-compat gateway's historical
+    503 mapping. The other five backends swallow query errors and return
+    ``None`` with a logged reason (the null-with-reason contract).
+
+    ``mnemos.db.openai_compat_repo`` re-exports this class so the gateway's
+    public import path (``openai_compat_repo.ModelRegistryUnavailable``) is
+    unchanged; the canonical definition lives here so the persistence layer
+    does not import from the db layer.
+    """
+
+
 def is_duplicate_memory_error(exc: BaseException) -> bool:
     """Best-effort "this row already exists" detection across backends.
 
@@ -551,7 +566,20 @@ class MemoryRepository(ABC):
         query: str,
         user: Any,
         limit: int = 5,
-    ) -> list[dict[str, Any]]: ...
+    ) -> list[dict[str, Any]]:
+        """Return up to ``limit`` prompt-ready memory rows for ``query``.
+
+        Each row carries at least ``id`` and ``content``, where ``content``
+        is the compression winner (``COALESCE(compressed_content, content)``).
+        Implementations also return ``namespace`` unchanged so callers can
+        apply the secret-vault subtraction without re-querying.
+
+        Vault rows are **never** returned: the subtraction applies to every
+        scope, root included, exactly as :meth:`VisibilityFilter.for_read`
+        renders ``exclude_namespaces``. A backend that cannot supply
+        ``namespace`` reports ``None`` rather than inventing a value.
+        """
+        ...
 
     # --- v4.1 handler-through-backend surface ---------------------------------
 
@@ -1294,7 +1322,20 @@ class ConsultationAuditRepository(ABC):
         task_type: str,
         cost_budget: float,
         quality_floor: float,
-    ) -> tuple[dict[str, Any] | None, list[str]]: ...
+    ) -> tuple[dict[str, Any] | None, list[str]]:
+        """Return the best model for ``task_type`` within budget/quality.
+
+        Returns a ``(model, required_caps)`` tuple. ``model`` is a dict with
+        keys ``provider``, ``model_id``, ``display_name``, ``cost_per_mtok``
+        (average of input+output, or None when either is unknown),
+        ``quality_score``, and ``context_window``; or ``None`` when no
+        available, non-deprecated model satisfies the constraints.
+        ``required_caps`` is the canonical capability list the policy
+        applied, for audit/debugging. All backends delegate to
+        ``mnemos.core.recommendation.choose_recommended_model`` so the
+        selection policy is identical regardless of backend.
+        """
+        ...
 
     @abstractmethod
     async def fetch_model_recommendation(
@@ -1312,7 +1353,19 @@ class ConsultationAuditRepository(ABC):
     async def fetch_available_models(self, tx: Transaction) -> list[Row]: ...
 
     @abstractmethod
-    async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None: ...
+    async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
+        """Return the registry provider for ``model_id``, or None if absent.
+
+        Backends that cannot supply a value report ``None`` with a logged
+        reason (SQLite, Oracle, DB2, MySQL) — never a fabricated default.
+        Postgres is the one backend that raises ``ModelRegistryUnavailable``
+        (defined in this module, re-exported by ``mnemos.db.openai_compat_repo``
+        for the gateway's historical import path) on a *query failure*,
+        preserving the OpenAI-compat gateway's historical 503 mapping.
+        Callers that only care about the value must handle both ``None``
+        and that exception.
+        """
+        ...
 
     # ── model-registry WRITES (daily provider sync; backend-overridable) ───────
     # Non-abstract so existing backends keep instantiating; backends that own a

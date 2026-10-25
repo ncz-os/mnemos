@@ -167,3 +167,69 @@ async def test_mysql_semantic_search_without_recency_uses_visibility_params_once
     assert len(params) == 4
     assert params[1:3] == ("alice", "ns1")
     embedder.embed.assert_called_once_with("needle")
+
+
+async def test_mysql_fetch_memory_context_tolerates_non_root_without_namespace(monkeypatch):
+    """Regression: ``fetch_memory_context`` must not assume ``user.namespace``.
+
+    The method is typed ``user: Any`` and is reachable with a duck-typed
+    caller (the Db2/Oracle siblings already defend with ``getattr``).
+    Dereferencing ``user.namespace`` directly raised ``AttributeError`` for
+    any non-root caller that omitted the field instead of falling back to
+    ``"default"``.
+    """
+    from mnemos.core import lifecycle
+
+    async def _fake_embedding(_query):
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr(lifecycle, "_get_embedding", _fake_embedding)
+
+    repo = MysqlMemoryRepository()
+    captured: dict[str, object] = {}
+
+    async def _fake_semantic_search(tx, *, embedding, limit, visibility):
+        captured["visibility"] = visibility
+        captured["limit"] = limit
+        return [{"id": "m1", "content": "ctx", "namespace": "default"}]
+
+    monkeypatch.setattr(repo, "semantic_search", _fake_semantic_search)
+
+    user = SimpleNamespace(user_id="bob", group_ids=[], role="user")  # no .namespace
+    rows = await repo.fetch_memory_context(SimpleNamespace(), "needle", user, limit=3)
+
+    assert rows == [{"id": "m1", "content": "ctx", "namespace": "default"}]
+    vis = captured["visibility"]
+    assert isinstance(vis, VisibilityFilter)
+    assert vis.scope is VisibilityScope.READABLE
+    assert vis.user_id == "bob"
+    # Fallback is "default" — not None (which would raise in for_read) and
+    # not silently dropped.
+    assert vis.namespace == "default"
+    assert captured["limit"] == 3
+
+
+async def test_mysql_fetch_memory_context_root_reads_cross_tenant(monkeypatch):
+    """Root keeps the cross-tenant read; the vault subtraction still applies."""
+    from mnemos.core import lifecycle
+
+    async def _fake_embedding(_query):
+        return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr(lifecycle, "_get_embedding", _fake_embedding)
+
+    repo = MysqlMemoryRepository()
+    captured: dict[str, object] = {}
+
+    async def _fake_semantic_search(tx, *, embedding, limit, visibility):
+        captured["visibility"] = visibility
+        return []
+
+    monkeypatch.setattr(repo, "semantic_search", _fake_semantic_search)
+
+    root = SimpleNamespace(user_id="root", group_ids=[], role="root", namespace="root-ns")
+    await repo.fetch_memory_context(SimpleNamespace(), "needle", root, limit=5)
+
+    vis = captured["visibility"]
+    assert vis.scope is VisibilityScope.ROOT_BYPASS
+    assert vis.namespace is None

@@ -1041,62 +1041,51 @@ class PostgresMemoryRepository(MemoryRepository):
     ) -> list[dict[str, Any]]:
         conn = _postgres_tx(tx).conn
         try:
-            if user.role == "root":
-                memories = await conn.fetch(
-                    """
-                    SELECT m.id, m.category,
-                           COALESCE(v.compressed_content, m.content) AS content
-                    FROM memories m
-                    LEFT JOIN memory_compressed_variants v
-                        ON v.memory_id = m.id
-                    WHERE
-                        m.deleted_at IS NULL
-                        AND m.archived_at IS NULL
-                        AND (
-                            to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)
-                            OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
-                        )
-                    ORDER BY m.updated DESC NULLS LAST
-                    LIMIT $2
-                    """,
-                    query,
-                    limit,
-                )
-            else:
-                vis_clause, vis_params = _core_read_visibility_predicate(
-                    user.user_id,
-                    list(user.group_ids),
-                    start_param_idx=1,
-                    table_alias="m",
-                )
-                ns_ph = f"${len(vis_params) + 1}"
-                q_ph = f"${len(vis_params) + 2}"
-                lim_ph = f"${len(vis_params) + 3}"
-                memories = await conn.fetch(
-                    f"""
-                    SELECT m.id, m.category,
-                           COALESCE(v.compressed_content, m.content) AS content
-                    FROM memories m
-                    LEFT JOIN memory_compressed_variants v
-                        ON v.memory_id = m.id
-                    WHERE m.deleted_at IS NULL
-                      AND m.archived_at IS NULL
-                      AND {vis_clause}
-                      AND m.namespace = {ns_ph}
-                      AND (
-                          to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})
-                          OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
-                      )
-                    ORDER BY m.updated DESC NULLS LAST
-                    LIMIT {lim_ph}
-                    """,
-                    *vis_params,
-                    user.namespace,
-                    query,
-                    limit,
-                )
+            # One VisibilityFilter for every scope, rendered by the shared
+            # Postgres renderer -- the secret-vault subtraction is a property
+            # of the filter (``exclude_namespaces``), not a hardcoded
+            # predicate spliced into each branch. Root reads cross-tenant;
+            # the vault rows are still subtracted because ``for_read`` sets
+            # ``exclude_namespaces`` for root too.
+            visibility = VisibilityFilter.for_caller(user)
+            vis_clause, vis_params, next_idx = _render_postgres_visibility(
+                visibility, start_idx=1, table_alias="m"
+            )
+            q_ph = f"${next_idx}"
+            lim_ph = f"${next_idx + 1}"
+            where = (
+                "m.deleted_at IS NULL "
+                "AND m.archived_at IS NULL "
+                + (f"AND {vis_clause} " if vis_clause else "")
+                + f"AND ("
+                f"to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})"
+                " OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')"
+                ")"
+            )
+            memories = await conn.fetch(
+                f"""
+                SELECT m.id, m.category, m.namespace,
+                       COALESCE(v.compressed_content, m.content) AS content
+                FROM memories m
+                LEFT JOIN memory_compressed_variants v
+                    ON v.memory_id = m.id
+                WHERE {where}
+                ORDER BY m.updated DESC NULLS LAST
+                LIMIT {lim_ph}
+                """,
+                *vis_params,
+                query,
+                limit,
+            )
             logger.info("[MNEMOS] Found %s memories for query '%s...'", len(memories), query[:30])
-            return [{"id": memory["id"], "content": memory["content"]} for memory in memories]
+            return [
+                {
+                    "id": memory["id"],
+                    "content": memory["content"],
+                    "namespace": memory["namespace"],
+                }
+                for memory in memories
+            ]
         except Exception as exc:
             logger.warning("[MNEMOS] Search failed for '%s...': %s", query[:50], exc)
             return []
@@ -3946,17 +3935,35 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
 
     async def fetch_model_provider(self, tx: Transaction, model_id: str) -> str | None:
         conn = _postgres_tx(tx).conn
-        row = await conn.fetchrow(
-            """
-            SELECT provider
-            FROM model_registry
-            WHERE model_id = $1
-              AND available = true
-              AND deprecated = false
-            LIMIT 1
-            """,
-            model_id,
-        )
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT provider
+                FROM model_registry
+                WHERE model_id = $1
+                  AND available = true
+                  AND deprecated = false
+                LIMIT 1
+                """,
+                model_id,
+            )
+        except Exception as exc:
+            # The OpenAI-compat gateway maps a failed registry query to a 503
+            # (pre-ABC behaviour on the raw asyncpg pool); the other five
+            # backends report None instead, so only Postgres raises here --
+            # the contract the ABC ``fetch_model_provider`` docstring declares.
+            # The exception class is canonical on mnemos.persistence.base;
+            # mnemos.db.openai_compat_repo re-exports it for the gateway's
+            # historical import path.
+            #
+            # Catch Exception (not just asyncpg.PostgresError) because the
+            # pool connection can also fail with ConnectionError /
+            # InterfaceError when the server is unreachable or the pool is
+            # draining -- the gateway must still see a 503, not a 500.
+            from mnemos.persistence.base import ModelRegistryUnavailable
+
+            logger.warning("[/v1/models/%s] registry lookup failed: %s", model_id, exc)
+            raise ModelRegistryUnavailable from exc
         if row is not None:
             return row["provider"]
         return None

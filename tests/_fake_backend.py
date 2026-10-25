@@ -18,6 +18,7 @@ lifecycle for the duration of a test.
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import datetime
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -1008,5 +1009,203 @@ def install_fake_backend(monkeypatch, *, rls_enabled: bool = False) -> FakeBacke
     monkeypatch.setattr(lc, "_pool", None)
     monkeypatch.setattr(lc, "_persistence_backend", backend)
     monkeypatch.setattr(lc, "_rls_enabled", rls_enabled)
+    monkeypatch.setattr(lc, "_cache", None)
+    return backend
+
+
+# ── Real Postgres facade over a fake asyncpg-shaped connection ─────────────
+#
+# The OpenAI-compat gateway routes through the persistence ABC (F-06), so a
+# test that wants to pin the *production* behaviour must exercise the real
+# ``PostgresMemoryRepository`` / ``PostgresConsultationAuditRepository``
+# instead of a hand-written stub that can drift from them. These helpers run
+# those production classes over a fake connection: the SQL, the row mapping
+# and the error handling are all the real code, only the socket is fake.
+
+
+class _FakeAsyncpgRecord(dict):
+    """``dict`` that also accepts attribute access, like an asyncpg Record.
+
+    The Postgres repositories read some rows positionally/as attributes and
+    some as mappings; a Record behaves like both.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:  # pragma: no cover - mirrors asyncpg
+            raise AttributeError(name) from exc
+
+
+def _order_by_graeae_weight_sql_order(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Python sort mirroring ``ORDER BY graeae_weight DESC NULLS LAST, model_id``."""
+    return sorted(
+        rows,
+        key=lambda row: (
+            row.get("graeae_weight") is None,
+            -(row.get("graeae_weight") or 0.0),
+            str(row.get("model_id") or ""),
+        ),
+    )
+
+
+def _filters_on(normalized_sql: str, column: str) -> bool:
+    """True when ``normalized_sql`` constrains ``column`` to a placeholder.
+
+    Matches ``column = $1`` / ``column=$1`` while ignoring identifiers that
+    merely *contain* the column name (``provider_metadata``) and the
+    ``SELECT provider`` projection.
+    """
+    return re.search(rf"\b{column}\s*=\s*\$\d+", normalized_sql) is not None
+
+
+def _placeholder_for(normalized_sql: str, column: str) -> int:
+    """1-based parameter index that ``column = $N`` binds."""
+    match = re.search(rf"\b{column}\s*=\s*\$(\d+)", normalized_sql)
+    if match is None:
+        raise AssertionError(f"no placeholder binds {column!r}")
+    return int(match.group(1))
+
+
+class FakePostgresConnection:
+    """Minimal asyncpg-shaped connection serving ``model_registry`` reads.
+
+    ``registry_rows`` are dicts with at least ``provider`` / ``model_id`` and
+    optionally ``display_name``, ``available`` (default True),
+    ``deprecated`` (default False) and ``graeae_weight``. The fake answers the
+    registry statements the Postgres audit repository actually emits; any
+    other statement gets an empty result rather than a fabricated row.
+
+    ``fail=True`` raises on every query, which is how the tests drive the
+    repository's real error paths (``[]`` for discovery, ``None`` for a
+    lookup, ``ModelRegistryUnavailable`` for the single-model lookup).
+    """
+
+    def __init__(self, *, registry_rows: list[dict[str, Any]] | None = None, fail: bool = False) -> None:
+        self.registry_rows: list[dict[str, Any]] = [dict(row) for row in (registry_rows or [])]
+        self.fail = fail
+        self.fetch_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.fetchrow_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    @staticmethod
+    def _available(row: dict[str, Any]) -> bool:
+        return bool(row.get("available", True)) and not bool(row.get("deprecated", False))
+
+    def _select_registry(self, sql: str, args: tuple[Any, ...]) -> list[dict[str, Any]]:
+        """Answer the registry SELECTs the audit repository emits.
+
+        The statement is classified by *structure* (which ``model_registry``
+        predicates are present and in what form), never by the order the
+        clauses happen to appear in or by exact spacing: the production SQL
+        writes the pair lookup ``provider = $1 AND model_id = $2`` but the
+        discovery statement as a multi-line block. Anything that is not one
+        of the three known shapes raises instead of returning every row —
+        a fake that answers an unrecognised statement with the whole registry
+        turns a real regression into a green test.
+        """
+        rows = [row for row in self.registry_rows if self._available(row)]
+        normalized = " ".join(sql.split()).lower()
+        if "from model_registry" not in normalized:
+            raise AssertionError(
+                f"unrecognised statement for FakePostgresConnection: {' '.join(sql.split())[:120]!r}"
+            )
+
+        filters_provider = _filters_on(normalized, "provider")
+        filters_model = _filters_on(normalized, "model_id")
+
+        if filters_provider and filters_model:
+            # (provider, model_id) pair lookup: the namespaced gateway form.
+            provider = args[_placeholder_for(normalized, "provider") - 1]
+            model_id = args[_placeholder_for(normalized, "model_id") - 1]
+            return [row for row in rows if row["provider"] == provider and row["model_id"] == model_id]
+        if filters_model:
+            model_id = args[_placeholder_for(normalized, "model_id") - 1]
+            return [row for row in rows if row["model_id"] == model_id]
+        if filters_provider:
+            provider = args[_placeholder_for(normalized, "provider") - 1]
+            return [row for row in rows if row["provider"] == provider]
+        if "order by" in normalized:
+            # Discovery: the only unfiltered shape the repository emits.
+            return _order_by_graeae_weight_sql_order(rows)
+        raise AssertionError(
+            f"unrecognised model_registry statement: {' '.join(sql.split())[:120]!r}"
+        )
+
+    async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+        self.fetch_calls.append((sql, args))
+        if self.fail:
+            raise RuntimeError("fake postgres connection failure")
+        return [_FakeAsyncpgRecord(row) for row in self._select_registry(sql, args)]
+
+    async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+        self.fetchrow_calls.append((sql, args))
+        if self.fail:
+            raise RuntimeError("fake postgres connection failure")
+        rows = self._select_registry(sql, args)
+        return _FakeAsyncpgRecord(rows[0]) if rows else None
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        if self.fail:
+            raise RuntimeError("fake postgres connection failure")
+        return "OK"
+
+    async def fetchval(self, sql: str, *args: Any) -> Any:
+        if self.fail:
+            raise RuntimeError("fake postgres connection failure")
+        return None
+
+
+class FakePostgresBackend:
+    """Persistence facade whose repositories are the REAL Postgres classes.
+
+    Only the connection is fake. ``transactional()`` hands out a
+    ``PostgresTransaction``, so the production ``_postgres_tx()`` type check
+    passes and every SQL statement asserted in the tests is the one the
+    Postgres backend really runs.
+    """
+
+    supports_listen_notify = True
+    supports_advisory_locks = True
+    supports_row_level_security = True
+    supports_pgvector = True
+    supports_webhooks = True
+
+    def __init__(self, conn: FakePostgresConnection) -> None:
+        from mnemos.persistence.postgres import (
+            PostgresConsultationAuditRepository,
+            PostgresMemoryRepository,
+        )
+
+        self._conn = conn
+        self._memories = PostgresMemoryRepository()
+        self._consultations_audit = PostgresConsultationAuditRepository()
+
+    @property
+    def memories(self) -> Any:
+        return self._memories
+
+    @property
+    def consultations_audit(self) -> Any:
+        return self._consultations_audit
+
+    @asynccontextmanager
+    async def transactional(self, *, isolation: Any = None, readonly: bool = False):
+        yield _PoolBackedTx(self._conn)
+
+    async def close(self) -> None:
+        return None
+
+
+def install_fake_postgres_backend(monkeypatch, conn: FakePostgresConnection) -> FakePostgresBackend:
+    """Install the real-Postgres facade for the duration of one test.
+
+    ``_pool`` is cleared so no legacy raw-pool path can fire; the repository
+    must reach storage exclusively through ``transactional()``.
+    """
+    import mnemos.core.lifecycle as lc
+
+    backend = FakePostgresBackend(conn)
+    monkeypatch.setattr(lc, "_pool", None)
+    monkeypatch.setattr(lc, "_persistence_backend", backend)
     monkeypatch.setattr(lc, "_cache", None)
     return backend

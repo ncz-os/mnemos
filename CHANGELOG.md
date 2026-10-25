@@ -62,6 +62,58 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
 
 ### Added
 
+- **`fetch_memory_context`: one filter-driven statement per backend.**
+  Every backend now builds its read predicate from a
+  `VisibilityFilter` and renders it with that dialect's existing
+  renderer, instead of splicing `AND m.namespace <> 'vault'` into
+  hand-written SQL. On Postgres `fetch_memory_context` previously had
+  two branches (root / non-root) with the vault subtraction hardcoded in
+  both; both now go through `_render_postgres_visibility`. The
+  subtraction is a property of the filter (`exclude_namespaces`), so a
+  backend cannot forget it while editing its own SQL. Rendered
+  predicates are row-identical to the previous form on Postgres:
+  `memories.namespace` is `NOT NULL` (v1_multiuser migration,
+  `ALTER TABLE memories ALTER COLUMN namespace SET NOT NULL`), so the
+  renderer's `namespace IS NULL OR ...` arm is unreachable there — and
+  that `IS NULL` arm is the repo-wide convention already used by
+  `eligibility.py`, `api/routes/memories.py` and the SQLite renderer.
+  MySQL now resolves its filter with `VisibilityFilter.for_caller(user)`
+  rather than recomputing `getattr(user, "namespace", None) or
+  "default"` (the fallback lives in the factory, so it cannot drift from
+  Oracle/Db2). SQLite composes its WHERE clause from a list of
+  predicates rather than string concatenation with a
+  trailing-`AND` variable, so the statement stays well-formed for every
+  caller shape including a userless one. Postgres/MySQL/SQLite read
+  visibility is otherwise unchanged; no caller-observable behaviour
+  changes on any backend.
+- **One factory for root-equivalent reads (F-06 slice 1 follow-up).**
+  `VisibilityFilter` gains `for_system()` and `for_caller()`, and
+  `Db2MemoryRepository.fetch_memory_context` /
+  `OracleMemoryRepository.fetch_memory_context` now build their filter
+  with `for_caller` instead of hand-constructing a `ROOT_BYPASS` filter
+  next to the `for_read` call for authenticated root users. Those two
+  root-like paths were two separate constructions of one concept, so the
+  vault subtraction had to be remembered independently in each — the
+  exact drift that previously produced a vault leak. `for_system()`
+  emits byte-for-byte what `for_read` emits for a root user and is
+  pinned as such by `tests/test_visibility_system_caller.py`.
+  Separately, `MysqlMemoryRepository.fetch_memory_context` no longer
+  dereferences `user.namespace` on a non-root caller: the method is typed
+  `user: Any`, and a duck-typed caller omitting the field raised
+  `AttributeError` where the Db2/Oracle siblings already fell back to
+  `"default"`; it now uses the same `getattr(...) or "default"` form.
+- **`MemoryRepository.fetch_memory_context` is the sole gateway context
+  read (F-06 slice 1).** The OpenAI-compat gateway no longer acquires the
+  raw asyncpg pool: `mnemos/db/openai_compat_repo.py` calls the persistence
+  ABC, so every backend serves the compiled `COALESCE(compressed_content,
+  content)` winner and the caller's tenancy from one place. The vault
+  subtraction that previously lived in the gateway's SQL is now part of the
+  ABC contract and is applied by all six backends — including for root
+  callers — and each row carries its `namespace` so callers need no second
+  query. `tests/test_fake_backend_sql_binding.py` pins the registry-statement
+  handling of the Postgres-over-fake-connection helper (pair lookups bind by
+  placeholder, not argument order, and unrecognised SQL raises instead of
+  silently returning every row).
 - **Streamable HTTP MCP at `/mcp`.** MNEMOS now exposes the current MCP
   transport alongside the OAuth-protected legacy `/sse` fallback. Both routes
   use the same tool registry, bearer/OAuth authorization, role, namespace,
@@ -161,6 +213,24 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
   No new ABC surface was needed (no (b) case): every method the tools
   now call was already abstract on the ABC and implemented on all six
   backends before this slice.
+- **OpenAI-compat gateway routes through the persistence ABC (F-06 slice 1).**
+  `mnemos/db/openai_compat_repo.py` no longer references `_lc._pool` directly:
+  `fetch_memory_context` routes through
+  `MemoryRepository.fetch_memory_context` (all six backends), which owns the
+  caller's visibility and the secret-vault subtraction, and the four `model_registry`
+  lookups (`fetch_model_recommendation`, `lookup_provider_for_model`,
+  `fetch_available_models`, `fetch_model_provider`) route through
+  `ConsultationAuditRepository` (all six backends). On SQLite the
+  repository was previously a dead code path (it only saw a raw asyncpg
+  pool); it now serves every call through the ABC. The
+  `ModelRegistryUnavailable` exception stays on
+  `openai_compat_repo` as the gateway's 503 signal: Postgres raises it
+  out of `fetch_model_provider` on a *query failure* (pre-ABC behaviour
+  preserved), the other five backends report `None` with a logged reason
+  per the null-with-reason contract. The contract is now declared on the
+  ABC base method's docstring so a subclass raising is not a Liskov
+  surprise. A backend that cannot supply a value reports `null` with a
+  reason, never a fabricated default.
 
 ### Fixed
 
