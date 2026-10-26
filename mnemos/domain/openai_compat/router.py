@@ -9,6 +9,7 @@ from mnemos.core.config import get_registered_task_classifier, get_settings
 from mnemos.core.injection_defense import _strip_one_frame, defend
 from mnemos.core.secret_detection import redact_content
 from mnemos.db import openai_compat_repo
+from mnemos.domain.route_policy import check_route
 
 from .content import _content_text, _message_to_dict
 from .providers import (
@@ -234,7 +235,13 @@ def _row_provider(row: Any) -> Optional[str]:
 
 async def list_models(user: Any) -> ModelsResponse:
     rows = await openai_compat_repo.fetch_available_models()
-    models = [ModelInfo(id=_row_model_id(row), owned_by=_owned_by(_row_provider(row))) for row in rows]
+    # The catalog never advertises a pair route_policy refuses: a banned
+    # provider/model pair is not "available" even when a registry row says so.
+    models = [
+        ModelInfo(id=_row_model_id(row), owned_by=_owned_by(_row_provider(row)))
+        for row in rows
+        if check_route(str(_row_provider(row) or ""), str(_row_model_id(row) or "")) is None
+    ]
     return ModelsResponse(data=models)
 
 

@@ -3,6 +3,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from mnemos.core.extras import missing_extra_detail
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
+from mnemos.domain.route_policy import check_route
 
 from .content import _flatten_messages_for_prompt, _has_content_blocks, _has_message_names, _plain_value
 from .schemas import ChatCompletionRequest
@@ -273,6 +274,20 @@ async def _prepare_provider_route(
         )
 
     bare_model = _strip_gateway_namespace(model, provider)
+    banned_reason = check_route(provider, bare_model)
+    if banned_reason is not None:
+        logger.warning("[MNEMOS] Rejected route model=%s -> provider=%s: %s", model, provider, banned_reason)
+        raise OpenAICompatError(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": banned_reason,
+                    "type": "invalid_request_error",
+                    "code": "route_policy_violation",
+                }
+            },
+        )
+
     engine_factory = get_engine or get_graeae_engine
     graeae = engine_factory()
     provider_cfg = dict(graeae.providers.get(provider, {}))

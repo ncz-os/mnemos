@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from mnemos.core.numeric import safe_float
+from mnemos.domain.route_policy import is_route_allowed
 
 
 @dataclass(frozen=True)
@@ -326,6 +327,9 @@ def choose_recommended_model(
         capable.append(row)
 
     capable = [row for row in capable if not _is_special_purpose(row)]
+    # PANTHEON's catalog never recommends a pair route_policy refuses — the
+    # router would only reject it at dispatch time.
+    capable = [row for row in capable if is_route_allowed(*_model_key(row))]
     if policy.excluded_name_tokens:
         capable = [row for row in capable if not _has_name_token(row, policy.excluded_name_tokens)]
     capable = _tier_filter(capable, policy)
