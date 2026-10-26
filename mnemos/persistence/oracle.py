@@ -669,10 +669,14 @@ async def create_oracle_pool(
         kwargs.setdefault("statement_cache_size", stmt_cache)
     else:
         kwargs.setdefault("stmtcachesize", stmt_cache)
-    # Explicit WAIT mode + timeout: default behaviour would otherwise
-    # block forever when the pool is saturated.
-    kwargs.setdefault("getmode", oracledb.POOL_GETMODE_WAIT)
-    kwargs.setdefault("timeout", pool_acquire_timeout)
+    # Bounded acquire: plain WAIT mode blocks forever when the pool is
+    # saturated, and python-oracledb only honours ``wait_timeout``
+    # (milliseconds) in TIMEDWAIT mode. ``timeout`` is NOT an acquire
+    # timeout: it is the idle time (seconds) after which pooled connections
+    # are closed, so setting it here both left acquire() unbounded and
+    # tore down warm connections after a minute of idleness.
+    kwargs.setdefault("getmode", oracledb.POOL_GETMODE_TIMEDWAIT)
+    kwargs.setdefault("wait_timeout", max(1, int(pool_acquire_timeout * 1000)))
     kwargs.setdefault("session_callback", _build_oracle_session_callback(settings))
 
     # DRCP support: server must also be configured with
