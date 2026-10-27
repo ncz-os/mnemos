@@ -465,6 +465,103 @@ async def test_every_band_round_trips(registry: RegistryHandle) -> None:
 
 
 @_conforming()
+async def test_non_payg_price_never_displaces_another_pricing_models_price(registry: RegistryHandle) -> None:
+    """A second non-payg row must not overwrite a price already mirrored.
+
+    Regression: the mirror guard once read ``payg OR pricing_model <> 'payg'
+    OR <all prices NULL>``. The middle disjunct is satisfied for *any*
+    non-payg row, so a later ``subscription`` price silently replaced a
+    ``free_tier`` 0.0 on the model row and made a free model look paid.
+    """
+    async with registry.transaction() as tx:
+        await registry.repo.upsert_model(tx, MODEL)
+        await registry.repo.upsert_price(
+            tx,
+            PriceBand(
+                provider=MODEL.provider,
+                model_id=MODEL.model_id,
+                pricing_model="free_tier",
+                band="standard",
+                price_in=0.0,
+                price_out=0.0,
+            ),
+        )
+        await registry.repo.upsert_price(
+            tx,
+            PriceBand(
+                provider=MODEL.provider,
+                model_id=MODEL.model_id,
+                pricing_model="subscription",
+                band="standard",
+                price_in=42.0,
+                price_out=84.0,
+            ),
+        )
+        model = await registry.repo.get_model(tx, MODEL.provider, MODEL.model_id)
+
+    assert model is not None
+    assert model.pricing_model == "free_tier"
+    assert model.price_in == 0.0
+
+
+@_conforming()
+async def test_non_payg_price_fills_an_unpriced_model(registry: RegistryHandle) -> None:
+    """The same guard must still let the first non-payg price through."""
+    async with registry.transaction() as tx:
+        await registry.repo.upsert_model(tx, MODEL)
+        await registry.repo.upsert_price(
+            tx,
+            PriceBand(
+                provider=MODEL.provider,
+                model_id=MODEL.model_id,
+                pricing_model="local",
+                band="standard",
+                price_in=0.0,
+                price_out=0.0,
+            ),
+        )
+        model = await registry.repo.get_model(tx, MODEL.provider, MODEL.model_id)
+
+    assert model is not None
+    assert model.pricing_model == "local"
+    assert model.price_in == 0.0
+
+
+@_conforming()
+async def test_payg_price_still_replaces_an_earlier_non_payg_price(registry: RegistryHandle) -> None:
+    """payg is authoritative: it overwrites whatever an earlier model mirrored."""
+    async with registry.transaction() as tx:
+        await registry.repo.upsert_model(tx, MODEL)
+        await registry.repo.upsert_price(
+            tx,
+            PriceBand(
+                provider=MODEL.provider,
+                model_id=MODEL.model_id,
+                pricing_model="free_tier",
+                band="standard",
+                price_in=0.0,
+                price_out=0.0,
+            ),
+        )
+        await registry.repo.upsert_price(
+            tx,
+            PriceBand(
+                provider=MODEL.provider,
+                model_id=MODEL.model_id,
+                pricing_model="payg",
+                band="standard",
+                price_in=3.0,
+                price_out=6.0,
+            ),
+        )
+        model = await registry.repo.get_model(tx, MODEL.provider, MODEL.model_id)
+
+    assert model is not None
+    assert model.pricing_model == "payg"
+    assert model.price_in == 3.0
+
+
+@_conforming()
 async def test_invalid_band_is_rejected(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
         await registry.repo.upsert_model(tx, MODEL)

@@ -5103,13 +5103,20 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
         #
         # * only ``band == 'standard'`` mirrors, so peak/off-peak rows never
         #   overwrite the headline price;
-        # * a priced ``payg`` row is authoritative and wins over other pricing
-        #   models (a model can be both API-priced and free-tier eligible);
-        # * otherwise a row that actually carries a price fills in -- this is
-        #   how a genuinely free model (``local``/``free_tier`` at 0.0) reads
-        #   as priced;
+        # * a ``payg`` row is authoritative: it always applies, and it wins
+        #   over every other pricing model (a model can be both API-priced and
+        #   free-tier eligible);
+        # * any other pricing model only fills in a row that carries no price
+        #   yet. It must NOT displace a price someone else already mirrored --
+        #   otherwise a later ``subscription`` row would silently clobber the
+        #   ``free_tier``/``local`` 0.0 that says the model is free;
         # * a row with no prices at all (``unknown``) mirrors nothing, so an
         #   unpriced model stays NULL and never looks free.
+        #
+        # The guard is therefore: payg always, OR (not already priced). The
+        # "already priced" test reads the row being updated, which is why the
+        # three IS NULL checks are ANDed together and ANDed with the non-payg
+        # branch -- an OR there would let any non-payg row through.
         carries_price = band.price_in is not None or band.price_out is not None or band.price_cached is not None
         if band.band == "standard" and carries_price:
             await _execute(
@@ -5118,10 +5125,9 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
                 "price_updated_at = COALESCE(?, CURRENT_TIMESTAMP), "
                 "pricing_model = ?, band = ? "
                 "WHERE provider = ? AND model_id = ? "
-                # A payg row always applies; a non-payg row only fills a row
-                # that is not already priced by payg.
-                "AND (? = 'payg' OR pricing_model <> 'payg' "
-                "OR price_in IS NULL AND price_out IS NULL AND price_cached IS NULL)",
+                "AND (? = 'payg' OR ("
+                "price_in IS NULL AND price_out IS NULL AND price_cached IS NULL"
+                "))",
                 (
                     band.price_in,
                     band.price_out,

@@ -83,10 +83,22 @@ free".** These are different facts and the contract never conflates them.
 * `upsert_model` does **not** write price columns at all. Prices belong to
   `upsert_price`, which stores `None` as SQL `NULL`.
 * `upsert_price` mirrors a `band == 'standard'` row onto the model row so the
-  existing `GET /v1/models` and recommendation paths keep working. A `payg`
-  row is authoritative; a non-`payg` row only fills in a row that carries no
-  price yet; and a row with no prices at all (`pricing_model='unknown'`)
-  mirrors nothing — so an unpriced model stays `NULL` rather than looking free.
+  existing `GET /v1/models` and recommendation paths keep working. The guard is
+  exactly `incoming is payg OR (all three mirrored prices are currently NULL)`:
+  * a `payg` row always applies and is authoritative — it overwrites whatever
+    was mirrored before, including an earlier non-`payg` price;
+  * any other pricing model fills in **only** while the row carries no price
+    yet. It never displaces a price already mirrored, so a later
+    `subscription` row cannot clobber a `free_tier` / `local` `0.0`;
+  * a row with no prices at all (`pricing_model='unknown'`) mirrors nothing —
+    an unpriced model stays `NULL` rather than looking free.
+
+  The "already priced" test reads the row **before** the update, so the three
+  `IS NULL` checks must be `AND`ed together and `AND`ed with the non-`payg`
+  branch. `OR`ing in `pricing_model <> 'payg'` would let every non-`payg` row
+  through and is the defect this rule exists to prevent;
+  `tests/persistence/test_model_registry_contract.py::test_non_payg_price_never_displaces_another_pricing_models_price`
+  is the regression guard.
 * `ModelFilter(priced=True)` selects rows where **any** price column is
   `NOT NULL`; `priced=False` selects rows where all are `NULL`.
 * `health_read` reports `priced_count` and `unpriced_count` with
