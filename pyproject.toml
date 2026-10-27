@@ -383,3 +383,16 @@ addopts = "--ignore=tests/test_live_e2e.py"
 markers = [
   "integration: integration tests requiring MNEMOS_TEST_DB (postgres://...)",
 ]
+# pytest-asyncio is REQUIRED, not optional: tests/conftest.py imports
+# pytest_asyncio at module scope and `tests/persistence/` is async throughout,
+# so without the plugin the suite does not even *collect*:
+#
+#     ImportError while loading conftest 'tests/conftest.py'
+#     ModuleNotFoundError: No module named 'pytest_asyncio'
+#
+# It is declared in the `dev` extra (`pip install -e '.[dev]'`) and in
+# requirements.txt. Bare `pip install -e .` is a runtime install and does NOT
+# pull it — run the tests from a dev install. Strict mode (the default) is
+# intended: async tests carry an explicit `@pytest.mark.asyncio`, so a fixture
+# or test that forgot one fails loudly instead of silently not awaiting.
+asyncio_mode = "strict"

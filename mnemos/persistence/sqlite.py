@@ -62,6 +62,7 @@ from mnemos.persistence.base import (
     SyncLogEntry,
     PRICE_BANDS,
     PRICING_MODELS,
+    model_registry_snapshot_digest,
     MorpheusConsolidationResult,
     MorpheusExtractBatch,
     MorpheusExtractCandidate,
@@ -762,6 +763,14 @@ def _sqlite_tx(tx: Transaction) -> SqliteTransaction:
     if not isinstance(tx, SqliteTransaction):
         raise TypeError("SQLite repositories require a SqliteTransaction")
     return tx
+
+
+#: "This model row carries a known price." Any non-NULL price column counts --
+#: ``price_cached`` included, because a cache-only price is still a price. The
+#: complement is emitted as ``NOT (...)`` rather than hand-written ``IS NULL``
+#: chains so ``priced=True`` and ``priced=False`` can never drift apart. Every
+#: repository that answers a ``priced`` question uses this one constant.
+_PRICED_SQL = "(price_in IS NOT NULL OR price_out IS NOT NULL OR price_cached IS NOT NULL)"
 
 
 class _SqliteRepository:
@@ -4815,14 +4824,19 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
     * Price rows live in ``model_prices`` keyed by
       (provider, model_id, pricing_model, band).
     * ``curated_routing`` is append-only and version-numbered.
-    * ``snapshot_digest`` canonicalises rows before hashing, so the digest is
-      independent of insertion order and of physical column layout.
+    * ``export_snapshot`` canonicalises rows before they are returned and
+      ``snapshot_digest`` hashes exactly that document, so both are independent
+      of insertion order and of physical column layout.
+    * A model is priced when ANY of the three price columns is ``NOT NULL``.
+      ``price_cached`` counts: a cache-only price row (``price_in``/``price_out``
+      unknown) is still a known price, and reading it as unpriced was the
+      defect this predicate exists to prevent.
     """
 
     backend_name = "sqlite"
 
     # Canonical export order: (provider, model_id) for models and prices,
-    # (provider, model_id, benchmark) for benchmarks. See ``snapshot_digest``.
+    # (provider, model_id, benchmark) for benchmarks. See ``export_snapshot``.
     _MODEL_ORDER = " ORDER BY provider ASC, model_id ASC"
     _PRICE_ORDER = " ORDER BY provider ASC, model_id ASC, pricing_model ASC, band ASC"
     _BENCH_ORDER = " ORDER BY provider ASC, model_id ASC, benchmark ASC"
@@ -4968,7 +4982,7 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
                 where.append("deprecated = ?")
                 params.append(1 if filters.deprecated else 0)
             if filters.priced is not None:
-                priced_sql = "(price_in IS NOT NULL OR price_out IS NOT NULL)"
+                priced_sql = _PRICED_SQL
                 where.append(priced_sql if filters.priced else f"NOT {priced_sql}")
         sql = "SELECT * FROM model_registry WHERE " + " AND ".join(where)
         sql += self._MODEL_ORDER
@@ -5291,14 +5305,16 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
             ),
         )
 
-    async def snapshot_digest(self, tx: Transaction) -> str:
-        """Stable SHA-256 over the registry's logical contents.
+    async def export_snapshot(self, tx: Transaction) -> dict[str, Any]:
+        """Canonical export document for the registry's logical contents.
 
-        Rows are canonicalised into sorted JSON with fixed key order and
-        ``repr``-stable scalars, so the digest is identical for the same
-        inputs regardless of insert order, table layout, or backend. Floats
-        go through ``repr`` (shortest round-trip form) so an identical
-        ``0.000001`` on every backend hashes identically.
+        Rows are canonicalised into fixed key order with ``repr``-stable
+        scalars, so the document is identical for the same inputs regardless
+        of insert order, table layout, or backend. Floats go through ``repr``
+        (shortest round-trip form) so an identical ``0.000001`` on every
+        backend encodes identically. Row ordering comes from
+        ``self._MODEL_ORDER`` / ``_PRICE_ORDER`` / ``_BENCH_ORDER``, which sort
+        on the logical key of each row.
         """
         conn = self._conn(tx)
         # Alias rows are pointers, not models: they must not contribute to the
@@ -5358,7 +5374,16 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
             "benchmarks": canonical_benchmarks,
             "curated_version": int(curated_version) if curated_version is not None else 0,
         }
-        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return payload
+
+    async def snapshot_digest(self, tx: Transaction) -> str:
+        """Stable SHA-256 over :meth:`export_snapshot`'s canonical encoding.
+
+        The digest is derived from the exported document rather than assembled
+        separately, so an export and its digest can never disagree.
+        """
+        payload = await self.export_snapshot(tx)
+        return model_registry_snapshot_digest(payload)
 
     async def health_read(self, tx: Transaction) -> ModelRegistryHealth:
         conn = self._conn(tx)
@@ -5372,7 +5397,7 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
             await _fetch_val(
                 conn,
                 "SELECT COUNT(*) FROM model_registry "
-                "WHERE alias_of IS NULL AND (price_in IS NOT NULL OR price_out IS NOT NULL)",
+                f"WHERE alias_of IS NULL AND {_PRICED_SQL}",
             )
             or 0
         )

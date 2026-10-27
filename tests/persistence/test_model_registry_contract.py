@@ -14,18 +14,25 @@ Parametrised over every backend that owns a registry repository:
 The cases are the contract, not the implementation:
 
 1. ``NULL`` stays ``NULL`` — unpriced is never ``0``, and a free model is
-   never reported as unpriced.
+   never reported as unpriced. A cache-only price (only ``price_cached``
+   known) is priced, and counts/filters as such.
 2. per-field ``source`` / ``fetched_at`` round-trip;
 3. price ``band`` round-trip (``standard`` / ``peak`` / ``off_peak``);
 4. alias uniqueness and lookalike rejection;
 5. the curated layer is immune to refresh;
-6. the export digest is identical for identical inputs, regardless of order;
-7. ``type(cls).__abstractmethods__`` is empty for every conforming backend.
+6. ``export_snapshot`` is the sorted, stable export document and
+   ``snapshot_digest`` is exactly its canonical hash — identical for identical
+   inputs, regardless of insertion order;
+7. ``type(cls).__abstractmethods__`` is empty for every conforming backend,
+   and ``MODEL_REGISTRY_OPERATIONS`` names exactly those abstract methods so
+   the advertised operation set cannot drift from the ABC.
 """
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import os
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -47,10 +54,15 @@ from mnemos.persistence.base import (
     ModelRegistryNotSupported,
     ModelRegistryRepository,
     PriceBand,
+    model_registry_snapshot_digest,
     SyncLogEntry,
 )
 
-pytestmark = pytest.mark.asyncio
+# No module-wide ``pytestmark``: the suite mixes coroutines with two sync
+# structural checks, and a module-wide mark would stamp ``asyncio`` onto the
+# sync tests (pytest-asyncio 1.x warns about that). Every async test is marked
+# explicitly instead — the parametrised ones through ``_conforming()`` /
+# ``_unsupported()`` below, the rest with ``@pytest.mark.asyncio``.
 
 POSTGRES_DSN_ENV = "MNEMOS_TEST_POSTGRES_DSN"
 
@@ -125,6 +137,12 @@ async def registry(request: Any, tmp_path: Any) -> AsyncIterator[RegistryHandle]
 
 
 def _conforming():
+    """Parametrize ``registry`` over the conforming backends, as an async test.
+
+    ``pytest_asyncio`` marks are stacked with the parametrization in order, so
+    the coroutine is opted into the plugin and the sync structural tests in
+    this module never inherit the ``asyncio`` mark.
+    """
     return pytest.mark.parametrize(
         "registry",
         [pytest.param("sqlite", id="sqlite"), pytest.param("postgres", id="postgres")],
@@ -173,6 +191,7 @@ def _dummy_call(method: Any) -> tuple[list[Any], dict[str, Any]]:
     return args, kwargs
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_backend_is_fully_conformant(registry: RegistryHandle) -> None:
     assert isinstance(registry.repo, ModelRegistryRepository)
@@ -185,6 +204,7 @@ async def test_backend_is_fully_conformant(registry: RegistryHandle) -> None:
         assert callable(getattr(registry.repo, operation)), operation
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("backend_name", UNSUPPORTED_BACKENDS)
 async def test_unsupported_backends_raise_named_errors(backend_name: str) -> None:
     """Non-conformance is a named, documented raise — never a silent empty result."""
@@ -221,6 +241,7 @@ async def test_unsupported_backends_raise_named_errors(backend_name: str) -> Non
 # ── 1. NULL stays NULL ────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_unpriced_model_keeps_null_prices(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -251,6 +272,7 @@ async def test_unpriced_model_keeps_null_prices(registry: RegistryHandle) -> Non
     assert health.unpriced_count == health.model_count
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_free_model_is_zero_not_null(registry: RegistryHandle) -> None:
     """A demonstrably free model is ``0.0`` and counts as PRICED, not unknown."""
@@ -279,6 +301,7 @@ async def test_free_model_is_zero_not_null(registry: RegistryHandle) -> None:
     assert health.unpriced_count == 0
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_priced_filter_distinguishes_null_from_zero(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -302,9 +325,53 @@ async def test_priced_filter_distinguishes_null_from_zero(registry: RegistryHand
     assert {m.model_id for m in priced} == {"free-one"}
 
 
+@pytest.mark.asyncio
+@_conforming()
+async def test_cached_only_price_counts_as_priced(registry: RegistryHandle) -> None:
+    """A cache-only price is a known price, not an unpriced model.
+
+    Regression: the ``priced`` predicate tested only ``price_in``/``price_out``
+    on both SQLite and Postgres, so a row whose only known price was
+    ``price_cached`` was counted and filtered as unpriced — contradicting the
+    rule that ANY non-NULL price column means priced. ``price_in`` and
+    ``price_out`` stay ``NULL`` here, so the case fails if the predicate ever
+    drops ``price_cached`` again.
+    """
+    only_cached = ModelRecord(provider="anthropic", model_id="cache-only")
+    async with registry.transaction() as tx:
+        await registry.repo.upsert_model(tx, only_cached)
+        await registry.repo.upsert_price(
+            tx,
+            PriceBand(
+                provider="anthropic",
+                model_id="cache-only",
+                pricing_model="payg",
+                band="standard",
+                price_in=None,
+                price_out=None,
+                price_cached=0.3,
+            ),
+        )
+        model = await registry.repo.get_model(tx, "anthropic", "cache-only")
+        health = await registry.repo.health_read(tx)
+        priced = await registry.repo.list_models(tx, ModelFilter(priced=True))
+        unpriced = await registry.repo.list_models(tx, ModelFilter(priced=False))
+
+    assert model is not None
+    assert model.price_cached == 0.3
+    # NULL is still NULL, and a cached-only row is not free.
+    assert model.price_in is None and model.price_out is None
+    assert health.model_count == 1
+    assert health.priced_count == 1
+    assert health.unpriced_count == 0
+    assert {m.model_id for m in priced} == {"cache-only"}
+    assert unpriced == []
+
+
 # ── 2. per-field provenance ───────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_field_observations_round_trip_with_provenance(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -338,6 +405,7 @@ async def test_field_observations_round_trip_with_provenance(registry: RegistryH
     assert merged.display_name == "GPT-5 (renamed)"
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_merge_fields_restricted_to_one_source(registry: RegistryHandle) -> None:
     """Refreshing one upstream must not restamp a field owned by another."""
@@ -375,6 +443,7 @@ async def test_merge_fields_restricted_to_one_source(registry: RegistryHandle) -
     assert merged.display_name == MODEL.display_name
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_merge_fields_never_creates_a_model(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -394,6 +463,7 @@ async def test_merge_fields_never_creates_a_model(registry: RegistryHandle) -> N
         assert await registry.repo.get_model(tx, "ghost", "nope") is None
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_null_observation_clears_a_field_rather_than_zeroing_it(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -419,6 +489,7 @@ async def test_null_observation_clears_a_field_rather_than_zeroing_it(registry: 
 # ── 3. band round-trip ────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_every_band_round_trips(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -464,6 +535,7 @@ async def test_every_band_round_trips(registry: RegistryHandle) -> None:
     assert model.price_in == 1.0
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_non_payg_price_never_displaces_another_pricing_models_price(registry: RegistryHandle) -> None:
     """A second non-payg row must not overwrite a price already mirrored.
@@ -504,6 +576,7 @@ async def test_non_payg_price_never_displaces_another_pricing_models_price(regis
     assert model.price_in == 0.0
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_non_payg_price_fills_an_unpriced_model(registry: RegistryHandle) -> None:
     """The same guard must still let the first non-payg price through."""
@@ -527,6 +600,7 @@ async def test_non_payg_price_fills_an_unpriced_model(registry: RegistryHandle) 
     assert model.price_in == 0.0
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_payg_price_still_replaces_an_earlier_non_payg_price(registry: RegistryHandle) -> None:
     """payg is authoritative: it overwrites whatever an earlier model mirrored."""
@@ -561,6 +635,7 @@ async def test_payg_price_still_replaces_an_earlier_non_payg_price(registry: Reg
     assert model.price_in == 3.0
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_invalid_band_is_rejected(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -580,6 +655,7 @@ async def test_invalid_band_is_rejected(registry: RegistryHandle) -> None:
 # ── 4. aliases ────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_alias_resolves_and_is_unique(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -596,6 +672,7 @@ async def test_alias_resolves_and_is_unique(registry: RegistryHandle) -> None:
     assert [m.model_id for m in listed] == [MODEL.model_id]
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_alias_lookalikes_and_self_pointers_are_rejected(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -615,6 +692,7 @@ async def test_alias_lookalikes_and_self_pointers_are_rejected(registry: Registr
             await registry.repo.set_alias(tx, MODEL.provider, "alias-two", "alias-one")
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_unknown_alias_resolves_to_none(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -624,6 +702,7 @@ async def test_unknown_alias_resolves_to_none(registry: RegistryHandle) -> None:
 # ── 5. curated layer is immune to refresh ────────────────────────────────────
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_curated_routing_is_versioned_and_refresh_safe(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -705,6 +784,7 @@ async def _seed_digest_fixture(repo: ModelRegistryRepository, tx: Any, order: li
     return await repo.snapshot_digest(tx)
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_snapshot_digest_is_deterministic(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -735,6 +815,7 @@ async def test_snapshot_digest_ignores_insertion_order(tmp_path: Any) -> None:
     assert digests[0] == digests[1], "identical logical contents must hash identically regardless of insert order"
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_snapshot_digest_tracks_content_changes(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -754,6 +835,7 @@ async def test_snapshot_digest_tracks_content_changes(registry: RegistryHandle) 
     assert before != after
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_null_and_zero_produce_different_digests(registry: RegistryHandle) -> None:
     """A digest that conflated unpriced with free would be worthless."""
@@ -775,6 +857,7 @@ async def test_null_and_zero_produce_different_digests(registry: RegistryHandle)
 # ── sync log + health ────────────────────────────────────────────────────────
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_sync_log_append_and_health(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -812,6 +895,7 @@ async def test_sync_log_append_and_health(registry: RegistryHandle) -> None:
     assert health.last_sync_at is not None
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_alias_rows_are_not_counted_as_models(registry: RegistryHandle) -> None:
     """An alias is a pointer, not a model: it must not inflate counts or the digest.
@@ -840,6 +924,7 @@ async def test_alias_rows_are_not_counted_as_models(registry: RegistryHandle) ->
     assert alias_row.price_in is None and alias_row.price_out is None
 
 
+@pytest.mark.asyncio
 @_conforming()
 async def test_health_write_round_trips(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
@@ -850,3 +935,147 @@ async def test_health_write_round_trips(registry: RegistryHandle) -> None:
         reread = await registry.repo.health_read(tx)
     assert reread.model_count == snapshot.model_count
     assert reread.priced_count == snapshot.priced_count
+
+
+@pytest.mark.asyncio
+@_conforming()
+async def test_export_snapshot_is_sorted_and_stable(registry: RegistryHandle) -> None:
+    """``export_snapshot`` is the export operation: sorted, stable, complete.
+
+    The document itself — not just its hash — is part of the contract, so a
+    consumer can compare or ship an export without reaching into a backend.
+    """
+    async with registry.transaction() as tx:
+        await _seed_digest_fixture(registry.repo, tx, [0, 1, 2])
+        first = await registry.repo.export_snapshot(tx)
+        second = await registry.repo.export_snapshot(tx)
+
+    assert first == second, "the same registry must export identically on repeat reads"
+    assert list(first) == ["models", "prices", "benchmarks", "curated_version"]
+
+    model_keys = [(m["provider"], m["model_id"]) for m in first["models"]]
+    assert model_keys == sorted(model_keys), "models must be sorted by (provider, model_id)"
+    price_keys = [(p["provider"], p["model_id"], p["pricing_model"], p["band"]) for p in first["prices"]]
+    assert price_keys == sorted(price_keys), "prices must be sorted by their logical key"
+    benchmark_keys = [(b["provider"], b["model_id"], b["benchmark"]) for b in first["benchmarks"]]
+    assert benchmark_keys == sorted(benchmark_keys), "benchmarks must be sorted by their logical key"
+
+
+@pytest.mark.asyncio
+@_conforming()
+async def test_export_snapshot_is_the_digest_input(registry: RegistryHandle) -> None:
+    """``snapshot_digest`` is exactly the canonical hash of ``export_snapshot``.
+
+    Pinning the relationship keeps the two operations from drifting: a backend
+    that hashed a payload the export never showed would disagree here.
+    """
+    async with registry.transaction() as tx:
+        await _seed_digest_fixture(registry.repo, tx, [0, 1, 2])
+        snapshot = await registry.repo.export_snapshot(tx)
+        digest = await registry.repo.snapshot_digest(tx)
+
+    expected = hashlib.sha256(
+        json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    assert digest == expected
+    assert digest == model_registry_snapshot_digest(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_export_snapshot_ignores_insertion_order(tmp_path: Any) -> None:
+    """Identical logical contents export identically in any insertion order."""
+    from mnemos.persistence.sqlite import SqliteBackend
+
+    settings = SimpleNamespace(database=SimpleNamespace(embedding_dim=8))
+    snapshots = []
+    for name, order in (("forward.db", [0, 1, 2]), ("reverse.db", [2, 1, 0])):
+        backend = SqliteBackend(tmp_path / name, settings)
+        await backend.open()
+        try:
+            async with backend.transactional() as tx:
+                await _seed_digest_fixture(backend.model_registry, tx, order)
+                snapshots.append(await backend.model_registry.export_snapshot(tx))
+        finally:
+            await backend.close()
+
+    assert snapshots[0] == snapshots[1]
+
+
+@pytest.mark.asyncio
+@_conforming()
+async def test_export_snapshot_keeps_null_distinct_from_zero(registry: RegistryHandle) -> None:
+    """An unpriced row and a free row must not export to the same document."""
+    async with registry.transaction() as tx:
+        await registry.repo.upsert_model(tx, ModelRecord(provider="p", model_id="m"))
+        await registry.repo.upsert_price(
+            tx,
+            PriceBand(provider="p", model_id="m", pricing_model="payg", band="standard", price_in=None, price_out=None),
+        )
+        unpriced = await registry.repo.export_snapshot(tx)
+        await registry.repo.upsert_price(
+            tx,
+            PriceBand(provider="p", model_id="m", pricing_model="payg", band="standard", price_in=0.0, price_out=0.0),
+        )
+        free = await registry.repo.export_snapshot(tx)
+
+    unpriced_model = unpriced["models"][0]
+    free_model = free["models"][0]
+    # Prices export in canonical numeric string form: ``None`` for unknown, and
+    # ``"0"`` for demonstrably free. The two must never converge on one value.
+    assert unpriced_model["price_in"] is None
+    assert free_model["price_in"] == "0"
+    assert unpriced_model != free_model
+
+
+# ── 7b. the operation set IS the ABC ─────────────────────────────────────────
+
+
+def test_operation_set_matches_the_abc() -> None:
+    """``MODEL_REGISTRY_OPERATIONS`` must name exactly the ABC's abstract methods.
+
+    Regression: the constant advertised ``snapshot_digest`` while the map called
+    for ``export_snapshot`` and no such method existed, so a backend could
+    conform to the constant and still not export anything. The constant, the
+    ABC and every implementation's operation set are now checked as one set.
+    """
+    abc_operations = set(ModelRegistryRepository.__abstractmethods__)
+    assert set(MODEL_REGISTRY_OPERATIONS) == abc_operations
+    assert len(MODEL_REGISTRY_OPERATIONS) == len(set(MODEL_REGISTRY_OPERATIONS)), "operations must be unique"
+    assert "export_snapshot" in MODEL_REGISTRY_OPERATIONS
+    assert "set_alias" in MODEL_REGISTRY_OPERATIONS
+
+    from mnemos.persistence.model_registry_unsupported import UnsupportedModelRegistryRepository
+    from mnemos.persistence.sqlite import SqliteModelRegistryRepository
+
+    for cls in (UnsupportedModelRegistryRepository, SqliteModelRegistryRepository):
+        for operation in MODEL_REGISTRY_OPERATIONS:
+            assert callable(getattr(cls, operation, None)), f"{cls.__name__} is missing {operation}()"
+
+
+def test_export_snapshot_helper_encodes_canonically() -> None:
+    """The shared digest helper is key-order and whitespace insensitive."""
+    a = {"models": [{"provider": "p", "model_id": "m"}], "prices": [], "benchmarks": [], "curated_version": 0}
+    b = {"curated_version": 0, "benchmarks": [], "prices": [], "models": [{"model_id": "m", "provider": "p"}]}
+    assert model_registry_snapshot_digest(a) == model_registry_snapshot_digest(b)
+    # ``None`` and ``0.0`` are different facts and must hash differently.
+    assert model_registry_snapshot_digest({"x": None}) != model_registry_snapshot_digest({"x": 0.0})
+
+
+def test_priced_predicate_covers_all_three_price_columns() -> None:
+    """Both conforming backends use the same three-column ``priced`` predicate.
+
+    The cached-only case above runs on SQLite (and on Postgres only with a
+    live DSN). This pins the SQL itself, so a backend that drops
+    ``price_cached`` from its predicate fails here even when the live arm is
+    skipped — the regression that started this fix was exactly a two-column
+    predicate on both backends.
+    """
+    from mnemos.persistence import postgres, sqlite
+
+    expected = "(price_in IS NOT NULL OR price_out IS NOT NULL OR price_cached IS NOT NULL)"
+    assert sqlite._PRICED_SQL == expected
+    assert postgres._PRICED_SQL == expected
+    for module in (sqlite, postgres):
+        source = inspect.getsource(module)
+        # No call site may hand-roll a two-column predicate again.
+        assert "(price_in IS NOT NULL OR price_out IS NOT NULL)" not in source

@@ -21,6 +21,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
+import hashlib
+import json
 from typing import Any, AsyncContextManager, Literal, Protocol, TypeAlias, Union, runtime_checkable
 
 from fastapi import HTTPException
@@ -79,6 +81,13 @@ class ModelRegistryNotSupported(NotImplementedError):
 # Operations every ``ModelRegistryRepository`` implementation must provide.
 # Kept as a module constant so non-conforming backends and the contract suite
 # name the same list (the suite skips on exactly these names).
+#
+# This tuple is the operation *set* of the contract, so it must match the
+# abstract methods of ``ModelRegistryRepository`` exactly — the contract suite
+# asserts that equality (``test_operation_set_matches_the_abc``), which is what
+# keeps the constant from drifting away from the ABC again. ``export_snapshot``
+# is the export operation by name; ``snapshot_digest`` is the digest-only
+# convenience built on top of it.
 MODEL_REGISTRY_OPERATIONS: tuple[str, ...] = (
     "upsert_model",
     "list_models",
@@ -92,6 +101,7 @@ MODEL_REGISTRY_OPERATIONS: tuple[str, ...] = (
     "curated_routing_get",
     "curated_routing_replace",
     "sync_log_append",
+    "export_snapshot",
     "snapshot_digest",
     "health_read",
     "health_write",
@@ -1490,6 +1500,19 @@ class NatsDispatchLogRepository(ABC):
         ...
 
 
+def model_registry_snapshot_digest(snapshot: Mapping[str, Any]) -> str:
+    """SHA-256 over an :meth:`ModelRegistryRepository.export_snapshot` document.
+
+    Defined once, here, so every backend hashes the export with the same
+    canonical encoding (sorted keys, no insignificant whitespace) and the
+    digest cannot drift between backends. ``snapshot_digest`` implementations
+    call this with their ``export_snapshot`` result rather than building a
+    second, independently-encoded payload.
+    """
+    canonical = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 class ModelRegistryRepository(ABC):
     """Backend-neutral model registry contract (provider/pricing DB, phase 1.5).
 
@@ -1522,9 +1545,11 @@ class ModelRegistryRepository(ABC):
     * **Curated routing is versioned and read-only to refresh.**
       ``curated_routing_replace`` bumps the version monotonically; the catalog
       refresh path only ever calls ``curated_routing_get``.
-    * **Snapshots are deterministic.** ``snapshot_digest`` over identical
-      inputs returns an identical digest regardless of insertion order or
-      backend.
+    * **Snapshots are deterministic.** ``export_snapshot`` returns the
+      canonical export document (sorted, stable encoding) and
+      ``snapshot_digest`` is the hex digest of exactly that document, so two
+      registries with the same logical contents hash identically regardless of
+      insertion order or backend.
     * **All writes take the caller's ``tx``** so a registry write commits or
       rolls back with the calling operation.
 
@@ -1661,13 +1686,56 @@ class ModelRegistryRepository(ABC):
         ...
 
     @abstractmethod
+    async def export_snapshot(self, tx: Transaction) -> dict[str, Any]:
+        """Return the canonical, backend-neutral export document for the registry.
+
+        This is the export operation: the returned mapping is the registry's
+        logical contents in one deterministic document, and
+        :meth:`snapshot_digest` is defined as the SHA-256 of exactly this
+        document's canonical encoding (``json.dumps(snapshot, sort_keys=True,
+        separators=(",", ":"))``). Implementations therefore build the digest
+        from this method rather than hashing independently — an export and its
+        digest can never disagree.
+
+        Shape (every key always present, so a consumer never has to guess):
+
+        ``{"models": [...], "prices": [...], "benchmarks": [...],
+        "curated_version": int}``
+
+        Determinism is part of the contract, not an implementation detail:
+
+        * ``models`` is sorted by ``(provider, model_id)`` and contains a dict
+          per model row with ``provider``, ``model_id``, ``display_name``,
+          ``family``, ``context_window``, ``max_output_tokens``,
+          ``capabilities`` (sorted list), ``price_in``, ``price_out``,
+          ``price_cached``, ``pricing_model``, ``band``, ``available``,
+          ``deprecated`` and ``alias_of``;
+        * ``prices`` is sorted by
+          ``(provider, model_id, pricing_model, band)`` and carries the same
+          price scalars per row;
+        * ``benchmarks`` is sorted by ``(provider, model_id, benchmark)`` with
+          its ``score``;
+        * ``curated_version`` is the newest curated version, ``0`` when the
+          curated layer was never written;
+        * price and score scalars are rendered in their canonical numeric
+          string form (``0.0`` -> ``"0"``, ``1.5`` -> ``"1.5"``,
+          ``0.000001`` -> ``"1e-06"``) so an identical value encodes identically
+          on every backend; ``None`` stays ``None``. The distinction survives:
+          an unpriced model exports ``null`` and a free one exports ``"0"``, so
+          the two never converge;
+        * alias rows (``alias_of`` set) are pointers, not models: they are
+          excluded from ``models`` exactly as :meth:`list_models` excludes
+          them, so registering an alias never changes an export.
+        """
+        ...
+
+    @abstractmethod
     async def snapshot_digest(self, tx: Transaction) -> str:
         """Return a stable hex digest over the registry's logical contents.
 
-        The digest is computed over canonically ordered, canonically encoded
-        rows (models, price bands, benchmarks, curated version) so the same
-        logical registry produces the same digest on every backend regardless
-        of insertion order or physical column layout.
+        Equal to the SHA-256 of :meth:`export_snapshot`'s canonical encoding
+        (see that method), so the digest is identical on every backend and in
+        every insertion order for the same logical registry.
         """
         ...
 
@@ -1755,6 +1823,9 @@ class UnsupportedModelRegistryRepository(ModelRegistryRepository):
 
     async def sync_log_append(self, tx: Transaction, entry: SyncLogEntry) -> None:
         raise self._unsupported("sync_log_append")
+
+    async def export_snapshot(self, tx: Transaction) -> dict[str, Any]:
+        raise self._unsupported("export_snapshot")
 
     async def snapshot_digest(self, tx: Transaction) -> str:
         raise self._unsupported("snapshot_digest")

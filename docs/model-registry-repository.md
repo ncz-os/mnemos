@@ -45,8 +45,8 @@ Implemented — `upsert_model`, `list_models`, `get_model`, `set_alias`,
 
 Listed in `PostgresModelRegistryRepository.MISSING_OPERATIONS` (raises
 `ModelRegistryNotSupported`) — `upsert_price`, `upsert_benchmark`,
-`curated_routing_get`, `curated_routing_replace`, `snapshot_digest`,
-`health_write`.
+`curated_routing_get`, `curated_routing_replace`, `export_snapshot`,
+`snapshot_digest`, `health_write`.
 
 The band-aware pricing upsert that predates the ABC (`upsert_model_pricing`,
 `write_price_history`) is unchanged and keeps working; it is not the ABC's
@@ -71,7 +71,8 @@ commits or rolls back with the operation that triggered it.
 | `curated_routing_get(tx) -> CuratedRouting \| None` | Newest curated snapshot (read-only). |
 | `curated_routing_replace(tx, *, rules, note=None) -> CuratedRouting` | Append a new version. The only write path to the curated layer. |
 | `sync_log_append(tx, entry)` | Append one provider-sync audit row. |
-| `snapshot_digest(tx) -> str` | Stable hex digest over the registry's logical contents. |
+| `export_snapshot(tx) -> dict` | Canonical export document: sorted models / prices / benchmarks plus the curated version. |
+| `snapshot_digest(tx) -> str` | SHA-256 of `export_snapshot`'s canonical encoding. |
 | `health_read(tx) -> ModelRegistryHealth` | Registry counters. |
 | `health_write(tx, health)` | Record a health snapshot. |
 
@@ -100,7 +101,11 @@ free".** These are different facts and the contract never conflates them.
   `tests/persistence/test_model_registry_contract.py::test_non_payg_price_never_displaces_another_pricing_models_price`
   is the regression guard.
 * `ModelFilter(priced=True)` selects rows where **any** price column is
-  `NOT NULL`; `priced=False` selects rows where all are `NULL`.
+  `NOT NULL` — `price_in`, `price_out` **or** `price_cached`; `priced=False` is
+  the exact complement. A cache-only row (only `price_cached` known) is
+  **priced**: it carries a real, observed number, and reading it as unpriced
+  was a defect on both SQLite and Postgres. `health_read` uses the same
+  three-column predicate, so the counters and the filter always agree.
 * `health_read` reports `priced_count` and `unpriced_count` with
   `priced + unpriced == model_count`, and counts a `0.0` model as **priced**.
 * **Alias rows are never counted as models.** An alias (`alias_of IS NOT NULL`)
@@ -108,8 +113,8 @@ free".** These are different facts and the contract never conflates them.
   `unpriced_count`, `list_models` and `snapshot_digest` all exclude it. Adding
   an alias must not change the export hash — otherwise a pure rename would
   look like a data change to every downstream consumer.
-* `snapshot_digest` distinguishes `NULL` from `0.0`, so a price change from
-  unknown to free (or back) changes the digest.
+* `export_snapshot` and `snapshot_digest` distinguish `NULL` from `0.0`, so a
+  price change from unknown to free (or back) changes the export and the digest.
 
 Legacy note: the pre-existing SQLite columns `input_cost_per_mtok` /
 `output_cost_per_mtok` are `NOT NULL DEFAULT 0` and are **not** part of the
@@ -157,12 +162,55 @@ running a price refresh leaves the curated version and rules untouched.
 
 ## Deterministic export
 
-`snapshot_digest` hashes canonically ordered, canonically encoded rows
-(models, price rows, benchmarks, curated version). The same logical registry
-yields the same digest on every backend, in any insertion order, so an export
-can be compared across backends and across runs.
+`export_snapshot` returns the registry's logical contents as one backend-neutral
+document:
+
+```python
+{
+    "models": [...],           # sorted by (provider, model_id)
+    "prices": [...],           # sorted by (provider, model_id, pricing_model, band)
+    "benchmarks": [...],       # sorted by (provider, model_id, benchmark)
+    "curated_version": 0,
+}
+```
+
+`sorted()` of the row keys is part of the contract, not an accident of the
+query: the same logical registry yields the same document on every backend, in
+any insertion order, so an export can be compared across backends and across
+runs. Prices and scores are rendered in canonical numeric string form
+(`0.0` → `"0"`, `1.5` → `"1.5"`); `None` stays `None`, so unpriced (`null`)
+and free (`"0"`) never converge. Alias rows are excluded — registering an
+alias never changes an export.
+
+`snapshot_digest` is **defined as** the SHA-256 of that document's canonical
+encoding (`json.dumps(snapshot, sort_keys=True, separators=(",", ":"))`), via
+the shared `model_registry_snapshot_digest` helper in `persistence/base.py`.
+Implementations derive the digest from `export_snapshot` rather than building
+a second payload, so an export and its digest cannot disagree, and the
+contract suite asserts the relationship (`test_export_snapshot_is_the_digest_input`).
+
+The operation set is checked, not assumed: `MODEL_REGISTRY_OPERATIONS` must
+equal `ModelRegistryRepository.__abstractmethods__`, and every backend class
+must expose each name (`test_operation_set_matches_the_abc`). The constant once
+advertised a `snapshot_digest`-only surface while the export operation the map
+requires (`export_snapshot`) did not exist; the parity test is what keeps the
+constant and the ABC from drifting apart again.
 
 ## Running the contract suite
+
+The suite needs `pytest-asyncio` — `tests/conftest.py` imports `pytest_asyncio`
+at module scope, so without it collection aborts with
+`ModuleNotFoundError: No module named 'pytest_asyncio'`. It is declared in the
+`dev` extra and in `requirements.txt`; install a dev environment, not a bare
+runtime one:
+
+```bash
+pip install -e '.[dev]'        # brings pytest + pytest-asyncio
+```
+
+`asyncio_mode = "strict"` is set in `pyproject.toml`: async tests carry an
+explicit `@pytest.mark.asyncio`, so a test that forgets one fails instead of
+silently not awaiting.
 
 ```bash
 python3 -m pytest -q tests/persistence/test_model_registry_contract.py
@@ -183,8 +231,8 @@ string fails if those backends ever start silently passing.
    and versioned `curated_routing` DDL, and translate the existing Oracle
    `ROWNUM`/`:named` write path onto the ABC. Phase 1.5 deliberately makes no
    Oracle DDL change and no behaviour change to the existing path.
-2. **Postgres** — add the four missing tables and implement the six operations
-   listed in `MISSING_OPERATIONS`.
+2. **Postgres** — add the four missing tables and implement the seven
+   operations listed in `MISSING_OPERATIONS`.
 3. **MySQL / MariaDB / DB2** — implement once the Oracle port establishes the
    physical shape; MariaDB rides the MySQL implementation.
 4. Delete each `*ModelRegistryRepository` class in

@@ -4052,6 +4052,13 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
         )
 
 
+#: "This model row carries a known price." Any non-NULL price column counts --
+#: ``price_cached`` included, because a cache-only price is still a price.
+#: Kept byte-identical to the SQLite predicate so ``priced`` means the same
+#: thing on both conforming backends.
+_PRICED_SQL = "(price_in IS NOT NULL OR price_out IS NOT NULL OR price_cached IS NOT NULL)"
+
+
 class PostgresModelRegistryRepository(ModelRegistryRepository):
     """Postgres end of the model-registry contract (phase 1.5, partial).
 
@@ -4079,6 +4086,7 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
         "upsert_benchmark",
         "curated_routing_get",
         "curated_routing_replace",
+        "export_snapshot",
         "snapshot_digest",
         "health_write",
     )
@@ -4167,7 +4175,7 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
             params.append(filters.deprecated)
             clauses.append(f"deprecated = ${len(params)}")
         if filters.priced is not None:
-            priced_sql = "(price_in IS NOT NULL OR price_out IS NOT NULL)"
+            priced_sql = _PRICED_SQL
             clauses.append(priced_sql if filters.priced else f"NOT {priced_sql}")
         if filters.capability is not None:
             params.append(filters.capability)
@@ -4352,9 +4360,9 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
     async def health_read(self, tx: Transaction) -> ModelRegistryHealth:
         conn = _postgres_tx(tx).conn
         row = await conn.fetchrow(
-            """
+            f"""
             SELECT COUNT(*) AS total,
-                   COUNT(*) FILTER (WHERE price_in IS NOT NULL OR price_out IS NOT NULL) AS priced
+                   COUNT(*) FILTER (WHERE {_PRICED_SQL}) AS priced
             FROM model_registry WHERE alias_of IS NULL
             """
         )
@@ -4384,6 +4392,9 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
 
     async def curated_routing_replace(self, tx: Transaction, **kwargs: Any) -> Any:
         raise self._unsupported("curated_routing_replace")
+
+    async def export_snapshot(self, tx: Transaction) -> dict[str, Any]:
+        raise self._unsupported("export_snapshot")
 
     async def snapshot_digest(self, tx: Transaction) -> str:
         raise self._unsupported("snapshot_digest")
