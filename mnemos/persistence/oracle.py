@@ -56,6 +56,7 @@ from mnemos.persistence.base import (
     CompressionQueueRepository,
     CompressionRepository,
     ConsultationAuditRepository,
+    ModelRegistryRepository,
     ConsultationsRepository,
     FederationRepository,
     FULL_STORAGE_CAPABILITY_DETAILS,
@@ -83,6 +84,7 @@ from mnemos.persistence.base import (
     WebhookRepository,
     WebhookSubscriptionRecord,
 )
+from mnemos.persistence.model_registry_unsupported import OracleModelRegistryRepository
 from mnemos.persistence.types import Row, assemble_consultation_full
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core.secret_detection import VAULT_NAMESPACE
@@ -8075,6 +8077,7 @@ class OracleBackend(OracleAuditJournalMixin):
         self._nats_dispatch_log_repo = OracleNatsDispatchLogRepository()
         self._webhooks_repo = OracleWebhookRepository()
         self._consultations_audit_repo = OracleConsultationAuditRepository()
+        self._model_registry_repo = OracleModelRegistryRepository()
         self._oauth_repo = OracleOAuthRepository()
         self._sessions_repo = OracleSessionsRepository()
         self._consultations_repo = OracleConsultationsRepository()
@@ -8875,6 +8878,11 @@ class OracleBackend(OracleAuditJournalMixin):
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
         return self._consultations_audit_repo
+
+    @property
+    def model_registry(self) -> ModelRegistryRepository:
+        # Phase 2: raises ModelRegistryNotSupported("oracle") on every call.
+        return self._model_registry_repo
 
     @property
     def oauth(self) -> OAuthRepository:

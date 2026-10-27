@@ -71,6 +71,7 @@ from mnemos.persistence.oracle import (
     _validate_and_format_vector,
 )
 from mnemos.persistence.base import IsolationLevel, Transaction
+from mnemos.persistence.model_registry_unsupported import Db2ModelRegistryRepository
 from mnemos.persistence.schema import ensure_db2_schema
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter
@@ -5252,6 +5253,7 @@ class Db2Backend(OracleBackend):
         self._compression_repo = Db2CompressionRepository()
         self._webhooks_repo = Db2WebhookRepository()
         self._consultations_audit_repo = Db2ConsultationAuditRepository()
+        self._model_registry_repo = Db2ModelRegistryRepository()
         self._federation_repo = Db2FederationRepository()
         self._morpheus_repo = Db2MorpheusRepository()
         self._state_kv_repo = Db2StateRepository()

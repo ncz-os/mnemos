@@ -12,6 +12,7 @@ from mnemos.core import audit_chain
 import inspect
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
@@ -47,10 +48,16 @@ from mnemos.persistence.base import (
     ConsultationAuditRepository,
     ConsultationsRepository,
     FederationRepository,
+    FieldObservation,
     IsolationLevel,
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
+    ModelFilter,
+    ModelRecord,
+    ModelRegistryHealth,
+    ModelRegistryNotSupported,
+    ModelRegistryRepository,
     MorpheusConsolidationResult,
     MorpheusExtractBatch,
     MorpheusExtractCandidate,
@@ -62,6 +69,7 @@ from mnemos.persistence.base import (
     OAuthRepository,
     SessionsRepository,
     StateRepository,
+    SyncLogEntry,
     Transaction,
     UsageLedgerRecord,
     UsageLedgerResult,
@@ -4044,6 +4052,346 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
         )
 
 
+class PostgresModelRegistryRepository(ModelRegistryRepository):
+    """Postgres end of the model-registry contract (phase 1.5, partial).
+
+    Scope discipline: phase 1.5 adds no DDL to Postgres and no live migration.
+    Model rows, alias resolution, the sync log, per-field observations and
+    health counters are served from columns that already exist, so those are
+    implemented. Everything that needs the new physical shape
+    (``model_prices``, ``model_benchmarks``, ``curated_routing``) is listed by
+    name in :attr:`MISSING_OPERATIONS` and raises
+    :class:`ModelRegistryNotSupported` — it is never silently stubbed with an
+    empty result. Phase 2 lands the DDL and closes the gap.
+
+    The plain pricing upsert that predates the ABC stays where it is and keeps
+    working (``upsert_model_pricing`` / ``write_price_history``); it is not the
+    ABC's ``upsert_price``, which is band-aware.
+    """
+
+    backend_name = "postgres"
+
+    #: Operations this class does not implement yet. Naming them (rather than
+    #: raising bare ``NotImplementedError``) is what lets the contract suite
+    #: report "unsupported backend: postgres — phase 2" instead of passing.
+    MISSING_OPERATIONS: tuple[str, ...] = (
+        "upsert_price",
+        "upsert_benchmark",
+        "curated_routing_get",
+        "curated_routing_replace",
+        "snapshot_digest",
+        "health_write",
+    )
+
+    @classmethod
+    def _unsupported(cls, operation: str) -> ModelRegistryNotSupported:
+        return ModelRegistryNotSupported(cls.backend_name, operation)
+
+    @staticmethod
+    def _row_to_model(row: Any) -> ModelRecord:
+        capabilities = row["capabilities"] or ()
+        return ModelRecord(
+            provider=row["provider"],
+            model_id=row["model_id"],
+            display_name=row["display_name"],
+            family=row["family"],
+            context_window=row["context_window"],
+            max_output_tokens=row["max_output_tokens"],
+            capabilities=tuple(capabilities),
+            # NULL stays NULL: Postgres has no "0 means unknown" convention in
+            # the price_* columns.
+            price_in=None if row["price_in"] is None else float(row["price_in"]),
+            price_out=None if row["price_out"] is None else float(row["price_out"]),
+            price_cached=None if row["price_cached"] is None else float(row["price_cached"]),
+            pricing_model=row["pricing_model"] or "unknown",
+            band=row["band"] or "standard",
+            available=bool(row["available"]),
+            deprecated=bool(row["deprecated"]),
+            alias_of=row["alias_of"],
+            price_updated_at=(row["price_updated_at"].isoformat() if row["price_updated_at"] else None),
+        )
+
+    _SELECT_COLUMNS = (
+        "provider, model_id, display_name, family, context_window, max_output_tokens, "
+        "capabilities, price_in, price_out, price_cached, price_updated_at, "
+        "COALESCE(pricing_model, 'unknown') AS pricing_model, "
+        "COALESCE(band, 'standard') AS band, available, deprecated, alias_of"
+    )
+
+    async def upsert_model(self, tx: Transaction, model: ModelRecord) -> bool:
+        conn = _postgres_tx(tx).conn
+        result = await conn.execute(
+            """
+            INSERT INTO model_registry
+                (provider, model_id, display_name, family, context_window,
+                 max_output_tokens, capabilities, available, deprecated)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (provider, model_id) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                family = EXCLUDED.family,
+                context_window = COALESCE(EXCLUDED.context_window, model_registry.context_window),
+                max_output_tokens = COALESCE(EXCLUDED.max_output_tokens, model_registry.max_output_tokens),
+                capabilities = EXCLUDED.capabilities,
+                available = EXCLUDED.available,
+                deprecated = EXCLUDED.deprecated,
+                last_seen = NOW(),
+                last_synced = NOW()
+            """,
+            model.provider,
+            model.model_id,
+            model.display_name,
+            model.family,
+            model.context_window,
+            model.max_output_tokens,
+            list(model.capabilities),
+            model.available,
+            model.deprecated,
+        )
+        return _pg_result_count(result) > 0
+
+    async def list_models(self, tx: Transaction, filters: ModelFilter | None = None) -> list[ModelRecord]:
+        conn = _postgres_tx(tx).conn
+        clauses = ["alias_of IS NULL"]
+        params: list[Any] = []
+        filters = filters or ModelFilter()
+        if filters.provider is not None:
+            params.append(filters.provider)
+            clauses.append(f"provider = ${len(params)}")
+        if filters.family is not None:
+            params.append(filters.family)
+            clauses.append(f"family = ${len(params)}")
+        if filters.available is not None:
+            params.append(filters.available)
+            clauses.append(f"available = ${len(params)}")
+        if filters.deprecated is not None:
+            params.append(filters.deprecated)
+            clauses.append(f"deprecated = ${len(params)}")
+        if filters.priced is not None:
+            priced_sql = "(price_in IS NOT NULL OR price_out IS NOT NULL)"
+            clauses.append(priced_sql if filters.priced else f"NOT {priced_sql}")
+        if filters.capability is not None:
+            params.append(filters.capability)
+            clauses.append(f"${len(params)} = ANY(capabilities)")
+        rows = await conn.fetch(
+            f"SELECT {self._SELECT_COLUMNS} FROM model_registry "
+            f"WHERE {' AND '.join(clauses)} ORDER BY provider ASC, model_id ASC",
+            *params,
+        )
+        return [self._row_to_model(row) for row in rows]
+
+    async def get_model(self, tx: Transaction, provider: str, model_id: str) -> ModelRecord | None:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            f"SELECT {self._SELECT_COLUMNS} FROM model_registry WHERE provider = $1 AND model_id = $2",
+            provider,
+            model_id,
+        )
+        return None if row is None else self._row_to_model(row)
+
+    async def set_alias(self, tx: Transaction, provider: str, alias: str, target_model_id: str) -> None:
+        """Register ``alias`` -> ``target_model_id``.
+
+        Same validation as SQLite: self-pointing, alias-to-alias chains and
+        case/separator lookalikes are refused. Postgres has no ``alias_of``
+        unique index yet, so the collision check runs inside the caller's
+        transaction (``SELECT ... FOR UPDATE`` on the provider's rows).
+        """
+        if alias == target_model_id:
+            raise ValueError(f"alias {alias!r} may not point at itself")
+        conn = _postgres_tx(tx).conn
+        target = await conn.fetchrow(
+            "SELECT model_id, alias_of FROM model_registry WHERE provider = $1 AND model_id = $2",
+            provider,
+            target_model_id,
+        )
+        if target is None:
+            raise ValueError(
+                f"alias {alias!r}: target model {target_model_id!r} does not exist in provider {provider!r}"
+            )
+        if target["alias_of"]:
+            raise ValueError(
+                f"alias {alias!r}: target {target_model_id!r} is itself an alias "
+                f"(-> {target['alias_of']!r}); aliases resolve one hop only"
+            )
+        wanted = re.sub(r"[^a-z0-9]", "", alias.lower())
+        siblings = await conn.fetch(
+            "SELECT model_id, alias_of FROM model_registry WHERE provider = $1 FOR UPDATE",
+            provider,
+        )
+        for row in siblings:
+            if row["model_id"] == alias:
+                if row["alias_of"] is None:
+                    raise ValueError(f"alias {alias!r} collides with an existing model id")
+                continue
+            for candidate in (row["model_id"], row["alias_of"]):
+                if not candidate or candidate == alias:
+                    continue
+                if re.sub(r"[^a-z0-9]", "", str(candidate).lower()) == wanted:
+                    raise ValueError(
+                        f"alias {alias!r} is a lookalike of existing id {candidate!r} "
+                        f"(same after case/separator normalisation)"
+                    )
+        await conn.execute(
+            """
+            INSERT INTO model_registry
+                (provider, model_id, display_name, capabilities, alias_of)
+            VALUES ($1, $2, $3, ARRAY[]::TEXT[], $4)
+            ON CONFLICT (provider, model_id) DO UPDATE SET alias_of = EXCLUDED.alias_of
+            """,
+            provider,
+            alias,
+            alias,
+            target_model_id,
+        )
+
+    async def resolve_alias(self, tx: Transaction, provider: str, alias: str) -> ModelRecord | None:
+        conn = _postgres_tx(tx).conn
+        row = await conn.fetchrow(
+            f"SELECT {self._SELECT_COLUMNS} FROM model_registry WHERE provider = $1 AND model_id = $2",
+            provider,
+            alias,
+        )
+        if row is None:
+            return None
+        target_id = row["alias_of"]
+        if target_id is None:
+            return self._row_to_model(row)
+        target = await conn.fetchrow(
+            f"SELECT {self._SELECT_COLUMNS} FROM model_registry WHERE provider = $1 AND model_id = $2",
+            provider,
+            target_id,
+        )
+        return None if target is None else self._row_to_model(target)
+
+    async def record_field_obs(self, tx: Transaction, obs: FieldObservation) -> None:
+        conn = _postgres_tx(tx).conn
+        await conn.execute(
+            """
+            INSERT INTO model_registry_field_obs (provider, model_id, field, value, source, fetched_at)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (provider, model_id, field) DO UPDATE SET
+                value = EXCLUDED.value, source = EXCLUDED.source, fetched_at = EXCLUDED.fetched_at
+            """,
+            obs.provider,
+            obs.model_id,
+            obs.field,
+            obs.value,
+            obs.source,
+            obs.fetched_at,
+        )
+
+    async def merge_fields(
+        self,
+        tx: Transaction,
+        provider: str,
+        model_id: str,
+        *,
+        authoritative_source: str | None = None,
+    ) -> ModelRecord | None:
+        """Project per-field observations onto the model row.
+
+        Only the fields Postgres already stores as columns can be projected;
+        everything else stays as an observation until phase 2 adds the rest.
+        """
+        conn = _postgres_tx(tx).conn
+        exists = await conn.fetchrow(
+            "SELECT 1 FROM model_registry WHERE provider = $1 AND model_id = $2",
+            provider,
+            model_id,
+        )
+        if exists is None:
+            return None
+        sql = (
+            "SELECT field, value FROM model_registry_field_obs "
+            "WHERE provider = $1 AND model_id = $2"
+        )
+        params: list[Any] = [provider, model_id]
+        if authoritative_source is not None:
+            params.append(authoritative_source)
+            sql += f" AND source = ${len(params)}"
+        observations = await conn.fetch(sql, *params)
+        updatable = {"display_name", "family", "context_window", "max_output_tokens", "alias_of"}
+        updates = {row["field"]: row["value"] for row in observations if row["field"] in updatable}
+        if updates:
+            assignments = []
+            values: list[Any] = []
+            for index, (column, value) in enumerate(sorted(updates.items()), start=1):
+                assignments.append(f"{column} = ${index}")
+                values.append(value)
+            values.extend([provider, model_id])
+            await conn.execute(
+                f"UPDATE model_registry SET {', '.join(assignments)} "
+                f"WHERE provider = ${len(values) - 1} AND model_id = ${len(values)}",
+                *values,
+            )
+        row = await conn.fetchrow(
+            f"SELECT {self._SELECT_COLUMNS} FROM model_registry WHERE provider = $1 AND model_id = $2",
+            provider,
+            model_id,
+        )
+        return None if row is None else self._row_to_model(row)
+
+    async def sync_log_append(self, tx: Transaction, entry: SyncLogEntry) -> None:
+        conn = _postgres_tx(tx).conn
+        await conn.execute(
+            """
+            INSERT INTO model_registry_sync_log
+                (provider, synced_at, models_found, models_added, models_updated,
+                 models_deprecated, error, duration_ms)
+            VALUES ($1, COALESCE($2::timestamptz, NOW()), $3, $4, $5, $6, $7, $8)
+            """,
+            entry.provider,
+            entry.synced_at,
+            entry.models_found,
+            entry.models_added,
+            entry.models_updated,
+            entry.models_deprecated,
+            entry.error,
+            entry.duration_ms,
+        )
+
+    async def health_read(self, tx: Transaction) -> ModelRegistryHealth:
+        conn = _postgres_tx(tx).conn
+        row = await conn.fetchrow(
+            """
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE price_in IS NOT NULL OR price_out IS NOT NULL) AS priced
+            FROM model_registry WHERE alias_of IS NULL
+            """
+        )
+        last_sync = await conn.fetchval("SELECT MAX(synced_at) FROM model_registry_sync_log")
+        curated = await conn.fetchval("SELECT COALESCE(MAX(version), 0) FROM curated_routing_versions")
+        total = int(row["total"] or 0)
+        priced = int(row["priced"] or 0)
+        return ModelRegistryHealth(
+            backend=self.backend_name,
+            model_count=total,
+            priced_count=priced,
+            unpriced_count=total - priced,
+            curated_version=int(curated or 0),
+            last_sync_at=last_sync.isoformat() if last_sync else None,
+        )
+
+    # ── phase-2 operations: named, explicit, never silently empty ─────────────
+
+    async def upsert_price(self, tx: Transaction, band: Any) -> None:
+        raise self._unsupported("upsert_price")
+
+    async def upsert_benchmark(self, tx: Transaction, **kwargs: Any) -> None:
+        raise self._unsupported("upsert_benchmark")
+
+    async def curated_routing_get(self, tx: Transaction) -> Any:
+        raise self._unsupported("curated_routing_get")
+
+    async def curated_routing_replace(self, tx: Transaction, **kwargs: Any) -> Any:
+        raise self._unsupported("curated_routing_replace")
+
+    async def snapshot_digest(self, tx: Transaction) -> str:
+        raise self._unsupported("snapshot_digest")
+
+    async def health_write(self, tx: Transaction, health: ModelRegistryHealth) -> None:
+        raise self._unsupported("health_write")
+
+
 class PostgresOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
     @staticmethod
     def _mcp_sql(sql: str) -> str:
@@ -6766,6 +7114,7 @@ class PostgresBackend:
         self._webhooks = PostgresWebhookRepository()
         self._nats_dispatch_log = PostgresNatsDispatchLogRepository()
         self._consultations_audit = PostgresConsultationAuditRepository()
+        self._model_registry = PostgresModelRegistryRepository()
         self._oauth = PostgresOAuthRepository()
         self._sessions = PostgresSessionsRepository()
         self._consultations = PostgresConsultationsRepository()
@@ -7171,6 +7520,10 @@ class PostgresBackend:
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
         return self._consultations_audit
+
+    @property
+    def model_registry(self) -> ModelRegistryRepository:
+        return self._model_registry
 
     @property
     def oauth(self) -> OAuthRepository:

@@ -76,6 +76,7 @@ from mnemos.persistence.base import (
     FEDERATION_CAPABILITY,
     MYSQL_CAPABILITY_DETAILS,
     ConsultationAuditRepository,
+    ModelRegistryRepository,
     FederationRepository,
     KG_CAPABILITY,
     IsolationLevel,
@@ -103,6 +104,7 @@ from mnemos.persistence.base import (
     WebhookRepository,
     WebhookSubscriptionRecord,
 )
+from mnemos.persistence.model_registry_unsupported import MysqlModelRegistryRepository
 from mnemos.core import webhook_constants
 from mnemos.persistence.hot_search import HotSearchMixin
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
@@ -7944,6 +7946,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
         self._webhooks_repo = MysqlWebhookRepository()
         self._nats_dispatch_log_repo = MysqlNatsDispatchLogRepository()
         self._consultations_audit_repo = MysqlConsultationAuditRepository()
+        self._model_registry_repo = MysqlModelRegistryRepository()
         self._federation_repo = MysqlFederationRepository()
         self._state_kv_repo = MysqlStateRepository()
         self._oauth_repo = MysqlOAuthRepository()
@@ -8337,6 +8340,11 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
         return self._consultations_audit_repo
+
+    @property
+    def model_registry(self) -> ModelRegistryRepository:
+        # Phase 2: raises ModelRegistryNotSupported("mysql") on every call.
+        return self._model_registry_repo
 
     @property
     def federation(self) -> FederationRepository:

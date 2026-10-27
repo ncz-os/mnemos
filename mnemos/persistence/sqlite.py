@@ -52,6 +52,16 @@ from mnemos.persistence.base import (
     KGRepository,
     MemoryRepository,
     MemoryStatsRow,
+    ModelFilter,
+    ModelRecord,
+    ModelRegistryHealth,
+    ModelRegistryRepository,
+    FieldObservation,
+    CuratedRouting,
+    PriceBand,
+    SyncLogEntry,
+    PRICE_BANDS,
+    PRICING_MODELS,
     MorpheusConsolidationResult,
     MorpheusExtractBatch,
     MorpheusExtractCandidate,
@@ -159,6 +169,9 @@ SQLITE_MIGRATION_FILES = [
     "0064_federation_journal_dialects.sql",
     "migrations_v7_0_api_keys_key_prefix_sqlite.sql",
     "migrations_v7_0_default_user_seed_sqlite.sql",
+    # phase 1.5: ModelRegistryRepository tables (model_prices, field obs,
+    # benchmarks, curated_routing, health) + nullable price columns.
+    "migrations_v7_1_model_registry_repository_sqlite.sql",
 ]
 
 
@@ -198,6 +211,49 @@ def _json_text(value: Any, *, default: Any = None) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value if value is not None else default)
+
+
+# Model-registry field observations map 1:1 onto model_registry columns.
+# Anything not listed here is stored as an observation but never projected by
+# ``merge_fields`` (benchmarks keep their own table).
+_MODEL_FIELD_TYPES: dict[str, str] = {
+    "display_name": "text",
+    "family": "text",
+    "context_window": "int",
+    "max_output_tokens": "int",
+    "arena_score": "float",
+    "arena_rank": "int",
+    "graeae_weight": "float",
+    "alias_of": "text",
+}
+
+
+def _coerce_field_value(field: str, value: str | None) -> Any:
+    """Coerce a stored observation value to the column's Python type.
+
+    ``None`` (a known-unknown observation) stays ``None``; it never becomes 0.
+    """
+    if value is None:
+        return None
+    kind = _MODEL_FIELD_TYPES.get(field)
+    if kind == "int":
+        return int(float(value))
+    if kind == "float":
+        return float(value)
+    return value
+
+
+def _canonical_number(value: Any) -> str | None:
+    """Canonical string form of a numeric registry cell, for hashing.
+
+    ``None`` stays ``None`` — "unpriced" is never conflated with ``"0"``.
+    """
+    if value is None:
+        return None
+    number = float(value)
+    if number == int(number) and abs(number) < 1e15:
+        return str(int(number))
+    return repr(number)
 
 
 def _json_array_text(value: Sequence[Any] | None) -> str | None:
@@ -4742,6 +4798,601 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
         return row["provider"] if row is not None else None
 
 
+class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
+    """SQLite implementation of the model-registry contract (phase 1.5).
+
+    This is the CI reference implementation. Postgres, Oracle, DB2, MySQL and
+    MariaDB do not implement the ABC yet; their repository classes carry
+    ``backend_name`` and raise :class:`ModelRegistryNotSupported` naming
+    themselves and ``phase 2``.
+
+    Conventions pinned here (the contract suite asserts all of them):
+
+    * ``NULL`` means unpriced. Every read returns ``None`` for an absent price
+      and never coerces to ``0``; ``upsert_price`` stores ``None`` as SQL
+      ``NULL``.
+    * Observations are per FIELD (``model_field_obs``), not per row.
+    * Price rows live in ``model_prices`` keyed by
+      (provider, model_id, pricing_model, band).
+    * ``curated_routing`` is append-only and version-numbered.
+    * ``snapshot_digest`` canonicalises rows before hashing, so the digest is
+      independent of insertion order and of physical column layout.
+    """
+
+    backend_name = "sqlite"
+
+    # Canonical export order: (provider, model_id) for models and prices,
+    # (provider, model_id, benchmark) for benchmarks. See ``snapshot_digest``.
+    _MODEL_ORDER = " ORDER BY provider ASC, model_id ASC"
+    _PRICE_ORDER = " ORDER BY provider ASC, model_id ASC, pricing_model ASC, band ASC"
+    _BENCH_ORDER = " ORDER BY provider ASC, model_id ASC, benchmark ASC"
+
+    @staticmethod
+    def _validate_pricing_model(value: str) -> str:
+        if value not in PRICING_MODELS:
+            raise ValueError(f"invalid pricing_model {value!r}; expected one of {PRICING_MODELS}")
+        return value
+
+    @staticmethod
+    def _validate_band(value: str) -> str:
+        if value not in PRICE_BANDS:
+            raise ValueError(f"invalid band {value!r}; expected one of {PRICE_BANDS}")
+        return value
+
+    @staticmethod
+    def _normalise_alias_candidate(value: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", value.lower())
+
+    @staticmethod
+    def _row_to_model(row: Row) -> ModelRecord:
+        caps_raw = row.get("capabilities")
+        if isinstance(caps_raw, str):
+            try:
+                parsed = json.loads(caps_raw)
+            except (TypeError, ValueError):
+                parsed = []
+            capabilities = tuple(str(c) for c in parsed) if isinstance(parsed, list) else ()
+        elif isinstance(caps_raw, (list, tuple)):
+            capabilities = tuple(str(c) for c in caps_raw)
+        else:
+            capabilities = ()
+
+        def _price(column: str) -> float | None:
+            # NULL stays None: ``0.0`` is a distinct, meaningful value.
+            value = row.get(column)
+            return None if value is None else float(value)
+
+        return ModelRecord(
+            provider=str(row["provider"]),
+            model_id=str(row["model_id"]),
+            display_name=row.get("display_name"),
+            family=row.get("family"),
+            context_window=None if row.get("context_window") is None else int(row["context_window"]),
+            max_output_tokens=(None if row.get("max_output_tokens") is None else int(row["max_output_tokens"])),
+            capabilities=capabilities,
+            price_in=_price("price_in"),
+            price_out=_price("price_out"),
+            price_cached=_price("price_cached"),
+            pricing_model=row.get("pricing_model") or "unknown",
+            band=row.get("band") or "standard",
+            available=bool(row.get("available", 1)),
+            deprecated=bool(row.get("deprecated", 0)),
+            alias_of=row.get("alias_of"),
+            price_updated_at=row.get("price_updated_at"),
+        )
+
+    async def upsert_model(self, tx: Transaction, model: ModelRecord) -> bool:
+        conn = self._conn(tx)
+        existing = await _fetch_one(
+            conn,
+            "SELECT provider FROM model_registry WHERE provider = ? AND model_id = ?",
+            (model.provider, model.model_id),
+        )
+        caps_json = json.dumps(list(model.capabilities))
+        if existing is None:
+            await _execute(
+                conn,
+                # The legacy NOT NULL columns ``input_cost_per_mtok`` /
+                # ``output_cost_per_mtok`` are deliberately NOT in this column
+                # list. They are not part of the ABC contract and are never
+                # read by it (reads go through price_* below). Omitting them
+                # lets the table's own ``DEFAULT 0`` fill them, so the
+                # repository never asserts a price it does not have — writing
+                # an explicit 0 here would look like "this model is free".
+                # The authoritative price columns (price_in/price_out/
+                # price_cached) stay NULL until ``upsert_price`` sets them.
+                "INSERT INTO model_registry "
+                "(provider, model_id, display_name, family, capabilities, "
+                "context_window, max_output_tokens, pricing_model, band, "
+                "available, deprecated, alias_of, last_synced) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (
+                    model.provider,
+                    model.model_id,
+                    model.display_name,
+                    model.family,
+                    caps_json,
+                    model.context_window,
+                    model.max_output_tokens,
+                    self._validate_pricing_model(model.pricing_model),
+                    self._validate_band(model.band),
+                    1 if model.available else 0,
+                    1 if model.deprecated else 0,
+                    model.alias_of,
+                ),
+            )
+            return True
+        # Update: never overwrite alias_of with NULL, and never touch prices
+        # (upsert_price owns those).
+        await _execute(
+            conn,
+            "UPDATE model_registry SET display_name = ?, family = ?, capabilities = ?, "
+            "context_window = COALESCE(?, context_window), "
+            "max_output_tokens = COALESCE(?, max_output_tokens), "
+            "available = ?, deprecated = ?, "
+            "alias_of = COALESCE(?, alias_of), "
+            "last_synced = CURRENT_TIMESTAMP "
+            "WHERE provider = ? AND model_id = ?",
+            (
+                model.display_name,
+                model.family,
+                caps_json,
+                model.context_window,
+                model.max_output_tokens,
+                1 if model.available else 0,
+                1 if model.deprecated else 0,
+                model.alias_of,
+                model.provider,
+                model.model_id,
+            ),
+        )
+        return False
+
+    async def list_models(self, tx: Transaction, filters: ModelFilter | None = None) -> list[ModelRecord]:
+        conn = self._conn(tx)
+        # Alias rows are registry rows too, but they are not "models" for
+        # catalog purposes — list_models never surfaces them.
+        where: list[str] = ["alias_of IS NULL"]
+        params: list[Any] = []
+        if filters is not None:
+            if filters.provider is not None:
+                where.append("provider = ?")
+                params.append(filters.provider)
+            if filters.family is not None:
+                where.append("family = ?")
+                params.append(filters.family)
+            if filters.available is not None:
+                where.append("available = ?")
+                params.append(1 if filters.available else 0)
+            if filters.deprecated is not None:
+                where.append("deprecated = ?")
+                params.append(1 if filters.deprecated else 0)
+            if filters.priced is not None:
+                priced_sql = "(price_in IS NOT NULL OR price_out IS NOT NULL)"
+                where.append(priced_sql if filters.priced else f"NOT {priced_sql}")
+        sql = "SELECT * FROM model_registry WHERE " + " AND ".join(where)
+        sql += self._MODEL_ORDER
+        rows = await _fetch_all(conn, sql, tuple(params))
+        models = [self._row_to_model(row) for row in rows]
+        if filters is not None and filters.capability is not None:
+            models = [m for m in models if filters.capability in m.capabilities]
+        return models
+
+    async def get_model(self, tx: Transaction, provider: str, model_id: str) -> ModelRecord | None:
+        row = await _fetch_one(
+            self._conn(tx),
+            "SELECT * FROM model_registry WHERE provider = ? AND model_id = ?",
+            (provider, model_id),
+        )
+        return None if row is None else self._row_to_model(row)
+
+    async def set_alias(self, tx: Transaction, provider: str, alias: str, target_model_id: str) -> None:
+        if alias == target_model_id:
+            raise ValueError(f"alias {alias!r} may not point at itself")
+        conn = self._conn(tx)
+        target = await _fetch_one(
+            conn,
+            "SELECT provider, model_id, alias_of FROM model_registry WHERE provider = ? AND model_id = ?",
+            (provider, target_model_id),
+        )
+        if target is None:
+            raise ValueError(f"alias {alias!r}: target model {target_model_id!r} does not exist in provider {provider!r}")
+        if target.get("alias_of"):
+            raise ValueError(
+                f"alias {alias!r}: target {target_model_id!r} is itself an alias "
+                f"(-> {target['alias_of']!r}); aliases resolve one hop only"
+            )
+        # Lookalike rejection: an alias that differs from a real id (or an
+        # existing alias) only in case or separator is ambiguous, so refuse it
+        # rather than let two "same-looking" names resolve differently.
+        wanted = self._normalise_alias_candidate(alias)
+        siblings = await _fetch_all(
+            conn,
+            "SELECT model_id, alias_of FROM model_registry WHERE provider = ?",
+            (provider,),
+        )
+        for row in siblings:
+            if row["model_id"] == alias:
+                raise ValueError(f"alias {alias!r} collides with an existing model id")
+            if row.get("alias_of") == alias:
+                # Re-pointing the same alias is allowed.
+                continue
+            for candidate in (row["model_id"], row.get("alias_of")):
+                if not candidate or candidate == alias:
+                    continue
+                if self._normalise_alias_candidate(str(candidate)) == wanted:
+                    raise ValueError(
+                        f"alias {alias!r} is a lookalike of existing id {candidate!r} "
+                        f"(same after case/separator normalisation)"
+                    )
+        # An alias is itself a registry row whose model_id is the alias and
+        # whose alias_of names the target. The unique index on
+        # (provider, alias_of) plus this pre-check make duplicates impossible.
+        existing = await _fetch_one(
+            conn,
+            "SELECT provider FROM model_registry WHERE provider = ? AND model_id = ?",
+            (provider, alias),
+        )
+        if existing is None:
+            await _execute(
+                conn,
+                "INSERT INTO model_registry "
+                "(provider, model_id, display_name, capabilities, pricing_model, band, "
+                "available, deprecated, alias_of, last_synced) "
+                "VALUES (?, ?, ?, '[]', 'unknown', 'standard', 1, 0, ?, CURRENT_TIMESTAMP)",
+                (provider, alias, alias, target_model_id),
+            )
+        else:
+            await _execute(
+                conn,
+                "UPDATE model_registry SET alias_of = ? WHERE provider = ? AND model_id = ?",
+                (target_model_id, provider, alias),
+            )
+
+    async def resolve_alias(self, tx: Transaction, provider: str, alias: str) -> ModelRecord | None:
+        conn = self._conn(tx)
+        row = await _fetch_one(
+            conn,
+            "SELECT alias_of FROM model_registry WHERE provider = ? AND model_id = ?",
+            (provider, alias),
+        )
+        if row is None:
+            return None
+        target_id = row.get("alias_of")
+        if target_id is None:
+            # Not an alias: a real id resolves to itself.
+            direct = await _fetch_one(
+                conn,
+                "SELECT * FROM model_registry WHERE provider = ? AND model_id = ?",
+                (provider, alias),
+            )
+            return None if direct is None else self._row_to_model(direct)
+        target = await _fetch_one(
+            conn,
+            "SELECT * FROM model_registry WHERE provider = ? AND model_id = ?",
+            (provider, target_id),
+        )
+        return None if target is None else self._row_to_model(target)
+
+    async def upsert_price(self, tx: Transaction, band: PriceBand) -> None:
+        self._validate_pricing_model(band.pricing_model)
+        self._validate_band(band.band)
+        conn = self._conn(tx)
+        await _execute(
+            conn,
+            "INSERT INTO model_prices "
+            "(provider, model_id, pricing_model, band, price_in, price_out, price_cached, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP)) "
+            "ON CONFLICT (provider, model_id, pricing_model, band) DO UPDATE SET "
+            "price_in = excluded.price_in, price_out = excluded.price_out, "
+            "price_cached = excluded.price_cached, observed_at = excluded.observed_at",
+            (
+                band.provider,
+                band.model_id,
+                band.pricing_model,
+                band.band,
+                band.price_in,
+                band.price_out,
+                band.price_cached,
+                band.observed_at,
+            ),
+        )
+        # The model row mirrors its standard band in the legacy price columns;
+        # this is what the existing GET /v1/models and recommendation paths
+        # read. Rules that keep the contract's NULL-vs-0 distinction honest:
+        #
+        # * only ``band == 'standard'`` mirrors, so peak/off-peak rows never
+        #   overwrite the headline price;
+        # * a priced ``payg`` row is authoritative and wins over other pricing
+        #   models (a model can be both API-priced and free-tier eligible);
+        # * otherwise a row that actually carries a price fills in -- this is
+        #   how a genuinely free model (``local``/``free_tier`` at 0.0) reads
+        #   as priced;
+        # * a row with no prices at all (``unknown``) mirrors nothing, so an
+        #   unpriced model stays NULL and never looks free.
+        carries_price = band.price_in is not None or band.price_out is not None or band.price_cached is not None
+        if band.band == "standard" and carries_price:
+            await _execute(
+                conn,
+                "UPDATE model_registry SET price_in = ?, price_out = ?, price_cached = ?, "
+                "price_updated_at = COALESCE(?, CURRENT_TIMESTAMP), "
+                "pricing_model = ?, band = ? "
+                "WHERE provider = ? AND model_id = ? "
+                # A payg row always applies; a non-payg row only fills a row
+                # that is not already priced by payg.
+                "AND (? = 'payg' OR pricing_model <> 'payg' "
+                "OR price_in IS NULL AND price_out IS NULL AND price_cached IS NULL)",
+                (
+                    band.price_in,
+                    band.price_out,
+                    band.price_cached,
+                    band.observed_at,
+                    band.pricing_model,
+                    band.band,
+                    band.provider,
+                    band.model_id,
+                    band.pricing_model,
+                ),
+            )
+
+    async def record_field_obs(self, tx: Transaction, obs: FieldObservation) -> None:
+        await _execute(
+            self._conn(tx),
+            "INSERT INTO model_field_obs (provider, model_id, field, value, source, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (provider, model_id, field) DO UPDATE SET "
+            "value = excluded.value, source = excluded.source, fetched_at = excluded.fetched_at",
+            (obs.provider, obs.model_id, obs.field, obs.value, obs.source, obs.fetched_at),
+        )
+
+    async def merge_fields(
+        self,
+        tx: Transaction,
+        provider: str,
+        model_id: str,
+        *,
+        authoritative_source: str | None = None,
+    ) -> ModelRecord | None:
+        conn = self._conn(tx)
+        model_row = await _fetch_one(
+            conn,
+            "SELECT * FROM model_registry WHERE provider = ? AND model_id = ?",
+            (provider, model_id),
+        )
+        if model_row is None:
+            return None
+        sql = (
+            "SELECT field, value, source, fetched_at FROM model_field_obs "
+            "WHERE provider = ? AND model_id = ?"
+        )
+        params: tuple[Any, ...] = (provider, model_id)
+        if authoritative_source is not None:
+            sql += " AND source = ?"
+            params = (provider, model_id, authoritative_source)
+        observations = await _fetch_all(conn, sql, params)
+
+        updates: dict[str, Any] = {}
+        for obs in observations:
+            field_name = obs["field"]
+            if field_name not in _MODEL_FIELD_TYPES:
+                continue
+            updates[field_name] = _coerce_field_value(field_name, obs["value"])
+        if updates:
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            await _execute(
+                conn,
+                f"UPDATE model_registry SET {assignments} WHERE provider = ? AND model_id = ?",
+                (*updates.values(), provider, model_id),
+            )
+        merged = await _fetch_one(
+            conn,
+            "SELECT * FROM model_registry WHERE provider = ? AND model_id = ?",
+            (provider, model_id),
+        )
+        assert merged is not None
+        return self._row_to_model(merged)
+
+    async def upsert_benchmark(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        benchmark: str,
+        score: float,
+        source: str,
+        fetched_at: str,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            "INSERT INTO model_benchmarks (provider, model_id, benchmark, score, source, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (provider, model_id, benchmark) DO UPDATE SET "
+            "score = excluded.score, source = excluded.source, fetched_at = excluded.fetched_at",
+            (provider, model_id, benchmark, score, source, fetched_at),
+        )
+
+    async def curated_routing_get(self, tx: Transaction) -> CuratedRouting | None:
+        row = await _fetch_one(
+            self._conn(tx),
+            "SELECT version, rules, note, created_at FROM curated_routing "
+            "ORDER BY version DESC LIMIT 1",
+        )
+        if row is None:
+            return None
+        rules_raw = row.get("rules")
+        try:
+            parsed = json.loads(rules_raw) if isinstance(rules_raw, str) else (rules_raw or [])
+        except (TypeError, ValueError):
+            parsed = []
+        rules = tuple(dict(rule) for rule in parsed if isinstance(rule, Mapping))
+        return CuratedRouting(
+            version=int(row["version"]),
+            rules=rules,
+            created_at=str(row["created_at"]),
+            note=row.get("note"),
+        )
+
+    async def curated_routing_replace(
+        self,
+        tx: Transaction,
+        *,
+        rules: Sequence[Mapping[str, Any]],
+        note: str | None = None,
+    ) -> CuratedRouting:
+        conn = self._conn(tx)
+        current = await _fetch_val(conn, "SELECT MAX(version) FROM curated_routing")
+        next_version = (int(current) if current is not None else 0) + 1
+        payload = json.dumps([dict(rule) for rule in rules], sort_keys=True, separators=(",", ":"))
+        await _execute(
+            conn,
+            "INSERT INTO curated_routing (version, rules, note, created_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            (next_version, payload, note),
+        )
+        row = await _fetch_one(
+            conn,
+            "SELECT version, rules, note, created_at FROM curated_routing WHERE version = ?",
+            (next_version,),
+        )
+        assert row is not None
+        return CuratedRouting(
+            version=int(row["version"]),
+            rules=tuple(dict(rule) for rule in json.loads(row["rules"])),
+            created_at=str(row["created_at"]),
+            note=row.get("note"),
+        )
+
+    async def sync_log_append(self, tx: Transaction, entry: SyncLogEntry) -> None:
+        await _execute(
+            self._conn(tx),
+            "INSERT INTO model_registry_sync_log "
+            "(provider, models_seen, models_upserted, status, error, synced_at, "
+            "models_found, models_added, models_updated, models_deprecated, duration_ms) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entry.provider,
+                entry.models_found,
+                entry.models_added + entry.models_updated,
+                "error" if entry.error else "ok",
+                entry.error,
+                entry.synced_at,
+                entry.models_found,
+                entry.models_added,
+                entry.models_updated,
+                entry.models_deprecated,
+                entry.duration_ms,
+            ),
+        )
+
+    async def snapshot_digest(self, tx: Transaction) -> str:
+        """Stable SHA-256 over the registry's logical contents.
+
+        Rows are canonicalised into sorted JSON with fixed key order and
+        ``repr``-stable scalars, so the digest is identical for the same
+        inputs regardless of insert order, table layout, or backend. Floats
+        go through ``repr`` (shortest round-trip form) so an identical
+        ``0.000001`` on every backend hashes identically.
+        """
+        conn = self._conn(tx)
+        models = await _fetch_all(conn, "SELECT * FROM model_registry" + self._MODEL_ORDER)
+        prices = await _fetch_all(conn, "SELECT * FROM model_prices" + self._PRICE_ORDER)
+        benchmarks = await _fetch_all(conn, "SELECT * FROM model_benchmarks" + self._BENCH_ORDER)
+        curated_version = await _fetch_val(conn, "SELECT MAX(version) FROM curated_routing")
+
+        canonical_models = [
+            {
+                "provider": str(row["provider"]),
+                "model_id": str(row["model_id"]),
+                "display_name": row.get("display_name"),
+                "family": row.get("family"),
+                "context_window": row.get("context_window"),
+                "max_output_tokens": row.get("max_output_tokens"),
+                "capabilities": sorted(json.loads(row["capabilities"]) if row.get("capabilities") else []),
+                "price_in": _canonical_number(row.get("price_in")),
+                "price_out": _canonical_number(row.get("price_out")),
+                "price_cached": _canonical_number(row.get("price_cached")),
+                "pricing_model": row.get("pricing_model") or "unknown",
+                "band": row.get("band") or "standard",
+                "available": bool(row.get("available", 1)),
+                "deprecated": bool(row.get("deprecated", 0)),
+                "alias_of": row.get("alias_of"),
+            }
+            for row in models
+        ]
+        canonical_prices = [
+            {
+                "provider": str(row["provider"]),
+                "model_id": str(row["model_id"]),
+                "pricing_model": str(row["pricing_model"]),
+                "band": str(row["band"]),
+                "price_in": _canonical_number(row.get("price_in")),
+                "price_out": _canonical_number(row.get("price_out")),
+                "price_cached": _canonical_number(row.get("price_cached")),
+            }
+            for row in prices
+        ]
+        canonical_benchmarks = [
+            {
+                "provider": str(row["provider"]),
+                "model_id": str(row["model_id"]),
+                "benchmark": str(row["benchmark"]),
+                "score": _canonical_number(row.get("score")),
+            }
+            for row in benchmarks
+        ]
+        payload = {
+            "models": canonical_models,
+            "prices": canonical_prices,
+            "benchmarks": canonical_benchmarks,
+            "curated_version": int(curated_version) if curated_version is not None else 0,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    async def health_read(self, tx: Transaction) -> ModelRegistryHealth:
+        conn = self._conn(tx)
+        model_count = int(await _fetch_val(conn, "SELECT COUNT(*) FROM model_registry") or 0)
+        priced_count = int(
+            await _fetch_val(
+                conn,
+                "SELECT COUNT(*) FROM model_registry WHERE price_in IS NOT NULL OR price_out IS NOT NULL",
+            )
+            or 0
+        )
+        curated_version = int(await _fetch_val(conn, "SELECT MAX(version) FROM curated_routing") or 0)
+        last_sync_at = await _fetch_val(conn, "SELECT MAX(synced_at) FROM model_registry_sync_log")
+        return ModelRegistryHealth(
+            backend=self.backend_name,
+            model_count=model_count,
+            priced_count=priced_count,
+            # unpriced + priced == model_count: NULL and 0 are distinct, so a
+            # free (0.0) model counts as priced.
+            unpriced_count=model_count - priced_count,
+            curated_version=curated_version,
+            last_sync_at=last_sync_at,
+        )
+
+    async def health_write(self, tx: Transaction, health: ModelRegistryHealth) -> None:
+        await _execute(
+            self._conn(tx),
+            "INSERT INTO model_registry_health "
+            "(backend, model_count, priced_count, unpriced_count, curated_version, last_sync_at, recorded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT (backend) DO UPDATE SET "
+            "model_count = excluded.model_count, priced_count = excluded.priced_count, "
+            "unpriced_count = excluded.unpriced_count, curated_version = excluded.curated_version, "
+            "last_sync_at = excluded.last_sync_at, recorded_at = CURRENT_TIMESTAMP",
+            (
+                health.backend,
+                health.model_count,
+                health.priced_count,
+                health.unpriced_count,
+                health.curated_version,
+                health.last_sync_at,
+            ),
+        )
+
+
 class SqliteOAuthRepository(_SqliteRepository, MCPOAuthRepositoryMixin, OAuthRepository):
     _mcp_lock_suffix = ""
 
@@ -6589,6 +7240,7 @@ class SqliteBackend:
         self._webhooks = SqliteWebhookRepository()
         self._nats_dispatch_log = SqliteNatsDispatchLogRepository()
         self._consultations_audit = SqliteConsultationAuditRepository()
+        self._model_registry = SqliteModelRegistryRepository()
         self._oauth = SqliteOAuthRepository()
         self._sessions = SqliteSessionsRepository()
         self._consultations = SqliteConsultationsRepository()
@@ -7881,6 +8533,10 @@ class SqliteBackend:
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
         return self._consultations_audit
+
+    @property
+    def model_registry(self) -> ModelRegistryRepository:
+        return self._model_registry
 
     @property
     def oauth(self) -> OAuthRepository:

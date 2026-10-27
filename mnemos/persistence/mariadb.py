@@ -32,6 +32,7 @@ from mnemos.persistence.base import (
     CompressionQueueRepository,
     CompressionRepository,
     ConsultationAuditRepository,
+    ModelRegistryRepository,
     FEDERATION_CAPABILITY,
     FederationRepository,
     KG_CAPABILITY,
@@ -47,6 +48,7 @@ from mnemos.persistence.base import (
     VersionRepository,
     WebhookRepository,
 )
+from mnemos.persistence.model_registry_unsupported import MariadbModelRegistryRepository
 from mnemos.persistence.mysql import (
     _DDL_CATEGORY_DECAY,
     _DDL_CATEGORY_DECAY_SEED,
@@ -1311,6 +1313,7 @@ class MariadbBackend(MysqlBackend):
         self._webhooks_repo = MariadbWebhookRepository()
         self._nats_dispatch_log_repo = MariadbNatsDispatchLogRepository()
         self._consultations_audit_repo = MariadbConsultationAuditRepository()
+        self._model_registry_repo = MariadbModelRegistryRepository()
         self._federation_repo = MariadbFederationRepository()
         self._state_kv_repo = MariadbStateRepository()
         self._oauth_repo = MysqlOAuthRepository()
@@ -1362,6 +1365,11 @@ class MariadbBackend(MysqlBackend):
     @property
     def consultations_audit(self) -> ConsultationAuditRepository:
         return self._consultations_audit_repo
+
+    @property
+    def model_registry(self) -> ModelRegistryRepository:
+        # Phase 2: raises ModelRegistryNotSupported("mariadb") on every call.
+        return self._model_registry_repo
 
     @property
     def federation(self) -> FederationRepository:

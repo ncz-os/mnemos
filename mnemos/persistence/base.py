@@ -49,6 +49,184 @@ class ModelRegistryUnavailable(Exception):
     """
 
 
+class ModelRegistryNotSupported(NotImplementedError):
+    """A backend cannot serve ``ModelRegistryRepository`` at all.
+
+    Raised from the repository *class* of every backend that does not yet
+    implement the model-registry contract (phase 2 covers Oracle, DB2, MySQL,
+    MariaDB and the remaining Postgres operations). This is deliberately a
+    ``NotImplementedError`` subclass so the historical ``except
+    NotImplementedError`` call sites keep working, but it is a *named*,
+    documented error carrying the backend id and the phase that will fix it:
+
+        unsupported backend: oracle — phase 2
+
+    The check is explicit — every non-conforming repository class lists
+    :data:`MODEL_REGISTRY_MISSING` (the operations it cannot serve) and the
+    contract suite reports it by name instead of silently passing.
+    """
+
+    def __init__(self, backend_name: str, operation: str | None = None, phase: str = "phase 2"):
+        self.backend_name = backend_name
+        self.operation = operation
+        self.phase = phase
+        detail = f"unsupported backend: {backend_name} — {phase}"
+        if operation is not None:
+            detail = f"{detail} (operation: {operation})"
+        super().__init__(detail)
+
+
+# Operations every ``ModelRegistryRepository`` implementation must provide.
+# Kept as a module constant so non-conforming backends and the contract suite
+# name the same list (the suite skips on exactly these names).
+MODEL_REGISTRY_OPERATIONS: tuple[str, ...] = (
+    "upsert_model",
+    "list_models",
+    "get_model",
+    "set_alias",
+    "resolve_alias",
+    "upsert_price",
+    "record_field_obs",
+    "merge_fields",
+    "upsert_benchmark",
+    "curated_routing_get",
+    "curated_routing_replace",
+    "sync_log_append",
+    "snapshot_digest",
+    "health_read",
+    "health_write",
+)
+
+# Backend ids that do not implement ``ModelRegistryRepository`` yet. The
+# contract suite skips on this set with ``unsupported backend: <name> — phase 2``.
+MODEL_REGISTRY_PHASE2_BACKENDS: tuple[str, ...] = ("oracle", "db2", "mysql", "mariadb")
+
+PRICING_MODELS: tuple[str, ...] = ("payg", "subscription", "free_tier", "local", "unknown")
+PRICE_BANDS: tuple[str, ...] = ("standard", "peak", "off_peak")
+
+
+@dataclass(frozen=True)
+class ModelRecord:
+    """One ``model_registry`` row, backend-neutral.
+
+    ``context_window`` and every price field use ``None`` for "unknown".
+    ``None`` is the ONLY unknown marker — a price of ``0.0`` means the model is
+    demonstrably free (``local`` / ``free_tier``), never "we did not look".
+    """
+
+    provider: str
+    model_id: str
+    display_name: str | None = None
+    family: str | None = None
+    context_window: int | None = None
+    max_output_tokens: int | None = None
+    capabilities: tuple[str, ...] = ()
+    price_in: float | None = None
+    price_out: float | None = None
+    price_cached: float | None = None
+    pricing_model: str = "unknown"
+    band: str = "standard"
+    available: bool = True
+    deprecated: bool = False
+    alias_of: str | None = None
+    price_updated_at: str | None = None
+
+
+@dataclass(frozen=True)
+class ModelFilter:
+    """Filter for :meth:`ModelRegistryRepository.list_models`.
+
+    Every field is optional; ``None`` means "no constraint". Filters combine
+    with AND. Ordering is deterministic: ``provider ASC, model_id ASC``.
+    """
+
+    provider: str | None = None
+    family: str | None = None
+    capability: str | None = None
+    available: bool | None = None
+    deprecated: bool | None = None
+    priced: bool | None = None
+
+
+@dataclass(frozen=True)
+class PriceBand:
+    """One (model, pricing_model, band) price row.
+
+    ``price_in`` / ``price_out`` / ``price_cached`` are USD per million tokens
+    and may be ``None`` (unpriced — never coerced to ``0``).
+    """
+
+    provider: str
+    model_id: str
+    pricing_model: str
+    band: str
+    price_in: float | None = None
+    price_out: float | None = None
+    price_cached: float | None = None
+    observed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class FieldObservation:
+    """One per-field observation with its own provenance.
+
+    ``field`` names the registry attribute (``context_window``,
+    ``price_in``, ``arena_score``, ...). ``source`` names the upstream that
+    supplied it and ``fetched_at`` is that source's observation timestamp —
+    both are per FIELD, not per row, so a catalog sweep can refresh
+    ``context_window`` without stamping the price observation as fresh.
+    ``value`` is stored as text (``None`` for a known-unknown).
+    """
+
+    provider: str
+    model_id: str
+    field: str
+    value: str | None
+    source: str
+    fetched_at: str
+
+
+@dataclass(frozen=True)
+class CuratedRouting:
+    """Versioned curated routing snapshot.
+
+    The curated layer is operator-owned. :meth:`curated_routing_replace` bumps
+    ``version`` and writes a new row; the catalog *refresh* path calls
+    :meth:`curated_routing_get` only — it has no write access by contract.
+    """
+
+    version: int
+    rules: tuple[dict[str, Any], ...]
+    created_at: str
+    note: str | None = None
+
+
+@dataclass(frozen=True)
+class SyncLogEntry:
+    """One provider-sync audit row."""
+
+    provider: str
+    models_found: int
+    models_added: int
+    models_updated: int
+    models_deprecated: int
+    error: str | None
+    duration_ms: int
+    synced_at: str
+
+
+@dataclass(frozen=True)
+class ModelRegistryHealth:
+    """Liveness/coverage counters for the registry."""
+
+    backend: str
+    model_count: int
+    priced_count: int
+    unpriced_count: int
+    curated_version: int
+    last_sync_at: str | None
+
+
 def is_duplicate_memory_error(exc: BaseException) -> bool:
     """Best-effort "this row already exists" detection across backends.
 
@@ -1310,6 +1488,282 @@ class NatsDispatchLogRepository(ABC):
           ``False`` return.
         """
         ...
+
+
+class ModelRegistryRepository(ABC):
+    """Backend-neutral model registry contract (provider/pricing DB, phase 1.5).
+
+    The registry is the authoritative catalog of ``(provider, model_id)`` rows,
+    the per-(model, pricing_model, band) price rows, per-FIELD observations
+    with provenance, the operator-owned curated routing layer, the sync audit
+    log, and the registry health counters. Every operation below is an
+    ``@abstractmethod``: there are no ``NotImplementedError`` defaults, so a
+    backend is either fully conformant (``not type(cls).__abstractmethods__``)
+    or it does not claim the capability at all and raises
+    :class:`ModelRegistryNotSupported` from its class with a named reason.
+
+    Invariants every implementation must honour:
+
+    * **NULL means unpriced.** A price column that is ``None`` is unknown. It
+      is never coerced to ``0`` — ``0.0`` means "demonstrably free", which is
+      a different fact. ``priced`` filters and the health counters treat
+      ``NULL`` and ``0`` as distinct.
+    * **Per-field provenance.** ``source`` and ``fetched_at`` are recorded per
+      observation (:class:`FieldObservation`), so merging an observation from
+      one upstream never stamps a sibling field as fresh.
+    * **Price rows are keyed by (provider, model_id, pricing_model, band).**
+      ``pricing_model`` is one of :data:`PRICING_MODELS`; ``band`` is one of
+      :data:`PRICE_BANDS`. Both round-trip verbatim.
+    * **Aliases never collide with real ids.** ``set_alias`` is the only write
+      path. ``alias_of`` is unique per provider, an alias may not point at
+      itself or at another alias (one hop only), and a lookalike id that
+      differs only in case/separators is rejected rather than silently
+      inserted. ``list_models`` never surfaces alias rows.
+    * **Curated routing is versioned and read-only to refresh.**
+      ``curated_routing_replace`` bumps the version monotonically; the catalog
+      refresh path only ever calls ``curated_routing_get``.
+    * **Snapshots are deterministic.** ``snapshot_digest`` over identical
+      inputs returns an identical digest regardless of insertion order or
+      backend.
+    * **All writes take the caller's ``tx``** so a registry write commits or
+      rolls back with the calling operation.
+
+    See ``docs/model-registry-repository.md`` for the full contract.
+    """
+
+    backend_name: str = "unknown"
+
+    @abstractmethod
+    async def upsert_model(self, tx: Transaction, model: ModelRecord) -> bool:
+        """Insert or update one model row; return ``True`` when it was inserted.
+
+        The ``(provider, model_id)`` pair is the identity. An update refreshes
+        ``display_name``/``family``/``capabilities``/``context_window``/
+        ``max_output_tokens`` and clears ``deprecated``; it does not touch the
+        price columns (those belong to :meth:`upsert_price`) or overwrite
+        ``alias_of`` when the incoming value is ``None``.
+        """
+        ...
+
+    @abstractmethod
+    async def list_models(self, tx: Transaction, filters: ModelFilter | None = None) -> list[ModelRecord]:
+        """Return models matching ``filters`` in ``(provider, model_id)`` order.
+
+        Ordering is part of the contract: deterministic, backend-independent.
+        """
+        ...
+
+    @abstractmethod
+    async def get_model(self, tx: Transaction, provider: str, model_id: str) -> ModelRecord | None:
+        """Return one model row, or ``None``. Never fabricates a default row."""
+        ...
+
+    @abstractmethod
+    async def set_alias(self, tx: Transaction, provider: str, alias: str, target_model_id: str) -> None:
+        """Register ``alias`` as a pointer to ``target_model_id`` for ``provider``.
+
+        Raises :class:`ValueError` when the alias is unusable, so a caller can
+        never half-apply one:
+
+        * ``alias`` equals ``target_model_id`` (an alias may not point at itself);
+        * ``target_model_id`` is itself an alias (one hop only);
+        * ``alias`` case/separator-insensitively collides with an existing
+          model id or alias in the same provider (lookalike pair).
+
+        Re-pointing an existing alias at a new target is allowed.
+        """
+        ...
+
+    @abstractmethod
+    async def resolve_alias(self, tx: Transaction, provider: str, alias: str) -> ModelRecord | None:
+        """Resolve ``alias`` to the model it points at, or ``None``.
+
+        Resolution is exactly one hop: an alias pointing at another alias is
+        rejected at write time, so this never loops. A non-alias id resolves to
+        itself when the model exists.
+        """
+        ...
+
+    @abstractmethod
+    async def upsert_price(self, tx: Transaction, band: PriceBand) -> None:
+        """Insert or replace one price row keyed by (model, pricing_model, band).
+
+        ``None`` price values are stored as SQL ``NULL`` — never as ``0``.
+        """
+        ...
+
+    @abstractmethod
+    async def record_field_obs(self, tx: Transaction, obs: FieldObservation) -> None:
+        """Upsert one per-field observation, replacing any prior value for that field.
+
+        The observation's ``source`` and ``fetched_at`` are stored alongside the
+        value and round-trip verbatim.
+        """
+        ...
+
+    @abstractmethod
+    async def merge_fields(
+        self,
+        tx: Transaction,
+        provider: str,
+        model_id: str,
+        *,
+        authoritative_source: str | None = None,
+    ) -> ModelRecord | None:
+        """Project the field observations onto the model row; return the row.
+
+        Only fields whose observation ``source`` equals ``authoritative_source``
+        (or all fields when it is ``None``) are applied. Fields with no
+        observation are left untouched. Returns ``None`` when the model row is
+        absent — an observation never creates a model.
+        """
+        ...
+
+    @abstractmethod
+    async def upsert_benchmark(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        benchmark: str,
+        score: float,
+        source: str,
+        fetched_at: str,
+    ) -> None:
+        """Upsert one (model, benchmark) score with its own provenance."""
+        ...
+
+    @abstractmethod
+    async def curated_routing_get(self, tx: Transaction) -> CuratedRouting | None:
+        """Return the newest curated routing snapshot, or ``None`` if never set."""
+        ...
+
+    @abstractmethod
+    async def curated_routing_replace(
+        self,
+        tx: Transaction,
+        *,
+        rules: Sequence[Mapping[str, Any]],
+        note: str | None = None,
+    ) -> CuratedRouting:
+        """Append a new curated snapshot at ``version = previous + 1``.
+
+        The previous snapshots are retained (history is never rewritten). This
+        is the ONLY write path to the curated layer; the refresh path takes the
+        read-only :meth:`curated_routing_get`.
+        """
+        ...
+
+    @abstractmethod
+    async def sync_log_append(self, tx: Transaction, entry: SyncLogEntry) -> None:
+        """Append one provider-sync audit row. Never mutates prior rows."""
+        ...
+
+    @abstractmethod
+    async def snapshot_digest(self, tx: Transaction) -> str:
+        """Return a stable hex digest over the registry's logical contents.
+
+        The digest is computed over canonically ordered, canonically encoded
+        rows (models, price bands, benchmarks, curated version) so the same
+        logical registry produces the same digest on every backend regardless
+        of insertion order or physical column layout.
+        """
+        ...
+
+    @abstractmethod
+    async def health_read(self, tx: Transaction) -> ModelRegistryHealth:
+        """Return registry counters, treating ``NULL`` and ``0`` prices as distinct."""
+        ...
+
+    @abstractmethod
+    async def health_write(self, tx: Transaction, health: ModelRegistryHealth) -> None:
+        """Record a health snapshot (used by the sync worker's liveness probe)."""
+        ...
+
+
+class UnsupportedModelRegistryRepository(ModelRegistryRepository):
+    """Base for backends that do not implement the registry yet.
+
+    Every operation raises :class:`ModelRegistryNotSupported` naming the
+    backend and ``phase 2``. Nothing here returns ``None``, an empty list, or
+    a zero counter: a caller on an unsupported backend must see a raise, never
+    a plausible-looking empty result. Subclasses set ``backend_name``; the
+    contract suite skips them with exactly that named reason.
+    """
+
+    backend_name: str = "unsupported"
+
+    def _unsupported(self, operation: str) -> ModelRegistryNotSupported:
+        return ModelRegistryNotSupported(self.backend_name, operation)
+
+    async def upsert_model(self, tx: Transaction, model: ModelRecord) -> bool:
+        raise self._unsupported("upsert_model")
+
+    async def list_models(self, tx: Transaction, filters: ModelFilter | None = None) -> list[ModelRecord]:
+        raise self._unsupported("list_models")
+
+    async def get_model(self, tx: Transaction, provider: str, model_id: str) -> ModelRecord | None:
+        raise self._unsupported("get_model")
+
+    async def set_alias(self, tx: Transaction, provider: str, alias: str, target_model_id: str) -> None:
+        raise self._unsupported("set_alias")
+
+    async def resolve_alias(self, tx: Transaction, provider: str, alias: str) -> ModelRecord | None:
+        raise self._unsupported("resolve_alias")
+
+    async def upsert_price(self, tx: Transaction, band: PriceBand) -> None:
+        raise self._unsupported("upsert_price")
+
+    async def record_field_obs(self, tx: Transaction, obs: FieldObservation) -> None:
+        raise self._unsupported("record_field_obs")
+
+    async def merge_fields(
+        self,
+        tx: Transaction,
+        provider: str,
+        model_id: str,
+        *,
+        authoritative_source: str | None = None,
+    ) -> ModelRecord | None:
+        raise self._unsupported("merge_fields")
+
+    async def upsert_benchmark(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        benchmark: str,
+        score: float,
+        source: str,
+        fetched_at: str,
+    ) -> None:
+        raise self._unsupported("upsert_benchmark")
+
+    async def curated_routing_get(self, tx: Transaction) -> CuratedRouting | None:
+        raise self._unsupported("curated_routing_get")
+
+    async def curated_routing_replace(
+        self,
+        tx: Transaction,
+        *,
+        rules: Sequence[Mapping[str, Any]],
+        note: str | None = None,
+    ) -> CuratedRouting:
+        raise self._unsupported("curated_routing_replace")
+
+    async def sync_log_append(self, tx: Transaction, entry: SyncLogEntry) -> None:
+        raise self._unsupported("sync_log_append")
+
+    async def snapshot_digest(self, tx: Transaction) -> str:
+        raise self._unsupported("snapshot_digest")
+
+    async def health_read(self, tx: Transaction) -> ModelRegistryHealth:
+        raise self._unsupported("health_read")
+
+    async def health_write(self, tx: Transaction, health: ModelRegistryHealth) -> None:
+        raise self._unsupported("health_write")
 
 
 class ConsultationAuditRepository(ABC):
