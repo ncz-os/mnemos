@@ -1079,3 +1079,99 @@ def test_priced_predicate_covers_all_three_price_columns() -> None:
         source = inspect.getsource(module)
         # No call site may hand-roll a two-column predicate again.
         assert "(price_in IS NOT NULL OR price_out IS NOT NULL)" not in source
+
+
+def _fake_postgres_tx(rows: list[dict[str, Any]]):
+    """A Postgres transaction stub whose ``conn.fetch`` honours the export SQL.
+
+    Lets the Postgres export run in CI without a live database. It rejects a
+    query that does not exclude alias rows or does not sort, so a future
+    rewrite that drops either property fails here rather than silently
+    producing an unstable digest.
+    """
+    from unittest.mock import MagicMock
+
+    from mnemos.persistence.postgres import PostgresTransaction
+
+    class _Conn:
+        async def fetch(self, sql: str, *_args: Any) -> list[dict[str, Any]]:
+            assert "alias_of IS NULL" in sql, "alias rows must not enter the export"
+            assert "ORDER BY provider ASC, model_id ASC" in sql, "export must be sorted"
+            return sorted(rows, key=lambda r: (r["provider"], r["model_id"]))
+
+    tx = MagicMock(spec=PostgresTransaction)
+    tx.conn = _Conn()
+    return tx
+
+
+def _registry_row(provider: str, model_id: str, **overrides: Any) -> dict[str, Any]:
+    row = {
+        "provider": provider,
+        "model_id": model_id,
+        "display_name": model_id,
+        "family": None,
+        "context_window": None,
+        "max_output_tokens": None,
+        "capabilities": None,
+        "price_in": None,
+        "price_out": None,
+        "price_cached": None,
+        "arena_score": None,
+        "available": True,
+        "deprecated": False,
+    }
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_postgres_export_snapshot_is_concrete_and_sorted() -> None:
+    """``export_snapshot`` is implemented on Postgres, not a ``NotSupported``.
+
+    The live Postgres arm needs a DSN; this pins the implementation itself so
+    the operation cannot regress to a raiser while CI has no database.
+    """
+    from mnemos.persistence.postgres import PostgresModelRegistryRepository
+
+    repo = PostgresModelRegistryRepository()
+    assert not type(repo).__abstractmethods__
+    assert "export_snapshot" not in repo.MISSING_OPERATIONS
+    assert "snapshot_digest" not in repo.MISSING_OPERATIONS
+
+    rows = [
+        _registry_row("xai", "grok-4"),
+        _registry_row("openai", "gpt-5", price_in=1, price_out=2, arena_score=1300),
+        _registry_row("anthropic", "claude-x", price_cached=0.3),
+    ]
+    snapshot = await repo.export_snapshot(_fake_postgres_tx(rows))
+
+    assert [m["model_id"] for m in snapshot["models"]] == ["claude-x", "gpt-5", "grok-4"]
+    # The document shape matches the SQLite reference.
+    assert set(snapshot) == {"models", "prices", "benchmarks", "curated_version"}
+    assert snapshot["curated_version"] == 0
+    # A cached-only price is a price; an unpriced row exports no price at all.
+    assert {p["model_id"] for p in snapshot["prices"]} == {"claude-x", "gpt-5"}
+    assert next(p for p in snapshot["prices"] if p["model_id"] == "claude-x")["price_cached"] == "0.3"
+    # NULL stays NULL: unpriced is never exported as "0".
+    grok = next(m for m in snapshot["models"] if m["model_id"] == "grok-4")
+    assert grok["price_in"] is None and grok["price_cached"] is None
+    assert [b["benchmark"] for b in snapshot["benchmarks"]] == ["arena_score"]
+
+
+@pytest.mark.asyncio
+async def test_postgres_snapshot_digest_is_the_canonical_export_hash() -> None:
+    """``snapshot_digest`` is exactly the shared hash of ``export_snapshot``."""
+    from mnemos.persistence.postgres import PostgresModelRegistryRepository
+
+    repo = PostgresModelRegistryRepository()
+    rows = [_registry_row("openai", "gpt-5", price_in=1), _registry_row("xai", "grok-4")]
+    tx = _fake_postgres_tx(rows)
+
+    snapshot = await repo.export_snapshot(tx)
+    digest = await repo.snapshot_digest(tx)
+    assert digest == model_registry_snapshot_digest(snapshot)
+    # Stable across identical inputs, independent of call order.
+    assert digest == await repo.snapshot_digest(_fake_postgres_tx(list(reversed(rows))))
+    # A price change that matters must move the digest.
+    repriced = [_registry_row("openai", "gpt-5", price_in=9), _registry_row("xai", "grok-4")]
+    assert await repo.snapshot_digest(_fake_postgres_tx(repriced)) != digest

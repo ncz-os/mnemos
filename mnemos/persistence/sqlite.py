@@ -56,6 +56,7 @@ from mnemos.persistence.base import (
     ModelRecord,
     ModelRegistryHealth,
     ModelRegistryRepository,
+    canonical_registry_number,
     FieldObservation,
     CuratedRouting,
     PriceBand,
@@ -244,17 +245,10 @@ def _coerce_field_value(field: str, value: str | None) -> Any:
     return value
 
 
-def _canonical_number(value: Any) -> str | None:
-    """Canonical string form of a numeric registry cell, for hashing.
-
-    ``None`` stays ``None`` — "unpriced" is never conflated with ``"0"``.
-    """
-    if value is None:
-        return None
-    number = float(value)
-    if number == int(number) and abs(number) < 1e15:
-        return str(int(number))
-    return repr(number)
+#: Canonical numeric form for the registry export. Defined in
+#: :mod:`mnemos.persistence.base` so every backend hashes identical values
+#: identically.
+_canonical_number = canonical_registry_number
 
 
 def _json_array_text(value: Sequence[Any] | None) -> str | None:

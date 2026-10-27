@@ -1500,6 +1500,26 @@ class NatsDispatchLogRepository(ABC):
         ...
 
 
+def canonical_registry_number(value: Any) -> str | None:
+    """Canonical string form of a numeric registry cell, for hashing.
+
+    ``None`` stays ``None`` — "unpriced" is never conflated with ``"0"``.
+    Floats go through ``repr`` (shortest round-trip form) so an identical
+    value encodes bit-identically on every backend, whatever the driver
+    returns it as (``Decimal``, ``float``, ``int`` or ``str``).
+    """
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        if value == value.to_integral_value():
+            return str(int(value))
+        return repr(float(value))
+    number = float(value)
+    if number == int(number) and abs(number) < 1e15:
+        return str(int(number))
+    return repr(number)
+
+
 def model_registry_snapshot_digest(snapshot: Mapping[str, Any]) -> str:
     """SHA-256 over an :meth:`ModelRegistryRepository.export_snapshot` document.
 

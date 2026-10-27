@@ -58,6 +58,8 @@ from mnemos.persistence.base import (
     ModelRegistryHealth,
     ModelRegistryNotSupported,
     ModelRegistryRepository,
+    canonical_registry_number,
+    model_registry_snapshot_digest,
     MorpheusConsolidationResult,
     MorpheusExtractBatch,
     MorpheusExtractCandidate,
@@ -4086,8 +4088,6 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
         "upsert_benchmark",
         "curated_routing_get",
         "curated_routing_replace",
-        "export_snapshot",
-        "snapshot_digest",
         "health_write",
     )
 
@@ -4394,10 +4394,109 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
         raise self._unsupported("curated_routing_replace")
 
     async def export_snapshot(self, tx: Transaction) -> dict[str, Any]:
-        raise self._unsupported("export_snapshot")
+        """Canonical export document, from the columns Postgres actually has.
+
+        Same document shape and logical ordering as the SQLite reference, so
+        the two backends export the same registry the same way:
+
+        * ``models`` — every non-alias ``model_registry`` row, sorted by
+          ``(provider, model_id)``;
+        * ``prices`` — one entry per *priced* model, derived from the model
+          row's ``price_in`` / ``price_out`` / ``price_cached``. Postgres has no
+          ``model_prices`` table (phase 1.5 adds no DDL), so per-band price
+          history is not part of this backend's export; the row's current
+          price is, because that is what Postgres stores;
+        * ``benchmarks`` — one entry per model carrying ``arena_score``, the
+          only benchmark the Postgres schema models;
+        * ``curated_version`` — ``0``: Postgres has no ``curated_routing``
+          table, so the curated layer is empty rather than unknown.
+
+        ``pricing_model`` / ``band`` are reported as ``"unknown"`` /
+        ``"standard"`` because those columns do not exist in the Postgres
+        schema yet — the ABC's defaults, not invented data. Numbers use the
+        shared canonical form, so ``NULL`` (unpriced) stays ``None`` and ``0``
+        (free) stays ``"0"``.
+        """
+        conn = _postgres_tx(tx).conn
+        rows = await conn.fetch(
+            "SELECT provider, model_id, display_name, family, context_window, "
+            "max_output_tokens, capabilities, price_in, price_out, price_cached, "
+            "arena_score, available, deprecated "
+            "FROM model_registry WHERE alias_of IS NULL "
+            "ORDER BY provider ASC, model_id ASC"
+        )
+
+        canonical_models: list[dict[str, Any]] = []
+        canonical_prices: list[dict[str, Any]] = []
+        canonical_benchmarks: list[dict[str, Any]] = []
+        for row in rows:
+            provider = str(row["provider"])
+            model_id = str(row["model_id"])
+            price_in = canonical_registry_number(row["price_in"])
+            price_out = canonical_registry_number(row["price_out"])
+            price_cached = canonical_registry_number(row["price_cached"])
+
+            canonical_models.append(
+                {
+                    "provider": provider,
+                    "model_id": model_id,
+                    "display_name": row["display_name"],
+                    "family": row["family"],
+                    "context_window": row["context_window"],
+                    "max_output_tokens": row["max_output_tokens"],
+                    "capabilities": sorted(str(c) for c in (row["capabilities"] or ())),
+                    "price_in": price_in,
+                    "price_out": price_out,
+                    "price_cached": price_cached,
+                    "pricing_model": "unknown",
+                    "band": "standard",
+                    "available": bool(row["available"]),
+                    "deprecated": bool(row["deprecated"]),
+                    "alias_of": None,
+                }
+            )
+            # An unpriced row contributes no price entry at all -- exporting a
+            # row of NULLs would let "unpriced" read as "priced at zero".
+            if price_in is not None or price_out is not None or price_cached is not None:
+                canonical_prices.append(
+                    {
+                        "provider": provider,
+                        "model_id": model_id,
+                        "pricing_model": "unknown",
+                        "band": "standard",
+                        "price_in": price_in,
+                        "price_out": price_out,
+                        "price_cached": price_cached,
+                    }
+                )
+            arena_score = canonical_registry_number(row["arena_score"])
+            if arena_score is not None:
+                canonical_benchmarks.append(
+                    {
+                        "provider": provider,
+                        "model_id": model_id,
+                        "benchmark": "arena_score",
+                        "score": arena_score,
+                    }
+                )
+
+        canonical_prices.sort(
+            key=lambda pr: (pr["provider"], pr["model_id"], pr["pricing_model"], pr["band"])
+        )
+        canonical_benchmarks.sort(
+            key=lambda b: (b["provider"], b["model_id"], b["benchmark"])
+        )
+
+        return {
+            "models": canonical_models,
+            "prices": canonical_prices,
+            "benchmarks": canonical_benchmarks,
+            "curated_version": 0,
+        }
 
     async def snapshot_digest(self, tx: Transaction) -> str:
-        raise self._unsupported("snapshot_digest")
+        """Stable SHA-256 over :meth:`export_snapshot`'s canonical encoding."""
+        return model_registry_snapshot_digest(await self.export_snapshot(tx))
 
     async def health_write(self, tx: Transaction, health: ModelRegistryHealth) -> None:
         raise self._unsupported("health_write")

@@ -22,7 +22,7 @@ declares its non-conformance by name.
 | Backend | Status | Notes |
 |---|---|---|
 | **SQLite** | **Conforming** | Full implementation; the CI reference. Always runs in the contract suite. |
-| **Postgres** | **Partial** | Implements the operations its existing schema supports; the rest raise a named error. Runs in the suite when `MNEMOS_TEST_POSTGRES_DSN` is set. |
+| **Postgres** | **Partial** | Implements the operations its existing schema supports (including `export_snapshot` / `snapshot_digest`); the rest raise a named error. Runs in the suite when `MNEMOS_TEST_POSTGRES_DSN` is set; the export operations also run DSN-free. |
 | Oracle | Not yet | `unsupported backend: oracle — phase 2` |
 | MySQL | Not yet | `unsupported backend: mysql — phase 2` |
 | MariaDB | Not yet | `unsupported backend: mariadb — phase 2` |
@@ -41,12 +41,31 @@ only where the columns already exist:
 
 Implemented — `upsert_model`, `list_models`, `get_model`, `set_alias`,
 `resolve_alias`, `record_field_obs`, `merge_fields`, `sync_log_append`,
-`health_read`.
+`health_read`, `export_snapshot`, `snapshot_digest`.
 
 Listed in `PostgresModelRegistryRepository.MISSING_OPERATIONS` (raises
 `ModelRegistryNotSupported`) — `upsert_price`, `upsert_benchmark`,
-`curated_routing_get`, `curated_routing_replace`, `export_snapshot`,
-`snapshot_digest`, `health_write`.
+`curated_routing_get`, `curated_routing_replace`, `health_write`.
+
+`export_snapshot` / `snapshot_digest` are served from the columns Postgres
+already has, so they need none of the missing tables: models come from
+`model_registry` (alias rows excluded, sorted by `(provider, model_id)`),
+prices from the row's `price_in` / `price_out` / `price_cached`, and
+benchmarks from `arena_score`. Two consequences worth knowing:
+
+* per-**band** price history is not in the Postgres export — that lives in
+  `model_prices`, which phase 2 adds; the row's current price is exported;
+* `pricing_model` / `band` are reported as `"unknown"` / `"standard"` and
+  `curated_version` as `0`, because those columns and the `curated_routing`
+  table do not exist in the Postgres schema yet. The digest is therefore
+  stable for a given Postgres registry, but it is **not** equal to the SQLite
+  digest for nominally similar content until phase 2 gives Postgres those
+  tables.
+
+`snapshot_digest` is `model_registry_snapshot_digest(export_snapshot(tx))` —
+the shared helper in `mnemos/persistence/base.py` — so the two can never
+disagree. Both operations are covered by DSN-free tests, so the implementation
+is exercised in CI even when the live Postgres arm is skipped.
 
 The band-aware pricing upsert that predates the ABC (`upsert_model_pricing`,
 `write_price_history`) is unchanged and keeps working; it is not the ABC's
@@ -231,7 +250,7 @@ string fails if those backends ever start silently passing.
    and versioned `curated_routing` DDL, and translate the existing Oracle
    `ROWNUM`/`:named` write path onto the ABC. Phase 1.5 deliberately makes no
    Oracle DDL change and no behaviour change to the existing path.
-2. **Postgres** — add the four missing tables and implement the seven
+2. **Postgres** — add the four missing tables and implement the five
    operations listed in `MISSING_OPERATIONS`.
 3. **MySQL / MariaDB / DB2** — implement once the Oracle port establishes the
    physical shape; MariaDB rides the MySQL implementation.
