@@ -813,6 +813,34 @@ async def test_sync_log_append_and_health(registry: RegistryHandle) -> None:
 
 
 @_conforming()
+async def test_alias_rows_are_not_counted_as_models(registry: RegistryHandle) -> None:
+    """An alias is a pointer, not a model: it must not inflate counts or the digest.
+
+    Regression: ``health_read`` and ``snapshot_digest`` once selected every row
+    in ``model_registry``, so registering an alias raised ``model_count`` by
+    one and changed the export hash even though no model had been added.
+    """
+    async with registry.transaction() as tx:
+        await registry.repo.upsert_model(tx, MODEL)
+        before = await registry.repo.health_read(tx)
+        digest_before = await registry.repo.snapshot_digest(tx)
+
+        await registry.repo.set_alias(tx, MODEL.provider, "gpt-phase15-latest", MODEL.model_id)
+
+        after = await registry.repo.health_read(tx)
+        digest_after = await registry.repo.snapshot_digest(tx)
+        alias_row = await registry.repo.get_model(tx, MODEL.provider, "gpt-phase15-latest")
+
+    assert after.model_count == before.model_count
+    assert after.priced_count == before.priced_count
+    assert after.unpriced_count == before.unpriced_count
+    assert digest_after == digest_before, "an alias must not change the export digest"
+    # The alias row itself carries no price -- it is never NULL-as-zero.
+    assert alias_row is not None
+    assert alias_row.price_in is None and alias_row.price_out is None
+
+
+@_conforming()
 async def test_health_write_round_trips(registry: RegistryHandle) -> None:
     async with registry.transaction() as tx:
         await registry.repo.upsert_model(tx, MODEL)

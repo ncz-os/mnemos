@@ -5301,7 +5301,12 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
         ``0.000001`` on every backend hashes identically.
         """
         conn = self._conn(tx)
-        models = await _fetch_all(conn, "SELECT * FROM model_registry" + self._MODEL_ORDER)
+        # Alias rows are pointers, not models: they must not contribute to the
+        # digest or any count, or adding an alias would change the export hash
+        # and inflate model_count.
+        models = await _fetch_all(
+            conn, "SELECT * FROM model_registry WHERE alias_of IS NULL" + self._MODEL_ORDER
+        )
         prices = await _fetch_all(conn, "SELECT * FROM model_prices" + self._PRICE_ORDER)
         benchmarks = await _fetch_all(conn, "SELECT * FROM model_benchmarks" + self._BENCH_ORDER)
         curated_version = await _fetch_val(conn, "SELECT MAX(version) FROM curated_routing")
@@ -5357,11 +5362,17 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
 
     async def health_read(self, tx: Transaction) -> ModelRegistryHealth:
         conn = self._conn(tx)
-        model_count = int(await _fetch_val(conn, "SELECT COUNT(*) FROM model_registry") or 0)
+        # Count models, not alias rows: an alias is a pointer to a model, so
+        # including it would inflate model_count and make
+        # priced + unpriced == model_count meaningless.
+        model_count = int(
+            await _fetch_val(conn, "SELECT COUNT(*) FROM model_registry WHERE alias_of IS NULL") or 0
+        )
         priced_count = int(
             await _fetch_val(
                 conn,
-                "SELECT COUNT(*) FROM model_registry WHERE price_in IS NOT NULL OR price_out IS NOT NULL",
+                "SELECT COUNT(*) FROM model_registry "
+                "WHERE alias_of IS NULL AND (price_in IS NOT NULL OR price_out IS NOT NULL)",
             )
             or 0
         )

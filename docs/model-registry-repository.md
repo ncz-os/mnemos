@@ -103,6 +103,11 @@ free".** These are different facts and the contract never conflates them.
   `NOT NULL`; `priced=False` selects rows where all are `NULL`.
 * `health_read` reports `priced_count` and `unpriced_count` with
   `priced + unpriced == model_count`, and counts a `0.0` model as **priced**.
+* **Alias rows are never counted as models.** An alias (`alias_of IS NOT NULL`)
+  is a pointer to a model, so `model_count`, `priced_count`,
+  `unpriced_count`, `list_models` and `snapshot_digest` all exclude it. Adding
+  an alias must not change the export hash — otherwise a pure rename would
+  look like a data change to every downstream consumer.
 * `snapshot_digest` distinguishes `NULL` from `0.0`, so a price change from
   unknown to free (or back) changes the digest.
 
