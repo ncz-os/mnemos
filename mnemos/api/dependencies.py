@@ -259,11 +259,14 @@ async def _flush_dirty_touches(backend, oauth) -> None:
                     _requeue_touch(key_id)
                 return
     finally:
-        # No other coroutine can run between the empty check above and this
-        # assignment, so a touch queued after it starts its own flusher.
+        # Drop our own reference on every exit path, not just the empty one:
+        # a failed write requeues nothing but leaves a concurrent touch in
+        # ``_dirty_keys``, and leaving ``_touch_task`` set there would be a
+        # dangling handle to a finished task. A touch queued after this point
+        # simply starts the next flusher -- ``_ensure_touch_flusher`` always
+        # schedules, it never waits on the old handle.
         with _auth_lock:
-            if not _dirty_keys:
-                _touch_task = None
+            _touch_task = None
 
 
 def _ensure_touch_flusher(backend, oauth) -> bool:

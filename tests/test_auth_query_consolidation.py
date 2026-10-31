@@ -219,3 +219,47 @@ def test_cache_entry_expires_after_the_ttl(monkeypatch):
     with pytest.raises(HTTPException) as excinfo:
         _call(auth_mod, backend)
     assert excinfo.value.status_code == 401
+
+
+def test_touch_flusher_clears_its_handle_after_a_failed_write(monkeypatch):
+    """A touch queued during a failing flush must not leave a dangling handle.
+
+    ``_flush_dirty_touches`` only cleared ``_touch_task`` when the queue was
+    empty, so a write that raised while a concurrent request had just queued
+    another key left the finished task referenced. The next flusher is still
+    scheduled (``_ensure_touch_flusher`` never waits on the old handle), but a
+    stale handle makes the in-flight state unreadable and is a leak.
+    """
+    auth_mod, backend, _oauth = _auth_env(monkeypatch, dict(_KEY_ROW))
+
+    started = asyncio.Event()
+    fail = asyncio.Event()
+    touched: list[str] = []
+
+    async def _boom(_backend, _oauth, key_ids):
+        touched.extend(key_ids)
+        started.set()
+        await fail.wait()
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(auth_mod, "_write_touches", _boom)
+
+    async def _run():
+        auth_mod._dirty_keys.clear()
+        auth_mod._touch_task = None
+        auth_mod._dirty_keys["key-1"] = None
+
+        task = asyncio.create_task(auth_mod._flush_dirty_touches(backend, backend.oauth))
+        await started.wait()
+        # A concurrent request queues another touch while the write is failing.
+        auth_mod._dirty_keys["key-2"] = None
+        auth_mod._touch_task = task
+        fail.set()
+        await task
+        return list(auth_mod._dirty_keys)
+
+    remaining = asyncio.run(_run())
+
+    assert touched == ["key-1"]
+    assert remaining == ["key-2"], "the concurrently queued touch must be preserved"
+    assert auth_mod._touch_task is None, "the flusher must drop its handle on every exit path"
