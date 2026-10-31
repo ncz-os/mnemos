@@ -424,7 +424,9 @@ def test_classify_persisted_text_fields_ignores_caller_secret_keys():
         memory_id="mem_m1_unit",
     )
     meta = classified.metadata
-    assert meta == {"host": "web-1"}
+    # The server's own M6 CLEAN stamp for the field it just classified is the
+    # only extra key: every caller-supplied ``secret_*`` key is gone.
+    assert meta == {"host": "web-1", "secret_field_classifiers": {"content": 1}}
     assert classified.namespace == "team"
 
 

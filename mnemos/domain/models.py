@@ -1,5 +1,6 @@
 """Pydantic models for MNEMOS API."""
 
+import asyncio
 import json
 import math
 import re
@@ -18,6 +19,11 @@ SUPPORTED_CONSULTATION_MODES: tuple[str, ...] = (
     "debate",
     "majority",
 )
+
+# M6 (code-health decisions 2026-10-31): a redaction pass over a result set
+# whose combined text is at least this large runs on a worker thread instead
+# of the event loop (about 0.25 s of CPU for 200 rows of 2 KB).
+DEFAULT_REDACT_THREAD_THRESHOLD_BYTES = 256 * 1024
 
 # Memory tags are lightweight filter labels. Bound the per-request list so a
 # single search cannot expand into an unbounded backend IN/ANY predicate.
@@ -505,6 +511,118 @@ def normalize_similarity(row) -> Optional[float]:
     return sim
 
 
+def redact_row_fields(
+    content: Optional[str],
+    compressed: Optional[str],
+    verbatim: Optional[str],
+    raw_meta: Any,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Redact the three text fields of one row (blocking helper).
+
+    Split out of :func:`row_to_memory` so :func:`rows_to_memories` can run it
+    for a whole result set on a worker thread (M6).
+    """
+    from mnemos.core.secret_detection import redact_field_with_stored
+
+    return (
+        redact_field_with_stored(content, raw_meta, "content"),
+        redact_field_with_stored(compressed, raw_meta, "compressed_content") if compressed else compressed,
+        redact_field_with_stored(verbatim, raw_meta, "verbatim_content") if verbatim else verbatim,
+    )
+
+
+async def rows_to_memories(
+    rows,
+    *,
+    include_compressed: bool = False,
+    redact_secrets: bool = False,
+    frame_data: bool = False,
+    thread_threshold_bytes: int = DEFAULT_REDACT_THREAD_THRESHOLD_BYTES,
+) -> List[MemoryItem]:
+    """Build MemoryItems for a result set, offloading large redaction batches.
+
+    M6 (code-health decisions 2026-10-31): redaction is pure CPU and runs on
+    the event loop. Rows whose stored CLEAN marker matches the current
+    classifier skip the recompute entirely (cheap); rows that still need a
+    recompute are bounded work. When the result set's total text is at least
+    ``thread_threshold_bytes`` the redaction pass is moved to one worker
+    thread and the event loop only serializes the finished items. Below the
+    threshold the work is cheaper in place than the thread hand-off.
+
+    Every argument is forwarded to :func:`row_to_memory`, so the output is
+    identical to ``[row_to_memory(r, ...) for r in rows]``.
+    """
+    row_list = list(rows)
+    if not redact_secrets or not row_list:
+        return [
+            row_to_memory(
+                row,
+                include_compressed=include_compressed,
+                redact_secrets=redact_secrets,
+                frame_data=frame_data,
+            )
+            for row in row_list
+        ]
+
+    total_bytes = 0
+    for row in row_list:
+        for key in ("content", "compressed_content", "verbatim_content"):
+            value = row.get(key)
+            if isinstance(value, str):
+                total_bytes += len(value)
+        if total_bytes >= thread_threshold_bytes:
+            break
+
+    if total_bytes < thread_threshold_bytes:
+        return [
+            row_to_memory(
+                row,
+                include_compressed=include_compressed,
+                redact_secrets=redact_secrets,
+                frame_data=frame_data,
+            )
+            for row in row_list
+        ]
+
+    pieces = [
+        (
+            row["content"],
+            row.get("compressed_content") if include_compressed else None,
+            row.get("verbatim_content"),
+            row.get("metadata"),
+        )
+        for row in row_list
+    ]
+    # One thread hand-off for the whole batch: each row is judged
+    # independently and the pure-Python classifier holds no locks.
+    redacted_rows = await asyncio.to_thread(_redact_row_fields_batch, pieces)
+    results = []
+    for row, (content, compressed, verbatim) in zip(row_list, redacted_rows):
+        # Rebuild the row with the redacted fields and let the synchronous
+        # builder do the (cheap) shaping; redaction is already applied, so it
+        # is not run a second time.
+        shaped = dict(row)
+        shaped["content"], shaped["compressed_content"], shaped["verbatim_content"] = (
+            content,
+            compressed,
+            verbatim,
+        )
+        results.append(
+            row_to_memory(
+                shaped,
+                include_compressed=include_compressed,
+                redact_secrets=False,
+                frame_data=frame_data,
+            )
+        )
+    return results
+
+
+def _redact_row_fields_batch(pieces):
+    """Apply :func:`redact_row_fields` to a whole batch (runs off-loop)."""
+    return [redact_row_fields(content, compressed, verbatim, meta) for content, compressed, verbatim, meta in pieces]
+
+
 def row_to_memory(
     row, include_compressed: bool = False, redact_secrets: bool = False, frame_data: bool = False
 ) -> MemoryItem:
@@ -566,12 +684,7 @@ def row_to_memory(
         # F2b (adversarial review 2026-06-28): prefer the spans recorded at
         # ingest classification (authoritative) over recomputing, so a later
         # classifier relaxation cannot re-expose a secret caught at ingest.
-        from mnemos.core.secret_detection import redact_field_with_stored
-
-        content = redact_field_with_stored(content, raw_meta, "content")
-        compressed = redact_field_with_stored(compressed, raw_meta, "compressed_content") if compressed else compressed
-        verbatim = redact_field_with_stored(verbatim, raw_meta, "verbatim_content") if verbatim else verbatim
-
+        content, compressed, verbatim = redact_row_fields(content, compressed, verbatim, raw_meta)
     if frame_data:
         from mnemos.core.injection_defense import defend
 

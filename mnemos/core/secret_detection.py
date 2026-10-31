@@ -35,6 +35,21 @@ from typing import Any, List, Tuple
 
 VAULT_NAMESPACE = "vault"
 
+# M6 (code-health decisions 2026-10-31): version stamp for the classifier's
+# verdicts. A CLEAN verdict recorded at ingest is only trusted at read time
+# while the classifier that produced it is this one — bump this whenever a
+# detector is added, relaxed or tightened (any change that could turn a
+# previously-CLEAN text into REDACT/VAULT), and every stored marker written by
+# an older classifier stops matching, so ``redact_field_with_stored`` resumes
+# recomputing for those rows. The marker is SERVER-ONLY (see M1,
+# ``persisted_text_classification.strip_caller_secret_metadata``).
+SECRET_CLASSIFIER_VERSION = 1
+
+# Metadata key holding the per-field CLEAN verdicts written at ingest
+# (``{field_name: classifier_version}``). SERVER-ONLY, like every other
+# ``secret_*`` key: stripped from caller input on every write path.
+SECRET_CLEAN_MARKER_KEY = "secret_field_classifiers"
+
 
 class SecretClass(str, Enum):
     CLEAN = "clean"
@@ -163,6 +178,7 @@ _ENV_SECRET_RE = re.compile(
     r"[A-Z0-9_]*)[ \t]*=[ \t]*(['\"]?)([^\s'\"]{8,})\2"
 )
 
+
 # Explicit secret denylist — specific credentials that must ALWAYS be masked
 # and drive VAULT wherever they appear, even when every other heuristic misses
 # the surrounding prose shape. The generic heuristics catch these in credential
@@ -198,11 +214,7 @@ _DENY_DIGESTS: frozenset[str] = frozenset(
         "dbba25a7a6cbcac63a326941b395a9d3ddcdd0d8beb5f316ca78cb6f9b23a870",
         "5eb17397dbb83e35b60e3f79efd4f96be85e965bc35ff6205bb731ad88b6a000",
     }
-    | {
-        hashlib.sha256(lit.strip().encode()).hexdigest()
-        for lit in _deny_literals_from_env().split(",")
-        if lit.strip()
-    }
+    | {hashlib.sha256(lit.strip().encode()).hexdigest() for lit in _deny_literals_from_env().split(",") if lit.strip()}
 )
 
 # Candidate tokens: a denylisted value appears as a whitespace/quote-delimited
@@ -229,6 +241,7 @@ def _iter_denylisted(text: str):
         if stripped and stripped != tok and _is_denylisted(stripped):
             off = tok.find(stripped)
             yield mo.start() + off, mo.start() + off + len(stripped)
+
 
 # Headers/markers that declare a memory to be a CREDENTIAL RECORD (the
 # whole thing exists to store secrets) -> VAULT the entire memory.
@@ -460,9 +473,7 @@ _REF_SLUG_SEGMENT_RE = re.compile(r"[a-z0-9._]+")
 # ("v1.2.3", "7.0.5"). Passphrases such as "correct-horse-battery-staple"
 # or "blue-river-lamp" are pure dictionary words and never match either
 # (review: the unprefixed shape alone let those through CLEAN).
-_REF_STRUCTURAL_SEGMENT_RE = re.compile(
-    r"(?:\d{4,}|v?\d+(?:\.\d+)+)", re.IGNORECASE
-)
+_REF_STRUCTURAL_SEGMENT_RE = re.compile(r"(?:\d{4,}|v?\d+(?:\.\d+)+)", re.IGNORECASE)
 # Stricter marker for unprefixed records: a date or long issue id
 # ("20261017", "12345") or a version ("v1.2.3"), never a bare year.
 _REF_STRONG_MARKER_RE = re.compile(r"(?:\d{5,}|v?\d+(?:\.\d+)+)", re.IGNORECASE)
@@ -518,8 +529,7 @@ def _record_password_is_git_ref(user: str | None, value: str) -> bool:
     # shape of a password and must stay detectable. Version segments
     # ("v2", "v1.2.3") are branch-shaped and do not count as mixed.
     mixed = any(
-        re.search(r"[a-z]", s) and re.search(r"\d", s) and not _REF_VERSION_SEGMENT_RE.fullmatch(s)
-        for s in segments
+        re.search(r"[a-z]", s) and re.search(r"\d", s) and not _REF_VERSION_SEGMENT_RE.fullmatch(s) for s in segments
     )
     left = (user or "").strip()
     if left and _REF_SLUG_TOKEN_RE.fullmatch(left) and _GIT_REF_PREFIX_RE.fullmatch(left):
@@ -966,13 +976,67 @@ def redact_field_with_stored(content: str | None, metadata: Any, field_name: str
     verdict. Rows written before the M1 fix (2026-10-31) can still carry a
     planted degenerate marker; trusting it would let the row opt out of
     the recompute backstop entirely.
+
+    M6 (code-health decisions 2026-10-31): a row the SERVER recorded as CLEAN
+    at ingest under the current classifier (``secret_field_classifiers`` ->
+    ``SECRET_CLASSIFIER_VERSION``) has no spans to mask, so the recompute --
+    measured at about 0.47 ms per KB of synchronous CPU on every read -- is
+    skipped and the content passes through untouched. Stored spans still win
+    over the marker; a marker left by an older classifier version never
+    matches and falls back to the recompute, so a classifier change cannot
+    silently keep masking decisions a newer classifier would reverse.
+    The marker is server-only: caller-supplied ``secret_*`` metadata is
+    stripped on every write path (M1), so it cannot be forged.
     """
     if not content:
         return content or ""
     spans = _stored_spans(metadata, field_name)
     if spans and _spans_mask_anything(content, spans):
         return redact(content, spans)
+    if is_clean_under_current_classifier(metadata, field_name):
+        return content
     return redact_content(content)
+
+
+def clean_marker_fields(
+    field_names: List[str] | Tuple[str, ...],
+) -> dict[str, int]:
+    """Build the server-side "clean under classifier vN" marker for ``field_names``.
+
+    Returns the map stored under ``metadata[SECRET_CLEAN_MARKER_KEY]``:
+    ``{field_name: SECRET_CLASSIFIER_VERSION}``. Only fields the classifier
+    actually examined and found CLEAN may be listed — a field that was not
+    supplied (``None``) is not a CLEAN verdict and must be left out.
+    """
+    return {name: SECRET_CLASSIFIER_VERSION for name in field_names}
+
+
+def is_clean_under_current_classifier(metadata: Any, field_name: str) -> bool:
+    """Whether ``metadata`` records ``field_name`` as CLEAN under this classifier.
+
+    Every check fails closed: a missing/malformed marker, a foreign
+    classifier version, or an unparsable metadata blob all return False, so
+    the caller recomputes rather than trusting an unknown verdict.
+    """
+    if metadata is None:
+        return False
+    if isinstance(metadata, str):
+        import json
+
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(metadata, dict):
+        return False
+    marker = metadata.get(SECRET_CLEAN_MARKER_KEY)
+    if not isinstance(marker, dict):
+        return False
+    stamped = marker.get(field_name)
+    # bool is an int subclass; ``True`` must never be read as version 1.
+    if isinstance(stamped, bool) or not isinstance(stamped, int):
+        return False
+    return stamped == SECRET_CLASSIFIER_VERSION
 
 
 def _spans_mask_anything(content: str, spans: list[tuple[int, int]]) -> bool:

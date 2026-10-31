@@ -60,6 +60,7 @@ from mnemos.domain.models import (
     RehydrationResponse,
     normalize_similarity,
     row_to_memory as _row_to_memory,
+    rows_to_memories as _rows_to_memories,
     score_to_similarity,
 )
 
@@ -1533,14 +1534,14 @@ async def search_memories(
     # wrapper. ``_row_to_memory`` here only redacts; injection-defense
     # framing is layered on at serialize time.
     _frame = _should_frame_data(user, operational=bool(request.operational))
-    memories = [
-        _row_to_memory(
-            r,
-            include_compressed=request.include_compressed,
-            redact_secrets=_redact,
-        )
-        for r in rows
-    ]
+    # M6 (code-health decisions 2026-10-31): a large result set's redaction
+    # pass is offloaded to a worker thread instead of burning the classifier
+    # on the event loop; small sets (and marker-clean rows) stay in place.
+    memories = await _rows_to_memories(
+        rows,
+        include_compressed=request.include_compressed,
+        redact_secrets=_redact,
+    )
 
     # v6.2 M-2.2.3: cross-encoder rerank for deep profile.
     # Reranker returns [] on breaker-open / error — we keep original
