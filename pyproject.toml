@@ -336,6 +336,65 @@ forbidden_modules = ["mnemos.api.routes"]
 allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
+# Every route module must import its shared helpers from a library module
+# (api/read_policy.py, api/memory_mutations.py, api/errors.py, a domain or
+# persistence module) rather than from a sibling route. Before, ingest, dag,
+# document_import, narrate, versions and the MCP dag tool all imported
+# private helpers from routes/memories.py, which made that one route the
+# shared library of the others.
+#
+# ``independence`` is used because Grimp refuses to evaluate a ``forbidden``
+# contract whose source and target are the same module ("Modules have shared
+# descendants") — which is exactly the shape of "a route may not import
+# another route". Adding a new route module means adding its dotted name to
+# ``modules`` below; tests/test_routes_no_private_imports.py fails until you
+# do, and names the offending symbol when a helper walks back in.
+name = "routes do not import each other's private names"
+type = "independence"
+modules = [
+  "mnemos.api.routes.acl",
+  "mnemos.api.routes.admin",
+  "mnemos.api.routes.admin_decay",
+  "mnemos.api.routes.audit",
+  "mnemos.api.routes.dag",
+  "mnemos.api.routes.document_import",
+  "mnemos.api.routes.entities",
+  "mnemos.api.routes.federation",
+  "mnemos.api.routes.health",
+  "mnemos.api.routes.ingest",
+  "mnemos.api.routes.journal",
+  "mnemos.api.routes.kg",
+  "mnemos.api.routes.kronos",
+  "mnemos.api.routes.mcp_audit",
+  "mnemos.api.routes.memories",
+  "mnemos.api.routes.morpheus",
+  "mnemos.api.routes.narrate",
+  "mnemos.api.routes.oauth",
+  "mnemos.api.routes.openai_compat",
+  "mnemos.api.routes.portability",
+  "mnemos.api.routes.sessions",
+  "mnemos.api.routes.state",
+  "mnemos.api.routes.tunnels",
+  "mnemos.api.routes.versions",
+  "mnemos.api.routes.webhooks",
+]
+ignore_imports = [
+  # The shared backend guards below are route-local shims over
+  # mnemos.api.persistence_helpers (they only add the per-route 503 label),
+  # not handlers: they carry no request or auth state.
+  "mnemos.api.routes.dag -> mnemos.api.routes._postgres_only",
+  "mnemos.api.routes.entities -> mnemos.api.routes._postgres_only",
+  "mnemos.api.routes.morpheus -> mnemos.api.routes._postgres_only",
+  # GET /v1/memories/{id}?format=... renders a narration body through the
+  # narrate route's pure formatter (no request/auth state). The helper is
+  # shared code that has not been relocated yet.
+  "mnemos.api.routes.memories -> mnemos.api.routes.narrate",
+  # revert_memory's feature-branch path takes the same advisory lock as
+  # merge_branch; the key derivation is pure and shared by design.
+  "mnemos.api.routes.versions -> mnemos.api.routes.dag",
+]
+
+[[tool.importlinter.contracts]]
 name = "webhooks does not couple to domain"
 type = "independence"
 modules = ["mnemos.webhooks", "mnemos.domain"]

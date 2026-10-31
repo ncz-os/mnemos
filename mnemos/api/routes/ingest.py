@@ -8,11 +8,11 @@ from fastapi import APIRouter, Depends, HTTPException
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import require_postgres_pool_or_503
-from mnemos.api.routes.memories import (
+from mnemos.api.memory_mutations import (
     _insert_memory_with_created_webhook,
     _rls_context,
-    _validate_permission_mode,
 )
+from mnemos.api.read_policy import _validate_permission_mode
 from mnemos.core.ids import new_memory_id
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.domain.models import SessionIngestRequest, SessionIngestResponse

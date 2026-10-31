@@ -1,6 +1,5 @@
 """Memory CRUD, search, and rehydration endpoints."""
 
-import asyncio
 import inspect
 import json
 import logging
@@ -23,6 +22,32 @@ from mnemos.api.persistence_helpers import (
     maybe_set_pg_rls as _maybe_set_pg_rls,
     require_postgres_pool_or_503,
 )
+
+# Shared read/write policy helpers live outside this module so the other
+# route modules import them from a library instead of from this file. They
+# are re-exported under their historical private names here because tests
+# and in-module call sites reference ``memories.<name>``.
+from mnemos.api.memory_mutations import (
+    _assert_no_active_deletion,
+    _invalidate_caches_after_mutation,
+    _metadata_for_audit,
+    _publish_bulk_created_events,
+    _publish_nats_with_timeout,
+    _rls_context,
+    _schedule_outbox_deliveries,
+    _write_memory_mutation_audit_entry,
+)
+from mnemos.api.read_policy import (
+    _content_redacted_for_embedding,
+    _mutation_visibility_for,
+    _read_visibility_for,
+    _redacted_for_webhook,
+    _should_frame_data,
+    _should_redact_secrets,
+    _should_redact_secrets_for_row,
+    _validate_permission_mode,
+    _vault_inclusive_read_visibility_for,
+)
 from mnemos.core.config import runtime_env_value_stripped
 from mnemos.core.ids import new_memory_id
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
@@ -36,7 +61,7 @@ from mnemos.domain.artemis_dedup import (
     duplicate_content_error_body,
     evaluate_memory_create_dedup,
 )
-from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+from mnemos.persistence.visibility import VisibilityFilter
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.persistence.base import DuplicateMemoryError
@@ -99,64 +124,6 @@ class _BulkCreateCandidate:
     permission_mode: int
     embedding_content: str
     embedding: list[float] | None = None
-
-
-async def _write_memory_mutation_audit_entry(
-    backend,
-    tx,
-    *,
-    op: str,
-    memory_id: str,
-    content: str,
-    category: str,
-    subcategory: str | None,
-    metadata: dict | None,
-    writer_id: str,
-    embedding=None,
-) -> None:
-    """Append a route-side audit-chain entry for one memory mutation.
-
-    This keeps the single create/update/delete and bulk-create paths on the
-    same helper so new write paths do not accidentally bypass the Ed25519
-    per-memory chain. The helper intentionally preserves the legacy API
-    behavior: when audit is disabled, unsupported by the backend, or missing
-    a session secret, the data write still commits.
-    """
-    from mnemos.audit.route_helper import write_configured_audit_entry
-
-    await write_configured_audit_entry(
-        backend,
-        tx,
-        op=op,
-        memory_id_str=memory_id,
-        snapshot={
-            "content": content,
-            "category": category,
-            "subcategory": subcategory,
-            "metadata": metadata,
-            "embedding": embedding,
-        },
-        writer_id=writer_id,
-    )
-
-
-def _metadata_for_audit(value) -> dict | None:
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, str):
-        if not value:
-            return None
-        try:
-            parsed = json.loads(value)
-        except Exception:
-            return {"_raw": value}
-        return parsed if isinstance(parsed, dict) else {"_value": parsed}
-    try:
-        return dict(value)
-    except Exception:
-        return None
 
 
 def effective_semantic_floor() -> float:
@@ -263,131 +230,6 @@ def _log_search_phase(trace_id: str, started_at: float, phase: str) -> None:
     logger.info("[search:%s] %s done in %dms", trace_id, phase, elapsed_ms)
 
 
-@asynccontextmanager
-async def _rls_context(conn, user: UserContext):
-    """Set PostgreSQL session variables for RLS when auth is active.
-
-    Uses ``SELECT set_config(name, $1, true)`` rather than
-    ``SET LOCAL <name> = $1`` because Postgres SET syntax does not
-    accept bind parameters (the value position must be a literal —
-    https://www.postgresql.org/docs/current/sql-set.html). The third
-    argument ``true`` makes the binding transaction-local, equivalent
-    to SET LOCAL. Same shape as ``maybe_set_pg_rls`` in
-    ``mnemos.api.persistence_helpers`` so the two RLS context paths
-    cannot drift.
-    """
-    if _lc._rls_enabled and user.authenticated:
-        async with conn.transaction():
-            await conn.execute(
-                "SELECT set_config('mnemos.current_user_id', $1, true)",
-                user.user_id,
-            )
-            await conn.execute(
-                "SELECT set_config('mnemos.current_role', $1, true)",
-                user.role,
-            )
-            yield conn
-    else:
-        yield conn
-
-
-def _validate_permission_mode(value: int | None, *, default: int | None = None) -> int | None:
-    """Validate Unix-style octal permission digits stored as an integer."""
-    if value is None:
-        return default
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise HTTPException(status_code=422, detail="permission_mode must be an integer")
-    if value < 0 or value > 777 or any(digit not in "01234567" for digit in str(value)):
-        raise HTTPException(status_code=422, detail="permission_mode must be octal-style 0-777")
-    return value
-
-
-async def _assert_no_active_deletion(
-    backend,
-    *,
-    owner_id: str,
-    namespace: str,
-) -> None:
-    """Refuse to write a row onto a scope that is currently being deleted.
-
-    Without this fence, a memory added during the 30-day grace window
-    (after the soft-delete sweep has marked the scope, before the
-    hard-delete phase runs) would survive past ``hard_deleted`` -- the
-    hard-delete only removes rows already carrying
-    ``deleted_at IS NOT NULL``, so a row inserted during grace still has
-    ``deleted_at IS NULL`` and is skipped forever, even though the
-    audit log claims the user was hard-deleted. Root is the exception:
-    operators may need to inject tombstone rows even mid-deletion.
-    """
-    from mnemos.persistence.worker_lifecycle import active_deletion_for_scope
-
-    try:
-        active = await active_deletion_for_scope(backend, target_user_id=owner_id, target_namespace=namespace)
-    except Exception:
-        # If the fence itself errors (e.g. backend doesn't expose
-        # transactional), fall through. The hard-delete resweep+verify
-        # loop added in deletion_request_worker.py is the second line of
-        # defence and refuses to mark the request complete on live rows.
-        return
-    if active is not None:
-        restore_by = active.get("restore_by")
-        detail = (
-            "This scope is currently subject to an active deletion request; "
-            "new writes are rejected until the grace window expires. "
-        )
-        if restore_by is not None:
-            detail += f"Restore deadline: {restore_by}."
-        raise HTTPException(status_code=409, detail=detail)
-
-
-def _should_redact_secrets(user: UserContext, *, include_secrets: bool = False, namespace: str | None = None) -> bool:
-    """Whether to mask credential spans for this read (redact-at-retrieval).
-
-    Privileged (full content, no masking) ONLY when the caller is root
-    AND explicitly opted in (include_secrets=True) or targeted the vault
-    namespace. Everything else — every non-root caller, and root on the
-    default path — gets credential spans masked ``[REDACTED]`` before the
-    content leaves the server. This is the redact-at-retrieval gate that
-    backstops a vaulted-miss and masks incidental spans (release-blocking
-    2026-06-13).
-    """
-    if not is_root(user):
-        return True
-    privileged = bool(include_secrets) or namespace == VAULT_NAMESPACE
-    return not privileged
-
-
-def _content_redacted_for_embedding(content: str, classified) -> str:
-    """Return ``content`` with secret spans masked, for embedding (F2, 2026-06-28).
-
-    Adversarial review F2: embeddings must not encode raw secret text. The
-    ingest classifier records spans per field (authoritative at ingest);
-    reuse them here rather than recomputing, so the embedding is masked
-    consistently with what was classified. Content with no spans is
-    returned unchanged (no recall cost for clean memories).
-    """
-    from mnemos.core.secret_detection import redact
-
-    spans = (getattr(classified, "redact_fields", None) or {}).get("content") or []
-    if not spans:
-        return content
-    return redact(content, spans)
-
-
-def _redacted_for_webhook(content: str, metadata) -> str:
-    """Span-redact ``content`` for outbound webhook payloads (F3, 2026-06-28).
-
-    Webhook payloads leave the server to an external HTTP endpoint; raw
-    secret content must not leak there (a non-root REST read would mask
-    it, and the receiver may feed the payload to an LLM). Use the stored
-    ingest spans when available, else recompute, matching the
-    redact-at-retrieval contract.
-    """
-    from mnemos.core.secret_detection import redact_field_with_stored
-
-    return redact_field_with_stored(content, metadata, "content")
-
-
 async def _get_embeddings_batch(texts: list[str]) -> list[list[float]]:
     """Embed a request batch through the process embedder."""
     from mnemos.runtime.embedder import get_embedder
@@ -447,185 +289,6 @@ async def _bulk_item_savepoint(tx, index: int):
             await _execute_tx_sql(tx, f"RELEASE SAVEPOINT {name}")
 
 
-def _should_redact_secrets_for_row(user: UserContext, row) -> bool:
-    """Row-aware redact gate for the GET-by-id explicit-fetch escape hatch.
-
-    Root fetching the exact id of a VAULT-namespace row gets full content
-    (the deliberate credential-fetch path); root fetching a NON-vault row by
-    id is still redacted so an ordinary root read can't leak an incidental
-    credential span (ngc-review 2026-06-13). Non-root always redacts.
-    """
-    if not is_root(user):
-        return True
-    row_ns = row.get("namespace") if hasattr(row, "get") else None
-    return row_ns != VAULT_NAMESPACE
-
-
-def _should_frame_data(user, *, operational: bool = False) -> bool:
-    """Whether to apply untrusted-data framing + injection quarantine.
-
-    Prompt-injection defense (release-gate 2026-06-13). Retrieved memories
-    are framed as untrusted reference DATA and AI-targeting injection
-    meta-instructions are quarantined on EVERY read path by default, so a
-    malicious stored memory cannot steer a consuming agent. The ONLY way to
-    get verbatim, unframed content is the explicit operational opt-in --
-    and, like ``include_secrets``, that opt-in is root-only. A non-root
-    caller is ALWAYS framed regardless of the flag.
-    """
-    if not is_root(user):
-        return True
-    return not bool(operational)
-
-
-def _read_visibility_for(user: UserContext, *, namespace: str) -> VisibilityFilter:
-    """Read-path visibility for an already-resolved namespace.
-
-    Root callers bypass; non-root callers are pinned. Use when the
-    handler has already pinned the namespace explicitly (e.g. on
-    create/update) so the same-namespace round-trip doesn't reject.
-    """
-    if is_root(user):
-        return VisibilityFilter(
-            scope=VisibilityScope.ROOT_BYPASS,
-            user_id=None,
-            group_ids=(),
-            namespace=namespace,
-        )
-    return VisibilityFilter.for_read(user, namespace=namespace)
-
-
-def _vault_inclusive_read_visibility_for(user: UserContext, *, namespace: str | None = None) -> VisibilityFilter:
-    """Root/vault-inclusive visibility for post-write response re-fetches.
-
-    Auto-vaulting moves a just-written row from the caller namespace to
-    ``vault``. The normal default read filter intentionally subtracts the
-    vault, so a same-transaction response re-fetch would return None and crash
-    or roll back. Post-write re-fetches are not enumeration; they target the
-    exact id that was just authorized and written, so use root-bypass without
-    the default vault subtraction to return the row reliably on every backend.
-    """
-    return VisibilityFilter(
-        scope=VisibilityScope.ROOT_BYPASS,
-        user_id=None,
-        group_ids=(),
-        namespace=namespace,
-        exclude_namespaces=(),
-    )
-
-
-def _mutation_visibility_for(user: UserContext, *, namespace: str | None) -> VisibilityFilter:
-    """Mutation-path visibility for an already-resolved namespace.
-
-    Root callers bypass; non-root callers are owner+namespace pinned.
-    """
-    if is_root(user):
-        return VisibilityFilter(
-            scope=VisibilityScope.ROOT_BYPASS,
-            user_id=None,
-            group_ids=(),
-            namespace=namespace,
-        )
-    return VisibilityFilter.for_mutation(user, namespace=namespace)
-
-
-def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
-    """Schedule HTTP send attempts for newly-enqueued outbox rows.
-
-    Called AFTER the writing transaction commits so the delivery
-    worker sees a committed row when it runs. ``_attempt_delivery``
-    is imported lazily to avoid pulling the webhook subsystem into
-    edge-profile cold paths.
-    """
-    if not delivery_ids:
-        return
-    from mnemos.webhooks.sender import _attempt_delivery
-
-    for did in delivery_ids:
-        _lc._schedule_delivery_attempt(_attempt_delivery(str(did)))
-
-
-async def _publish_nats_with_timeout(
-    subject: str,
-    payload: dict,
-    *,
-    msg_id: str,
-) -> None:
-    from mnemos.core.config import get_settings
-    from mnemos.nats import publish_event as _nats_publish_event
-
-    timeout = float(get_settings().nats.publish_timeout_seconds)
-    try:
-        await asyncio.wait_for(
-            _nats_publish_event(subject, payload, msg_id=msg_id),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "NATS publish timed out after %.3fs for %s; scheduling retry",
-            timeout,
-            subject,
-        )
-        try:
-            _lc._schedule_background(_nats_publish_event(subject, payload, msg_id=msg_id))
-        except RuntimeError as exc:
-            logger.warning("NATS publish retry scheduling failed for %s: %s", subject, exc)
-
-
-async def _publish_bulk_created_events(events: list[dict], source_node: str) -> None:
-    """Publish bulk-create events concurrently without flooding NATS."""
-    if not events:
-        return
-    from mnemos.core.config import get_settings
-
-    semaphore = asyncio.Semaphore(get_settings().nats.bulk_publish_concurrency)
-
-    async def _publish_one(event: dict) -> None:
-        safe_ns = safe_subject_segment(event["namespace"])
-        async with semaphore:
-            try:
-                await _publish_nats_with_timeout(
-                    f"mnemos.memory.created.{safe_ns}",
-                    {**event, "source_node": source_node},
-                    msg_id=f"{event['memory_id']}.created",
-                )
-            except Exception as exc:
-                logger.warning(
-                    "NATS bulk-create publish failed for %s: %s",
-                    event["memory_id"],
-                    exc,
-                )
-
-    await asyncio.gather(*(_publish_one(event) for event in events))
-
-
-async def _invalidate_caches_after_mutation() -> None:
-    """Invalidate read-side caches after any memory write.
-
-    The per-user SEARCH cache is gone: it was wired to ``_lc._cache``,
-    which the lifecycle hard-wires to ``None`` (no Redis in the
-    runtime), so every read missed and every write went nowhere. With
-    it goes the ``SCAN MATCH "mnemos:search:*"`` invalidation sweep
-    that only ever matched keys of a cache that never existed.
-
-    The ``/stats`` cache entry (``stats:global:v2``) is still dropped:
-    it belongs to the stats surface, not the search surface.
-
-    The visibility epoch is STILL bumped here: the MCP
-    principal-context cache (role / namespace — authorization inputs)
-    subscribes to it, so a revoke must advance the epoch even though
-    search no longer reads one.
-    """
-    if _lc._cache:
-        try:
-            await _lc._cache.delete("stats:global:v2")
-        except Exception:
-            pass
-    try:
-        await _lc._vis_epoch_get_incr()  # bump; errors silently
-    except Exception:
-        pass
-
-
 def _row_archived_at(row) -> object | None:
     try:
         return row.get("archived_at")
@@ -651,110 +314,6 @@ def _is_memory_owner(row, user: UserContext) -> bool:
 # never called. Callers either pull `read_visibility_predicate`
 # directly from mnemos.core.visibility or use one of the
 # `_listing_visibility_for` / `_mutation_visibility_for` helpers.
-
-
-async def _insert_memory_with_created_webhook(
-    *,
-    conn,
-    mem_id: str,
-    content: str,
-    category: str,
-    subcategory: Optional[str] = None,
-    metadata: Optional[dict] = None,
-    owner_id: str,
-    namespace: str,
-    permission_mode: int = 600,
-    verbatim_content: Optional[str] = None,
-    source_model: Optional[str] = None,
-    source_provider: Optional[str] = None,
-    source_session: Optional[str] = None,
-    source_agent: Optional[str] = None,
-    audit_writer_id: Optional[str] = None,
-):
-    """Insert a canonical memory row and enqueue memory.created in the same txn."""
-    verbatim = verbatim_content if verbatim_content is not None else content
-    await conn.execute(
-        "INSERT INTO memories "
-        "(id, content, category, subcategory, metadata, quality_rating, verbatim_content, "
-        "owner_id, namespace, permission_mode, "
-        "source_model, source_provider, source_session, source_agent) "
-        "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
-        mem_id,
-        content,
-        category,
-        subcategory,
-        json.dumps(metadata or {}),
-        verbatim,
-        owner_id,
-        namespace,
-        permission_mode,
-        source_model,
-        source_provider,
-        source_session,
-        source_agent,
-    )
-    if audit_writer_id:
-        try:
-            backend = _lc.get_persistence_backend()
-            tx = getattr(conn, "_mnemos_transaction", None)
-            if tx is None:
-                from mnemos.persistence.postgres import PostgresTransaction
-
-                tx = PostgresTransaction(conn)
-            await _write_memory_mutation_audit_entry(
-                backend,
-                tx,
-                op="create",
-                memory_id=mem_id,
-                content=content,
-                category=category,
-                subcategory=subcategory,
-                metadata=metadata,
-                writer_id=audit_writer_id,
-            )
-        except Exception:
-            from mnemos.core.config import audit_chain_required_flag
-
-            if audit_chain_required_flag():
-                raise
-            logger.exception("[ingest/create] audit-chain write failed for memory %s", mem_id)
-
-    event_payload = {
-        "memory_id": mem_id,
-        "category": category,
-        "subcategory": subcategory,
-        "content": _redacted_for_webhook(content, metadata),
-        "owner_id": owner_id,
-        "namespace": namespace,
-    }
-
-    from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
-
-    await _dispatch_webhook(
-        "memory.created",
-        event_payload,
-        conn=conn,
-        owner_id=owner_id,
-        namespace=namespace,
-    )
-
-    from mnemos.nats.client import get_node_name as _nats_get_node_name
-
-    safe_ns = safe_subject_segment(namespace)
-    nats_intents: list[NatsPublishIntent] = [
-        (
-            f"mnemos.memory.created.{safe_ns}",
-            {
-                "memory_id": mem_id,
-                "namespace": namespace,
-                "category": category,
-                "source_node": _nats_get_node_name(),
-            },
-            f"{mem_id}.created",
-        )
-    ]
-
-    return nats_intents
 
 
 async def _bump_recall_counters(memory_ids: list) -> None:

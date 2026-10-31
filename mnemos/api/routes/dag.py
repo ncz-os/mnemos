@@ -18,8 +18,8 @@ import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.api.routes._postgres_only import _require_postgres_backend
-from mnemos.api.routes.memories import _schedule_outbox_deliveries
-from mnemos.api.routes.memories import _should_redact_secrets
+from mnemos.api.memory_mutations import _schedule_outbox_deliveries
+from mnemos.api.read_policy import _should_redact_secrets
 from mnemos.core.secret_detection import redact_field_with_stored
 from mnemos.core.visibility import (
     ACL_READ_BIT,
