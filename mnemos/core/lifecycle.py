@@ -282,6 +282,28 @@ async def _build_sqlite_backend(db_path, settings):
 
 
 def _select_persistence_backend(settings) -> str:
+    """Resolve which persistence backend the deployment runs on.
+
+    Precedence (highest first):
+
+    1. An explicitly configured DSN (``database.dsn`` / ``database.url``) —
+       the scheme decides. A DSN with an UNKNOWN scheme is a configuration
+       error, never a silent fall back to Postgres: falling back would
+       connect to the wrong database and, for a credential-shaped DSN, leak
+       it to a Postgres server.
+    2. An explicitly configured backend name.
+    3. The per-backend environment shortcuts ``ORACLE_DSN`` / ``DB2_DSN`` —
+       these select the backend AND supply its DSN (see
+       :func:`_oracle_dsn_from_settings` / :func:`_db2_dsn_from_settings`).
+    4. An explicit Postgres connection config (host/port/database/user).
+    5. The configured backend name (when it is not "auto").
+    6. The DSN scheme, when the DSN was not explicitly configured.
+    7. The profile default (sqlite on edge/dev, postgres otherwise).
+
+    An explicit backend name that CONFLICTS with an explicitly configured
+    DSN scheme logs a warning and the DSN wins, because the DSN names the
+    server to actually connect to.
+    """
     database_settings = getattr(settings, "database", None)
     if database_settings is None:
         return "postgres"
@@ -291,12 +313,34 @@ def _select_persistence_backend(settings) -> str:
         database_url = getattr(database_settings, field_name, "").strip().lower()
         if database_url and field_name in explicit_database_fields:
             url_backend = _backend_from_database_url(database_url)
-            return url_backend or "postgres"
+            if url_backend is None:
+                if _is_libpq_keyword_dsn(database_url):
+                    # libpq keyword/value form ("host=... dbname=...") has no
+                    # scheme and is Postgres-only by definition.
+                    url_backend = "postgres"
+                else:
+                    raise ValueError(
+                        f"Unsupported database DSN scheme in {field_name!r}: {_dsn_scheme(database_url)!r}. "
+                        "Expected one of postgres, postgresql, sqlite, oracle, db2, mysql, mariadb."
+                    )
+            if "backend" in explicit_database_fields and configured != "auto":
+                explicit_backend = _normalize_backend_name(configured)
+                if explicit_backend != url_backend:
+                    logger.warning(
+                        "Explicit persistence backend %r conflicts with the configured "
+                        "database DSN scheme %r; using the DSN scheme %r.",
+                        explicit_backend,
+                        _dsn_scheme(database_url),
+                        url_backend,
+                    )
+            return url_backend
 
     if "backend" in explicit_database_fields and configured != "auto":
         return _normalize_backend_name(configured)
     # Per-backend env var shortcuts: ORACLE_DSN / DB2_DSN override
-    # explicit postgres connection defaults (host/port/user).
+    # explicit postgres connection defaults (host/port/user). The DSN
+    # itself is read back through _oracle_dsn_from_settings /
+    # _db2_dsn_from_settings, which fall back to these env vars.
     if oracle_dsn_env():
         return "oracle"
     if db2_dsn_env():
@@ -355,6 +399,33 @@ def _backend_from_database_url(database_url: str) -> str | None:
     return None
 
 
+def _dsn_scheme(database_url: str) -> str:
+    """Return the URL scheme of a DSN without its credentials.
+
+    Used in log lines and error messages: a DSN can carry a password, so
+    only the scheme is ever logged.
+    """
+    scheme, separator, _rest = database_url.partition("://")
+    if not separator:
+        return "<no scheme>"
+    return scheme
+
+
+def _is_libpq_keyword_dsn(database_url: str) -> bool:
+    """Return whether a DSN uses the libpq keyword/value form.
+
+    ``host=localhost port=5432 dbname=mnemos`` is a valid asyncpg DSN and
+    has no scheme. It is Postgres-only by definition, so it is not an
+    "unknown scheme" error.
+    """
+    if "=" not in database_url:
+        return False
+    if "://" in database_url:
+        return False
+    first_token = database_url.split(None, 1)[0]
+    return "=" in first_token and first_token.split("=", 1)[0].isidentifier()
+
+
 def _parse_required_capabilities(raw: str) -> set[str]:
     return {part.strip().lower() for part in raw.replace(";", ",").split(",") if part.strip()}
 
@@ -398,14 +469,22 @@ def _database_dsn_from_settings(settings) -> str:
 
 
 def _oracle_dsn_from_settings(settings) -> str:
+    """Return the Oracle DSN to connect with.
+
+    The configured ``database.dsn`` / ``database.url`` wins when it carries
+    an ``oracle://`` scheme. Otherwise the ``ORACLE_DSN`` environment
+    shortcut is used: it also SELECTS the Oracle backend in
+    :func:`_select_persistence_backend`, so the DSN has to be readable from
+    the same place the selection is made from — otherwise the backend is
+    chosen but startup fails with "no oracle:// DSN configured".
+    """
     database_settings = getattr(settings, "database", None)
-    if database_settings is None:
-        return ""
-    for field_name in ("dsn", "url"):
-        database_url = getattr(database_settings, field_name, "").strip()
-        if database_url.startswith(("oracle:", "oracle+oracledb:")):
-            return database_url
-    return ""
+    if database_settings is not None:
+        for field_name in ("dsn", "url"):
+            database_url = getattr(database_settings, field_name, "").strip()
+            if database_url.startswith(("oracle:", "oracle+oracledb:")):
+                return database_url
+    return oracle_dsn_env()
 
 
 async def _build_oracle_backend(dsn, settings):
@@ -433,14 +512,20 @@ async def _build_oracle_backend(dsn, settings):
 
 
 def _db2_dsn_from_settings(settings) -> str:
+    """Return the IBM Db2 DSN to connect with.
+
+    Mirrors :func:`_oracle_dsn_from_settings`: the configured
+    ``database.dsn`` / ``database.url`` wins when it carries a ``db2://``
+    scheme, otherwise the ``DB2_DSN`` environment shortcut is used — it is
+    what selects the Db2 backend in :func:`_select_persistence_backend`.
+    """
     database_settings = getattr(settings, "database", None)
-    if database_settings is None:
-        return ""
-    for field_name in ("dsn", "url"):
-        database_url = getattr(database_settings, field_name, "").strip()
-        if database_url.startswith(("db2:", "ibm_db2:", "db2+ibm_db:")):
-            return database_url
-    return ""
+    if database_settings is not None:
+        for field_name in ("dsn", "url"):
+            database_url = getattr(database_settings, field_name, "").strip()
+            if database_url.startswith(("db2:", "ibm_db2:", "db2+ibm_db:")):
+                return database_url
+    return db2_dsn_env()
 
 
 async def _build_db2_backend(dsn, settings):
