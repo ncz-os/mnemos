@@ -963,6 +963,18 @@ class _AuthSettings(BaseSettings):
     enabled: bool = Field(False, validation_alias="MNEMOS_AUTH_ENABLED")
     default_namespace: str = Field("default", validation_alias="MNEMOS_DEFAULT_NAMESPACE")
     personal_user_id: str = Field("default", validation_alias="MNEMOS_PERSONAL_USER_ID")
+    # Per-request authentication cost (decision M5). ``get_current_user``
+    # otherwise runs one ``lookup_api_key`` transaction plus a background
+    # ``touch_api_key`` write on every bearer request.
+    #   cache_ttl_seconds      — how long a key-hash -> UserContext result is
+    #                            reused before the row is read again. Also the
+    #                            cross-worker revocation lag: another worker
+    #                            keeps honouring a revoked key for at most this
+    #                            long. 0 disables the cache entirely.
+    #   touch_interval_seconds — minimum spacing between ``api_keys.last_used``
+    #                            writes for one key. 0 touches on every request.
+    cache_ttl_seconds: float = Field(30.0, validation_alias="MNEMOS_AUTH_CACHE_TTL_SECONDS")
+    touch_interval_seconds: float = Field(60.0, validation_alias="MNEMOS_AUTH_TOUCH_INTERVAL_SECONDS")
 
 
 class _RuntimeSettings(BaseSettings):
