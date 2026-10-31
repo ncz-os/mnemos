@@ -1076,9 +1076,7 @@ class _AuditSettings(BaseModel):
     require_session_secret: str = Field(
         default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET")
     )
-    require_chain_key: str = Field(
-        default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_AUDIT_CHAIN_KEY")
-    )
+    require_chain_key: str = Field(default_factory=lambda: runtime_env_value_stripped("MNEMOS_REQUIRE_AUDIT_CHAIN_KEY"))
     chain: str = Field(default_factory=lambda: runtime_env_value("MNEMOS_AUDIT_CHAIN", ""))
     root_private_key: str = Field(default_factory=lambda: runtime_env_value_stripped("MNEMOS_AUDIT_ROOT_PRIVKEY"))
 
@@ -1243,6 +1241,41 @@ def normalize_profile(raw_profile: str | None) -> str:
     return profile
 
 
+#: section -> the settings model whose ``model_fields`` define its valid keys,
+#: so :func:`warn_unknown_toml_keys` can flag an unknown *key*, not just an
+#: unknown table. Populated here (before ``_build_settings`` runs) because
+#: ``warn_unknown_toml_keys`` is called from the top of that function.
+_TOML_SECTION_MODELS: dict[str, type[BaseSettings]] = {
+    "layers": _LayerSettings,
+    "database": _DatabaseSettings,
+    "graeae": _GraeaeSettings,
+    "server": _ServerSettings,
+    "services": _ProfileServiceSettings,
+    "webhook": _WebhookSettings,
+    "providers": _ProviderSettings,
+    "mcp": _MCPSettings,
+    "rate_limit": _RateLimitSettings,
+    "resilience": _ResilienceSettings,
+    "observability": _ObservabilitySettings,
+    "compression": _CompressionSettings,
+    "artemis": _ArtemisSettings,
+    "morpheus": _MorpheusSettings,
+    "persephone": _PersephoneSettings,
+    "kronos": KronosSettings,
+    "pantheon": PantheonSettings,
+    "knemon": KnemonSettings,
+    "federation": _FederationSettings,
+    "oauth": _OAuthSettings,
+    "auth": _AuthSettings,
+    "runtime": _RuntimeSettings,
+    "tools": _ToolSettings,
+    "logging": _LoggingSettings,
+    "nats": _NatsSettings,
+    "audit": _AuditSettings,
+    "hive_mind": _HiveMindSettings,
+}
+
+
 def _build_settings() -> Settings:
     toml_config = _load_toml()
     warn_unknown_toml_keys(toml_config, _loaded_toml_path)
@@ -1336,37 +1369,6 @@ def _build_settings() -> Settings:
         for group_name, group in groups.items()
         if isinstance(group, BaseSettings)
     }
-    _TOML_SECTION_MODELS.update(
-        {
-            "layers": _LayerSettings,
-            "database": _DatabaseSettings,
-            "graeae": _GraeaeSettings,
-            "server": _ServerSettings,
-            "services": _ProfileServiceSettings,
-            "webhook": _WebhookSettings,
-            "providers": _ProviderSettings,
-            "mcp": _MCPSettings,
-            "rate_limit": _RateLimitSettings,
-            "resilience": _ResilienceSettings,
-            "observability": _ObservabilitySettings,
-            "compression": _CompressionSettings,
-            "artemis": _ArtemisSettings,
-            "morpheus": _MorpheusSettings,
-            "persephone": _PersephoneSettings,
-            "kronos": KronosSettings,
-            "pantheon": PantheonSettings,
-            "knemon": KnemonSettings,
-            "federation": _FederationSettings,
-            "oauth": _OAuthSettings,
-            "auth": _AuthSettings,
-            "runtime": _RuntimeSettings,
-            "tools": _ToolSettings,
-            "logging": _LoggingSettings,
-            "nats": _NatsSettings,
-            "audit": _AuditSettings,
-            "hive_mind": _HiveMindSettings,
-        }
-    )
     _apply_profile_defaults(settings)
     _apply_backend_layer_defaults(settings)
     settings.services.resolution = resolve_profile_services(
@@ -1474,6 +1476,7 @@ CONSUMED_TOML_SECTIONS: frozenset[str] = frozenset(
         "logging",
         "mcp",
         "morpheus",
+        "multiuser",  # read by mnemos.core.lifecycle (rls_enabled)
         "nats",
         "oauth",
         "observability",
@@ -1487,6 +1490,7 @@ CONSUMED_TOML_SECTIONS: frozenset[str] = frozenset(
         "services",
         "tools",
         "webhook",
+        "worker",  # read by mnemos.core.lifecycle (enabled)
     }
 )
 
@@ -1525,10 +1529,6 @@ def _model_consumed_keys(section: str) -> frozenset[str] | None:
     return frozenset(group.model_fields)
 
 
-#: section -> the settings model whose ``model_fields`` define its valid keys.
-#: Built lazily below (the models are declared above ``_build_settings``); this
-#: mapping is what makes an unknown *key* detectable, not just an unknown table.
-_TOML_SECTION_MODELS: dict[str, type[BaseSettings]] = {}
 #: Sub-tables that are credential/plugin containers whose child keys are
 #: free-form names (``[graeae.providers.perplexity]`` — the key IS a provider
 #: id). Those children are not settings, so they are skipped wholesale.
