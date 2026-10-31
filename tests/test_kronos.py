@@ -88,6 +88,29 @@ def _day_start() -> datetime:
     return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+def _isolate_bind_guard_env(monkeypatch) -> None:
+    """Give the TestClient-based tests a known bind-guard precondition.
+
+    ``TestClient(app)`` drives the real lifespan, which refuses to start an
+    unauthenticated API unless ``mnemos serve`` recorded a loopback bind
+    (``mnemos/core/network_guard.py``). These tests monkeypatch the user
+    dependency instead of enabling auth, and they do not go through
+    ``mnemos serve``. Two ambient leaks break them depending on test order:
+
+    * the guard's escape hatch left set by another test, and
+    * a stale validated-bind value set via ``record_validated_bind``, which
+      writes through ``set_runtime_env_value`` and therefore survives
+      monkeypatch's env restore.
+
+    Pin both to "nothing recorded, escape hatch off" and record loopback.
+    """
+    from mnemos.core import network_guard
+
+    monkeypatch.delenv(network_guard.UNSAFE_NETWORK_BIND_ENV, raising=False)
+    monkeypatch.delenv(network_guard.BIND_CHECKED_ENV, raising=False)
+    network_guard.record_validated_bind("127.0.0.1")
+
+
 def _stable_daily_rows(memory_id: str, baseline_count: int, current_count: int) -> list[dict]:
     today = _day_start()
     rows = [
@@ -199,6 +222,7 @@ def test_kronos_routes_disabled_return_503(monkeypatch, tmp_path):
     from mnemos.api.main import app
     from mnemos.core.config import _reset_settings_for_tests
 
+    _isolate_bind_guard_env(monkeypatch)
     monkeypatch.setenv("MNEMOS_KRONOS_ENABLED", "false")
     monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "mnemos.sqlite3"))
     _reset_settings_for_tests()
@@ -221,6 +245,7 @@ def test_kronos_routes_enabled_return_expected_json_shape(monkeypatch, tmp_path)
     from mnemos.core.config import _reset_settings_for_tests
     import mnemos.core.lifecycle as lc
 
+    _isolate_bind_guard_env(monkeypatch)
     monkeypatch.setenv("MNEMOS_KRONOS_ENABLED", "true")
     monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "mnemos.sqlite3"))
     _reset_settings_for_tests()

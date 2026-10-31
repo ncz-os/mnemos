@@ -52,14 +52,22 @@ def test_reset_returns_to_base():
 
 
 def test_full_jitter_returns_zero_or_positive():
-    # With base_seconds=1, repeated samples should sometimes be
-    # very small. We can't assert randomness exactly, but we CAN
-    # assert no negative results across many samples.
+    # base == cap == 4.0, so every window is 4.0 and full jitter must
+    # sample uniformly from [0, 4.0] on every call. The previous version
+    # discarded every sample and asserted nothing, so a backoff that
+    # returned -1.0 (or the window itself on every call) passed. Pin the
+    # per-sample bound and that the samples actually spread across the
+    # window instead of pinning to one edge.
     bo = ReconnectBackoff(base_seconds=4.0, cap_seconds=4.0)
-    for _ in range(100):
-        bo.next_delay()  # advance and discard
+    samples = []
+    for _ in range(200):
+        sample = bo.next_delay()
+        assert 0.0 <= sample <= 4.0, f"jittered delay outside [0, window]: {sample}"
+        samples.append(sample)
         bo.reset()
-    # If any sample had been negative the test would have raised.
+
+    assert min(samples) < 1.0, f"full jitter never produced a small delay: min={min(samples)}"
+    assert max(samples) > 3.0, f"full jitter never produced a large delay: max={max(samples)}"
 
 
 def test_invalid_constructor_args_reject():
