@@ -11,6 +11,7 @@ Allowed exceptions to the ban are:
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import tomllib
@@ -22,6 +23,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from mnemos.core.extras import install_hint, is_extra_installed
 from mnemos.core.services import ServiceResolution, parse_component_selection, resolve_profile_services
+
+logger = logging.getLogger(__name__)
 
 
 PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
@@ -334,6 +337,10 @@ class _ProviderSettings(BaseSettings):
         validation_alias="MNEMOS_EMBED_MODEL_PATH",
     )
     embed_n_ctx: int = Field(8192, validation_alias="MNEMOS_EMBED_N_CTX")
+    # 0 = auto (resolve to the CPU count). Kept in step with
+    # ``embed_threads_env()``, which is the reader the embedder actually
+    # uses — the two used to disagree (this field said "auto", the
+    # reader said "cpu_count"), so the same knob had two answers.
     embed_threads: int = Field(0, validation_alias="MNEMOS_EMBED_THREADS")  # 0 = auto
     embed_gpu_layers: int = Field(0, validation_alias="MNEMOS_EMBED_GPU_LAYERS")
 
@@ -961,6 +968,13 @@ class _AuthSettings(BaseSettings):
     model_config = _config_model_config()
 
     enabled: bool = Field(False, validation_alias="MNEMOS_AUTH_ENABLED")
+    # FALLBACK namespace, used only for callers that have no namespace
+    # of their own: the auth-disabled singleton (PERSONAL_SINGLETON) and
+    # the session-cookie path. An API-key caller gets the namespace from
+    # the joined ``users`` row instead, and the MCP connector sends no
+    # namespace at all when MNEMOS_DEFAULT_NAMESPACE is unset — the
+    # server resolves it from the caller in both cases. See
+    # ``default_namespace_env()`` for the single reader of the variable.
     default_namespace: str = Field("default", validation_alias="MNEMOS_DEFAULT_NAMESPACE")
     personal_user_id: str = Field("default", validation_alias="MNEMOS_PERSONAL_USER_ID")
 
@@ -1597,7 +1611,40 @@ def embed_n_ctx_env() -> int:
 
 
 def embed_threads_env() -> int:
-    return int(runtime_env_value("MNEMOS_EMBED_THREADS", str(max(1, os.cpu_count() or 4))))
+    """Return the llama-cpp thread count.
+
+    ``0`` means "auto" everywhere (the ``embed_threads`` settings field
+    documents it that way), so it is resolved HERE to the CPU count
+    instead of being passed through: ``llama_cpp`` treats a falsy
+    ``n_threads`` as its own ``max(cpu_count // 2, 1)`` default, which
+    is a DIFFERENT number from the documented auto value — the same
+    knob was resolving to two different thread counts.
+
+    A negative value is not a thread count; it falls back to auto with
+    a warning rather than being handed to llama-cpp.
+    """
+    raw = runtime_env_value_stripped("MNEMOS_EMBED_THREADS")
+    if not raw:
+        return max(1, os.cpu_count() or 4)
+    try:
+        threads = int(raw)
+    except ValueError:
+        logger.warning(
+            "MNEMOS_EMBED_THREADS=%r is not an integer; using the auto value (%d).",
+            raw,
+            max(1, os.cpu_count() or 4),
+        )
+        return max(1, os.cpu_count() or 4)
+    if threads == 0:
+        return max(1, os.cpu_count() or 4)
+    if threads < 0:
+        logger.warning(
+            "MNEMOS_EMBED_THREADS=%d is not a valid thread count; using the auto value (%d).",
+            threads,
+            max(1, os.cpu_count() or 4),
+        )
+        return max(1, os.cpu_count() or 4)
+    return threads
 
 
 def embed_gpu_layers_env() -> int:
@@ -1777,11 +1824,22 @@ def federation_feed_include_private() -> bool:
     and ``federation_source IS NULL`` prevents loops.
     """
     raw = runtime_env_value_stripped("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE").lower()
+    if not raw:
+        return True  # unset: trusted-LAN posture
     if raw in {"no", "0", "false", "off"}:
         return False
     if raw in {"yes", "1", "true", "on"}:
         return True
-    return True  # unset: trusted-LAN posture
+    # An unrecognised value must NOT silently mean "include private rows":
+    # a typo ("flase"), a stray word, or a value from another flag's
+    # vocabulary would then quietly widen what leaves the host. Warn and
+    # fall back to the documented default (the trusted-LAN posture).
+    logger.warning(
+        "MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=%r is not a recognised value; expected "
+        "1/true/yes/on or 0/false/no/off. Using the default (include private).",
+        raw,
+    )
+    return True  # default: trusted-LAN posture
 
 
 def session_secret_required() -> bool:
@@ -1789,14 +1847,48 @@ def session_secret_required() -> bool:
     return runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET").lower() in {"yes", "1", "true"}
 
 
+def _audit_chain_mode() -> str:
+    """Return the normalised ``MNEMOS_AUDIT_CHAIN`` mode.
+
+    ``off`` (the default), ``on`` (best-effort) or ``required`` (a
+    covered mutation must roll back when signing fails).
+
+    The boolean spellings (``1`` / ``true`` / ``yes``) are accepted as
+    ``on``: an operator who writes ``MNEMOS_AUDIT_CHAIN=1`` means "turn
+    the chain on", and silently treating that as OFF leaves a deployment
+    believing it is audited when it is not. ``MNEMOS_AUDIT_CHAIN=0`` /
+    ``false`` / ``no`` mean ``off``.
+
+    An unrecognised value is a configuration mistake, so it warns and
+    falls back to ``off`` — the safe direction: an audit chain the
+    operator asked for in an unclear way does not silently fail every
+    covered mutation, and the warning names the accepted values.
+    """
+    raw = runtime_env_value_stripped("MNEMOS_AUDIT_CHAIN").lower()
+    if not raw:
+        return "off"
+    if raw in {"off", "0", "false", "no", "none", "disabled"}:
+        return "off"
+    if raw in {"on", "1", "true", "yes", "enabled"}:
+        return "on"
+    if raw == "required":
+        return "required"
+    logger.warning(
+        "MNEMOS_AUDIT_CHAIN=%r is not a recognised value; expected off, on, required "
+        "(1/true/yes are accepted as 'on'). Treating it as 'off'.",
+        raw,
+    )
+    return "off"
+
+
 def audit_chain_enabled_flag() -> bool:
     """Return whether MNEMOS_AUDIT_CHAIN enables audit-chain writes."""
-    return runtime_env_value("MNEMOS_AUDIT_CHAIN", "").lower() in {"on", "required"}
+    return _audit_chain_mode() in {"on", "required"}
 
 
 def audit_chain_required_flag() -> bool:
     """Require audited mutation callers to roll back if signing fails."""
-    return runtime_env_value("MNEMOS_AUDIT_CHAIN", "").lower() == "required"
+    return _audit_chain_mode() == "required"
 
 
 def audit_chain_key_required() -> bool:
@@ -1855,10 +1947,39 @@ def agent_bus_db_env() -> str:
     return runtime_env_value("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 
 
+def default_namespace_env() -> str:
+    """Return the configured ``MNEMOS_DEFAULT_NAMESPACE`` (empty when unset).
+
+    ONE reader for the variable, so the two consumers cannot disagree
+    about what it means. The semantics are:
+
+    * **unset / blank** — no namespace is configured. The REST path
+      resolves the namespace from the CALLER (the API key's joined
+      ``users.namespace``, or the auth-disabled singleton's
+      ``auth.default_namespace``); the MCP connector sends no
+      ``namespace`` at all, so the server resolves it the same way.
+    * **set** — the named namespace is used as the connector write
+      stamp (MCP) and as the fallback namespace for callers that have
+      no namespace of their own (the auth-disabled singleton and the
+      session-cookie path).
+
+    The two paths therefore agree on the VALUE; they differ only in
+    WHEN the value applies, and that difference is deliberate: the
+    connector stamp must not override a caller's own namespace, while
+    the REST fallback has nothing else to fall back to.
+    """
+    return runtime_env_value_stripped("MNEMOS_DEFAULT_NAMESPACE")
+
+
 def connector_default_namespace() -> str | None:
-    """Return the MCP connector namespace override, if explicitly set."""
-    value = os.environ.get("MNEMOS_DEFAULT_NAMESPACE", "").strip()
-    return value or None
+    """Return the MCP connector namespace override, if explicitly set.
+
+    ``None`` means "no override": the request carries no ``namespace``
+    and the server resolves it from the API key's user row. This is the
+    documented behaviour of the connector gallery (unset env → no
+    namespace key in the request body).
+    """
+    return default_namespace_env() or None
 
 
 def hot_rs_enabled() -> bool:
