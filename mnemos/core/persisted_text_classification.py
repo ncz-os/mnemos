@@ -38,6 +38,33 @@ def _metadata_dict(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
         return {}
 
 
+# M1 (code-health decisions 2026-10-31): every ``secret_*`` metadata key is
+# SERVER-ONLY. ``secret_redact_fields`` / ``secret_redact_spans`` are the
+# stored-span marker the read path trusts ahead of recomputing the
+# classifier, so a caller that could write one could switch read-time
+# masking off for a row (plant ``{"content": [[0, 0]]}`` — a span list that
+# masks nothing). ``secret_vaulted`` / ``secret_original_namespace`` /
+# ``secret_classified_at`` / ``secret_reasons`` are equally
+# authorization-relevant. The prefix is the contract: any future
+# ``secret_*`` key is stripped too, so a new marker cannot become
+# caller-writable by omission.
+_SERVER_ONLY_METADATA_PREFIX = "secret_"
+
+
+def strip_caller_secret_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Drop every caller-/peer-supplied ``secret_*`` metadata key.
+
+    Applied at every write path (create, bulk create, PATCH, import,
+    federation ingest) BEFORE classification, so the classification result
+    is the only source of secret metadata that can ever be persisted.
+    """
+    return {
+        key: value
+        for key, value in _metadata_dict(metadata).items()
+        if not str(key).startswith(_SERVER_ONLY_METADATA_PREFIX)
+    }
+
+
 def classify_persisted_text_fields(
     *,
     content: str | None = None,
@@ -55,10 +82,15 @@ def classify_persisted_text_fields(
     per field so retrieval paths can mask the canonical, verbatim, and
     compressed forms consistently.
 
+    Caller-supplied ``secret_*`` metadata is dropped first (see
+    :func:`strip_caller_secret_metadata`): this function is the only source
+    of the server-stamped marker, so the metadata in the result is rebuilt
+    from scratch rather than merged over whatever the caller sent.
+
     The helper fails closed: classifier exceptions quarantine into the vault.
     """
 
-    meta = _metadata_dict(metadata)
+    meta = strip_caller_secret_metadata(metadata)
     fields = {
         "content": content,
         "verbatim_content": verbatim_content,

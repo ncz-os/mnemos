@@ -2169,6 +2169,18 @@ async def update_memory(
             updates["metadata"] = json.dumps(_classified.metadata)
         if _classified.vaulted:
             updates["namespace"] = _classified.namespace
+    elif request.metadata is not None:
+        # M1 (code-health decisions 2026-10-31): a metadata-only PATCH still
+        # has to go through the classifier. Writing ``request.metadata``
+        # verbatim let a caller plant the server-only stored-span marker
+        # (``{"secret_redact_fields": {"content": [[0, 0]]}}``) and switch
+        # read-time masking off for the row, because the read path trusts a
+        # stored span list ahead of recomputing. Re-derive the whole marker
+        # from the PERSISTED text instead, merged under the caller's keys, so
+        # ``secret_*`` can only ever be written by the server. A metadata
+        # PATCH alone cannot see the stored text here, so the merge happens
+        # in-transaction below where the row is loaded.
+        updates["_reclassify_metadata"] = True
 
     # Authorization + mutation in a single repository call: the
     # visibility predicate folds into the UPDATE … RETURNING, so a
@@ -2183,6 +2195,28 @@ async def update_memory(
     try:
         async with backend.transactional() as tx:
             await _maybe_set_pg_rls(tx, user)
+            if updates.pop("_reclassify_metadata", False):
+                # M1: a metadata-only PATCH re-derives ``secret_*`` from the
+                # text already persisted on the row, so the marker can never
+                # be planted, stale, or silently dropped (a metadata PATCH
+                # that omits ``secret_redact_fields`` would otherwise erase
+                # it on the same UPDATE).
+                existing = await backend.memories.get_memory(
+                    tx,
+                    memory_id,
+                    visibility=visibility,
+                    include_archived=True,
+                )
+                if existing is not None:
+                    _patch_classified = classify_persisted_text_fields(
+                        content=existing["content"],
+                        verbatim_content=existing.get("verbatim_content"),
+                        metadata=request.metadata,
+                        namespace=existing.get("namespace") or user.namespace,
+                        classified_at="patch",
+                        memory_id=memory_id,
+                    )
+                    updates["metadata"] = json.dumps(_patch_classified.metadata)
             if updates:
                 try:
                     row = await backend.memories.update_memory(

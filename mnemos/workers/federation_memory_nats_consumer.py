@@ -34,6 +34,7 @@ import asyncpg
 
 from mnemos.core.config import Settings, get_settings, nats_federation_enabled
 from mnemos.core.extras import is_extra_installed
+from mnemos.core.persisted_text_classification import strip_caller_secret_metadata
 from mnemos.domain.federation import _store_memories
 from mnemos.nats.backoff import ReconnectBackoff
 from mnemos.nats.client import get_node_name
@@ -445,6 +446,10 @@ def _memory_from_event(payload: Mapping[str, Any], peer: FederationMemoryPeer) -
     if not isinstance(metadata, dict):
         metadata = {}
     metadata = {**metadata, "federation_nats_source_node": payload.get("source_node")}
+    # M1: ``secret_*`` metadata is server-only. A peer is a caller like any
+    # other, so its keys are stripped here as well — otherwise a peer could
+    # plant ``secret_redact_fields: {"content": [[0, 0]]}`` and switch off
+    # read-time masking on the receiving node.
     return {
         "id": memory_id,
         "content": content,
@@ -453,7 +458,7 @@ def _memory_from_event(payload: Mapping[str, Any], peer: FederationMemoryPeer) -
         "subcategory": payload.get("subcategory"),
         "namespace": payload.get("namespace") or "default",
         "quality_rating": payload.get("quality_rating") or 75,
-        "metadata": metadata,
+        "metadata": strip_caller_secret_metadata(metadata),
         "source_model": payload.get("source_model"),
         "source_provider": payload.get("source_provider"),
         "source_session": payload.get("source_session"),
