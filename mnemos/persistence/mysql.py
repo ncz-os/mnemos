@@ -6970,6 +6970,7 @@ class MysqlFederationRepository(FederationRepository):
         updated_after: Any | None = None,
         id_after: str | None = None,
         limit: int = 100,
+        include_content_hash: bool = False,
     ) -> list[Row]:
         where = ["deleted_at IS NULL"]
         params: list[Any] = []
@@ -6977,11 +6978,13 @@ class MysqlFederationRepository(FederationRepository):
             where.append("(updated > %s OR (updated = %s AND id > %s))")
             params.extend([updated_after, updated_after, id_after])
         params.append(limit)
+        columns = "id, content, category, subcategory, metadata, owner_id, namespace, updated"
+        if include_content_hash:
+            columns += ", content_hash"
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
                 f"""
-                SELECT id, content, category, subcategory, metadata,
-                       owner_id, namespace, updated
+                SELECT {columns}
                   FROM memories
                  WHERE {" AND ".join(where)}
                  ORDER BY updated ASC, id ASC
@@ -7367,17 +7370,102 @@ class MysqlFederationRepository(FederationRepository):
             )
             return self._peer_row(await _fetchone_dict(cursor))
 
-    async def update_peer_schema_check(self, tx: Transaction, peer_id: str, peer_version: str | None) -> None:
+    async def update_peer_schema_check(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        peer_version: str | None,
+        embed_model: str | None = None,
+        embed_dim: int | None = None,
+    ) -> None:
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
                 """
                 UPDATE federation_peers
                    SET peer_mnemos_version = %s,
-                       last_schema_check_at = CURRENT_TIMESTAMP(6)
+                       last_schema_check_at = CURRENT_TIMESTAMP(6),
+                       peer_embed_model = %s,
+                       peer_embed_dim = %s
                  WHERE id = %s
                 """,
-                (peer_version, peer_id),
+                (peer_version, embed_model, embed_dim, peer_id),
             )
+
+    async def record_sync_lag(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        *,
+        last_cursor_ts: Any | None = None,
+        lag_seconds: float | None = None,
+        rows_pulled: int | None = None,
+        rows_last_sync: int | None = None,
+        embedding_status: str | None = None,
+    ) -> None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE federation_peers
+                   SET last_cursor_ts = %s,
+                       lag_seconds = %s,
+                       rows_last_sync = %s,
+                       embedding_status = %s
+                 WHERE id = %s
+                """,
+                (
+                    last_cursor_ts,
+                    lag_seconds,
+                    rows_pulled if rows_pulled is not None else rows_last_sync,
+                    embedding_status,
+                    peer_id,
+                ),
+            )
+
+    async def record_consecutive_failures(self, tx: Transaction, peer_id: str, value: int) -> None:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE federation_peers SET consecutive_failures = %s WHERE id = %s",
+                (int(value), peer_id),
+            )
+
+    async def list_federated_memory_hashes(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        sql = [
+            """
+            SELECT id, content, updated, federation_remote_updated
+              FROM memories
+             WHERE id LIKE CONCAT(%s, '%')
+               AND federation_source = %s
+               AND deleted_at IS NULL
+               AND archived_at IS NULL
+               AND consolidated_into IS NULL
+            """
+        ]
+        params: list[Any] = [f"fed:{peer_name}:", peer_name]
+        if namespace:
+            sql.append("AND namespace = %s")
+            params.append(namespace)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute("".join(sql), tuple(params))
+            rows = await _fetch_all_dicts(cursor)
+        out: list[Row] = []
+        for record in rows:
+            content = record.get("content") or ""
+            if isinstance(content, (bytes, bytearray)):
+                content = content.decode("utf-8", "replace")
+            out.append(
+                {
+                    "id": record["id"],
+                    "content_hash": hashlib.sha256(str(content).encode("utf-8")).hexdigest(),
+                    "updated": record.get("federation_remote_updated") or record.get("updated"),
+                }
+            )
+        return out
 
     async def record_schema_abort(
         self,
@@ -7650,6 +7738,43 @@ class MysqlFederationRepository(FederationRepository):
                 (limit,),
             )
             return await _fetch_all_dicts(cursor)
+
+    async def list_namespace_digest_rows(
+        self,
+        tx: Transaction,
+        *,
+        namespace: str | None = None,
+        limit: int = 100_000,
+    ) -> list[Row]:
+        where = "m.namespace = %s" if namespace else "1 = 1"
+        params: list[Any] = [namespace] if namespace else []
+        params.append(limit)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT m.id, m.content, m.updated
+                  FROM memories m
+                 WHERE {where}
+                   AND {_eligibility.eligible_for_federation("m")}
+                 ORDER BY m.updated ASC, m.id ASC
+                 LIMIT %s
+                """,
+                tuple(params),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        out: list[Row] = []
+        for row in rows:
+            content = row.get("content") or ""
+            if isinstance(content, (bytes, bytearray)):
+                content = content.decode("utf-8", "replace")
+            out.append(
+                {
+                    "id": row["id"],
+                    "content_hash": hashlib.sha256(str(content).encode("utf-8")).hexdigest(),
+                    "updated": row.get("updated"),
+                }
+            )
+        return out
 
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         async with tx.conn.cursor() as cursor:

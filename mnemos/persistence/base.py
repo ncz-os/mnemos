@@ -2472,7 +2472,17 @@ class FederationRepository(ABC):
         updated_after: Any | None = None,
         id_after: str | None = None,
         limit: int = 100,
-    ) -> list[Row]: ...
+        include_content_hash: bool = False,
+    ) -> list[Row]:
+        """Page memories in (updated, id) order for the federation feed.
+
+        ``include_content_hash=True`` (M12 item 4) additionally selects a
+        ``content_hash`` column on backends that store one, so
+        /v1/federation/digest can bucket on the *stored* hash instead of
+        re-hashing content per row. Backends without the column simply omit
+        the key; the digest falls back to hashing content.
+        """
+        ...
 
     @abstractmethod
     async def create_peer(
@@ -2572,7 +2582,66 @@ class FederationRepository(ABC):
         tx: Transaction,
         peer_id: str,
         peer_version: str | None,
-    ) -> None: ...
+        embed_model: str | None = None,
+        embed_dim: int | None = None,
+    ) -> None:
+        """Record the peer's version and (M12 item 2) embedder fingerprint."""
+        ...
+
+    async def record_sync_lag(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        *,
+        last_cursor_ts: Any | None = None,
+        lag_seconds: float | None = None,
+        rows_pulled: int | None = None,
+        rows_last_sync: int | None = None,
+        embedding_status: str | None = None,
+    ) -> None:
+        """Record per-peer lag/health after a successful sync (M12 item 1).
+
+        Not abstract: the value is telemetry, and a backend that has not been
+        taught the columns yet degrades to "no lag samples" rather than
+        refusing every sync at runtime.
+        """
+        return None
+
+    async def record_consecutive_failures(self, tx: Transaction, peer_id: str, value: int) -> None:
+        """Set the peer's consecutive-failure counter (M12 item 1)."""
+        return None
+
+    @abstractmethod
+    async def list_namespace_digest_rows(
+        self,
+        tx: Transaction,
+        *,
+        namespace: str | None = None,
+        limit: int = 100_000,
+    ) -> list[Row]:
+        """``[{id, content_hash, updated}]`` for /v1/federation/digest (M12 item 4).
+
+        ``updated`` is the value peers see on the wire (the column the feed
+        cursor is built from), not the local-only bookkeeping timestamps, so a
+        replica holding the same rows computes the same buckets.
+        """
+        ...
+
+    @abstractmethod
+    async def list_federated_memory_hashes(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        """``[{id, content_hash, updated}]`` for the replica rows we hold.
+
+        ``id`` is the LOCAL id (``fed:<peer>:<remote>``); anti-entropy strips
+        the prefix so both sides hash the same id. Used by
+        ``mnemos.domain.anti_entropy.build_local_digest``.
+        """
+        ...
 
     @abstractmethod
     async def record_schema_abort(

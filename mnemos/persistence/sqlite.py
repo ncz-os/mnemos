@@ -185,6 +185,8 @@ SQLITE_MIGRATION_FILES = [
     "0069_federation_sync_skipped_deleted.sql",
     # FB103: expression index behind GET /v1/memories?meta=job_id:X.
     "migrations_v7_3_memory_metadata_eq_index_sqlite.sql",
+    # M12 items 1/2: federation_peers lag/health columns + peer fingerprint.
+    "migrations_replica_health_sqlite.sql",
 ]
 
 
@@ -6583,16 +6585,99 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             )
         )
 
-    async def update_peer_schema_check(self, tx: Transaction, peer_id: str, peer_version: str | None) -> None:
+    async def update_peer_schema_check(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        peer_version: str | None,
+        embed_model: str | None = None,
+        embed_dim: int | None = None,
+    ) -> None:
         await _execute(
             self._conn(tx),
             """
             UPDATE federation_peers
-            SET peer_mnemos_version = ?, last_schema_check_at = CURRENT_TIMESTAMP
+            SET peer_mnemos_version = ?,
+                last_schema_check_at = CURRENT_TIMESTAMP,
+                peer_embed_model = ?,
+                peer_embed_dim = ?
             WHERE id = ?
             """,
-            (peer_version, peer_id),
+            (peer_version, embed_model, embed_dim, peer_id),
         )
+
+    async def record_sync_lag(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        *,
+        last_cursor_ts: Any | None = None,
+        lag_seconds: float | None = None,
+        rows_pulled: int | None = None,
+        rows_last_sync: int | None = None,
+        embedding_status: str | None = None,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            UPDATE federation_peers
+            SET last_cursor_ts = ?,
+                lag_seconds = ?,
+                rows_last_sync = ?,
+                embedding_status = ?
+            WHERE id = ?
+            """,
+            (
+                _sqlite_value(last_cursor_ts),
+                lag_seconds,
+                rows_pulled if rows_pulled is not None else rows_last_sync,
+                embedding_status,
+                peer_id,
+            ),
+        )
+
+    async def record_consecutive_failures(self, tx: Transaction, peer_id: str, value: int) -> None:
+        await _execute(
+            self._conn(tx),
+            "UPDATE federation_peers SET consecutive_failures = ? WHERE id = ?",
+            (int(value), peer_id),
+        )
+
+    async def list_federated_memory_hashes(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        params: list[Any] = [f"fed:{peer_name}:%", peer_name]
+        sql = [
+            """
+            SELECT id, content, updated, federation_remote_updated
+            FROM memories
+            WHERE id LIKE ?
+              AND federation_source = ?
+              AND deleted_at IS NULL
+              AND archived_at IS NULL
+              AND consolidated_into IS NULL
+            """
+        ]
+        if namespace:
+            sql.append("AND namespace = ?")
+            params.append(namespace)
+        rows = await _fetch_all(self._conn(tx), "".join(sql), tuple(params))
+        out: list[Row] = []
+        for row in rows:
+            record = dict(row)
+            content = record.get("content") or ""
+            out.append(
+                {
+                    "id": record["id"],
+                    "content_hash": hashlib.sha256(str(content).encode("utf-8")).hexdigest(),
+                    "updated": record.get("federation_remote_updated") or record.get("updated"),
+                }
+            )
+        return out
 
     async def record_schema_abort(
         self,
@@ -6865,6 +6950,41 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             """,
             (limit,),
         )
+
+    async def list_namespace_digest_rows(
+        self,
+        tx: Transaction,
+        *,
+        namespace: str | None = None,
+        limit: int = 100_000,
+    ) -> list[Row]:
+        params: list[Any] = []
+        if namespace:
+            where = "m.namespace = ?"
+            params.append(namespace)
+        else:
+            where = "1 = 1"
+        params.append(limit)
+        rows = await _fetch_all(
+            self._conn(tx),
+            f"""
+            SELECT m.id, m.content, m.updated
+            FROM memories m
+            WHERE {where}
+              AND {_eligibility.eligible_for_federation("m")}
+            ORDER BY m.updated ASC, m.id ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        return [
+            {
+                "id": row["id"],
+                "content_hash": hashlib.sha256(str(row.get("content") or "").encode("utf-8")).hexdigest(),
+                "updated": row.get("updated"),
+            }
+            for row in rows
+        ]
 
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         return await _fetch_one(

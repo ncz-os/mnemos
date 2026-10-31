@@ -34,6 +34,7 @@ from urllib.parse import unquote, urlparse
 
 from mnemos.core import eligibility as _eligibility
 from mnemos.core.config import db2_text_search_override, db2_vector_index_override
+from mnemos.core import eligibility as _eligibility
 from mnemos.core import webhook_constants
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.oracle import (
@@ -3642,14 +3643,17 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         updated_after: Any | None = None,
         id_after: str | None = None,
         limit: int = 100,
+        include_content_hash: bool = False,
     ) -> list[Row]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
+        columns = (
+            "id, content, category, subcategory, metadata, owner_id, namespace, updated" + (", content_hash" if include_content_hash else "")
+        )
         try:
             if updated_after is not None and id_after is not None:
                 sql = (
-                    "SELECT id, content, category, subcategory, metadata, "
-                    "owner_id, namespace, updated FROM memories "
+                    f"SELECT {columns} FROM memories "
                     "WHERE deleted_at IS NULL "
                     "AND (updated > ? OR (updated = ? AND id > ?)) "
                     "ORDER BY updated ASC, id ASC "
@@ -3658,8 +3662,7 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 params = (updated_after, updated_after, id_after, limit)
             else:
                 sql = (
-                    "SELECT id, content, category, subcategory, metadata, "
-                    "owner_id, namespace, updated FROM memories "
+                    f"SELECT {columns} FROM memories "
                     "WHERE deleted_at IS NULL "
                     "ORDER BY updated ASC, id ASC "
                     "FETCH FIRST ? ROWS ONLY"
@@ -3718,6 +3721,50 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         return await self.get_peer(tx, peer_id)
 
     # ── consolidation + tombstone ────────────────────────────────────────
+
+    async def list_namespace_digest_rows(
+        self,
+        tx: Any,
+        *,
+        namespace: str | None = None,
+        limit: int = 100_000,
+    ) -> list[Row]:
+        where = "m.namespace = ?" if namespace else "1 = 1"
+        params: list[Any] = [namespace] if namespace else []
+        params.append(limit)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id, m.content, m.updated
+                  FROM memories m
+                 WHERE {where}
+                   AND {_eligibility.eligible_for_federation("m")}
+                 ORDER BY m.updated ASC, m.id ASC
+                 FETCH FIRST ? ROWS ONLY
+                """,
+                tuple(params),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        out: list[Row] = []
+        for row in rows:
+            content = row.get("content") or ""
+            if hasattr(content, "read"):
+                content = content.read()
+            if isinstance(content, (bytes, bytearray)):
+                content = content.decode("utf-8", "replace")
+            out.append(
+                {
+                    "id": row["id"],
+                    "content_hash": hashlib.sha256(str(content).encode("utf-8")).hexdigest(),
+                    "updated": row.get("updated"),
+                }
+            )
+        return out
 
     async def fetch_federated_memory_marker(self, tx: Any, local_id: str) -> Row | None:
         conn = _conn_from_tx(tx)
@@ -4341,6 +4388,8 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         tx: Any,
         peer_id: str,
         peer_version: str | None,
+        embed_model: str | None = None,
+        embed_dim: int | None = None,
     ) -> None:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -4350,13 +4399,107 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 """
                 UPDATE federation_peers SET
                     peer_mnemos_version = ?,
-                    last_schema_check_at = CURRENT TIMESTAMP
+                    last_schema_check_at = CURRENT TIMESTAMP,
+                    peer_embed_model = ?,
+                    peer_embed_dim = ?
                  WHERE id = ?
                 """,
-                (peer_version, peer_id),
+                (peer_version, embed_model, embed_dim, peer_id),
             )
         finally:
             await _call(cursor.close)
+
+    async def record_sync_lag(
+        self,
+        tx: Any,
+        peer_id: str,
+        *,
+        last_cursor_ts: Any | None = None,
+        lag_seconds: float | None = None,
+        rows_pulled: int | None = None,
+        rows_last_sync: int | None = None,
+        embedding_status: str | None = None,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE federation_peers SET
+                    last_cursor_ts = ?,
+                    lag_seconds = ?,
+                    rows_last_sync = ?,
+                    embedding_status = ?
+                 WHERE id = ?
+                """,
+                (
+                    last_cursor_ts,
+                    lag_seconds,
+                    rows_pulled if rows_pulled is not None else rows_last_sync,
+                    embedding_status,
+                    peer_id,
+                ),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def record_consecutive_failures(self, tx: Any, peer_id: str, value: int) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE federation_peers SET consecutive_failures = ? WHERE id = ?",
+                (int(value), peer_id),
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def list_federated_memory_hashes(
+        self,
+        tx: Any,
+        *,
+        peer_name: str,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        sql = [
+            """
+            SELECT id, content, updated, federation_remote_updated
+              FROM memories
+             WHERE id LIKE ?
+               AND federation_source = ?
+               AND deleted_at IS NULL
+               AND archived_at IS NULL
+               AND consolidated_into IS NULL
+            """
+        ]
+        params: list[Any] = [f"fed:{peer_name}:%", peer_name]
+        if namespace:
+            sql.append("AND namespace = ?")
+            params.append(namespace)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(cursor.execute, "".join(sql), tuple(params))
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        out: list[Row] = []
+        for record in rows:
+            content = record.get("content") or ""
+            if hasattr(content, "read"):
+                content = content.read()
+            if isinstance(content, (bytes, bytearray)):
+                content = content.decode("utf-8", "replace")
+            out.append(
+                {
+                    "id": record["id"],
+                    "content_hash": hashlib.sha256(str(content).encode("utf-8")).hexdigest(),
+                    "updated": record.get("federation_remote_updated") or record.get("updated"),
+                }
+            )
+        return out
 
     # ── feed queries ─────────────────────────────────────────────────────
 

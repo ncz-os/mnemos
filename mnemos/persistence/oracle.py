@@ -7165,14 +7165,17 @@ class OracleFederationRepository(FederationRepository):
         updated_after: Any | None = None,
         id_after: str | None = None,
         limit: int = 100,
+        include_content_hash: bool = False,
     ) -> list[Row]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
+        columns = (
+            "id, content, category, subcategory, metadata, owner_id, namespace, updated" + (", content_hash" if include_content_hash else "")
+        )
         try:
             if updated_after is not None and id_after is not None:
                 sql = (
-                    "SELECT id, content, category, subcategory, metadata, "
-                    "owner_id, namespace, updated FROM memories "
+                    f"SELECT {columns} FROM memories "
                     "WHERE deleted_at IS NULL "
                     "AND (updated > :upd OR (updated = :upd AND id > :id_after)) "
                     "ORDER BY updated ASC, id ASC "
@@ -7181,8 +7184,7 @@ class OracleFederationRepository(FederationRepository):
                 params = {"upd": updated_after, "id_after": id_after, "limit": limit}
             else:
                 sql = (
-                    "SELECT id, content, category, subcategory, metadata, "
-                    "owner_id, namespace, updated FROM memories "
+                    f"SELECT {columns} FROM memories "
                     "WHERE deleted_at IS NULL "
                     "ORDER BY updated ASC, id ASC "
                     "FETCH FIRST :limit ROWS ONLY"
@@ -7592,6 +7594,8 @@ class OracleFederationRepository(FederationRepository):
         tx: Transaction,
         peer_id: str,
         peer_version: str | None,
+        embed_model: str | None = None,
+        embed_dim: int | None = None,
     ) -> None:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -7601,13 +7605,148 @@ class OracleFederationRepository(FederationRepository):
                 """
                 UPDATE federation_peers SET
                     peer_mnemos_version = :pv,
-                    last_schema_check_at = SYSTIMESTAMP
+                    last_schema_check_at = SYSTIMESTAMP,
+                    peer_embed_model = :em,
+                    peer_embed_dim = :ed
                  WHERE id = :id
                 """,
-                {"id": peer_id, "pv": peer_version},
+                {"id": peer_id, "pv": peer_version, "em": embed_model, "ed": embed_dim},
             )
         finally:
             await _call(cursor.close)
+
+    async def record_sync_lag(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        *,
+        last_cursor_ts: Any | None = None,
+        lag_seconds: float | None = None,
+        rows_pulled: int | None = None,
+        rows_last_sync: int | None = None,
+        embedding_status: str | None = None,
+    ) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE federation_peers SET
+                    last_cursor_ts = :cts,
+                    lag_seconds = :lag,
+                    rows_last_sync = :rows,
+                    embedding_status = :status
+                 WHERE id = :id
+                """,
+                {
+                    "id": peer_id,
+                    "cts": last_cursor_ts,
+                    "lag": lag_seconds,
+                    "rows": rows_pulled if rows_pulled is not None else rows_last_sync,
+                    "status": embedding_status,
+                },
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def record_consecutive_failures(self, tx: Transaction, peer_id: str, value: int) -> None:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE federation_peers SET consecutive_failures = :v WHERE id = :id",
+                {"id": peer_id, "v": int(value)},
+            )
+        finally:
+            await _call(cursor.close)
+
+    async def list_federated_memory_hashes(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        sql = [
+            """
+            SELECT id, content, updated, federation_remote_updated
+              FROM memories
+             WHERE id LIKE :prefix ESCAPE '\\'
+               AND federation_source = :peer
+               AND deleted_at IS NULL
+               AND archived_at IS NULL
+               AND consolidated_into IS NULL
+            """
+        ]
+        params: dict[str, Any] = {"prefix": f"fed:{peer_name}:%", "peer": peer_name}
+        if namespace:
+            sql.append("AND namespace = :ns")
+            params["ns"] = namespace
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(cursor.execute, "".join(sql), params)
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        out: list[Row] = []
+        for record in rows:
+            content = record.get("content") or ""
+            if hasattr(content, "read"):
+                content = content.read()
+            out.append(
+                {
+                    "id": record["id"],
+                    "content_hash": hashlib.sha256(str(content).encode("utf-8")).hexdigest(),
+                    "updated": record.get("federation_remote_updated") or record.get("updated"),
+                }
+            )
+        return out
+
+    async def list_namespace_digest_rows(
+        self,
+        tx: Transaction,
+        *,
+        namespace: str | None = None,
+        limit: int = 100_000,
+    ) -> list[Row]:
+        where = "m.namespace = :ns" if namespace else "1 = 1"
+        params: dict[str, Any] = {"limit": limit}
+        if namespace:
+            params["ns"] = namespace
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id, m.content, m.updated
+                  FROM memories m
+                 WHERE {where}
+                   AND {_eligibility.eligible_for_federation("m")}
+                 ORDER BY m.updated ASC, m.id ASC
+                 FETCH FIRST :limit ROWS ONLY
+                """,
+                params,
+            )
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        out: list[Row] = []
+        for row in rows:
+            content = row.get("content") or ""
+            if hasattr(content, "read"):
+                content = content.read()
+            out.append(
+                {
+                    "id": row["id"],
+                    "content_hash": hashlib.sha256(str(content).encode("utf-8")).hexdigest(),
+                    "updated": row.get("updated"),
+                }
+            )
+        return out
 
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         conn = _conn_from_tx(tx)

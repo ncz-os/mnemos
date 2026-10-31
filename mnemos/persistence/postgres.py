@@ -5421,12 +5421,16 @@ class PostgresFederationRepository(FederationRepository):
         updated_after: Any | None = None,
         id_after: str | None = None,
         limit: int = 100,
+        include_content_hash: bool = False,
     ) -> list[Row]:
         conn = _postgres_tx(tx).conn
+        columns = "id, content, category, subcategory, metadata, owner_id, namespace, updated"
+        if include_content_hash:
+            columns += ", content_hash"
         if updated_after is not None and id_after is not None:
             return await conn.fetch(
-                """
-                SELECT id, content, category, subcategory, metadata, owner_id, namespace, updated
+                f"""
+                SELECT {columns}
                 FROM memories
                 WHERE deleted_at IS NULL
                   AND (updated > $1 OR (updated = $1 AND id > $2))
@@ -5438,8 +5442,8 @@ class PostgresFederationRepository(FederationRepository):
                 limit,
             )
         return await conn.fetch(
-            """
-            SELECT id, content, category, subcategory, metadata, owner_id, namespace, updated
+            f"""
+            SELECT {columns}
             FROM memories
             WHERE deleted_at IS NULL
             ORDER BY updated ASC, id ASC
@@ -5796,16 +5800,98 @@ class PostgresFederationRepository(FederationRepository):
             peer_id,
         )
 
-    async def update_peer_schema_check(self, tx: Transaction, peer_id: str, peer_version: str | None) -> None:
+    async def update_peer_schema_check(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        peer_version: str | None,
+        embed_model: str | None = None,
+        embed_dim: int | None = None,
+    ) -> None:
         await _postgres_tx(tx).conn.execute(
             """
             UPDATE federation_peers
-            SET peer_mnemos_version = $2, last_schema_check_at = NOW()
+            SET peer_mnemos_version = $2,
+                last_schema_check_at = NOW(),
+                peer_embed_model = $3,
+                peer_embed_dim = $4
             WHERE id = $1::uuid
             """,
             peer_id,
             peer_version,
+            embed_model,
+            embed_dim,
         )
+
+    async def record_sync_lag(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        *,
+        last_cursor_ts: Any | None = None,
+        lag_seconds: float | None = None,
+        rows_pulled: int | None = None,
+        rows_last_sync: int | None = None,
+        embedding_status: str | None = None,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            UPDATE federation_peers
+            SET last_cursor_ts = $2,
+                lag_seconds = $3,
+                rows_last_sync = $4,
+                embedding_status = $5
+            WHERE id = $1::uuid
+            """,
+            peer_id,
+            last_cursor_ts,
+            lag_seconds,
+            rows_pulled if rows_pulled is not None else rows_last_sync,
+            embedding_status,
+        )
+
+    async def record_consecutive_failures(self, tx: Transaction, peer_id: str, value: int) -> None:
+        await _postgres_tx(tx).conn.execute(
+            "UPDATE federation_peers SET consecutive_failures = $2 WHERE id = $1::uuid",
+            peer_id,
+            int(value),
+        )
+
+    async def list_federated_memory_hashes(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        params: list[Any] = [f"fed:{peer_name}:%", peer_name]
+        sql = [
+            """
+            SELECT id, content, updated, federation_remote_updated
+            FROM memories
+            WHERE id LIKE $1
+              AND federation_source = $2
+              AND deleted_at IS NULL
+              AND archived_at IS NULL
+              AND consolidated_into IS NULL
+            """
+        ]
+        if namespace:
+            sql.append("AND namespace = $3")
+            params.append(namespace)
+        result = await _postgres_tx(tx).conn.fetch("".join(sql), *params)
+        out: list[Row] = []
+        for row in result:
+            record = dict(row)
+            content = record.get("content") or ""
+            out.append(
+                {
+                    "id": record["id"],
+                    "content_hash": hashlib.sha256(str(content).encode("utf-8")).hexdigest(),
+                    "updated": record.get("federation_remote_updated") or record.get("updated"),
+                }
+            )
+        return out
 
     async def record_schema_abort(
         self,
@@ -6049,6 +6135,37 @@ class PostgresFederationRepository(FederationRepository):
                 limit,
             )
         )
+
+    async def list_namespace_digest_rows(
+        self,
+        tx: Transaction,
+        *,
+        namespace: str | None = None,
+        limit: int = 100_000,
+    ) -> list[Row]:
+        where = "m.namespace = $1" if namespace else "1 = 1"
+        params: list[Any] = [namespace] if namespace else []
+        limit_placeholder = f"${len(params) + 1}"
+        params.append(limit)
+        result = await _postgres_tx(tx).conn.fetch(
+            f"""
+            SELECT m.id, m.content, m.updated
+            FROM memories m
+            WHERE {where}
+              AND {_eligibility.eligible_for_federation("m")}
+            ORDER BY m.updated ASC, m.id ASC
+            LIMIT {limit_placeholder}
+            """,
+            *params,
+        )
+        return [
+            {
+                "id": row["id"],
+                "content_hash": hashlib.sha256(str(row["content"] or "").encode("utf-8")).hexdigest(),
+                "updated": row["updated"],
+            }
+            for row in result
+        ]
 
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         return await _postgres_tx(tx).conn.fetchrow(
