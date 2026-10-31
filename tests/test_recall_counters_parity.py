@@ -397,6 +397,9 @@ def test_invalidate_caches_after_mutation_has_no_search_scan():
 @pytest.mark.parametrize(
     ("module_name", "class_name"),
     [
+        # The ABC declares the contract the backends implement. It is first
+        # so a broken annotation on the contract fails before any backend.
+        ("mnemos.persistence.base", "MemoryRepository"),
         ("mnemos.persistence.sqlite", "SqliteMemoryRepository"),
         ("mnemos.persistence.postgres", "PostgresMemoryRepository"),
         ("mnemos.persistence.mysql", "MysqlMemoryRepository"),
@@ -406,14 +409,14 @@ def test_invalidate_caches_after_mutation_has_no_search_scan():
     ],
 )
 def test_bump_recall_counts_signature_resolves_on_every_backend(module_name, class_name):
-    """``bump_recall_counts`` must be resolvable on all six backends.
+    """``bump_recall_counts`` must be resolvable on the ABC and all six backends.
 
     ``typing.get_type_hints`` resolves each annotation BY NAME against the
     defining module's globals, so an annotation that referenced an
     unimported name raises ``NameError`` here. This pins the real contract
-    the class body already depends on: ``Sequence`` comes from
+    the class bodies already depend on: ``Sequence`` comes from
     ``collections.abc`` (the convention used throughout
-    ``mnemos/persistence/``, including ``base.py``), not ``typing``.
+    ``mnemos/persistence/``), not ``typing``.
 
     It also proves MariaDB really is covered: it inherits the batch bump
     from ``MysqlMemoryRepository`` rather than declaring its own.
