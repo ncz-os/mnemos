@@ -216,10 +216,10 @@ def effective_semantic_margin_floor() -> float:
 def _resolve_margin_floor(request_min_margin) -> float:
     """Single source of truth for the OOD margin floor actually applied to a
     request: a per-request override if finite & in range, else the env/default.
-    Returned value is finite and clamped to [0, 1]. Used for BOTH the cache key
-    and the gate execution so a cached result and a fresh recompute always gate
-    identically, even if an internal caller passes an out-of-range/non-finite
-    min_margin that bypasses request-field validation (ngc-review 2026-06-13).
+    Returned value is finite and clamped to [0, 1], so a caller that bypasses
+    request-field validation with an out-of-range/non-finite min_margin still
+    gates identically to one that passes a validated value (ngc-review
+    2026-06-13).
     """
     if request_min_margin is not None:
         try:
@@ -1265,12 +1265,10 @@ async def search_memories(
     Results are computed per request — there is no response cache.
     """
     # Secret vault (release-blocking 2026-06-13): include_secrets is
-    # root-only and MUST be enforced BEFORE any cache-key construction,
-    # cache read, or cache write. The cache key encodes
-    # include_secrets into a distinct (secret-inclusive) bucket; if a
-    # non-root caller were allowed past this point they could read — or
-    # populate — the root-only secret bucket via that key. Rejecting up
-    # front guarantees the secret-inclusive cache bucket is reachable
+    # root-only and MUST be enforced BEFORE any row is fetched or any
+    # result is redacted. If a non-root caller were allowed past this
+    # point they could read, or populate, the secret-inclusive result
+    # set. Rejecting up front guarantees the vault bucket is reachable
     # only by root. (Duplicated visibility-factory call below stays
     # defense-in-depth.)
     if request.operational and not is_root(user):
@@ -1502,9 +1500,8 @@ async def search_memories(
                     # UNANCHORED *and* FLAT result set is dropped. Operators
                     # disable it fleet-wide with MNEMOS_SEMANTIC_MARGIN_FLOOR=0
                     # and callers per-request with min_margin=0.0. Resolve via
-                    # the SAME sanitizer used for the cache key so a cached
-                    # entry and its live recompute can never gate differently
-                    # (ngc-review 2026-06-13).
+                    # the SAME sanitizer every path uses so the gate can never
+                    # differ between callers (ngc-review 2026-06-13).
                     margin_floor = _resolve_margin_floor(request.min_margin)
                     if rows and ood_gate_enabled() and margin_floor and margin_floor > 0.0:
                         if is_ood_result_set(request.query, rows, margin_floor=margin_floor):
@@ -1529,7 +1526,7 @@ async def search_memories(
     _log_search_phase(search_trace_id, search_started_at, "metadata_fetch")
     # Redact-at-retrieval: mask credential spans unless this is a root
     # include_secrets / vault-targeted search. Backstops a vaulted-miss and
-    # masks incidental spans before the result set is serialized OR cached.
+    # masks incidental spans before the result set is serialized.
     _redact = _should_redact_secrets(user, include_secrets=bool(request.include_secrets), namespace=search_namespace)
     # Framing is applied as the FINAL pass below (after rerank/decay) so the
     # cross-encoder reranker scores RAW content, not the data-boundary
@@ -1612,7 +1609,7 @@ async def search_memories(
 
     # Prompt-injection defense (release-gate 2026-06-13): frame each hit's
     # content as untrusted DATA + quarantine AI-targeting injection
-    # meta-instructions, as the LAST transform before serialize/cache so a
+    # meta-instructions, as the LAST transform before serialize so a
     # malicious stored memory cannot steer a consuming agent. Skipped only
     # for the root operational opt-in (verbatim recall). Reranker/decay ran
     # on raw content above; framing here keeps their scoring intact.
