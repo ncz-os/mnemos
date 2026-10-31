@@ -16,10 +16,10 @@ from pydantic import BaseModel
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.routes.memories import _should_redact_secrets
 from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.api.routes._postgres_only import _require_postgres_backend
 from mnemos.api.routes.memories import _schedule_outbox_deliveries
+from mnemos.api.routes.memories import _should_redact_secrets
 from mnemos.core.secret_detection import redact_field_with_stored
 from mnemos.core.visibility import (
     ACL_READ_BIT,
@@ -125,7 +125,7 @@ def _history_content(content, user: UserContext, *, namespace: str | None = None
     ``GET /v1/memories/{id}``. These queries do not select ``metadata``, so
     there is no stored-span marker to reuse; recompute (``redact_content``)
     is the correct and stricter source here. Non-root callers are always
-    masked, and root is masked on the default path — no history route grants
+    masked, and root is masked on the default path -- no history route grants
     a plaintext read.
     """
     if not _should_redact_secrets(user, namespace=namespace):
@@ -133,8 +133,6 @@ def _history_content(content, user: UserContext, *, namespace: str | None = None
     from mnemos.core.secret_detection import redact_content
 
     return redact_content(content)
-
-
 router = APIRouter(prefix="/v1/memories", tags=["dag"])
 
 
@@ -303,10 +301,9 @@ async def get_memory_log(
                 # small; this is belt-and-braces.
                 if len(principals) > _MAX_PRINCIPALS_PER_QUERY:
                     logger.warning(
-                        "[DAG] principals list size %d exceeds cap %d; truncating for ACL visibility check on %s",
-                        len(principals),
-                        _MAX_PRINCIPALS_PER_QUERY,
-                        memory_id,
+                        "[DAG] principals list size %d exceeds cap %d; "
+                        "truncating for ACL visibility check on %s",
+                        len(principals), _MAX_PRINCIPALS_PER_QUERY, memory_id,
                     )
                     principals = principals[:_MAX_PRINCIPALS_PER_QUERY]
                 # The memory_acl.perm bit mask MUST come from the
@@ -324,16 +321,12 @@ async def get_memory_log(
                 # fetchval (returns scalar-or-None) for parity with
                 # the rest of dag.py and to keep the fake backend in
                 # tests/test_dag_visibility_gap.py trivially mockable.
-                acl_visible = bool(principals) and bool(
-                    await conn.fetchrow(
-                        "SELECT 1 FROM memory_acl WHERE memory_id = $1 "
-                        "AND principal = ANY($2::text[]) "
-                        "AND (perm & $3::smallint) <> 0 LIMIT 1",
-                        memory_id,
-                        principals,
-                        ACL_READ_BIT,
-                    )
-                )
+                acl_visible = bool(principals) and bool(await conn.fetchrow(
+                    "SELECT 1 FROM memory_acl WHERE memory_id = $1 "
+                    "AND principal = ANY($2::text[]) "
+                    "AND (perm & $3::smallint) <> 0 LIMIT 1",
+                    memory_id, principals, ACL_READ_BIT,
+                ))
 
                 def _snap_visible(r) -> bool:
                     if r["namespace"] != user.namespace:
@@ -343,12 +336,9 @@ async def get_memory_log(
                         and r["group_id"] is not None
                         and r["group_id"] in user.group_ids
                     )
-                    return (
-                        r["owner_id"] == user.user_id
-                        or (r["permission_mode"] % 10) >= 4
-                        or group_visible
-                        or acl_visible
-                    )
+                    return (r["owner_id"] == user.user_id
+                            or (r["permission_mode"] % 10) >= 4
+                            or group_visible or acl_visible)
 
                 rows = [r for r in rows if _snap_visible(r)]
 

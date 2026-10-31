@@ -27,11 +27,15 @@ import pathlib
 
 # (filename, enclosing function) pairs allowed to call row_to_memory without an
 # explicit redact_secrets flag: write-then-echo paths returning the caller's own
-# just-written/just-reverted row. Adding to this list is a conscious decision.
+# just-written row. Adding to this list is a conscious decision.
+#
+# M2 (code-health decisions 2026-10-31) removed ``update_memory`` and
+# ``revert_memory`` from this list: both now pass the redaction gate like every
+# other read, so their echo no longer bypasses masking. ``create_memory`` stays
+# because its response is the caller's own just-written row inside the create
+# transaction (and M1 re-classifies that row before it is stored).
 ECHO_ALLOWLIST: set[tuple[str, str]] = {
     ("memories.py", "create_memory"),
-    ("memories.py", "update_memory"),
-    ("versions.py", "revert_memory"),
 }
 
 _ROUTES_DIR = pathlib.Path(__file__).resolve().parents[1] / "mnemos" / "api" / "routes"

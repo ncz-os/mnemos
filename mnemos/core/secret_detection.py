@@ -163,7 +163,6 @@ _ENV_SECRET_RE = re.compile(
     r"[A-Z0-9_]*)[ \t]*=[ \t]*(['\"]?)([^\s'\"]{8,})\2"
 )
 
-
 # Explicit secret denylist — specific credentials that must ALWAYS be masked
 # and drive VAULT wherever they appear, even when every other heuristic misses
 # the surrounding prose shape. The generic heuristics catch these in credential
@@ -199,7 +198,11 @@ _DENY_DIGESTS: frozenset[str] = frozenset(
         "dbba25a7a6cbcac63a326941b395a9d3ddcdd0d8beb5f316ca78cb6f9b23a870",
         "5eb17397dbb83e35b60e3f79efd4f96be85e965bc35ff6205bb731ad88b6a000",
     }
-    | {hashlib.sha256(lit.strip().encode()).hexdigest() for lit in _deny_literals_from_env().split(",") if lit.strip()}
+    | {
+        hashlib.sha256(lit.strip().encode()).hexdigest()
+        for lit in _deny_literals_from_env().split(",")
+        if lit.strip()
+    }
 )
 
 # Candidate tokens: a denylisted value appears as a whitespace/quote-delimited
@@ -226,7 +229,6 @@ def _iter_denylisted(text: str):
         if stripped and stripped != tok and _is_denylisted(stripped):
             off = tok.find(stripped)
             yield mo.start() + off, mo.start() + off + len(stripped)
-
 
 # Headers/markers that declare a memory to be a CREDENTIAL RECORD (the
 # whole thing exists to store secrets) -> VAULT the entire memory.
@@ -458,7 +460,9 @@ _REF_SLUG_SEGMENT_RE = re.compile(r"[a-z0-9._]+")
 # ("v1.2.3", "7.0.5"). Passphrases such as "correct-horse-battery-staple"
 # or "blue-river-lamp" are pure dictionary words and never match either
 # (review: the unprefixed shape alone let those through CLEAN).
-_REF_STRUCTURAL_SEGMENT_RE = re.compile(r"(?:\d{4,}|v?\d+(?:\.\d+)+)", re.IGNORECASE)
+_REF_STRUCTURAL_SEGMENT_RE = re.compile(
+    r"(?:\d{4,}|v?\d+(?:\.\d+)+)", re.IGNORECASE
+)
 # Stricter marker for unprefixed records: a date or long issue id
 # ("20261017", "12345") or a version ("v1.2.3"), never a bare year.
 _REF_STRONG_MARKER_RE = re.compile(r"(?:\d{5,}|v?\d+(?:\.\d+)+)", re.IGNORECASE)
@@ -514,7 +518,8 @@ def _record_password_is_git_ref(user: str | None, value: str) -> bool:
     # shape of a password and must stay detectable. Version segments
     # ("v2", "v1.2.3") are branch-shaped and do not count as mixed.
     mixed = any(
-        re.search(r"[a-z]", s) and re.search(r"\d", s) and not _REF_VERSION_SEGMENT_RE.fullmatch(s) for s in segments
+        re.search(r"[a-z]", s) and re.search(r"\d", s) and not _REF_VERSION_SEGMENT_RE.fullmatch(s)
+        for s in segments
     )
     left = (user or "").strip()
     if left and _REF_SLUG_TOKEN_RE.fullmatch(left) and _GIT_REF_PREFIX_RE.fullmatch(left):
