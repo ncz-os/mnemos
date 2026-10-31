@@ -147,7 +147,7 @@ async def test_sync_peer_records_feed_failure_then_raises(monkeypatch):
                 "copy_embeddings": False,
             }
 
-        async def update_peer_schema_check(self, tx, peer_id, peer_version):
+        async def update_peer_schema_check(self, tx, peer_id, peer_version, embed_model=None, embed_dim=None):
             return None
 
         async def create_sync_log(self, tx, peer_id, cursor_before):
@@ -158,6 +158,10 @@ async def test_sync_peer_records_feed_failure_then_raises(monkeypatch):
 
         async def record_sync_error(self, tx, peer_id, error):
             self.recorded_error = error
+
+        async def record_consecutive_failures(self, tx, peer_id, value):
+            # M12 item 1: a failed pass bumps the peer's failure counter.
+            self.recorded_failures = value
 
     class Backend:
         def __init__(self):
