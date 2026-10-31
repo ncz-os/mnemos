@@ -3637,3 +3637,48 @@ def test_webhook_succeeded_terminal_trigger_migration_list_sync():
             "/migrations/33-webhook-succeeded-terminal-trigger.sql:ro"
         ) in text, compose_name
         assert "-f /migrations/33-webhook-succeeded-terminal-trigger.sql" in text, compose_name
+
+
+def test_dispatcher_legacy_patch_is_undone_on_the_owning_module():
+    """A ``monkeypatch`` on a legacy name must not leak into its owner.
+
+    ``mnemos.webhooks.dispatcher`` forwards ``setattr`` on its legacy names
+    to chain.py / workers.py / types.py, and every production call site
+    reads the owner (``webhook_chain._abandon_live_successor_attempt``,
+    ``webhook_types.REPAIR_BURST_INTERVAL``). ``monkeypatch`` only remembers
+    the value it shadowed on ``dispatcher`` itself, so undo never touched
+    the owner: a fake stayed installed for the rest of the session. That
+    was the cause of the order-dependent failures in this file (5 cases
+    ending in ``RuntimeError: successor cleanup failed``) and of a leaked
+    0.02 s repair cadence for any later worker test.
+    """
+    from _pytest.monkeypatch import MonkeyPatch
+
+    from mnemos.webhooks import chain as webhook_chain
+    from mnemos.webhooks import dispatcher as webhook_dispatcher
+    from mnemos.webhooks import types as webhook_types
+    from mnemos.webhooks import workers as webhook_workers
+
+    original_abandon = webhook_chain._abandon_live_successor_attempt
+    original_interval = webhook_types.REPAIR_BURST_INTERVAL
+    original_recover = webhook_workers._recover_due_deliveries
+
+    mp = MonkeyPatch()
+    try:
+        mp.setattr(webhook_dispatcher, "_abandon_live_successor_attempt", object())
+        mp.setattr(webhook_dispatcher, "REPAIR_BURST_INTERVAL", 0.02)
+        mp.setattr(webhook_dispatcher, "_recover_due_deliveries", object())
+
+        # The shim must still make the patch visible to production code.
+        assert webhook_chain._abandon_live_successor_attempt is not original_abandon
+        assert webhook_types.REPAIR_BURST_INTERVAL == 0.02
+        assert webhook_workers._recover_due_deliveries is not original_recover
+    finally:
+        mp.undo()
+
+    assert webhook_dispatcher._abandon_live_successor_attempt is original_abandon
+    assert webhook_chain._abandon_live_successor_attempt is original_abandon
+    assert webhook_dispatcher.REPAIR_BURST_INTERVAL == original_interval
+    assert webhook_types.REPAIR_BURST_INTERVAL == original_interval
+    assert webhook_dispatcher._recover_due_deliveries is original_recover
+    assert webhook_workers._recover_due_deliveries is original_recover

@@ -1597,6 +1597,15 @@ async def test_state_kv_is_namespace_scoped(backend_case: BackendCase):
 async def test_sqlite_vector_semantic_search(tmp_path):
     from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
+    # This is the vec0 candidate-path parity case: without the sqlite-vec
+    # wheel the backend silently falls back to the UDF scan, the query
+    # still returns rows, and the assertions below would pass without
+    # ever exercising the path they exist to pin. Skip instead.
+    pytest.importorskip(
+        "sqlite_vec",
+        reason="sqlite-vec wheel not installed; the vec0 candidate path cannot be exercised",
+    )
+
     # The runtime dim guard (added in the embed-dim slice) requires
     # _expected_embedding_dim to match the fixture vector length. Pass
     # a settings shim with embedding_dim=3 so the 3-D fixture vectors

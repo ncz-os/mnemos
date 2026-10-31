@@ -141,6 +141,7 @@ _LEGACY_MODULES = {
     "asyncpg": __import__("asyncpg"),
 }
 _LEGACY_ATTR_TARGETS: dict[str, object] = {}
+_LEGACY_ATTR_ORIGINALS: dict[str, Any] = {}
 
 
 def _register_legacy_attrs(target: object, names: tuple[str, ...]) -> None:
@@ -273,12 +274,50 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+_UNSET = object()
+# Owner-module value saved at the first forwarded write of each legacy name.
+# Every later write to the same name (monkeypatch's undo, or a re-patch
+# inside one test) puts the saved original back on the owner.
+_LEGACY_ATTR_PRISTINE: dict[str, Any] = {}
+
+
 class _DispatcherModule(_module_types.ModuleType):
+    """Module type that mirrors ``dispatcher.<legacy name>`` reads onto the owner.
+
+    ``monkeypatch.setattr(dispatcher, "<legacy name>", fake)`` forwards the
+    write to chain.py / workers.py / types.py (see :func:`__setattr__`
+    below). On undo, monkeypatch only restores the shadowed value on *this*
+    module; without the forwarding below it never touches the owner, so the
+    fake stayed installed in ``chain.py`` / ``workers.py`` / ``types.py`` for
+    the rest of the session. That leaked a fake ``_recover_due_deliveries``,
+    a fake ``_abandon_live_successor_attempt`` (5 order-dependent webhook
+    failures) and a 0.02 s ``REPAIR_BURST_INTERVAL`` (a live tuning value
+    read back from ``types.py``).
+
+    The owner therefore always carries this module's current value: the
+    first write records the owner's original, every later write (monkeypatch's
+    undo, a re-patch inside one test) forwards the new value, and
+    ``__delattr__`` restores the recorded original. Unpatched names are not
+    shadowed here, so they keep resolving through ``__getattr__``.
+    """
+
     def __setattr__(self, name: str, value: Any) -> None:
         target = _LEGACY_ATTR_TARGETS.get(name)
-        if target is not None:
-            setattr(target, name, value)
+        if target is None:
+            super().__setattr__(name, value)
+            return
+        if name not in _LEGACY_ATTR_PRISTINE:
+            _LEGACY_ATTR_PRISTINE[name] = getattr(target, name, _UNSET)
         super().__setattr__(name, value)
+        setattr(target, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        target = _LEGACY_ATTR_TARGETS.get(name)
+        super().__delattr__(name)
+        if target is not None:
+            saved = _LEGACY_ATTR_PRISTINE.get(name, _UNSET)
+            if saved is not _UNSET:
+                setattr(target, name, saved)
 
 
 sys.modules[__name__].__class__ = _DispatcherModule

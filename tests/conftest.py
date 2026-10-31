@@ -67,6 +67,34 @@ def reset_rate_limiter_state():
 
 
 @pytest.fixture(autouse=True)
+def isolate_settings_singleton(monkeypatch):
+    """Clear the memoised settings object around every test.
+
+    :func:`mnemos.core.config.get_settings` memoises its result in the
+    module global ``_settings`` and ``_sync_compat_exports`` mutates that
+    instance in place. A test that rebinds ``config._settings`` to ``None``
+    (``monkeypatch.setattr(config, "_settings", None)`` — done by several
+    suites to re-read an env var) gets its *own* fresh object while
+    recording ``None`` as the undo value. The undo therefore leaves the
+    test's environment-derived object installed, and the next test inherits
+    it: ``FEDERATION_ALLOW_PRIVATE=false`` from
+    ``test_federation_peer_ssrf.py`` reaching
+    ``test_federation_lan_peer_policy.py``, ``MNEMOS_PROFILE=server`` from
+    ``test_auth_failclosed.py`` reaching the deployment-profile tests.
+
+    Clearing the global here makes the *next* ``get_settings()`` rebuild
+    from that test's own environment, so test order cannot decide which
+    values are cached. Nothing is rebuilt in teardown, so the environment
+    is already restored by the time the global is cleared.
+    """
+    from mnemos.core import config
+
+    monkeypatch.setattr(config, "_settings", None)
+    yield
+    monkeypatch.setattr(config, "_settings", None)
+
+
+@pytest.fixture(autouse=True)
 def ensure_default_event_loop():
     """Keep legacy sync tests using asyncio.get_event_loop() working on 3.11+."""
     try:

@@ -125,11 +125,18 @@ def test_mcp_server_configs_use_real_subcommands():
 
 def test_mcp_server_configs_have_authorization_or_env_token():
     """Every ``mcpServers`` entry that runs ``mnemos serve mcp-stdio``
-    SHOULD reference ``MNEMOS_API_KEY`` (env stamp) or the SSE
-    variant should send an ``Authorization`` header. Without it,
-    the connector example will 401 against a default-auth-enabled
-    server."""
-    failures: list[tuple[str, str]] = []
+    must reference ``MNEMOS_API_KEY`` (env stamp), and every SSE entry
+    must send a bearer ``Authorization`` header. Without it the
+    connector example will 401 against a default-auth-enabled server.
+
+    This used to collect violations into ``failures`` and then end
+    without asserting anything, so it passed no matter what the docs
+    said. Every scanned entry must now be compliant, and the test
+    fails if it found nothing to scan (that would mean the extraction
+    broke, not that the docs are clean).
+    """
+    failures: list[tuple[str, str, str]] = []
+    scanned = 0
     for doc in _connector_md_files():
         text = doc.read_text(encoding="utf-8")
         for block in _extract_json_blocks(text):
@@ -151,35 +158,23 @@ def test_mcp_server_configs_have_authorization_or_env_token():
                     and len(args) >= 2
                     and args[:2] == ["serve", "mcp-stdio"]
                 ):
+                    scanned += 1
                     env = cfg.get("env") or {}
                     if not isinstance(env, dict) or "MNEMOS_API_KEY" not in env:
-                        failures.append(
-                            (doc.name, server_name)
-                        )
+                        failures.append((doc.name, server_name, "stdio entry carries no MNEMOS_API_KEY"))
                 # SSE transport variant.
                 elif cfg.get("transport") == "sse":
+                    scanned += 1
                     headers = cfg.get("headers") or {}
                     auth = headers.get("Authorization") or ""
                     if not auth.lower().startswith("bearer"):
-                        failures.append(
-                            (doc.name, server_name)
-                        )
-    # We allow some doc snippets to omit the token (placeholder /
-    # legacy / SSH-spawn pattern that injects token via remote
-    # command line). Just require: the FIRST stdio config in each
-    # doc contains MNEMOS_API_KEY in env. The audit catches
-    # totally-token-less docs, not every variant.
-    if failures:
-        # Group by doc — if a doc has any compliant entry, give it
-        # a pass. Operators copy the FIRST example they see most
-        # of the time.
-        per_doc: dict[str, list[str]] = {}
-        for doc_name, server_name in failures:
-            per_doc.setdefault(doc_name, []).append(server_name)
-        # Just ensure none of the failures are in stdio/sse FIRST
-        # examples — let the bulk-failure case go through with a
-        # log instead of a hard fail. The hard-fail variant would
-        # be too brittle against existing legacy snippets.
+                        failures.append((doc.name, server_name, "sse entry carries no bearer Authorization header"))
+
+    assert scanned, "no mnemos serve mcp-stdio or SSE mcpServers entries were found in the connector docs"
+    assert not failures, (
+        "connector doc mcpServers entries have no credential, so the "
+        f"copy-paste example 401s: {failures!r}"
+    )
 
 
 def test_at_least_one_doc_per_surface():
@@ -212,3 +207,82 @@ def test_readme_links_resolve():
         if not target.exists():
             failures.append(match.group(1))
     assert not failures, f"README references missing files: {failures}"
+
+def _credential_failures(blocks: list[str]) -> tuple[int, list[tuple[str, str, str]]]:
+    """Run the credential scan over ``blocks`` instead of the real docs.
+
+    Mirrors ``test_mcp_server_configs_have_authorization_or_env_token``
+    so both branches can be exercised against synthetic snippets: the
+    shipped connector docs only contain stdio examples today, so an
+    in-place SSE regression could never be caught by scanning them.
+    """
+    failures: list[tuple[str, str, str]] = []
+    scanned = 0
+    for block in blocks:
+        try:
+            parsed = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if not _is_mcp_server_config(parsed):
+            continue
+        for server_name, cfg in parsed["mcpServers"].items():
+            if not isinstance(cfg, dict):
+                continue
+            command = cfg.get("command")
+            args = cfg.get("args", []) or []
+            if command == "mnemos" and isinstance(args, list) and len(args) >= 2 and args[:2] == ["serve", "mcp-stdio"]:
+                scanned += 1
+                env = cfg.get("env") or {}
+                if not isinstance(env, dict) or "MNEMOS_API_KEY" not in env:
+                    failures.append(("doc.md", server_name, "stdio entry carries no MNEMOS_API_KEY"))
+            elif cfg.get("transport") == "sse":
+                scanned += 1
+                headers = cfg.get("headers") or {}
+                auth = headers.get("Authorization") or ""
+                if not auth.lower().startswith("bearer"):
+                    failures.append(("doc.md", server_name, "sse entry carries no bearer Authorization header"))
+    return scanned, failures
+
+
+@pytest.mark.parametrize(
+    ("block", "scanned", "failing"),
+    [
+        (
+            '{"mcpServers": {"mnemos": {"command": "mnemos", '
+            '"args": ["serve", "mcp-stdio"], "env": {"MNEMOS_API_KEY": "x"}}}}',
+            1,
+            False,
+        ),
+        (
+            '{"mcpServers": {"mnemos": {"command": "mnemos", '
+            '"args": ["serve", "mcp-stdio"], "env": {"MNEMOS_TOKEN": "x"}}}}',
+            1,
+            True,
+        ),
+        (
+            '{"mcpServers": {"mnemos": {"command": "mnemos", "args": ["serve", "mcp-stdio"]}}}',
+            1,
+            True,
+        ),
+        (
+            '{"mcpServers": {"mnemos": {"transport": "sse", "url": "http://h/sse", '
+            '"headers": {"Authorization": "Bearer ${env:MNEMOS_TOKEN}"}}}}',
+            1,
+            False,
+        ),
+        (
+            '{"mcpServers": {"mnemos": {"transport": "sse", "url": "http://h/sse", "headers": {"X-Debug": "1"}}}}',
+            1,
+            True,
+        ),
+        (
+            '{"mcpServers": {"mnemos": {"transport": "sse", "url": "http://h/sse"}}}',
+            1,
+            True,
+        ),
+    ],
+)
+def test_credential_scan_rejects_missing_tokens(block, scanned, failing):
+    found_scanned, failures = _credential_failures([block])
+    assert found_scanned == scanned
+    assert bool(failures) is failing, failures

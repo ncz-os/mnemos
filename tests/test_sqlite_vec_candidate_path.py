@@ -14,6 +14,11 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip(
+    "sqlite_vec",
+    reason="sqlite-vec wheel not installed; the vec0 candidate path cannot be exercised",
+)
+
 from mnemos.persistence import SqliteBackend
 from mnemos.persistence.sqlite import _fetch_one
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope

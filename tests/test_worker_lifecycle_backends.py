@@ -6,6 +6,15 @@ from typing import Any
 
 import pytest
 
+# The persephone extra is gated on ``zstandard`` (mnemos/core/extras.py
+# EXTRA_PROBES) and ``mnemos.domain.persephone`` raises RuntimeError rather
+# than ImportError at import, so a bare import here errors collection instead
+# of skipping. Gate on the extra's probe.
+pytest.importorskip(
+    "zstandard",
+    reason="persephone subsystem not installed; pip install mnemos-core[persephone]",
+)
+
 from mnemos.domain.persephone.runner import sweep_for_archival
 from mnemos.domain.admin_lifecycle_repo import AdminLifecycleRepository
 from mnemos.persistence.sqlite import SqliteBackend, _execute, _fetch_one
