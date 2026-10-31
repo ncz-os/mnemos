@@ -8,7 +8,8 @@ import math
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Optional
+from collections.abc import Callable
+from typing import Generic, Optional, TypeVar
 from uuid import uuid4
 
 import asyncpg
@@ -64,6 +65,8 @@ from mnemos.domain.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 router = APIRouter(prefix="/v1", tags=["memories"])
 
 
@@ -158,27 +161,104 @@ def _metadata_for_audit(value) -> dict | None:
         return None
 
 
+class _StaticSetting(Generic[_T]):
+    """A startup-time setting: read once from the environment, then frozen.
+
+    M7: SEMANTIC_FLOOR / MARGIN_FLOOR / OOD_GATE are fleet-wide rollout
+    knobs. Reading them per request meant every search re-parsed the env, an
+    invalid value re-logged its warning on every call, and the value could
+    change between two requests in the same process. One read, one answer.
+
+    The first read is deferred to the first ``.value`` access so importing
+    this router never freezes an environment the operator is still setting up.
+    """
+
+    __slots__ = ("name", "default", "normalize", "log_tag", "_resolved", "_value")
+
+    def __init__(self, name: str, default: _T, normalize: Callable[[str], _T | None], log_tag: str) -> None:
+        self.name = name
+        self.default = default
+        self.normalize = normalize
+        self.log_tag = log_tag
+        self._resolved = False
+        self._value = default
+
+    @property
+    def value(self) -> _T:
+        if not self._resolved:
+            self.reload()
+        return self._value
+
+    def reload(self) -> _T:
+        self._resolved = True
+        raw = runtime_env_value_stripped(self.name)
+        normalized = None if raw is None or raw == "" else self.normalize(raw)
+        if normalized is None:
+            if raw:
+                logger.warning("%s invalid %s=%r; using default %r", self.log_tag, self.name, raw, self.default)
+            self._value = self.default
+        else:
+            self._value = normalized
+        return self._value
+
+
+def _normalize_unit_interval(raw: str) -> float | None:
+    """Parse a [0, 1] float; ``None`` means "invalid, use the default"."""
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    # Reject NaN/inf — float() accepts them but the clamp would silently
+    # turn them into 1.0/0.0, contradicting "invalid -> default".
+    if not math.isfinite(val):
+        return None
+    # Clamp to [0, 1] to match the request field's bounds; a stray large
+    # env value would otherwise empty nearly every unanchored semantic set
+    # (ngc-review 2026-06-13). 0.0 = gate disabled.
+    return max(0.0, min(1.0, val))
+
+
+def _normalize_ood_gate(raw: str) -> bool:
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+_STATIC_SEMANTIC_FLOOR = _StaticSetting(
+    "MNEMOS_SEMANTIC_FLOOR",
+    DEFAULT_SEMANTIC_FLOOR,
+    _normalize_unit_interval,
+    "[VECTOR]",
+)
+_STATIC_SEMANTIC_MARGIN_FLOOR = _StaticSetting(
+    "MNEMOS_SEMANTIC_MARGIN_FLOOR",
+    DEFAULT_SEMANTIC_MARGIN_FLOOR,
+    _normalize_unit_interval,
+    "[VECTOR]",
+)
+_STATIC_OOD_GATE = _StaticSetting(
+    "MNEMOS_SEMANTIC_OOD_GATE",
+    True,
+    _normalize_ood_gate,
+    "[VECTOR]",
+)
+
+
+def _reload_static_settings() -> None:
+    """Re-read the startup-time rollout knobs (tests and in-process reloads)."""
+    _STATIC_SEMANTIC_FLOOR.reload()
+    _STATIC_SEMANTIC_MARGIN_FLOOR.reload()
+    _STATIC_OOD_GATE.reload()
+
+
 def effective_semantic_floor() -> float:
     """Default semantic relevance floor applied when a caller does not
     pass min_score. Operator-overridable fleet-wide via
     MNEMOS_SEMANTIC_FLOOR (set 0.0 to restore legacy top-k-nearest
     behavior for clients that pre-date the floor). Clamped to [0, 1].
     Invalid values fall back to DEFAULT_SEMANTIC_FLOOR.
+    Read once (M7) — see :class:`_StaticSetting`; call
+    :func:`_reload_static_settings` after changing the environment in-process.
     """
-    raw = runtime_env_value_stripped("MNEMOS_SEMANTIC_FLOOR")
-    if raw is None or raw == "":
-        return DEFAULT_SEMANTIC_FLOOR
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        logger.warning("[VECTOR] invalid MNEMOS_SEMANTIC_FLOOR=%r; using default %.2f", raw, DEFAULT_SEMANTIC_FLOOR)
-        return DEFAULT_SEMANTIC_FLOOR
-    # Reject NaN/inf — float() accepts them but the clamp would silently
-    # turn them into 1.0/0.0, contradicting "invalid -> default".
-    if not math.isfinite(val):
-        logger.warning("[VECTOR] non-finite MNEMOS_SEMANTIC_FLOOR=%r; using default %.2f", raw, DEFAULT_SEMANTIC_FLOOR)
-        return DEFAULT_SEMANTIC_FLOOR
-    return max(0.0, min(1.0, val))
+    return _STATIC_SEMANTIC_FLOOR.value
 
 
 def effective_semantic_margin_floor() -> float:
@@ -187,30 +267,9 @@ def effective_semantic_margin_floor() -> float:
     MNEMOS_SEMANTIC_MARGIN_FLOOR (set 0.0 to DISABLE the margin/anchor gate
     and keep the absolute-floor behavior only). Invalid / non-finite values
     fall back to DEFAULT_SEMANTIC_MARGIN_FLOOR. Negative clamps to 0 (disabled).
+    Read once (M7) — see :class:`_StaticSetting`.
     """
-    raw = runtime_env_value_stripped("MNEMOS_SEMANTIC_MARGIN_FLOOR")
-    if raw is None or raw == "":
-        return DEFAULT_SEMANTIC_MARGIN_FLOOR
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
-        logger.warning(
-            "[VECTOR] invalid MNEMOS_SEMANTIC_MARGIN_FLOOR=%r; using default %.3f",
-            raw,
-            DEFAULT_SEMANTIC_MARGIN_FLOOR,
-        )
-        return DEFAULT_SEMANTIC_MARGIN_FLOOR
-    if not math.isfinite(val):
-        logger.warning(
-            "[VECTOR] non-finite MNEMOS_SEMANTIC_MARGIN_FLOOR=%r; using default %.3f",
-            raw,
-            DEFAULT_SEMANTIC_MARGIN_FLOOR,
-        )
-        return DEFAULT_SEMANTIC_MARGIN_FLOOR
-    # Clamp to [0, 1] to match the request field's bounds; a stray large
-    # env value would otherwise empty nearly every unanchored semantic set
-    # (ngc-review 2026-06-13). 0.0 = gate disabled.
-    return max(0.0, min(1.0, val))
+    return _STATIC_SEMANTIC_MARGIN_FLOOR.value
 
 
 def _resolve_margin_floor(request_min_margin) -> float:
@@ -247,11 +306,9 @@ def ood_gate_enabled() -> bool:
     rollback levers; set MNEMOS_SEMANTIC_OOD_GATE=0 to restore pre-gate recall
     instantly. Residual risk: a genuine zero-lexical-overlap paraphrase with a
     flat distribution; none was observed in tuning.
+    Read once (M7) — see :class:`_StaticSetting`.
     """
-    raw = runtime_env_value_stripped("MNEMOS_SEMANTIC_OOD_GATE")
-    if raw is None or raw == "":
-        return True
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+    return _STATIC_OOD_GATE.value
 
 
 NatsPublishIntent = tuple[str, dict, str]

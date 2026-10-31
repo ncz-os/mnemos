@@ -8,10 +8,6 @@ import logging
 import os
 import sys
 
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Optional, Protocol
@@ -21,7 +17,14 @@ import asyncpg
 from fastapi import HTTPException
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from mnemos.core.config import PG_CONFIG, db2_dsn_env, get_settings, oracle_dsn_env, required_capabilities_env
+from mnemos.core.config import (
+    PG_CONFIG,
+    db2_dsn_env,
+    get_settings,
+    load_toml_config,
+    oracle_dsn_env,
+    required_capabilities_env,
+)
 from mnemos.core.pool import PoolManager
 
 # Redis is not a runtime dependency. The optional aioredis cache this shim
@@ -695,19 +698,15 @@ def _sqlite_path_from_settings(settings):
 
 
 def _load_config() -> dict:
-    """Load config.toml from standard locations. Returns empty dict if not found."""
-    candidates = [
-        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.toml"),
-        "/etc/mnemos/config.toml",
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                with open(path, "rb") as f:
-                    return tomllib.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to parse {path}: {e}")
-    return {}
+    """Load config.toml from standard locations. Returns empty dict if not found.
+
+    Delegates to the settings loader instead of keeping a second candidate
+    list here: the old copy knew only ``<repo>/config.toml`` and
+    ``/etc/mnemos/config.toml``, so a deployment pointed at a config with
+    ``MNEMOS_CONFIG_PATH`` silently read no file at all and ``[multiuser]
+    rls_enabled`` stayed at its default. One reader, one answer.
+    """
+    return load_toml_config()
 
 
 def _configured_federation_peer_urls() -> list[str]:

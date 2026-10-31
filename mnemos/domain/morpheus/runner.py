@@ -27,7 +27,12 @@ from uuid import UUID, uuid4
 import asyncpg  # noqa: F401
 import numpy as np
 
-from mnemos.core.config import get_settings, hot_rs_enabled, morpheus_orphan_timeout_hours_env
+from mnemos.core.config import (
+    get_settings,
+    hot_rs_enabled,
+    morpheus_orphan_timeout_hours_env,
+    runtime_env_bool_from,
+)
 from mnemos.core.extras import is_extra_installed
 from mnemos.core.native_accel import load_hot_rs
 from mnemos.core.ids import new_memory_id
@@ -167,7 +172,7 @@ def _truthy(value: object) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
+        return runtime_env_bool_from(value)
     return bool(value)
 
 

@@ -64,7 +64,7 @@ from urllib.parse import unquote, urlparse
 
 from mnemos.core.auth_context import UserContext
 from mnemos.core import eligibility as _eligibility
-from mnemos.core.config import embedding_dim_env, runtime_env_value_stripped
+from mnemos.core.config import embedding_dim_env, runtime_env_float, runtime_env_int, runtime_env_value_stripped
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.base import (
     BranchRepository,
@@ -151,25 +151,26 @@ _DEFAULT_MYSQL_PY_COSINE_MAX_ROWS = 10_000
 
 
 def _env_int(name: str, default: int) -> int:
+    """Read a pool knob through the shared typed runtime reader.
+
+    M7: the Oracle and MySQL modules each carried their own copy of this
+    parser (and ``mnemos.core.config`` carried a third). Delegate, keep the
+    local warning so the operator still sees which knob fell back.
+    """
     raw = runtime_env_value_stripped(name)
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
+    value = runtime_env_int(name, default)
+    if raw and value == default:
         _LOG.warning("Ignoring unparsable %s=%r; using default %d", name, raw, default)
-        return default
+    return value
 
 
 def _env_float(name: str, default: float) -> float:
+    """Read a pool knob through the shared typed runtime reader (see ``_env_int``)."""
     raw = runtime_env_value_stripped(name)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
+    value = runtime_env_float(name, default)
+    if raw and value == default:
         _LOG.warning("Ignoring unparsable %s=%r; using default %.1f", name, raw, default)
-        return default
+    return value
 
 
 # Threshold (max eligible rows) at which the Python-side cosine

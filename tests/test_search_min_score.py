@@ -9,6 +9,13 @@ Covers:
     nonsense queries, while FTS results are never filtered.
   * min_score=0.0 opts out; missing semantic score fails closed.
   * effective_semantic_floor() honors MNEMOS_SEMANTIC_FLOOR.
+  * effective_semantic_floor() / effective_semantic_margin_floor() /
+    ood_gate_enabled() read their knob once (M7): changing the environment
+    after the first read does not move them until _reload_static_settings().
+
+The floor/margin/OOD knobs are frozen on first read, so every test that
+mutates one re-reads through ``_reload_static_settings()`` — otherwise the
+first test to touch it would pin the value for the whole module.
 """
 
 from __future__ import annotations
@@ -31,6 +38,18 @@ from mnemos.domain.models import (
     row_to_memory,
     score_to_similarity,
 )
+
+
+@pytest.fixture(autouse=True)
+def _reread_static_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test starts from env-unset and re-reads the M7 startup knobs."""
+    monkeypatch.delenv("MNEMOS_SEMANTIC_FLOOR", raising=False)
+    monkeypatch.delenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", raising=False)
+    monkeypatch.delenv("MNEMOS_SEMANTIC_OOD_GATE", raising=False)
+    memories_handler._reload_static_settings()
+    yield
+    memories_handler._reload_static_settings()
+
 
 from tests._fake_backend import install_fake_backend
 
@@ -246,20 +265,26 @@ def test_default_floor_value_sane():
     assert 0.5 <= DEFAULT_SEMANTIC_FLOOR <= 0.65
 
 
+def _set(monkeypatch, name: str, value: str) -> None:
+    """Set a startup knob and re-read it the way a process restart would."""
+    monkeypatch.setenv(name, value)
+    memories_handler._reload_static_settings()
+
+
 def test_effective_floor_env_override(monkeypatch):
-    monkeypatch.setenv("MNEMOS_SEMANTIC_FLOOR", "0.0")
+    _set(monkeypatch, "MNEMOS_SEMANTIC_FLOOR", "0.0")
     assert memories_handler.effective_semantic_floor() == 0.0
-    monkeypatch.setenv("MNEMOS_SEMANTIC_FLOOR", "0.62")
+    _set(monkeypatch, "MNEMOS_SEMANTIC_FLOOR", "0.62")
     assert memories_handler.effective_semantic_floor() == pytest.approx(0.62)
-    monkeypatch.setenv("MNEMOS_SEMANTIC_FLOOR", "garbage")
+    _set(monkeypatch, "MNEMOS_SEMANTIC_FLOOR", "garbage")
     assert memories_handler.effective_semantic_floor() == DEFAULT_SEMANTIC_FLOOR
     # non-finite must fall back to default, not clamp to 1.0/0.0
     for bad in ("nan", "inf", "-inf"):
-        monkeypatch.setenv("MNEMOS_SEMANTIC_FLOOR", bad)
+        _set(monkeypatch, "MNEMOS_SEMANTIC_FLOOR", bad)
         assert memories_handler.effective_semantic_floor() == DEFAULT_SEMANTIC_FLOOR
     monkeypatch.delenv("MNEMOS_SEMANTIC_FLOOR", raising=False)
+    memories_handler._reload_static_settings()
     assert memories_handler.effective_semantic_floor() == DEFAULT_SEMANTIC_FLOOR
-
 
 
 # --- OOD / nonsense-query margin + lexical-anchor gate (UAT 2026-06-13 c2) ----
@@ -312,9 +337,7 @@ def test_ood_lexical_anchor_keeps_weak_query():
 
 def test_ood_skewed_distribution_keeps_even_unanchored():
     # top-1 stands out (skewed) -> genuine even without a lexical anchor.
-    rows = [_srow(0.85, "alpha beta gamma delta")] + [
-        _srow(0.60, "alpha beta gamma delta") for _ in range(9)
-    ]
+    rows = [_srow(0.85, "alpha beta gamma delta")] + [_srow(0.60, "alpha beta gamma delta") for _ in range(9)]
     assert is_ood_result_set("zzz qqq www", rows) is False
 
 
@@ -341,16 +364,17 @@ def test_ood_nonfinite_floor_disables_gate():
 
 
 def test_effective_margin_floor_env_override(monkeypatch):
-    monkeypatch.setenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", "0.0")
+    _set(monkeypatch, "MNEMOS_SEMANTIC_MARGIN_FLOOR", "0.0")
     assert memories_handler.effective_semantic_margin_floor() == 0.0
-    monkeypatch.setenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", "0.030")
+    _set(monkeypatch, "MNEMOS_SEMANTIC_MARGIN_FLOOR", "0.030")
     assert memories_handler.effective_semantic_margin_floor() == pytest.approx(0.030)
-    monkeypatch.setenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", "garbage")
+    _set(monkeypatch, "MNEMOS_SEMANTIC_MARGIN_FLOOR", "garbage")
     assert memories_handler.effective_semantic_margin_floor() == DEFAULT_SEMANTIC_MARGIN_FLOOR
     for bad in ("nan", "inf", "-inf"):
-        monkeypatch.setenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", bad)
+        _set(monkeypatch, "MNEMOS_SEMANTIC_MARGIN_FLOOR", bad)
         assert memories_handler.effective_semantic_margin_floor() == DEFAULT_SEMANTIC_MARGIN_FLOOR
     monkeypatch.delenv("MNEMOS_SEMANTIC_MARGIN_FLOOR", raising=False)
+    memories_handler._reload_static_settings()
     assert memories_handler.effective_semantic_margin_floor() == DEFAULT_SEMANTIC_MARGIN_FLOOR
 
 
@@ -362,9 +386,9 @@ def test_min_margin_request_field_rejects_negative():
     assert MemorySearchRequest(query="x", min_margin=0.05).min_margin == pytest.approx(0.05)
 
 
-
 def test_stem_conservative_no_short_word_collisions():
     from mnemos.domain.models import _stem
+
     # short words must NOT be over-stripped into colliding stems.
     assert _stem("law") == "law"
     assert _stem("laws") == "laws"  # 'law' would be < _MIN_STEM_LEN -> not stripped
@@ -394,10 +418,11 @@ def test_ood_refuses_generator_fails_open():
 
 def test_ood_gate_enabled_env(monkeypatch):
     for off in ("0", "false", "FALSE", "no", "off"):
-        monkeypatch.setenv("MNEMOS_SEMANTIC_OOD_GATE", off)
+        _set(monkeypatch, "MNEMOS_SEMANTIC_OOD_GATE", off)
         assert memories_handler.ood_gate_enabled() is False
     for on in ("1", "true", "yes", "on", "anything"):
-        monkeypatch.setenv("MNEMOS_SEMANTIC_OOD_GATE", on)
+        _set(monkeypatch, "MNEMOS_SEMANTIC_OOD_GATE", on)
         assert memories_handler.ood_gate_enabled() is True
     monkeypatch.delenv("MNEMOS_SEMANTIC_OOD_GATE", raising=False)
+    memories_handler._reload_static_settings()
     assert memories_handler.ood_gate_enabled() is True

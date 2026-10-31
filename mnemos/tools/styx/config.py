@@ -10,7 +10,7 @@ import socket
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from mnemos.core.config import runtime_env_snapshot
+from mnemos.core.config import runtime_env_bool_from, runtime_env_snapshot
 from mnemos.tools.styx.errors import StyxConfigError
 
 #: Environment variable carrying the Google service-account credential. It
@@ -111,10 +111,14 @@ def _int_env(env: dict[str, str], name: str, default: int) -> int:
 
 
 def _bool_env(env: dict[str, str], name: str, default: bool = False) -> bool:
-    raw = env.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    """Apply the process-wide truthy vocabulary to an injected env mapping.
+
+    STYX builds its config from an injected ``env`` dict rather than
+    ``os.environ``, so it cannot call ``runtime_env_bool`` directly — it uses
+    the same parser, so ``STYX_*`` flags cannot mean something different from
+    every other flag.
+    """
+    return runtime_env_bool_from(env.get(name), default)
 
 
 @dataclass(frozen=True)

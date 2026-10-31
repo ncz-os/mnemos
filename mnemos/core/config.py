@@ -1245,6 +1245,7 @@ def normalize_profile(raw_profile: str | None) -> str:
 
 def _build_settings() -> Settings:
     toml_config = _load_toml()
+    warn_unknown_toml_keys(toml_config, _loaded_toml_path)
     server_toml = _toml_section(toml_config, "server")
     server = _ServerSettings(**server_toml)
     server.profile = normalize_profile(_profile_from_sources(toml_config, server_toml, server))
@@ -1335,6 +1336,37 @@ def _build_settings() -> Settings:
         for group_name, group in groups.items()
         if isinstance(group, BaseSettings)
     }
+    _TOML_SECTION_MODELS.update(
+        {
+            "layers": _LayerSettings,
+            "database": _DatabaseSettings,
+            "graeae": _GraeaeSettings,
+            "server": _ServerSettings,
+            "services": _ProfileServiceSettings,
+            "webhook": _WebhookSettings,
+            "providers": _ProviderSettings,
+            "mcp": _MCPSettings,
+            "rate_limit": _RateLimitSettings,
+            "resilience": _ResilienceSettings,
+            "observability": _ObservabilitySettings,
+            "compression": _CompressionSettings,
+            "artemis": _ArtemisSettings,
+            "morpheus": _MorpheusSettings,
+            "persephone": _PersephoneSettings,
+            "kronos": KronosSettings,
+            "pantheon": PantheonSettings,
+            "knemon": KnemonSettings,
+            "federation": _FederationSettings,
+            "oauth": _OAuthSettings,
+            "auth": _AuthSettings,
+            "runtime": _RuntimeSettings,
+            "tools": _ToolSettings,
+            "logging": _LoggingSettings,
+            "nats": _NatsSettings,
+            "audit": _AuditSettings,
+            "hive_mind": _HiveMindSettings,
+        }
+    )
     _apply_profile_defaults(settings)
     _apply_backend_layer_defaults(settings)
     settings.services.resolution = resolve_profile_services(
@@ -1422,13 +1454,134 @@ def _apply_profile_defaults(settings: Settings) -> None:
         setattr(getattr(settings, group_name), field_name, value)
 
 
+#: Top-level config.toml tables that ``_build_settings`` actually consumes.
+#: Kept next to the loader rather than derived by introspection so a reviewer
+#: can diff it against ``_build_settings`` by eye.
+CONSUMED_TOML_SECTIONS: frozenset[str] = frozenset(
+    {
+        "artemis",
+        "audit",
+        "auth",
+        "compression",
+        "database",
+        "deployment",
+        "federation",
+        "graeae",
+        "hive_mind",
+        "knemon",
+        "kronos",
+        "layers",
+        "logging",
+        "mcp",
+        "morpheus",
+        "nats",
+        "oauth",
+        "observability",
+        "pantheon",
+        "persephone",
+        "providers",
+        "rate_limit",
+        "resilience",
+        "runtime",
+        "server",
+        "services",
+        "tools",
+        "webhook",
+    }
+)
+
+#: The config file the current process actually loaded (``None`` when none was
+#: found). Recorded by :func:`_load_toml` so callers that used to re-scan their
+#: own hardcoded candidate list — ``mnemos.core.lifecycle._load_config`` in
+#: particular — resolve the same file, ``MNEMOS_CONFIG_PATH`` included.
+_loaded_toml_path: Path | None = None
+_loaded_toml: dict[str, Any] = {}
+
+
+def loaded_toml_path() -> Path | None:
+    """Return the config.toml this process loaded, or ``None``."""
+    return _loaded_toml_path
+
+
 def _load_toml() -> dict[str, Any]:
+    global _loaded_toml_path, _loaded_toml
     for toml_path in _config_paths():
         if toml_path.exists():
             with toml_path.open("rb") as f:
                 data = tomllib.load(f)
-            return data if isinstance(data, dict) else {}
+            _loaded_toml_path = toml_path
+            _loaded_toml = data if isinstance(data, dict) else {}
+            return _loaded_toml
+    _loaded_toml_path = None
+    _loaded_toml = {}
     return {}
+
+
+def _model_consumed_keys(section: str) -> frozenset[str] | None:
+    """Names a settings model accepts for ``section`` (None when unmodelled)."""
+    group = _TOML_SECTION_MODELS.get(section)
+    if group is None:
+        return None
+    return frozenset(group.model_fields)
+
+
+#: section -> the settings model whose ``model_fields`` define its valid keys.
+#: Built lazily below (the models are declared above ``_build_settings``); this
+#: mapping is what makes an unknown *key* detectable, not just an unknown table.
+_TOML_SECTION_MODELS: dict[str, type[BaseSettings]] = {}
+#: Sub-tables that are credential/plugin containers whose child keys are
+#: free-form names (``[graeae.providers.perplexity]`` — the key IS a provider
+#: id). Those children are not settings, so they are skipped wholesale.
+_FREE_FORM_TOML_SUBTABLES: dict[str, frozenset[str]] = {
+    "graeae": frozenset({"providers"}),
+}
+
+
+def load_toml_config() -> dict[str, Any]:
+    """Return the parsed config.toml table (empty when none exists).
+
+    Every consumer of config.toml — the settings build and
+    ``mnemos.core.lifecycle``'s ``[multiuser]``/``[worker]`` reads — goes
+    through here so they cannot disagree about which file is live.
+    """
+    return dict(_loaded_toml)
+
+
+def warn_unknown_toml_keys(toml_config: dict[str, Any], path: Path | None = None) -> list[str]:
+    """Log every config.toml section/key no settings model consumes.
+
+    ``_config_model_config`` sets ``extra="ignore"``, so an operator who writes
+    ``[features] semantic_search = false`` (or a stale ``[hooks]`` block copied
+    from the example file) gets silence: the key parses, nothing reads it, and
+    the deployment behaves as if it were never written. This surfaces the
+    drift at startup instead. Returns the offending ``"section.key"`` paths so
+    tests (and ``mnemos doctor``-style callers) can assert on them.
+    """
+    where = str(path) if path is not None else "config.toml"
+    unknown: list[str] = []
+    for section, value in toml_config.items():
+        if section not in CONSUMED_TOML_SECTIONS:
+            unknown.append(section)
+            logger.warning("%s: [%s] is not read by any settings model; its keys are ignored.", where, section)
+            continue
+        if not isinstance(value, dict):
+            continue
+        consumed = _model_consumed_keys(section)
+        if consumed is None:
+            continue
+        free_form = _FREE_FORM_TOML_SUBTABLES.get(section, frozenset())
+        for key, sub_value in value.items():
+            if key in consumed or key in free_form:
+                continue
+            dotted = f"{section}.{key}"
+            unknown.append(dotted)
+            logger.warning(
+                "%s: [%s].%s is not read by any settings model; it is ignored.",
+                where,
+                section,
+                key,
+            )
+    return unknown
 
 
 def _config_paths() -> list[Path]:
@@ -1523,11 +1676,29 @@ def runtime_env_float(name: str, default: float) -> float:
         return default
 
 
+#: The one truthy vocabulary. ``runtime_env_bool`` and
+#: ``runtime_env_bool_from`` both use it, so an env var and a config value
+#: spelling "yes" cannot mean different things in different modules.
+_TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
+
+
 def runtime_env_bool(name: str, default: bool = False) -> bool:
     raw = runtime_env_value_stripped(name)
     if not raw:
         return default
-    return raw.lower() in {"1", "true", "yes", "on"}
+    return runtime_env_bool_from(raw)
+
+
+def runtime_env_bool_from(value: Any, default: bool = False) -> bool:
+    """Apply the truthy vocabulary to an already-read value (env or config)."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    raw = str(value).strip().lower()
+    if not raw:
+        return default
+    return raw in _TRUTHY_STRINGS
 
 
 def export_stream_timeout_seconds_env() -> float:
@@ -1847,6 +2018,11 @@ def session_secret_required() -> bool:
     return runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET").lower() in {"yes", "1", "true"}
 
 
+#: ``MNEMOS_AUDIT_CHAIN`` read once at startup — here at settings-build time and
+#: again on every ``reload_settings()`` — and cached, instead of being re-parsed
+#: (and re-warned) on every audited mutation (M7). ``None`` means "not resolved
+#: yet"; the readers below resolve on first use, so an import that never builds
+#: settings still answers correctly.
 def _audit_chain_mode() -> str:
     """Return the normalised ``MNEMOS_AUDIT_CHAIN`` mode.
 
@@ -1879,16 +2055,6 @@ def _audit_chain_mode() -> str:
         raw,
     )
     return "off"
-
-
-def audit_chain_enabled_flag() -> bool:
-    """Return whether MNEMOS_AUDIT_CHAIN enables audit-chain writes."""
-    return _audit_chain_mode() in {"on", "required"}
-
-
-def audit_chain_required_flag() -> bool:
-    """Require audited mutation callers to roll back if signing fails."""
-    return _audit_chain_mode() == "required"
 
 
 def audit_chain_key_required() -> bool:
@@ -1984,7 +2150,7 @@ def connector_default_namespace() -> str | None:
 
 def hot_rs_enabled() -> bool:
     """Return whether optional Rust hot-path acceleration is enabled."""
-    return os.environ.get("MNEMOS_HOT_RS_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+    return runtime_env_bool("MNEMOS_HOT_RS_ENABLED", False)
 
 
 def mcp_nats_raw_enabled() -> bool:
@@ -1994,7 +2160,7 @@ def mcp_nats_raw_enabled() -> bool:
     when set, the raw NATS message body is forwarded verbatim instead
     of being re-shaped into a {subject, summary} envelope.
     """
-    return os.getenv("MNEMOS_MCP_NATS_RAW", "").strip().lower() in {"1", "true", "yes", "on"}
+    return runtime_env_bool("MNEMOS_MCP_NATS_RAW", False)
 
 
 def raw_env(name: str, default: str = "") -> str:
@@ -2029,6 +2195,20 @@ def _reset_settings_for_tests() -> None:
     exercise environment/config-file overrides without process isolation.
     """
     reload_settings()
+
+
+def audit_chain_enabled_flag() -> bool:
+    """Return whether MNEMOS_AUDIT_CHAIN enables audit-chain writes."""
+    # Deliberately read live, not cached at startup: the mode is an operator
+    # switch whose documented contract is that it takes effect without a
+    # restart, and a process-wide cache breaks that contract for any caller
+    # that sets the variable after the settings were built.
+    return _audit_chain_mode() in {"on", "required"}
+
+
+def audit_chain_required_flag() -> bool:
+    """Require audited mutation callers to roll back if signing fails."""
+    return _audit_chain_mode() == "required"
 
 
 _sync_compat_exports(get_settings())
