@@ -9,6 +9,7 @@ capability; the in-memory store is reserved for isolated tests/development.
 from __future__ import annotations
 
 import base64
+import collections
 import hashlib
 import hmac
 import json
@@ -104,7 +105,10 @@ class _SlidingWindowRateLimiter:
         self.window_seconds = window_seconds
         self.max_callers = max_callers
         self.backoff_max_seconds = backoff_max_seconds
-        self._hits: dict[str, list[float]] = {}
+        # Bounded size is enforced on first sight of a caller (see
+        # ``_make_room``), so no table ever grows past ``max_callers`` and
+        # ``check`` only has to look at the caller in front of it.
+        self._hits: dict[str, collections.deque[float]] = {}
         self._blocked_until: dict[str, float] = {}
         self._violations: dict[str, int] = {}
         self._last_seen: dict[str, float] = {}
@@ -113,10 +117,17 @@ class _SlidingWindowRateLimiter:
         """Return ``(allowed, retry_after_seconds)`` for *caller*."""
         now = time.monotonic()
         cutoff = now - self.window_seconds
-        self._prune(cutoff, now)
-        has_room, capacity_retry_after = self._make_room(caller, now)
-        if not has_room:
-            return False, capacity_retry_after
+        tracked = self._last_seen.get(caller)
+        if tracked is None:
+            # Unknown caller: the table may be full, and only then does
+            # anything expire that we have to look at.
+            has_room, capacity_retry_after = self._make_room(caller, now)
+            if not has_room:
+                return False, capacity_retry_after
+        elif tracked < cutoff and caller not in self._blocked_until:
+            # Idle past the window with no pending backoff: nothing of this
+            # caller's is live any more, so it can be forgotten outright.
+            self._forget(caller)
         self._last_seen[caller] = now
 
         blocked_until = self._blocked_until.get(caller, 0.0)
@@ -129,7 +140,11 @@ class _SlidingWindowRateLimiter:
                 self._blocked_until[caller] = blocked_until
             return False, max(1, ceil(blocked_until - now))
 
-        hits = self._hits.setdefault(caller, [])
+        hits = self._hits.get(caller)
+        if hits is None:
+            hits = self._hits[caller] = collections.deque()
+        while hits and hits[0] <= cutoff:
+            hits.popleft()
         if len(hits) >= self.limit:
             if self.backoff_max_seconds:
                 violations = self._violations.get(caller, 0) + 1
@@ -143,33 +158,32 @@ class _SlidingWindowRateLimiter:
         hits.append(now)
         return True, 0
 
-    def _prune(self, cutoff: float, now: float) -> None:
-        for caller in list(self._last_seen):
-            recent = [stamp for stamp in self._hits.get(caller, ()) if stamp > cutoff]
-            if recent:
-                self._hits[caller] = recent
-            else:
-                self._hits.pop(caller, None)
-            if self._blocked_until.get(caller, 0.0) <= now:
-                self._blocked_until.pop(caller, None)
-            if caller not in self._hits and caller not in self._blocked_until:
-                self._violations.pop(caller, None)
-                self._last_seen.pop(caller, None)
+    def _forget(self, caller: str) -> None:
+        self._hits.pop(caller, None)
+        self._blocked_until.pop(caller, None)
+        self._violations.pop(caller, None)
+        self._last_seen.pop(caller, None)
 
     def _make_room(self, caller: str, now: float) -> tuple[bool, int]:
-        if caller in self._last_seen or len(self._last_seen) < self.max_callers:
+        seen = self._last_seen
+        if caller in seen or len(seen) < self.max_callers:
             return True, 0
-        evictable = [
-            known_caller for known_caller in self._last_seen if self._blocked_until.get(known_caller, 0.0) <= now
-        ]
+        # ``_blocked_until`` is keyed by insertion; indexing it here must not
+        # create the entry, or the "nothing is blocked" case below turns into
+        # a single zero deadline and the caller is retried immediately.
+        blocked_map = self._blocked_until
+        evictable = [known for known in seen if blocked_map.get(known, 0.0) <= now]
         if not evictable:
-            retry_at = min(self._blocked_until.values())
-            return False, max(1, ceil(retry_at - now))
-        oldest = min(evictable, key=self._last_seen.__getitem__)
-        self._hits.pop(oldest, None)
-        self._blocked_until.pop(oldest, None)
-        self._violations.pop(oldest, None)
-        self._last_seen.pop(oldest, None)
+            # Every tracked caller is in backoff. Reject and let the caller
+            # retry when the oldest deadline passes; a map with nothing
+            # actually blocking falls back to one second instead of the
+            # base's ValueError out of min() on an empty sequence.
+            deadlines = list(blocked_map.values())
+            if not deadlines:
+                return False, 1
+            return False, max(1, ceil(min(deadlines) - now))
+        oldest = min(evictable, key=seen.__getitem__)
+        self._forget(oldest)
         return True, 0
 
 

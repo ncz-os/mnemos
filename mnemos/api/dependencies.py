@@ -13,9 +13,37 @@ credential check ran.
 
 (Originally split out from a pre-v4 `api/auth.py` module that no
 longer exists.)
+
+Per-request cost (decision M5)
+------------------------------
+A bearer request used to cost a full ``lookup_api_key`` transaction plus a
+background ``touch_api_key`` write, every request, forever. Both are now
+bounded:
+
+* a key hash -> ``UserContext`` cache with a short TTL
+  (``MNEMOS_AUTH_CACHE_TTL_SECONDS``, default 30 s). A cached hit costs no
+  database work at all, so :class:`AuthCacheStats` counts lookups that now
+  bypass the database instead of tracing every one.
+* ``api_keys.last_used`` is written at most once per
+  ``MNEMOS_AUTH_TOUCH_INTERVAL_SECONDS`` (default 60 s) per key, and the write
+  is no longer one background coroutine per request: at most one flusher task
+  drains a dirty-key set.
+
+**Revocation lag is bounded by the TTL, per worker.** Revoking a key
+(``DELETE /apikeys/{key_id}``) clears *this* process's cache immediately, so
+the next request on the same worker gets 401. Another worker — a second
+uvicorn worker, a second replica behind a load balancer — keeps serving the
+cached ``UserContext`` until its own entry expires, i.e. for at most the TTL.
+Set a shorter TTL when that window matters more than the saved round trips,
+or the longest acceptable lag when it does not.
 """
+
+import collections
 import hashlib
 import logging
+import threading
+import time
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -30,9 +58,257 @@ _auth_enabled: bool = False
 _default_namespace: str = "default"
 _personal_user_id: str = "default"
 
-PERSONAL_SINGLETON: "Optional[UserContext]" = None   # set by configure_auth(); None before startup
+PERSONAL_SINGLETON: "Optional[UserContext]" = None  # set by configure_auth(); None before startup
 
 _bearer = HTTPBearer(auto_error=False)
+
+# ── Per-request authentication cost (decision M5) ───────────────────────────
+#
+# Two module-level knobs, configured once at startup from ``settings.auth``:
+#
+#   _cache_ttl     — a key-hash -> UserContext entry is reused for this many
+#                    seconds (0 disables the cache). This is also the
+#                    cross-worker revocation lag: worker A clears its own cache
+#                    when it revokes, worker B only finds out when its entry
+#                    expires.
+#   _touch_interval — at most one api_keys.last_used write per key per this
+#                    many seconds (0 touches on every request).
+#
+# Both are read at call time so ``configure_auth`` (tests, lifespan) can change
+# them without re-importing the module.
+_AUTH_CACHE_TTL_DEFAULT = 30.0
+_AUTH_TOUCH_INTERVAL_DEFAULT = 60.0
+_cache_ttl: float = _AUTH_CACHE_TTL_DEFAULT
+_touch_interval: float = _AUTH_TOUCH_INTERVAL_DEFAULT
+_AUTH_CACHE_MAX_ENTRIES = 4096
+_AUTH_CACHE_SWEEP_EVERY = 256  # lookups between expired-entry sweeps
+_TOUCH_SWEEP_EVERY = 1024  # touches between stale-key sweeps
+
+# Protect every mutation below: get_current_user runs on the event loop, but
+# the touch flusher hops into a worker thread and revoke_api_key may be called
+# from a sync context. The dicts are only touched under this lock, so the
+# claim and the write it guards cannot interleave.
+_auth_lock = threading.RLock()
+_key_cache: dict[str, tuple["UserContext", float]] = {}  # key hash -> (ctx, expires)
+_touch_times: dict[object, float] = {}  # key id -> last write (monotonic)
+_dirty_keys: "collections.OrderedDict[object, None]" = collections.OrderedDict()
+_touch_task: "Optional[object]" = None  # in-flight flusher task
+_lookups_since_sweep = 0
+_touches_since_sweep = 0
+
+
+@dataclass(frozen=True)
+class AuthCacheStats:
+    """Observability counters for the M5 cache, for operators and tests."""
+
+    key_cache_entries: int
+    pending_touches: int
+
+
+def auth_cache_stats() -> AuthCacheStats:
+    """Return the current size of the credential cache and the touch queue."""
+    with _auth_lock:
+        return AuthCacheStats(key_cache_entries=len(_key_cache), pending_touches=len(_dirty_keys))
+
+
+def _reset_auth_caches() -> None:
+    """Drop every cached credential and pending last_used touch.
+
+    Called by ``configure_auth`` at startup and available to tests that
+    reconfigure auth mid-process: entries minted under one configuration must
+    not leak into the next one.
+    """
+    with _auth_lock:
+        _key_cache.clear()
+        _touch_times.clear()
+        _dirty_keys.clear()
+
+
+def _cache_get(key_hash: str, now: float) -> "Optional[UserContext]":
+    with _auth_lock:
+        entry = _key_cache.get(key_hash)
+        if entry is None:
+            return None
+        context, expires_at = entry
+        if expires_at <= now:
+            del _key_cache[key_hash]
+            return None
+        return context
+
+
+def _cache_put(key_hash: str, context: UserContext, now: float) -> None:
+    global _lookups_since_sweep
+    ttl = _cache_ttl
+    if ttl <= 0:
+        return
+    with _auth_lock:
+        _key_cache[key_hash] = (context, now + ttl)
+        _lookups_since_sweep += 1
+        if _lookups_since_sweep < _AUTH_CACHE_SWEEP_EVERY and len(_key_cache) <= _AUTH_CACHE_MAX_ENTRIES:
+            return
+        _lookups_since_sweep = 0
+        expired = [known for known, (_, expires_at) in _key_cache.items() if expires_at <= now]
+        for known in expired:
+            del _key_cache[known]
+        # Still over the bound with nothing expired to collect: drop the
+        # oldest-inserted entries. Cache misses are safe, just slower.
+        overflow = len(_key_cache) - _AUTH_CACHE_MAX_ENTRIES
+        if overflow > 0:
+            for known in list(_key_cache)[:overflow]:
+                del _key_cache[known]
+
+
+def _cache_clear(key_hash: "Optional[str]") -> None:
+    """Drop one entry (or all of them when *key_hash* is None)."""
+    with _auth_lock:
+        if key_hash is None:
+            _key_cache.clear()
+        else:
+            _key_cache.pop(key_hash, None)
+
+
+def invalidate_api_key_cache(key_id=None, key_hash: "Optional[str]" = None) -> None:
+    """Forget a credential after it was revoked, deleted or regenerated.
+
+    Called by the revoke route. ``key_hash`` drops the exact entry; ``key_id``
+    additionally drops any entry whose row carries that id (the cache is keyed
+    by hash, so the id is only known from the cached context). Passing
+    neither clears the whole cache, which is the safe answer when the caller
+    cannot say which credential changed.
+
+    This only clears the calling process's cache. Other workers keep serving
+    their cached result until their entry expires — see the module docstring.
+    """
+    if key_id is None and key_hash is None:
+        _cache_clear(None)
+        return
+    with _auth_lock:
+        if key_hash is not None:
+            _key_cache.pop(key_hash, None)
+        if key_id is not None:
+            stale = [
+                known for known, (context, _) in _key_cache.items() if getattr(context, "api_key_id", None) == key_id
+            ]
+            for known in stale:
+                del _key_cache[known]
+
+
+def _note_touch(key_id) -> bool:
+    """Claim the last_used write for *key_id*. True when the caller should write."""
+    global _touches_since_sweep
+    now = time.monotonic()
+    with _auth_lock:
+        last = _touch_times.get(key_id)
+        if last is not None and now - last < _touch_interval:
+            return False
+        _touch_times[key_id] = now
+        _dirty_keys[key_id] = None
+        _touches_since_sweep += 1
+        if _touches_since_sweep >= _TOUCH_SWEEP_EVERY:
+            _touches_since_sweep = 0
+            interval = _touch_interval
+            stale = [known for known, stamp in _touch_times.items() if now - stamp >= interval]
+            for known in stale:
+                del _touch_times[known]
+    return True
+
+
+def _requeue_touch(key_id) -> None:
+    """Allow *key_id* to be offered again after a failed write.
+
+    The last_used stamp is set to "now", i.e. the normal debounce starts
+    from the failure: the next request after ``_touch_interval`` queues a
+    retry. Nothing is re-queued here on purpose — a store that stays down must
+    not turn into a retry loop that outlives the requests that asked for it.
+    The record is left in ``_touch_times`` so a revoked-then-recreated id
+    cannot bypass the debounce; ``invalidate_api_key_cache`` drops it.
+    """
+    with _auth_lock:
+        _touch_times[key_id] = time.monotonic()
+
+
+async def _write_touches(backend, oauth, key_ids) -> None:
+    """One transaction per batch of last_used bumps."""
+    async with backend.transactional() as tx:
+        for key_id in key_ids:
+            await oauth.touch_api_key(tx, key_id)
+
+
+async def _flush_dirty_touches(backend, oauth) -> None:
+    """Write every queued last_used bump in one transaction, then clear the queue.
+
+    One transaction for the whole batch, not one per request: keys queued
+    while the previous batch was being written are picked up by the next turn
+    of the loop. A failed write is *not* retried in the same task — a store
+    that stays down must not spin here, it must wait for the debounce (or the
+    next request).
+    """
+    global _touch_task
+    try:
+        while True:
+            with _auth_lock:
+                if not _dirty_keys:
+                    return
+                key_ids = list(_dirty_keys)
+                _dirty_keys.clear()
+            try:
+                await _write_touches(backend, oauth, key_ids)
+            except Exception as e:
+                logger.warning(f"[AUTH] Failed to update last_used for keys {key_ids}: {e}")
+                for key_id in key_ids:
+                    _requeue_touch(key_id)
+                return
+    finally:
+        # Drop our own reference on every exit path, not just the empty one:
+        # a failed write requeues nothing but leaves a concurrent touch in
+        # ``_dirty_keys``, and leaving ``_touch_task`` set there would be a
+        # dangling handle to a finished task. A touch queued after this point
+        # simply starts the next flusher -- ``_ensure_touch_flusher`` always
+        # schedules, it never waits on the old handle.
+        with _auth_lock:
+            _touch_task = None
+
+
+def _ensure_touch_flusher(backend, oauth) -> bool:
+    """True when a flusher that will drain the queue is (now) running.
+
+    A task created here cannot have started yet — the caller has not yielded —
+    so its first drain is guaranteed to see the key queued by ``_schedule_touch``
+    just before. An existing flusher that is still running may already have
+    taken its last snapshot of the queue, so it is *not* cancelled (that would
+    drop the batch it is in the middle of): a second one is started instead,
+    and it drains whatever is left. At most one extra drain is in flight, and
+    only for the turn in which a new touch is queued.
+    """
+    global _touch_task
+    try:
+        # Imported outside the lock: the module may still be initialising.
+        from mnemos.core.lifecycle import _schedule_background
+    except Exception as e:  # pragma: no cover - lifecycle is always importable
+        logger.debug(f"[AUTH] last_used update not scheduled: {e}")
+        return False
+    with _auth_lock:
+        current = _touch_task
+        try:
+            _touch_task = _schedule_background(_flush_dirty_touches(backend, oauth))
+        except Exception as e:  # no running loop (scripts, sync callers)
+            logger.debug(f"[AUTH] last_used update not scheduled: {e}")
+            _touch_task = current
+            return False
+    return True
+
+
+def _schedule_touch(backend, oauth, key_id) -> bool:
+    """Debounced, single-flight last_used bump. Returns True when queued."""
+    if key_id is None or _touch_interval <= 0 or not _note_touch(key_id):
+        return False
+    if _ensure_touch_flusher(backend, oauth):
+        return True
+    # Nothing can drain the queue here (no running loop). Hand the key back so
+    # the next request queues it again once the debounce allows.
+    with _auth_lock:
+        _dirty_keys.pop(key_id, None)
+    return False
 
 
 def configure_auth(config: dict | None = None) -> None:
@@ -40,6 +316,7 @@ def configure_auth(config: dict | None = None) -> None:
     from mnemos.core.config import get_settings
 
     global _auth_enabled, _default_namespace, _personal_user_id, PERSONAL_SINGLETON
+    global _cache_ttl, _touch_interval
     settings = get_settings().auth
     if config is None:
         config = {}
@@ -48,6 +325,16 @@ def configure_auth(config: dict | None = None) -> None:
         _auth_enabled = config.get("enabled", settings.enabled)
     _default_namespace = config.get("default_namespace", settings.default_namespace)
     _personal_user_id = config.get("personal_user_id", settings.personal_user_id)
+    # The cache and touch-debounce knobs are read from settings.auth on every
+    # call; configure_auth may override them (tests do) but a reconfiguration
+    # must never inherit entries minted under the previous one.
+    _cache_ttl = float(getattr(settings, "cache_ttl_seconds", _AUTH_CACHE_TTL_DEFAULT))
+    _touch_interval = float(getattr(settings, "touch_interval_seconds", _AUTH_TOUCH_INTERVAL_DEFAULT))
+    if config.get("cache_ttl_seconds") is not None:
+        _cache_ttl = float(config["cache_ttl_seconds"])
+    if config.get("touch_interval_seconds") is not None:
+        _touch_interval = float(config["touch_interval_seconds"])
+    _reset_auth_caches()
     PERSONAL_SINGLETON = UserContext(
         user_id=_personal_user_id,
         group_ids=[],
@@ -57,7 +344,8 @@ def configure_auth(config: dict | None = None) -> None:
     )
     logger.info(
         f"Auth configured: enabled={_auth_enabled}, "
-        f"namespace={_default_namespace}, personal_user={_personal_user_id}"
+        f"namespace={_default_namespace}, personal_user={_personal_user_id}, "
+        f"auth_cache_ttl={_cache_ttl}s, last_used_touch_interval={_touch_interval}s"
     )
 
 
@@ -73,9 +361,7 @@ def _auth_backend(request: Request):
     """
     backend = getattr(request.app.state, "persistence_backend", None)
     if backend is None:
-        raise HTTPException(
-            status_code=503, detail="Persistence backend not available"
-        )
+        raise HTTPException(status_code=503, detail="Persistence backend not available")
     if not getattr(backend, "_supports_oauth_persistence", False):
         raise HTTPException(
             status_code=503,
@@ -85,15 +371,6 @@ def _auth_backend(request: Request):
             ),
         )
     return backend.oauth, backend
-
-
-async def _touch_api_key(backend, oauth, key_id) -> None:
-    """Bump ``api_keys.last_used`` via the backend-neutral OAuth repository."""
-    try:
-        async with backend.transactional() as tx:
-            await oauth.touch_api_key(tx, key_id)
-    except Exception as e:
-        logger.warning(f"[AUTH] Failed to update last_used for key {key_id}: {e}")
 
 
 async def get_current_user(
@@ -113,26 +390,39 @@ async def get_current_user(
 
     oauth, backend = _auth_backend(request)
 
-    # 1. API key (Bearer) — existing behaviour.
+    # 1. API key (Bearer) — existing behaviour, now behind a short TTL cache
+    #    and a debounced last_used touch (decision M5).
     if credentials is not None:
         raw_key = credentials.credentials
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
-        async with backend.transactional() as tx:
-            row = await oauth.lookup_api_key(tx, key_hash)
-        if row is None or row.get("revoked"):
-            raise HTTPException(status_code=401, detail="Invalid or revoked API key")
-
-        from mnemos.core.lifecycle import _schedule_background
-
-        _schedule_background(_touch_api_key(backend, oauth, row["id"]))
-
-        return UserContext(
-            user_id=row["user_id"],
-            group_ids=list(row.get("group_ids") or []),
-            role=row["role"],
-            namespace=row["namespace"],
-            authenticated=True,
-        )
+        context = _cache_get(key_hash, time.monotonic())
+        if context is None:
+            async with backend.transactional() as tx:
+                row = await oauth.lookup_api_key(tx, key_hash)
+            if row is None or row.get("revoked"):
+                raise HTTPException(status_code=401, detail="Invalid or revoked API key")
+            fresh = UserContext(
+                user_id=row["user_id"],
+                group_ids=list(row.get("group_ids") or []),
+                role=row["role"],
+                namespace=row["namespace"],
+                authenticated=True,
+            )
+            # The id is what revoke_api_key is given; keeping it on the context
+            # lets the revoke route drop exactly this cache entry.
+            fresh.api_key_id = row["id"]
+            _cache_put(key_hash, fresh, time.monotonic())
+            context = fresh
+        # Never hand out the cached object itself — neither on a hit nor on
+        # the miss that just stored it: a route that appended to
+        # user.group_ids would edit every later request's identity for the
+        # rest of the TTL (potentially on another task).
+        context = replace(context, group_ids=list(context.group_ids))
+        # Debounced: at most one last_used write per key per touch interval,
+        # on cache hits as well as misses (a token used all day still shows a
+        # recent last_used).
+        _schedule_touch(backend, oauth, context.api_key_id)
+        return context
 
     # 2. Session cookie — v3.0.0+ path (only checked when no Bearer).
     from mnemos.core.oauth import SESSION_COOKIE_NAME

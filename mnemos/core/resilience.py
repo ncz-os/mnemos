@@ -3,6 +3,7 @@ from __future__ import annotations
 """GRAEAE resilience primitives with in-process and Redis-backed backends."""
 
 import asyncio
+import collections
 import concurrent.futures
 import hashlib
 import hmac
@@ -807,13 +808,24 @@ class RedisCircuitBreakerPool(_RedisPoolBase):
             logger.error("[CB] %s: Redis success record failed: %s", provider, exc, exc_info=True)
 
     def status(self) -> dict[str, dict[str, Any]]:
-        return {provider: self._last_status.get(provider, {"state": "unknown", "failures": None}) for provider in self._providers}
+        return {
+            provider: self._last_status.get(provider, {"state": "unknown", "failures": None})
+            for provider in self._providers
+        }
 
 
 class RedisRateLimiterPool(_RedisPoolBase):
     """Atomic fixed-window Redis provider rate limiter."""
 
-    def __init__(self, storage_uri: str, key_prefix: str, *, overrides: dict[str, int] | None = None, redis_client: Any | None = None, allow_fallback: bool = False) -> None:
+    def __init__(
+        self,
+        storage_uri: str,
+        key_prefix: str,
+        *,
+        overrides: dict[str, int] | None = None,
+        redis_client: Any | None = None,
+        allow_fallback: bool = False,
+    ) -> None:
         super().__init__(storage_uri, redis_client=redis_client, allow_fallback=allow_fallback)
         self.key_prefix = key_prefix
         self._overrides = overrides or {}
@@ -843,7 +855,16 @@ class RedisRateLimiterPool(_RedisPoolBase):
 class RedisConcurrencyLimiterPool(_RedisPoolBase):
     """Redis sorted-set reservation ledger with atomic expiring leases."""
 
-    def __init__(self, storage_uri: str, key_prefix: str, *, overrides: dict[str, int] | None = None, lease_seconds: int = 300, redis_client: Any | None = None, allow_fallback: bool = False) -> None:
+    def __init__(
+        self,
+        storage_uri: str,
+        key_prefix: str,
+        *,
+        overrides: dict[str, int] | None = None,
+        lease_seconds: int = 300,
+        redis_client: Any | None = None,
+        allow_fallback: bool = False,
+    ) -> None:
         super().__init__(storage_uri, redis_client=redis_client, allow_fallback=allow_fallback)
         self.key_prefix = key_prefix
         self._overrides = overrides or {}
@@ -990,7 +1011,10 @@ class RedisConcurrencyLimiterPool(_RedisPoolBase):
                         )
 
     def status(self) -> dict[str, dict[str, int]]:
-        return {provider: {"in_flight": len(tokens), "max": self._limit(provider)} for provider, tokens in self._tokens.items()}
+        return {
+            provider: {"in_flight": len(tokens), "max": self._limit(provider)}
+            for provider, tokens in self._tokens.items()
+        }
 
 
 class InProcessRateLimiter:
@@ -1000,15 +1024,29 @@ class InProcessRateLimiter:
         self.provider = provider
         self.rpm = rpm
         self._window = 60.0
-        self._timestamps: list[float] = []
+        # Stamps are appended in monotonic order, so the expired ones are
+        # always a prefix: drop them with a cursor/compact instead of
+        # rebuilding the whole list on every call.
+        self._timestamps: collections.deque[float] = collections.deque()
+        self._expired = 0  # leading stamps known to be past the cutoff
         self._lock = threading.Lock()
+
+    def _drop_expired(self, cutoff: float) -> None:
+        stamps = self._timestamps
+        expired = self._expired
+        while expired < len(stamps) and stamps[expired] <= cutoff:
+            expired += 1
+        if expired and expired * 2 >= len(stamps):
+            for _ in range(expired):
+                stamps.popleft()
+            expired = 0
+        self._expired = expired
 
     def is_allowed(self) -> bool:
         with self._lock:
             now = time.monotonic()
-            cutoff = now - self._window
-            self._timestamps = [timestamp for timestamp in self._timestamps if timestamp > cutoff]
-            if len(self._timestamps) >= self.rpm:
+            self._drop_expired(now - self._window)
+            if len(self._timestamps) - self._expired >= self.rpm:
                 logger.warning("[RL] %s: rate limit reached (%d rpm)", self.provider, self.rpm)
                 return False
             self._timestamps.append(now)
@@ -1016,9 +1054,8 @@ class InProcessRateLimiter:
 
     def current_rpm(self) -> int:
         with self._lock:
-            now = time.monotonic()
-            cutoff = now - self._window
-            return sum(1 for timestamp in self._timestamps if timestamp > cutoff)
+            self._drop_expired(time.monotonic() - self._window)
+            return len(self._timestamps) - self._expired
 
 
 class InProcessRateLimiterPool:
@@ -1027,8 +1064,7 @@ class InProcessRateLimiterPool:
     def __init__(self, overrides: dict[str, int] | None = None):
         limits = {**_PROVIDER_RPM, **(overrides or {})}
         self._limiters: dict[str, InProcessRateLimiter] = {
-            provider: InProcessRateLimiter(provider, rpm)
-            for provider, rpm in limits.items()
+            provider: InProcessRateLimiter(provider, rpm) for provider, rpm in limits.items()
         }
 
     def _get(self, provider: str) -> InProcessRateLimiter:
@@ -1629,14 +1665,10 @@ class NatsConcurrencyLimiter:
             from nats.js.api import KeyValueConfig  # type: ignore[import-not-found]
 
             return await _nats_maybe_await(
-                source.create_key_value(
-                    config=KeyValueConfig(bucket=self.bucket, history=1, ttl=self.lease_seconds)
-                )
+                source.create_key_value(config=KeyValueConfig(bucket=self.bucket, history=1, ttl=self.lease_seconds))
             )
         except ImportError:
-            return await _nats_maybe_await(
-                source.create_key_value(bucket=self.bucket, ttl=self.lease_seconds)
-            )
+            return await _nats_maybe_await(source.create_key_value(bucket=self.bucket, ttl=self.lease_seconds))
         except TypeError:
             return await _nats_maybe_await(source.create_key_value(self.bucket))
         except Exception as exc:
@@ -1694,9 +1726,7 @@ class NatsConcurrencyLimiter:
         raw_leases = payload.get("leases")
         if isinstance(raw_leases, dict):
             return {
-                str(token): float(expires_at)
-                for token, expires_at in raw_leases.items()
-                if float(expires_at) > now
+                str(token): float(expires_at) for token, expires_at in raw_leases.items() if float(expires_at) > now
             }
 
         # Compatibility with the earlier aggregate-counter prototype. Preserve
@@ -1811,10 +1841,7 @@ class NatsConcurrencyLimiter:
                     for owned_token, (owned_provider, limit) in self._token_limits.items()
                     if owned_provider == provider
                 ]
-            results = [
-                await self._refresh_slot_record(provider, owned_token, limit)
-                for owned_token, limit in owned
-            ]
+            results = [await self._refresh_slot_record(provider, owned_token, limit) for owned_token, limit in owned]
             return all(results)
 
         effective_max = self.max_concurrent if max_concurrent is None else max_concurrent

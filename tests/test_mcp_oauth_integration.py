@@ -1630,3 +1630,72 @@ async def test_dcr_is_rate_limited(
 
     assert statuses[:REGISTRATION_RATE_LIMIT] == [201] * REGISTRATION_RATE_LIMIT
     assert statuses[-1] == 429, "registration must be rate limited"
+
+
+def test_rate_limiter_never_min_of_an_empty_backoff_map(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_make_room`` must not compute a retry time from an empty mapping.
+
+    The base reached ``min(self._blocked_until.values())`` whenever capacity
+    was full but no caller had a pending deadline yet, raising ValueError out
+    of the auth hot path instead of rejecting. An *unblocked* tracked caller
+    is evictable, so that state has room; the guard now only has to cover the
+    genuinely-empty map.
+    """
+    from mnemos.mcp import oauth as mcp_oauth
+
+    now = 1000.0
+    monkeypatch.setattr(mcp_oauth.time, "monotonic", lambda: now)
+    limiter = mcp_oauth._SlidingWindowRateLimiter(limit=1, window_seconds=60.0, max_callers=1, backoff_max_seconds=60.0)
+    assert limiter.check("caller") == (True, 0)
+    assert limiter.check("caller")[0] is False  # saturated and now in backoff
+    limiter._blocked_until.clear()  # deadline expired/absent while still tracked
+    assert limiter.max_callers == 1
+    assert len(limiter._last_seen) == 1
+    assert "caller" in limiter._last_seen
+    assert limiter._blocked_until == {}
+
+    allowed, retry_after = limiter._make_room("newcomer", now)
+
+    assert allowed is True, (limiter.__dict__, "an unblocked caller is evictable, so there is room")
+    assert retry_after == 0
+    assert "caller" not in limiter._last_seen
+    assert limiter._make_room("another", now) == (True, 0)
+
+
+def test_rate_limiter_does_not_walk_every_tracked_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``check`` must be O(caller), not O(callers): one call = one time lookup."""
+    from mnemos.mcp import oauth as mcp_oauth
+
+    calls = 0
+
+    def _clock() -> float:
+        nonlocal calls
+        calls += 1
+        return 1000.0
+
+    monkeypatch.setattr(mcp_oauth.time, "monotonic", _clock)
+    limiter = mcp_oauth._SlidingWindowRateLimiter(limit=100, window_seconds=60.0, max_callers=4096)
+    for i in range(4096):
+        limiter.check(f"ip:10.0.{i // 256}.{i % 256}")
+    assert len(limiter._last_seen) == 4096
+
+    calls = 0
+    for _ in range(100):
+        limiter.check("ip:192.0.2.1")
+
+    # The base called the clock once per tracked caller (100 x 4096 lookups).
+    assert calls <= 100 * 3, f"{calls} clock reads for 100 checks over 4096 callers"
+
+
+def test_idle_caller_is_forgotten_after_its_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per-caller state must not outlive the window (bounded memory)."""
+    from mnemos.mcp import oauth as mcp_oauth
+
+    clock = [1000.0]
+    monkeypatch.setattr(mcp_oauth.time, "monotonic", lambda: clock[0])
+    limiter = mcp_oauth._SlidingWindowRateLimiter(limit=2, window_seconds=60.0, max_callers=10)
+
+    assert limiter.check("gone") == (True, 0)
+    clock[0] += 61.0
+    assert limiter.check("gone") == (True, 0)
+    assert list(limiter._hits["gone"]) == [clock[0]]

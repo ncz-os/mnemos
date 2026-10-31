@@ -11,7 +11,10 @@ On by default (`RATE_LIMIT_ENABLED=true`). Tune via environment variables:
 Route-specific limits (e.g. on `/v1/consultations`) are applied via
 `@limiter.limit()` in the relevant handler.
 """
+
 import logging
+import threading
+import time
 
 from slowapi import Limiter, _rate_limit_exceeded_handler  # noqa: F401 — re-exported
 from slowapi.errors import RateLimitExceeded  # noqa: F401
@@ -90,19 +93,45 @@ class _FailOpenLimiter(Limiter):
     ships no redis.
     """
 
-    def _check_request_limit(self, request, endpoint_func, in_middleware=True):  # type: ignore[override]
+    # While the store is down this path runs on every request, so the warning
+    # itself is rate-limited: log the first failure, then at most one summary
+    # per interval (with the number of requests swallowed since the last one).
+    FAIL_OPEN_LOG_INTERVAL_SECONDS = 60.0
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._fail_open_lock = threading.Lock()
+        self._fail_open_last_log = 0.0
+        self._fail_open_suppressed = 0
+
+    def _log_fail_open(self, exc: BaseException) -> None:
+        now = time.monotonic()
+        with self._fail_open_lock:
+            first = self._fail_open_last_log == 0.0
+            due = now - self._fail_open_last_log >= self.FAIL_OPEN_LOG_INTERVAL_SECONDS
+            if not first and not due:
+                self._fail_open_suppressed += 1
+                return
+            suppressed = self._fail_open_suppressed
+            self._fail_open_last_log = now
+            self._fail_open_suppressed = 0
+        suffix = f" ({suppressed} similar failures suppressed)" if suppressed else ""
+        logger.warning(
+            "rate-limit store unavailable (%s: %s); allowing the request through. "
+            "Rate limiting is DISABLED until the store recovers. storage_uri=%s%s",
+            type(exc).__name__,
+            exc,
+            RATE_LIMIT_STORAGE,
+            suffix,
+        )
+
+    def _check_request_limit(self, request, endpoint_func, in_middleware=True) -> None:  # type: ignore[override]
         try:
             return super()._check_request_limit(request, endpoint_func, in_middleware)
         except RateLimitExceeded:
             raise
         except Exception as exc:
-            logger.warning(
-                "rate-limit store unavailable (%s: %s); allowing the request through. "
-                "Rate limiting is DISABLED until the store recovers. storage_uri=%s",
-                type(exc).__name__,
-                exc,
-                RATE_LIMIT_STORAGE,
-            )
+            self._log_fail_open(exc)
             # Swallowing the error is not enough on its own. SlowAPIMiddleware
             # treats "no exception" as "limits were evaluated" and goes on to
             # `_inject_headers(response, request.state.view_rate_limit)` -- and

@@ -10,7 +10,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 import mnemos.core.lifecycle as _lc
-from mnemos.api.dependencies import UserContext, get_current_user, require_root
+from mnemos.api.dependencies import (
+    UserContext,
+    get_current_user,
+    invalidate_api_key_cache,
+    require_root,
+)
 from mnemos.api.persistence_helpers import (
     backend_or_503,
     require_oauth_backend,
@@ -212,6 +217,12 @@ async def revoke_api_key(
         revoked = await backend.oauth.revoke_api_key(tx, key_id)
     if not revoked:
         raise HTTPException(status_code=404, detail="API key not found or already revoked")
+    # Drop this worker's cached UserContext for the key now, so the very next
+    # request on this process is a 401 rather than "valid for up to the auth
+    # cache TTL". Other workers (other uvicorn workers or replicas) keep
+    # serving until their own cache entry expires — that lag is the TTL, see
+    # mnemos/api/dependencies.py.
+    invalidate_api_key_cache(key_id=key_id)
     logger.info(f"[ADMIN] Revoked API key id={key_id}")
 
 
