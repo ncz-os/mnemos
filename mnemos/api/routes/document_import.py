@@ -52,7 +52,7 @@ def _docling_max_concurrency() -> int:
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import backend_or_503
-from mnemos.api.routes.memories import _validate_permission_mode
+from mnemos.api.read_policy import _validate_permission_mode
 from mnemos.core.config import get_settings, runtime_env_value
 from mnemos.core.ids import new_memory_id
 from mnemos.domain.document_repo import (

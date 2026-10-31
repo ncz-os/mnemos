@@ -14,7 +14,7 @@ from datetime import date, datetime
 from typing import Any
 
 from mnemos.core.auth_context import UserContext
-from mnemos.api.routes.memories import _should_redact_secrets
+from mnemos.api.read_policy import _should_redact_secrets
 
 from ._runtime import (
     MCP_DEFAULT_LIMIT_MAX,
@@ -46,6 +46,7 @@ def _redact_history_content(content: str, user: UserContext) -> str:
 
     return redact_content(content)
 
+
 logger = logging.getLogger(__name__)
 BRANCH_MEMORY_RATE_LIMIT_PER_MINUTE = 30
 
@@ -74,7 +75,10 @@ async def tool_log_memory(
     safe_id = _safe_path_segment(memory_id, label="memory_id")
     _safe_path_segment(branch, label="branch")
     limit = _bounded_int(
-        limit, label="limit", minimum=1, maximum=MCP_DEFAULT_LIMIT_MAX,
+        limit,
+        label="limit",
+        minimum=1,
+        maximum=MCP_DEFAULT_LIMIT_MAX,
     )
     if user is None:
         commits = await _rest_get(
@@ -179,9 +183,7 @@ async def tool_branch_memory(
 
     try:
         async with backend.transactional() as tx:
-            return await backend.memory_branches.create_memory_branch(
-                tx, memory_id, name, from_commit, user
-            )
+            return await backend.memory_branches.create_memory_branch(tx, memory_id, name, from_commit, user)
 
     except Exception as e:
         logger.error(f"[MCP] branch_memory failed: {e}", exc_info=True)
