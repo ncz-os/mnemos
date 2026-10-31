@@ -2676,6 +2676,27 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
             await cursor.execute(sql, tuple(params))
             return await _fetch_all_dicts(cursor)
 
+    async def bump_recall_counts(
+        self,
+        tx: Transaction,
+        memory_ids: Sequence[str],
+    ) -> int:
+        ids = [str(memory_id) for memory_id in memory_ids]
+        if not ids:
+            return 0
+        placeholders = ", ".join(["%s"] * len(ids))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE memories SET "
+                "recall_count = COALESCE(recall_count, 0) + 1, "
+                "last_recalled_at = NOW(6) "
+                f"WHERE id IN ({placeholders}) "
+                "AND deleted_at IS NULL "
+                "AND archived_at IS NULL",
+                ids,
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+
     async def backfill_missing_content_hashes(
         self,
         tx: Transaction,
