@@ -109,7 +109,11 @@ from mnemos.core import webhook_constants
 from mnemos.persistence.hot_search import HotSearchMixin
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin, oauth_utc
 from mnemos.persistence.mysql_oauth import MysqlBrowserOAuthMixin
-from mnemos.persistence.schema import split_postgres_statements
+from mnemos.persistence.schema import (
+    resolve_embedding_dim,
+    split_postgres_statements,
+    warn_embedding_dimension_mismatch,
+)
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
@@ -120,8 +124,13 @@ _DEFAULT_MYSQL_POOL_MIN = 2
 _DEFAULT_MYSQL_POOL_MAX = 10
 _DEFAULT_MYSQL_ACQUIRE_TIMEOUT = 60.0
 
-# MySQL 9.0 native vector column declaration
-_VECTOR_COLUMN = f"VECTOR({_DEFAULT_EMBEDDING_DIM})"
+# MySQL 9.0 native vector column declaration. The width is NOT baked in at
+# import time: the DDL templates carry a ``{embedding_dim}`` placeholder that
+# ``_init_ddls(embedding_dim)`` fills from the active settings (config.toml
+# included) at open() time, so the column is sized by the same value the
+# runtime guard enforces. Sizing it from the environment here made a TOML-only
+# embedding dim invisible to the DDL.
+_VECTOR_COLUMN_TEMPLATE = "VECTOR({embedding_dim})"
 
 # Threshold above which the Python-side cosine fallback is considered
 # "operating at scale". When the eligible corpus exceeds this count, we
@@ -445,6 +454,74 @@ async def _ensure_mysql_columns(conn: Any, table: str, definitions: dict[str, st
                 await cursor.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
 
+async def _embedding_column_definition(conn: Any, table: str, column: str) -> str | None:
+    """Return the live VECTOR(n) type of ``table.column`` (None when absent)."""
+    async with conn.cursor() as cursor:
+        await cursor.execute(
+            """
+            SELECT COLUMN_TYPE
+              FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE()
+               AND TABLE_NAME = %s
+               AND COLUMN_NAME = %s
+            """,
+            (table, column),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    return str(row[0])
+
+
+async def _column_has_vectors(conn: Any, table: str, column: str) -> bool:
+    async with conn.cursor() as cursor:
+        await cursor.execute(f"SELECT 1 FROM {table} WHERE {column} IS NOT NULL LIMIT 1")
+        return await cursor.fetchone() is not None
+
+
+async def _retype_embedding_column(conn: Any, table: str, column: str, embedding_dim: int) -> None:
+    """Retype an EMPTY VECTOR column to the configured width.
+
+    Only ever called after ``_column_has_vectors`` said the column holds no
+    vectors: resizing a populated VECTOR column would silently invalidate every
+    stored embedding, which is the operator's decision, not startup's.
+    """
+    definition = _VECTOR_COLUMN_TEMPLATE.format(embedding_dim=int(embedding_dim))
+    async with conn.cursor() as cursor:
+        await cursor.execute(f"ALTER TABLE {table} MODIFY COLUMN {column} {definition}")
+
+
+async def _ensure_embedding_column_dim(
+    conn: Any,
+    *,
+    table: str,
+    column: str,
+    embedding_dim: int,
+    label: str,
+) -> None:
+    """M8 startup check: the live VECTOR column must match the configured width.
+
+    An empty column is retyped in place (the same posture Postgres takes in
+    ``_ensure_postgres_embedding_shape``); a populated one raises so startup
+    fails loudly instead of running searches and writes against a column that
+    cannot hold the configured embedder's output.
+    """
+    current = await _embedding_column_definition(conn, table, column)
+    if current is None:
+        # Fresh install (DDL just ran) or an unsupported server: nothing to check.
+        return
+    if not warn_embedding_dimension_mismatch(embedding_dim, current, label):
+        return
+    if not await _column_has_vectors(conn, table, column):
+        await _retype_embedding_column(conn, table, column, embedding_dim)
+        _LOG.warning("%s was empty and has been retyped to VECTOR(%d)", label, int(embedding_dim))
+        return
+    raise RuntimeError(
+        f"{label} is {current} but MNEMOS_EMBEDDING_DIM={int(embedding_dim)}; refusing to "
+        "resize a populated column. Re-embed or clear embeddings before changing dims."
+    )
+
+
 def _split_mysql_statements(sql: str) -> list[str]:
     """Statement splitter that understands MySQL/MariaDB trigger bodies.
 
@@ -637,7 +714,7 @@ def _has_executable_mysql_sql(statement: str) -> bool:
 
 # ── DDL ───────────────────────────────────────────────────────────────────────
 
-_DDL_MEMORIES = f"""\
+_DDL_MEMORIES = """\
 CREATE TABLE IF NOT EXISTS memories (
     id                VARCHAR(64)   NOT NULL,
     content           LONGTEXT      NOT NULL,
@@ -672,7 +749,7 @@ CREATE TABLE IF NOT EXISTS memories (
     deleted_at        DATETIME(6),
     created           DATETIME(6)   NOT NULL DEFAULT NOW(6),
     updated           DATETIME(6)   NOT NULL DEFAULT NOW(6),
-    embedding         {_VECTOR_COLUMN},
+    embedding         {vector_column},
     PRIMARY KEY (id),
     INDEX idx_memories_ns_cat  (namespace, category),
     INDEX idx_memories_owner   (owner_id, namespace),
@@ -1330,6 +1407,12 @@ CREATE TABLE IF NOT EXISTS morpheus_extract_failures (
     CHECK (status IN ('retryable', 'dead_letter'))
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
+
+
+def _init_ddls(embedding_dim: int) -> list[str]:
+    """Render the inline schema with the configured vector width."""
+    vector_column = _VECTOR_COLUMN_TEMPLATE.format(embedding_dim=int(embedding_dim))
+    return [ddl.replace("{vector_column}", vector_column) for ddl in _INIT_DDLS]
 
 
 _INIT_DDLS = [
@@ -2435,10 +2518,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         # Oracle/Db2/Postgres on either.
         vis = VisibilityFilter.for_caller(user)
         rows = await self.semantic_search(tx, embedding=embedding, limit=limit, visibility=vis)
-        return [
-            {"id": row["id"], "content": row["content"], "namespace": row["namespace"]}
-            for row in rows
-        ]
+        return [{"id": row["id"], "content": row["content"], "namespace": row["namespace"]} for row in rows]
 
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
         # Mirror the Oracle backend: re-create the READABLE filter from the
@@ -4893,9 +4973,7 @@ class MysqlCompressionQueueRepository(CompressionQueueRepository):
         """
         try:
             async with conn.cursor() as cursor:
-                await cursor.execute(
-                    "SELECT COUNT(*) AS variants FROM memory_compressed_variants"
-                )
+                await cursor.execute("SELECT COUNT(*) AS variants FROM memory_compressed_variants")
                 row = await _fetchone_dict(cursor)
         except Exception as exc:
             # aiomysql/pymysql errors carry the numeric server errno as
@@ -7946,6 +8024,9 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     supports_nats_dispatch_log = True  # backed by MysqlNatsDispatchLogRepository, see .nats_dispatch_log
     _supports_core_persistence = True
     _supports_oauth_persistence = True
+    # (table, column) the M8 startup dimension check inspects. MySQL keeps
+    # embeddings inline on memories; MariaDB overrides this to its join table.
+    _embedding_column_target = ("memories", "embedding")
 
     def __init__(self, pool: Any, settings: Any) -> None:
         self._pool = pool
@@ -7979,6 +8060,15 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     @property
     def pool(self) -> Any:
         return self._pool
+
+    def _resolve_embedding_dim(self) -> int:
+        """Configured embedder width for DDL sizing and the startup check.
+
+        Reads the live settings (config.toml included) so a TOML-only
+        ``database.embedding_dim`` reaches the DDL; falls back to the
+        environment when no settings object was supplied (lite/test paths).
+        """
+        return resolve_embedding_dim(self._settings)
 
     @property
     def capabilities(self) -> set[str]:
@@ -8392,8 +8482,16 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                 async with conn.cursor() as cursor:
                     await cursor.execute("SET time_zone = '+00:00'")
                     await cursor.execute("SELECT 1")
-                    for ddl in _INIT_DDLS:
+                    embedding_dim = self._resolve_embedding_dim()
+                    for ddl in _init_ddls(embedding_dim):
                         await cursor.execute(ddl)
+                await _ensure_embedding_column_dim(
+                    conn,
+                    table=self._embedding_column_target[0],
+                    column=self._embedding_column_target[1],
+                    embedding_dim=embedding_dim,
+                    label=".".join(self._embedding_column_target),
+                )
                 await _ensure_mysql_oauth_schema(conn)
                 await _ensure_mysql_webhook_schema(conn)
                 await _ensure_mysql_federation_journal(conn)

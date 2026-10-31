@@ -96,6 +96,7 @@ from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import eligibility as _eligibility
 from mnemos.core import webhook_constants
+from mnemos.persistence.schema import warn_embedding_dimension_mismatch
 
 logger = logging.getLogger(__name__)
 
@@ -1321,10 +1322,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             "ORDER BY m.updated DESC LIMIT ?",
             params,
         )
-        return [
-            {"id": row["id"], "content": row["content"], "namespace": row["namespace"]}
-            for row in rows
-        ]
+        return [{"id": row["id"], "content": row["content"], "namespace": row["namespace"]} for row in rows]
 
     async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
         self._require_dim(embedding, "upsert_memory_embedding")
@@ -3877,9 +3875,7 @@ class SqliteCompressionQueueRepository(_SqliteRepository, CompressionQueueReposi
         Exception would swallow unrelated errors.
         """
         try:
-            count = await _fetch_val(
-                conn, "SELECT COUNT(*) FROM memory_compressed_variants"
-            )
+            count = await _fetch_val(conn, "SELECT COUNT(*) FROM memory_compressed_variants")
         except sqlite3.OperationalError as exc:
             if "no such table" not in str(exc):
                 raise
@@ -5024,7 +5020,9 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
             (provider, target_model_id),
         )
         if target is None:
-            raise ValueError(f"alias {alias!r}: target model {target_model_id!r} does not exist in provider {provider!r}")
+            raise ValueError(
+                f"alias {alias!r}: target model {target_model_id!r} does not exist in provider {provider!r}"
+            )
         if target.get("alias_of"):
             raise ValueError(
                 f"alias {alias!r}: target {target_model_id!r} is itself an alias "
@@ -5195,10 +5193,7 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
         )
         if model_row is None:
             return None
-        sql = (
-            "SELECT field, value, source, fetched_at FROM model_field_obs "
-            "WHERE provider = ? AND model_id = ?"
-        )
+        sql = "SELECT field, value, source, fetched_at FROM model_field_obs WHERE provider = ? AND model_id = ?"
         params: tuple[Any, ...] = (provider, model_id)
         if authoritative_source is not None:
             sql += " AND source = ?"
@@ -5249,8 +5244,7 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
     async def curated_routing_get(self, tx: Transaction) -> CuratedRouting | None:
         row = await _fetch_one(
             self._conn(tx),
-            "SELECT version, rules, note, created_at FROM curated_routing "
-            "ORDER BY version DESC LIMIT 1",
+            "SELECT version, rules, note, created_at FROM curated_routing ORDER BY version DESC LIMIT 1",
         )
         if row is None:
             return None
@@ -5280,8 +5274,7 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
         payload = json.dumps([dict(rule) for rule in rules], sort_keys=True, separators=(",", ":"))
         await _execute(
             conn,
-            "INSERT INTO curated_routing (version, rules, note, created_at) "
-            "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            "INSERT INTO curated_routing (version, rules, note, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
             (next_version, payload, note),
         )
         row = await _fetch_one(
@@ -5334,9 +5327,7 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
         # Alias rows are pointers, not models: they must not contribute to the
         # digest or any count, or adding an alias would change the export hash
         # and inflate model_count.
-        models = await _fetch_all(
-            conn, "SELECT * FROM model_registry WHERE alias_of IS NULL" + self._MODEL_ORDER
-        )
+        models = await _fetch_all(conn, "SELECT * FROM model_registry WHERE alias_of IS NULL" + self._MODEL_ORDER)
         prices = await _fetch_all(conn, "SELECT * FROM model_prices" + self._PRICE_ORDER)
         benchmarks = await _fetch_all(conn, "SELECT * FROM model_benchmarks" + self._BENCH_ORDER)
         curated_version = await _fetch_val(conn, "SELECT MAX(version) FROM curated_routing")
@@ -5404,14 +5395,11 @@ class SqliteModelRegistryRepository(_SqliteRepository, ModelRegistryRepository):
         # Count models, not alias rows: an alias is a pointer to a model, so
         # including it would inflate model_count and make
         # priced + unpriced == model_count meaningless.
-        model_count = int(
-            await _fetch_val(conn, "SELECT COUNT(*) FROM model_registry WHERE alias_of IS NULL") or 0
-        )
+        model_count = int(await _fetch_val(conn, "SELECT COUNT(*) FROM model_registry WHERE alias_of IS NULL") or 0)
         priced_count = int(
             await _fetch_val(
                 conn,
-                "SELECT COUNT(*) FROM model_registry "
-                f"WHERE alias_of IS NULL AND {_PRICED_SQL}",
+                f"SELECT COUNT(*) FROM model_registry WHERE alias_of IS NULL AND {_PRICED_SQL}",
             )
             or 0
         )
@@ -5656,8 +5644,7 @@ class SqliteOAuthRepository(_SqliteRepository, MCPOAuthRepositoryMixin, OAuthRep
         )
         row = await _fetch_one(
             conn,
-            "SELECT id, user_id, key_prefix, label, created_at, last_used, revoked "
-            "FROM api_keys WHERE id=?",
+            "SELECT id, user_id, key_prefix, label, created_at, last_used, revoked FROM api_keys WHERE id=?",
             (key_id,),
         )
         return build_api_key_row(
@@ -8139,6 +8126,10 @@ class SqliteBackend:
 
     async def _create_vec_virtual_table(self, conn: Any) -> None:
         self._memories._vec_index_complete = False
+        # M8: the inline ``memories.embedding`` JSON column is what a
+        # non-vec0 install searches, and nothing else re-checks it — the
+        # guards below only cover the vec0 table and memory_embeddings.
+        await self._check_embedding_dimension(conn)
         # This health flag is shared by every connection/process. Canonical
         # writes invalidate it even when they bypass the embedding repository.
         await _execute(
@@ -8364,6 +8355,52 @@ class SqliteBackend:
             except (TypeError, ValueError):
                 continue
         return histogram
+
+    async def _check_embedding_dimension(self, conn: Any) -> None:
+        """Cross-check the configured dim against the live SQLite embedding tables.
+
+        M8: the vec0 guards in :meth:`_create_vec_virtual_table` cover the
+        virtual table and the canonical fallback rows, but not the plain
+        ``memories.embedding`` JSON column another writer may have filled at
+        a different width (a federation copy, a backfill script, an older
+        process). With sqlite-vec loaded the vec0 table is the search
+        authority; without it the JSON column is. Either way a width that
+        disagrees with the configuration is reported loudly at startup
+        instead of degrading search silently.
+        """
+        configured = self._resolve_embedding_dim()
+        table = await _fetch_one(
+            conn,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memories'",
+        )
+        if not table:
+            return
+        columns = await _fetch_all(conn, "PRAGMA table_info(memories)")
+        names = {(row.get("name") if isinstance(row, dict) else row[1]) for row in columns}
+        if "embedding" not in names:
+            return
+        row = await _fetch_one(
+            conn,
+            "SELECT embedding FROM memories WHERE embedding IS NOT NULL LIMIT 1",
+        )
+        if not row:
+            return
+        raw = row.get("embedding") if isinstance(row, dict) else row[0]
+        if raw is None:
+            return
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            raw = bytes(raw).decode("utf-8", "replace")
+        try:
+            width = len(json.loads(raw))
+        except (TypeError, ValueError):
+            return
+        if warn_embedding_dimension_mismatch(configured, width):
+            raise RuntimeError(
+                f"SQLite embedding dimension mismatch: memories.embedding stores "
+                f"{width}-dimensional vectors but MNEMOS_EMBEDDING_DIM resolves to "
+                f"{configured}. Refusing to start; re-embed the rows at the "
+                f"configured dimension or set MNEMOS_EMBEDDING_DIM to {width}."
+            )
 
     def _resolve_embedding_dim(self) -> int:
         # Settings can be None in tests + lite-CLI paths. Fall back to 768

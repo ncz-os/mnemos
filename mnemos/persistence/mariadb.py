@@ -74,10 +74,6 @@ from mnemos.persistence.mysql import (
     _MysqlTransaction,
     _boosted_rank_supersession_sort_key,
     _content_hash,
-    _ensure_mysql_columns,
-    _ensure_mysql_oauth_schema,
-    _ensure_mysql_federation_journal,
-    _ensure_mysql_webhook_schema,
     _fetch_all_dicts,
     _is_unique_violation,
     _is_vec_distance_unsupported,
@@ -102,12 +98,16 @@ from mnemos.persistence.mysql import (
     MysqlVersionRepository,
     MysqlWebhookRepository,
 )
+from mnemos.persistence.schema import resolve_embedding_dim, warn_embedding_dimension_mismatch  # noqa: F401
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter
 
 _LOG = logging.getLogger(__name__)
 
-_VECTOR_COLUMN = f"VECTOR({_DEFAULT_EMBEDDING_DIM}) NOT NULL"
+# The width is filled in by ``_init_ddls(embedding_dim)`` from the active
+# settings (config.toml included) at open() time, never from the environment at
+# import time: the DDL and the runtime guard must agree on the same value.
+_VECTOR_COLUMN_TEMPLATE = "VECTOR({embedding_dim}) NOT NULL"
 
 _DDL_MEMORIES = """\
 CREATE TABLE IF NOT EXISTS memories (
@@ -189,10 +189,10 @@ CREATE TABLE IF NOT EXISTS memory_archive (
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
-_DDL_MEMORY_EMBEDDINGS = f"""\
+_DDL_MEMORY_EMBEDDINGS = """\
 CREATE TABLE IF NOT EXISTS memory_embeddings (
     memory_id  VARCHAR(64) CHARACTER SET ascii NOT NULL,
-    embedding  {_VECTOR_COLUMN},
+    embedding  {vector_column},
     PRIMARY KEY (memory_id),
     VECTOR INDEX (embedding),
     CONSTRAINT fk_memory_embeddings_memory
@@ -399,6 +399,19 @@ CREATE TABLE IF NOT EXISTS morpheus_extract_run_memories (
     KEY idx_morpheus_extract_run_memories_memory (memory_id, processed_at DESC)
 ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
+
+
+def _init_ddls(embedding_dim: int | None = None) -> list[str]:
+    """Render the inline schema with the configured vector width.
+
+    ``embedding_dim`` is resolved from the live settings by the caller; when
+    omitted (scripts, tests) it falls back to ``resolve_embedding_dim(None)``
+    so the DDL and the runtime guard still share one reader.
+    """
+    if embedding_dim is None:
+        embedding_dim = resolve_embedding_dim()
+    vector_column = _VECTOR_COLUMN_TEMPLATE.format(embedding_dim=int(embedding_dim))
+    return [ddl.replace("{vector_column}", vector_column) for ddl in _INIT_DDLS]
 
 
 _INIT_DDLS = [
@@ -1282,6 +1295,10 @@ class MariadbStateRepository(MysqlStateRepository):
 class MariadbBackend(MysqlBackend):
     """MariaDB 11.7+ persistence facade backed by an aiomysql connection pool."""
 
+    # MariaDB keeps embeddings in a separate memory_embeddings table, so the
+    # startup dimension check has to look there rather than at memories.
+    _embedding_column_target = ("memory_embeddings", "embedding")
+
     supports_listen_notify = False
     supports_advisory_locks = False
     supports_row_level_security = False
@@ -1407,115 +1424,6 @@ class MariadbBackend(MysqlBackend):
                     record.get("payload_json"),
                 ),
             )
-
-    async def open(self) -> None:
-        """Validate pool connectivity and apply UTC + init DDL."""
-        if self._closed or self._pool is None:
-            return
-        try:
-            async with self._pool.acquire() as conn:
-                async with conn.cursor() as cursor:
-                    await cursor.execute("SET time_zone = '+00:00'")
-                    await cursor.execute("SELECT 1")
-                    for ddl in _INIT_DDLS:
-                        await cursor.execute(ddl)
-                await _ensure_mysql_oauth_schema(conn)
-                await _ensure_mysql_webhook_schema(conn)
-                await _ensure_mysql_federation_journal(conn, separate_embeddings=True)
-                await _ensure_mysql_columns(
-                    conn,
-                    "memories",
-                    {
-                        "federation_remote_updated": "federation_remote_updated DATETIME(6)",
-                        "consolidated_at": "consolidated_at DATETIME(6)",
-                        "federation_last_pushed_at": "federation_last_pushed_at DATETIME(6)",
-                        "federation_push_peer": "federation_push_peer VARCHAR(512)",
-                        "morpheus_run_id": "morpheus_run_id CHAR(36)",
-                        "source_memories": "source_memories LONGTEXT",
-                        "provenance": "provenance VARCHAR(64)",
-                        "triples_extracted_at": "triples_extracted_at DATETIME(6)",
-                    },
-                )
-                await _ensure_mysql_columns(
-                    conn,
-                    "kg_triples",
-                    {"extracted_by_run_id": "extracted_by_run_id CHAR(36)"},
-                )
-                await _ensure_mysql_columns(
-                    conn,
-                    "memory_branches",
-                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
-                )
-                await _ensure_mysql_columns(
-                    conn,
-                    "entities",
-                    {
-                        "owner_id": "owner_id VARCHAR(256) NOT NULL DEFAULT 'default'",
-                        "namespace": "namespace VARCHAR(256) NOT NULL DEFAULT 'default'",
-                        "deleted_at": "deleted_at TIMESTAMP(6) NULL",
-                    },
-                )
-                await _ensure_mysql_columns(
-                    conn,
-                    "sessions",
-                    {
-                        "namespace": "namespace VARCHAR(256) NOT NULL DEFAULT 'default'",
-                        "deleted_at": "deleted_at TIMESTAMP(6) NULL",
-                    },
-                )
-                await _ensure_mysql_columns(
-                    conn,
-                    "session_messages",
-                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
-                )
-                await _ensure_mysql_columns(
-                    conn,
-                    "session_memory_injections",
-                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
-                )
-                await _ensure_mysql_columns(
-                    conn,
-                    "federation_peers",
-                    {
-                        "auth_token": "auth_token TEXT",
-                        "api_key": "api_key TEXT",
-                        "namespace_filter": "namespace_filter JSON",
-                        "category_filter": "category_filter JSON",
-                        "sync_interval_secs": "sync_interval_secs INT NOT NULL DEFAULT 300",
-                        "last_sync_cursor": "last_sync_cursor TEXT",
-                        "cursor_updated": "cursor_updated TEXT",
-                        "last_error": "last_error TEXT",
-                        "last_error_at": "last_error_at TIMESTAMP(6) NULL",
-                        "total_pulled": "total_pulled INT NOT NULL DEFAULT 0",
-                        "compat_mode": "compat_mode VARCHAR(32) NOT NULL DEFAULT 'strict'",
-                        "peer_mnemos_version": "peer_mnemos_version VARCHAR(128)",
-                        "last_schema_check_at": "last_schema_check_at TIMESTAMP(6) NULL",
-                        "copy_embeddings": "copy_embeddings BOOLEAN NOT NULL DEFAULT FALSE",
-                        "created": "created TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
-                        "updated": "updated TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
-                    },
-                )
-                await _ensure_mysql_columns(
-                    conn,
-                    "federation_sync_log",
-                    {
-                        "direction": "direction VARCHAR(16) NOT NULL DEFAULT 'pull'",
-                        "status": "status VARCHAR(32) NOT NULL DEFAULT 'started'",
-                        "started_at": "started_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
-                        "finished_at": "finished_at TIMESTAMP(6) NULL",
-                        "memories_pulled": "memories_pulled INT NOT NULL DEFAULT 0",
-                        "memories_new": "memories_new INT NOT NULL DEFAULT 0",
-                        "memories_updated": "memories_updated INT NOT NULL DEFAULT 0",
-                        "records_seen": "records_seen INT NOT NULL DEFAULT 0",
-                        "records_written": "records_written INT NOT NULL DEFAULT 0",
-                        "cursor_before": "cursor_before TEXT",
-                        "cursor_after": "cursor_after TEXT",
-                    },
-                )
-                await conn.commit()
-        except Exception:
-            _LOG.exception("MariadbBackend.open failed while provisioning the required schema")
-            raise
 
 
 __all__ = [

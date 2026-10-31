@@ -12,6 +12,7 @@ import inspect
 import logging
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -43,9 +44,9 @@ _POSTGRES_OAUTH_MIGRATION = _DB_DIR / "migrations_v5_4_0_mcp_oauth.sql"
 # The runner also tracks its own per-statement BEGIN/COMMIT/ROLLBACK
 # state so the migrations cannot be wrapped in one outer transaction
 # either.
-_POSTGRES_SCHEMA_LOCK_KEY: int = int.from_bytes(
-    hashlib.sha256(b"mnemos_schema_migration").digest()[:8], "big", signed=False
-) & 0x7FFFFFFFFFFFFFFF
+_POSTGRES_SCHEMA_LOCK_KEY: int = (
+    int.from_bytes(hashlib.sha256(b"mnemos_schema_migration").digest()[:8], "big", signed=False) & 0x7FFFFFFFFFFFFFFF
+)
 
 _POSTGRES_LEGACY_MIGRATIONS: tuple[Path, ...] = (
     _DB_DIR / "migrations.sql",
@@ -148,6 +149,81 @@ def resolve_embedding_dim(settings: Any | None = None) -> int:
         return int(raw)
     except (TypeError, ValueError):
         return embedding_dim_env()
+
+
+def embedding_dimension_mismatch(
+    configured: int | None,
+    column: Any,
+    label: str = "memories.embedding",
+) -> str | None:
+    """Return one operator-facing message when a stored column outgrew the config.
+
+    The startup dimension check (M8) compares three numbers: the configured
+    ``MNEMOS_EMBEDDING_DIM`` (settings), the live ``memories.embedding`` column
+    width, and the embedder's discovered output width. This helper owns the
+    config-vs-column half so every backend reports it identically, instead of
+    each one growing its own wording (and its own silent path).
+
+    ``column`` is whatever the backend could read: an ``int`` width, a backend
+    type string (``"vector(1024)"``, ``"VECTOR(1024, FLOAT32)"``, ``"VECTOR(768)"``,
+    ``"float[768]"``) or ``None`` when it could not be determined. The caller
+    passes ``None`` for "unknown" and gets no message — a probe that failed is
+    not evidence of a mismatch, and refusing startup on an unreadable catalog
+    would take a healthy node down for a permissions quirk.
+
+    An unknown config (``None``) still yields a message: the column is then
+    sized by something other than the running configuration, which is exactly
+    the silent drift the check exists to catch.
+    """
+    width = _column_embed_dim(column)
+    if width is None:
+        return None
+    if configured is None:
+        return (
+            f"{label} is sized for {width}-dimensional embeddings, but the configured "
+            "embedding dimension is unknown. Set MNEMOS_EMBEDDING_DIM to the "
+            f"embedder's output width ({width}) so search and writes agree."
+        )
+    if int(configured) == width:
+        return None
+    return (
+        f"{label} is sized for {width}-dimensional embeddings but "
+        f"MNEMOS_EMBEDDING_DIM={configured}; refusing to run a column whose width "
+        "disagrees with the configured embedder. Re-embed (or retype) the column "
+        "before changing the embedding model or dimension."
+    )
+
+
+_COLUMN_EMBED_DIM_RE = re.compile(r"(\d+)")
+
+
+def _column_embed_dim(column: Any) -> int | None:
+    """Extract the integer width from a column width or a backend type string."""
+    if column is None or isinstance(column, bool):
+        return None
+    if isinstance(column, int):
+        return column if column > 0 else None
+    match = _COLUMN_EMBED_DIM_RE.search(str(column))
+    if match is None:
+        return None
+    try:
+        width = int(match.group(1))
+    except ValueError:  # pragma: no cover - the regex only admits digits
+        return None
+    return width if width > 0 else None
+
+
+def warn_embedding_dimension_mismatch(
+    configured: int | None,
+    column: Any,
+    label: str = "memories.embedding",
+) -> bool:
+    """Log the mismatch and return whether one was found (never raises)."""
+    message = embedding_dimension_mismatch(configured, column, label)
+    if message is None:
+        return False
+    _LOG.error("Embedding dimension mismatch: %s", message)
+    return True
 
 
 def postgres_migration_paths() -> list[Path]:
@@ -431,6 +507,10 @@ async def ensure_oracle_schema(pool: Any, settings: Any | None = None) -> None:
             await _commit_if_available(conn)
         finally:
             await _maybe_await(cursor.close)
+        # M8: the DDL above is idempotent, so a pre-existing 768-wide column
+        # silently survives a change to MNEMOS_EMBEDDING_DIM. Read the live
+        # catalog and refuse to start on a disagreement.
+        await check_oracle_embedding_dim(conn, embedding_dim)
 
 
 async def ensure_db2_schema(pool: Any, settings: Any | None = None) -> None:
@@ -446,6 +526,94 @@ async def ensure_db2_schema(pool: Any, settings: Any | None = None) -> None:
                 finally:
                     await _maybe_await(cursor.close)
             await _commit_if_available(conn)
+        # M8: same catalog check as Oracle (Db2 reports the width through
+        # SYSCAT.COLUMNS.TYPENAME as ``VECTOR(768, FLOAT32)``).
+        await check_db2_embedding_dim(conn, embedding_dim)
+
+
+#: Oracle reports a ``VECTOR(768, FLOAT32)`` column through
+#: ``ALL_TAB_COLUMNS.DATA_TYPE``. The width is the first integer in the type
+#: name, so ``_column_embed_dim`` reads it directly.
+_ORACLE_EMBEDDING_DIM_SQL = """
+SELECT DATA_TYPE
+  FROM ALL_TAB_COLUMNS
+ WHERE UPPER(TABLE_NAME) = 'MEMORIES'
+   AND UPPER(COLUMN_NAME) = 'EMBEDDING'
+"""
+
+#: Db2 exposes the same column type through ``SYSCAT.COLUMNS.TYPENAME``.
+_DB2_EMBEDDING_DIM_SQL = """
+SELECT TYPENAME
+  FROM SYSCAT.COLUMNS
+ WHERE TABNAME = 'MEMORIES'
+   AND COLNAME = 'EMBEDDING'
+"""
+
+
+async def check_oracle_embedding_dim(conn: Any, embedding_dim: int) -> None:
+    """M8: fail startup when ``memories.embedding`` disagrees with the config.
+
+    Oracle's ``VECTOR(768, FLOAT32)`` column width is fixed at CREATE TABLE
+    time; the idempotent migrations never retype an existing column, so a
+    changed ``MNEMOS_EMBEDDING_DIM`` would otherwise run searches and writes
+    against a column the embedder cannot fill. An unreadable catalog (no
+    privilege, table not yet visible) is treated as "unknown" — a failed probe
+    is not evidence of a mismatch.
+    """
+    await _check_catalog_embedding_dim(
+        conn,
+        _ORACLE_EMBEDDING_DIM_SQL,
+        embedding_dim,
+        label="memories.embedding",
+        backend="Oracle",
+    )
+
+
+async def check_db2_embedding_dim(conn: Any, embedding_dim: int) -> None:
+    """M8: Db2 counterpart of :func:`check_oracle_embedding_dim`."""
+    await _check_catalog_embedding_dim(
+        conn,
+        _DB2_EMBEDDING_DIM_SQL,
+        embedding_dim,
+        label="memories.embedding",
+        backend="Db2",
+    )
+
+
+async def _check_catalog_embedding_dim(
+    conn: Any,
+    sql: str,
+    embedding_dim: int,
+    *,
+    label: str,
+    backend: str,
+) -> None:
+    cursor = await _maybe_await(conn.cursor)
+    try:
+        try:
+            await _maybe_await(cursor.execute, sql)
+            row = await _maybe_await(cursor.fetchone)
+        except Exception as exc:  # pragma: no cover - catalog privileges vary
+            _LOG.warning(
+                "%s embedding dimension check skipped: catalog probe failed (%s)",
+                backend,
+                _first_line(exc),
+            )
+            return
+    finally:
+        await _maybe_await(cursor.close)
+    if row is None:
+        return
+    column_type = row.get("DATA_TYPE") if isinstance(row, Mapping) else row[0]
+    if column_type is None:
+        return
+    if not warn_embedding_dimension_mismatch(embedding_dim, str(column_type), label):
+        return
+    raise RuntimeError(
+        f"{backend} {label} is {column_type} but MNEMOS_EMBEDDING_DIM={int(embedding_dim)}; "
+        "refusing to start against an embedding column whose width disagrees with the "
+        "configured embedder. Re-embed (or retype) the column before changing dims."
+    )
 
 
 async def _execute_postgres_statement(conn: Any, statement: str, path: Path, *, in_transaction: bool) -> None:
@@ -884,7 +1052,11 @@ __all__ = [
     "oracle_migration_paths",
     "postgres_migration_paths",
     "render_migration_sql",
+    "check_db2_embedding_dim",
+    "check_oracle_embedding_dim",
+    "embedding_dimension_mismatch",
     "resolve_embedding_dim",
+    "warn_embedding_dimension_mismatch",
     "split_db2_statements",
     "split_oracle_statements",
     "split_postgres_statements",
