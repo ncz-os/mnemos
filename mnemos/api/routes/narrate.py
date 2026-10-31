@@ -13,7 +13,6 @@ v3.3 S-II ships the rule-based narrator dispatcher (see
 cached small-LLM call behind the same seam — the HTTP surface is
 stable across that change.
 """
-
 from __future__ import annotations
 
 from typing import Optional
@@ -86,10 +85,7 @@ def _render_narration(memory_row: dict, variant_row: dict | None, format: str) -
 
 
 async def build_narration_body(
-    backend,
-    tx,
-    memory_row: dict,
-    format: str,
+    backend, tx, memory_row: dict, format: str,
 ) -> str:
     """Build just the narrated body string from a pre-fetched memory row.
 
@@ -112,8 +108,7 @@ async def build_narration_body(
     identically to Postgres-backed profiles.
     """
     variant_row = await backend.compression.fetch_compressed_variant_by_memory_id(
-        tx,
-        memory_row["id"],
+        tx, memory_row["id"],
     )
     return _render_narration(memory_row, variant_row, format)
 
@@ -237,15 +232,12 @@ async def compute_narrate(
     async with backend.transactional() as tx:
         await maybe_set_pg_rls(tx, user)
         memory_row = await backend.memories.get_memory(
-            tx,
-            memory_id,
-            visibility=visibility,
+            tx, memory_id, visibility=visibility,
         )
         if memory_row is None:
             raise HTTPException(status_code=404, detail="Memory not found")
         variant_row = await backend.compression.fetch_compressed_variant_by_memory_id(
-            tx,
-            memory_id,
+            tx, memory_id,
         )
 
     # Redact-at-retrieval (release-blocking 2026-06-13): masked at response

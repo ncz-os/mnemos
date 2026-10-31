@@ -234,11 +234,13 @@ def test_row_to_memory_redact_then_frame_compose():
 
 # ── route gate ─────────────────────────────────────────────────────────
 def test_should_frame_data_gate():
-    from mnemos.api.routes.memories import _should_frame_data
+    from mnemos.api.read_policy import _should_frame_data
 
     # is_root() reads user; emulate with a minimal context. Use the real
     # helper via monkeypatch-free objects mirroring test_secret_credential_prose.
-    import mnemos.api.routes.memories as mod
+    # The helper resolves is_root from api.read_policy's namespace (it moved
+    # out of routes.memories), so patch it there.
+    import mnemos.api.read_policy as mod
 
     class _U:  # stand-in user
         pass
@@ -339,8 +341,8 @@ def test_tightened_patterns_still_catch_real_injection(text):
 def test_should_frame_data_nonroot_operational_still_frames():
     """Even if a non-root request smuggles operational=True past validation,
     the gate still frames (defense-in-depth behind the route 403)."""
-    from mnemos.api.routes.memories import _should_frame_data
-    import mnemos.api.routes.memories as mod
+    from mnemos.api.read_policy import _should_frame_data
+    import mnemos.api.read_policy as mod
 
     class _U:
         pass
