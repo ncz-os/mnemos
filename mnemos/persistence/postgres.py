@@ -1302,6 +1302,24 @@ class PostgresMemoryRepository(MemoryRepository):
             memory_id,
         )
 
+    async def bump_recall_counts(
+        self,
+        tx: Transaction,
+        memory_ids: Sequence[str],
+    ) -> int:
+        ids = [str(memory_id) for memory_id in memory_ids]
+        if not ids:
+            return 0
+        result = await _postgres_tx(tx).conn.execute(
+            "UPDATE memories "
+            "SET recall_count = COALESCE(recall_count, 0) + 1, last_recalled_at = NOW() "
+            "WHERE id = ANY($1::text[]) "
+            "AND deleted_at IS NULL "
+            "AND archived_at IS NULL",
+            ids,
+        )
+        return _pg_result_count(result)
+
     async def backfill_missing_content_hashes(
         self,
         tx: Transaction,

@@ -1949,6 +1949,26 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             )
         return await _fetch_one(conn, sql, params)
 
+    async def bump_recall_counts(
+        self,
+        tx: Transaction,
+        memory_ids: Sequence[str],
+    ) -> int:
+        ids = [str(memory_id) for memory_id in memory_ids]
+        if not ids:
+            return 0
+        placeholders = ", ".join(["?"] * len(ids))
+        return await _execute_count(
+            self._conn(tx),
+            "UPDATE memories "
+            "SET recall_count = COALESCE(recall_count, 0) + 1, "
+            "last_recalled_at = CURRENT_TIMESTAMP "
+            f"WHERE id IN ({placeholders}) "
+            "AND deleted_at IS NULL "
+            "AND archived_at IS NULL",
+            tuple(ids),
+        )
+
     async def backfill_missing_content_hashes(
         self,
         tx: Transaction,
