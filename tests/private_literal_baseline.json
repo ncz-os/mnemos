@@ -8,7 +8,7 @@
     "docs/STREAMING_REPLICATION.md": 2,
     "docs/oracle-port-blogpost.md": 1,
     "mnemos/core/config.py": 4,
-    "mnemos/core/net_validation.py": 4,
+    "mnemos/core/net_validation.py": 3,
     "ops/bridge-tier2-nightly.sh": 2,
     "ops/patroni/docker-compose.yml": 5,
     "ops/patroni/haproxy.cfg": 4,

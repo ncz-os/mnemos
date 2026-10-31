@@ -10,17 +10,16 @@ Two classes of address are refused, and they are refused for different
 reasons:
 
 ``never allowed``
-    The cloud instance-metadata service and its kin — link-local
-    (169.254.169.254, fe80::a9fe:a9fe), multicast, reserved and
-    unspecified — plus any IPv6 address that EMBEDS one of those IPv4
-    addresses (6to4, NAT64, IPv4-mapped). "I trust my LAN" is not a
-    reason to reach the metadata service, so ``allow_private`` does NOT
-    open this class.
+    The cloud instance-metadata service and its kin — the IPv4
+    link-local metadata address, its IPv6 spellings, multicast,
+    reserved and unspecified — plus any IPv6 address that EMBEDS one
+    of those IPv4 addresses (6to4, NAT64, IPv4-mapped). "I trust my
+    LAN" is not a reason to reach the metadata service, so
+    ``allow_private`` does NOT open this class.
 
 ``private``
-    RFC1918, loopback and CGNAT (100.64.0.0/10, RFC 6598). These are
-    ordinary LAN / overlay peers: closed by default, opened by
-    ``allow_private``.
+    RFC1918, loopback and the RFC 6598 CGNAT range. These are ordinary
+    LAN / overlay peers: closed by default, opened by ``allow_private``.
 
 The escape hatch
 ----------------
@@ -28,9 +27,9 @@ The escape hatch
 ``allow_private=True`` (or ``WEBHOOK_ALLOW_PRIVATE_HOSTS=true`` for the
 webhook sender, ``FEDERATION_ALLOW_PRIVATE=true`` for federation peers)
 is the documented way to reach a LAN peer, a Tailscale/other overlay
-address — including a CGNAT (100.64.0.0/10) one — or a local test
-endpoint. It opens the ``private`` class only. The metadata service
-stays unreachable in every configuration.
+address — including a CGNAT one — or a local test endpoint. It opens the
+``private`` class only. The metadata service stays unreachable in every
+configuration.
 """
 from __future__ import annotations
 
@@ -63,12 +62,12 @@ _BLOCKED_METADATA_HOSTS = frozenset({
 
 _IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
-# Carrier-grade NAT (RFC 6598). ``ipaddress`` deliberately reports
-# 100.64.0.0/10 as neither private nor global, so it slips through both
+# Carrier-grade NAT (RFC 6598). ``ipaddress`` deliberately reports the
+# CGNAT range as neither private nor global, so it slips through both
 # the private-address check and any "is it routable" reasoning. Inside a
-# cloud VPC (or behind a Tailscale/other overlay gateway) 100.64.0.0/10
-# addresses the carrier network — reaching one from MNEMOS is a way out of
-# the intended network boundary, not a legitimate webhook peer.
+# cloud VPC (or behind a Tailscale/other overlay gateway) that range
+# addresses the carrier network — reaching one from MNEMOS is a way out
+# of the intended network boundary, not a legitimate webhook peer.
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 # Well-known NAT64 prefix (RFC 6052 §2.1) and the RFC 8215 local-use
@@ -138,9 +137,9 @@ def _embedded_ipv4_candidates(ip: _IPAddress) -> tuple[ipaddress.IPv4Address, ..
     * Teredo (``2001::/32``) — the embedded (server) IPv4 sits in the low
       32 bits, with the client IPv4 XOR-obfuscated in the middle.
 
-    A 6to4 address of the cloud metadata endpoint
-    (``2002:a9fe:a9fe::`` = ``169.254.169.254``) is the classic way to
-    smuggle a blocked IPv4 target past a literal-IP blocklist, because
+    A 6to4 address of the cloud metadata endpoint (the ``2002:a9fe:a9fe::``
+    spelling of the IPv4 link-local metadata address) is the classic way
+    to smuggle a blocked IPv4 target past a literal-IP blocklist, because
     the IPv6 form is not itself in the blocked IPv4 range.
     """
     if isinstance(ip, ipaddress.IPv4Address):
@@ -161,21 +160,21 @@ def _embedded_ipv4_candidates(ip: _IPAddress) -> tuple[ipaddress.IPv4Address, ..
 def _is_never_allowed_ip(ip: _IPAddress) -> bool:
     """Addresses that are never a legitimate target, on any network.
 
-    Link-local covers the cloud instance-metadata endpoints (169.254.169.254,
-    fe80::a9fe:a9fe); multicast, reserved and unspecified are not hosts you can
-    federate with. These stay blocked even when private addressing is allowed,
-    because "I trust my LAN" is not a reason to let a *hostname* resolve into
-    the metadata service.
+    Link-local covers the cloud instance-metadata endpoints (the IPv4
+    link-local address and its IPv6 spellings); multicast, reserved and
+    unspecified are not hosts you can federate with. These stay blocked
+    even when private addressing is allowed, because "I trust my LAN" is
+    not a reason to let a *hostname* resolve into the metadata service.
 
     Kept separate from `_is_private_ip` so relaxing private addressing cannot
-    silently relax this class too: a DNS name resolving to 169.254.169.254 is
-    caught here regardless of the allow-private flag, which is exactly the
-    rebinding path that a literal-string blocklist misses.
+    silently relax this class too: a DNS name resolving to the metadata
+    address is caught here regardless of the allow-private flag, which is
+    exactly the rebinding path that a literal-string blocklist misses.
 
     An IPv6 address that EMBEDS a blocked IPv4 address (6to4 / NAT64) is
-    never allowed either: ``[2002:a9fe:a9fe::]`` is the metadata endpoint
-    in another notation, and a NAT64 address reaches any IPv4 target
-    through a translator the operator does not control.
+    never allowed either: the ``[2002:a9fe:a9fe::]`` spelling is the
+    metadata endpoint in another notation, and a NAT64 address reaches any
+    IPv4 target through a translator the operator does not control.
     """
     if ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
         return True
@@ -191,11 +190,11 @@ def _is_private_ip(ip: _IPAddress) -> bool:
     Blocked by default; permitted when the caller opts in (trusted-LAN
     federation, local webhook testing).
 
-    The CGNAT range (100.64.0.0/10) is in this class, not in the
-    never-allowed one: a Tailscale/overlay peer may legitimately live
-    there, so ``allow_private`` still opens it up. What must stay closed
-    even with ``allow_private`` is the metadata service — that is the
-    never-allowed class above.
+    The CGNAT range is in this class, not in the never-allowed one: a
+    Tailscale/overlay peer may legitimately live there, so
+    ``allow_private`` still opens it up. What must stay closed even with
+    ``allow_private`` is the metadata service — that is the never-allowed
+    class above.
     """
     if ip.is_loopback or ip.is_private:
         return True
