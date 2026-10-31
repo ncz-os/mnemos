@@ -51,23 +51,48 @@ def test_reset_returns_to_base():
     assert bo._current == 1.0
 
 
-def test_full_jitter_returns_zero_or_positive():
-    # base == cap == 4.0, so every window is 4.0 and full jitter must
-    # sample uniformly from [0, 4.0] on every call. The previous version
-    # discarded every sample and asserted nothing, so a backoff that
-    # returned -1.0 (or the window itself on every call) passed. Pin the
-    # per-sample bound and that the samples actually spread across the
-    # window instead of pinning to one edge.
-    bo = ReconnectBackoff(base_seconds=4.0, cap_seconds=4.0)
-    samples = []
-    for _ in range(200):
-        sample = bo.next_delay()
-        assert 0.0 <= sample <= 4.0, f"jittered delay outside [0, window]: {sample}"
-        samples.append(sample)
-        bo.reset()
+def test_full_jitter_samples_inside_the_current_window(monkeypatch):
+    # The previous version called next_delay() 100 times and asserted
+    # nothing (the comment claimed a negative sample "would have raised",
+    # which was false), so any implementation passed -- a constant
+    # window, a negative delay, or an uncapped one.
+    #
+    # Full jitter is uniform(0, window) over the *current* window, so pin
+    # the exact bounds per call by replacing the RNG with a stub that
+    # returns its endpoints and a midpoint.
+    samples = [0.0, 0.5, 1.0]
+    monkeypatch.setattr(
+        "mnemos.nats.backoff.random.uniform",
+        lambda low, high: low + (high - low) * samples.pop(0),
+    )
 
-    assert min(samples) < 1.0, f"full jitter never produced a small delay: min={min(samples)}"
-    assert max(samples) > 3.0, f"full jitter never produced a large delay: max={max(samples)}"
+    # base == cap == 4.0: the window never moves, so every sample is in
+    # [0, 4.0] and the value is exactly what the RNG returned.
+    bo = ReconnectBackoff(base_seconds=4.0, cap_seconds=4.0)
+    delays = [bo.next_delay() for _ in range(3)]
+
+    assert delays == [0.0, 2.0, 4.0]
+    assert all(delay >= 0.0 for delay in delays)
+
+
+def test_next_delay_is_bounded_by_the_advancing_window(monkeypatch):
+    # base 1s, cap 4s, multiplier 2: the windows offered to the RNG are
+    # 1, 2, 4, 4 -- so a delayed reconnect can never exceed the cap, and
+    # a sample at the top of a window proves the bound used is the
+    # current one rather than a fixed base or an unbounded value.
+    offered: list[tuple[float, float]] = []
+
+    def _uniform(low: float, high: float) -> float:
+        offered.append((low, high))
+        return high
+
+    monkeypatch.setattr("mnemos.nats.backoff.random.uniform", _uniform)
+
+    bo = ReconnectBackoff(base_seconds=1.0, cap_seconds=4.0, multiplier=2.0)
+    delays = [bo.next_delay() for _ in range(4)]
+
+    assert offered == [(0.0, 1.0), (0.0, 2.0), (0.0, 4.0), (0.0, 4.0)]
+    assert delays == [1.0, 2.0, 4.0, 4.0]
 
 
 def test_invalid_constructor_args_reject():
