@@ -882,6 +882,12 @@ class MemoryRepository(ABC):
           * return the number of rows actually updated.
 
         An empty ``memory_ids`` is a no-op that returns 0.
+
+        ``Sequence`` here is ``collections.abc.Sequence``, imported at the
+        top of this module and of every backend module that implements this
+        method -- not ``typing.Sequence``. That is the convention across
+        ``mnemos/persistence/``; adding a ``typing`` import alongside the
+        existing one would be an F811 redefinition.
         """
         ...
 
