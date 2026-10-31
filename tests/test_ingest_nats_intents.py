@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from mnemos.api.routes import memories
+from mnemos.api import memory_mutations
 
 pytestmark = pytest.mark.asyncio
 
@@ -32,7 +32,7 @@ async def test_insert_memory_returns_nats_intent_without_publishing_inline(monke
     monkeypatch.setattr("mnemos.nats.client.get_node_name", lambda: "test-node")
 
     conn = _Conn()
-    intents = await memories._insert_memory_with_created_webhook(
+    intents = await memory_mutations._insert_memory_with_created_webhook(
         conn=conn,
         mem_id="mem_ingest",
         content="secret session body",

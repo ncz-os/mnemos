@@ -328,7 +328,7 @@ def _schedule_dedup_side_effects(payload: dict[str, Any]) -> None:
     delivery_ids = [str(item) for item in payload.pop("delivery_ids", [])]
     nats_intents = payload.pop("nats_intents", [])
     if delivery_ids:
-        from mnemos.api.routes.memories import _schedule_outbox_deliveries
+        from mnemos.api.memory_mutations import _schedule_outbox_deliveries
 
         _schedule_outbox_deliveries(delivery_ids)
     if nats_intents:

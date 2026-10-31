@@ -13,7 +13,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from mnemos.core.secret_detection import SecretClass, VAULT_NAMESPACE, classify
+from mnemos.core.secret_detection import (
+    SECRET_CLEAN_MARKER_KEY,
+    SecretClass,
+    VAULT_NAMESPACE,
+    classify,
+    clean_marker_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +104,7 @@ def classify_persisted_text_fields(
     }
     reasons: list[str] = []
     redact_fields: dict[str, list[tuple[int, int]]] = {}
+    clean_fields: list[str] = []
     vaulted = False
 
     try:
@@ -106,6 +113,10 @@ def classify_persisted_text_fields(
                 continue
             finding = classify(str(text))
             if finding.cls is SecretClass.CLEAN:
+                # M6: remember the CLEAN verdict so the read path can skip
+                # recomputing the classifier for this field. Only fields the
+                # classifier actually saw are recorded.
+                clean_fields.append(field_name)
                 continue
             reasons.extend(f"{field_name}:{reason}" for reason in finding.reasons)
             if finding.spans:
@@ -138,6 +149,11 @@ def classify_persisted_text_fields(
         # Back-compat for older readers/tests that looked only at canonical spans.
         if "content" in redact_fields:
             meta["secret_redact_spans"] = redact_fields["content"]
+    if clean_fields:
+        # M6 (code-health decisions 2026-10-31): the "clean under classifier
+        # vN" marker. Stamped only here and only from an actual CLEAN verdict;
+        # the read path skips its recompute while the version still matches.
+        meta[SECRET_CLEAN_MARKER_KEY] = clean_marker_fields(clean_fields)
 
     if vaulted:
         logger.warning(

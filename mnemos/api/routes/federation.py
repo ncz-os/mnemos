@@ -15,6 +15,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from mnemos.api.dependencies import UserContext, get_current_user, require_root
+from mnemos.api.errors import database_disconnected_detail, is_db_disconnect as _is_db_disconnect
 from mnemos.api.persistence_helpers import require_federation_backend
 from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain import federation as _fed
@@ -39,54 +40,6 @@ router = APIRouter(prefix="/v1/federation", tags=["federation"])
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
-
-# Class names + error strings that indicate the DB backend lost its
-# connection (vs a legitimate query failure / programming error).
-# Matched by name + chained-cause walk so we don't hard-import every
-# DB driver. Triggered by the 2026-05-23 a GPU host investigation
-# (hive job 019e563f): mnemos-api-cerb's Oracle standby was MOUNTED
-# (not OPEN READ ONLY), oracledb raised DPY-6005 inside feed_query,
-# raw 500 propagated to the production host federation pull worker.
-_DB_DISCONNECT_EXC_NAMES = frozenset(
-    {
-        "OperationalError",  # oracledb + sqlalchemy + psycopg
-        "InterfaceError",  # oracledb + psycopg
-        "ConnectionDoesNotExistError",  # asyncpg
-        "ConnectionRefusedError",  # builtin
-        "DisconnectionError",  # sqlalchemy
-        "CannotConnectNowError",  # asyncpg
-    }
-)
-_DB_DISCONNECT_TEXT_MARKERS = (
-    "dpy-6005",
-    "cannot connect",
-    "connection refused",
-    "connection reset",
-    "connection lost",
-    "no listener",
-    "ora-12541",  # TNS no listener
-    "ora-12514",  # listener doesn't currently know
-    "could not translate host name",
-)
-
-
-def _is_db_disconnect(exc: BaseException) -> bool:
-    """Walk the exception + its __cause__/__context__ chain matching
-    known DB-disconnect class names + text markers. Returns True when
-    the failure looks like the backend lost its connection rather than
-    a programming error."""
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        if type(cur).__name__ in _DB_DISCONNECT_EXC_NAMES:
-            return True
-        text = str(cur).lower()
-        if any(marker in text for marker in _DB_DISCONNECT_TEXT_MARKERS):
-            return True
-        cur = cur.__cause__ or cur.__context__
-    return False
 
 
 async def _require_federation_role(
@@ -728,11 +681,7 @@ async def federation_feed(
             )
             raise HTTPException(
                 status_code=503,
-                detail={
-                    "error": "database_disconnected",
-                    "exception_type": type(e).__name__,
-                    "message": str(e),
-                },
+                detail=database_disconnected_detail(e),
             )
         logger.exception("[federation/feed] unexpected error in feed_query")
         raise
@@ -820,11 +769,7 @@ async def federation_memory(
             )
             raise HTTPException(
                 status_code=503,
-                detail={
-                    "error": "database_disconnected",
-                    "exception_type": type(e).__name__,
-                    "message": str(e),
-                },
+                detail=database_disconnected_detail(e),
             )
         logger.exception("[federation/memory] unexpected error in get_feed_memory")
         raise

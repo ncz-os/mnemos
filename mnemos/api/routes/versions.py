@@ -12,7 +12,7 @@ from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
-from mnemos.api.routes.memories import _should_frame_data, _should_redact_secrets
+from mnemos.api.read_policy import _should_frame_data, _should_redact_secrets
 from mnemos.domain.models import MemoryItem, row_to_memory as _row_to_memory
 from mnemos.persistence.types import MEMORY_COLS
 

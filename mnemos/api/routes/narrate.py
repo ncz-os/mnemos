@@ -245,7 +245,7 @@ async def compute_narrate(
     # a VAULT row by exact id gets full content (fleet credential fetch);
     # root narrating a non-vault row, and every non-root caller, has any
     # credential span masked.
-    from mnemos.api.routes.memories import _should_redact_secrets_for_row
+    from mnemos.api.read_policy import _should_redact_secrets_for_row
 
     redact = _should_redact_secrets_for_row(user, memory_row)
     return _build_narrate_response(memory_id, memory_row, variant_row, format, redact=redact)

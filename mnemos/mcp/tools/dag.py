@@ -14,7 +14,7 @@ from datetime import date, datetime
 from typing import Any
 
 from mnemos.core.auth_context import UserContext
-from mnemos.api.routes.memories import _should_redact_secrets
+from mnemos.api.read_policy import _should_redact_secrets
 
 from ._runtime import (
     MCP_DEFAULT_LIMIT_MAX,

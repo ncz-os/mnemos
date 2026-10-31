@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.errors import translate_persistence_error
 from mnemos.api.persistence_helpers import require_state_backend
 from mnemos.core.security import scope_namespace, scope_owner
 
@@ -43,10 +44,10 @@ async def list_state_keys(
             )
         return {"keys": [dict(r) for r in rows]}
     except NotImplementedError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise translate_persistence_error(e) from e
     except Exception as e:
         logger.error(f"Error listing state keys: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise translate_persistence_error(e) from e
 
 
 @router.get("/state/{key}")
@@ -86,10 +87,10 @@ async def get_state(
     except HTTPException:
         raise
     except NotImplementedError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise translate_persistence_error(e) from e
     except Exception as e:
         logger.error(f"Error getting state key: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise translate_persistence_error(e) from e
 
 
 @router.put("/state/{key}", status_code=200)
@@ -121,10 +122,10 @@ async def set_state(
     except HTTPException:
         raise
     except NotImplementedError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise translate_persistence_error(e) from e
     except Exception as e:
         logger.error(f"Error setting state key '{key}': {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise translate_persistence_error(e) from e
 
 
 @router.delete("/state/{key}", status_code=204)
@@ -146,6 +147,6 @@ async def delete_state(
                 namespace=target_ns,
             )
     except NotImplementedError as e:
-        raise HTTPException(status_code=503, detail=str(e))
+        raise translate_persistence_error(e) from e
     if not deleted:
         raise HTTPException(status_code=404, detail=f"State key '{key}' not found")

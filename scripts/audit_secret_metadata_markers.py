@@ -75,6 +75,15 @@ SERVER_CLASSIFIED_AT = {
 
 SPAN_KEYS = ("secret_redact_fields", "secret_redact_spans")
 
+# M6 (2026-10-31): ``secret_field_classifiers`` holds the per-field "CLEAN
+# under classifier vN" marker the read path trusts to skip its recompute. The
+# server writes ``{field: <current classifier version>}`` for fields it
+# examined and found clean, so any other shape (unknown version, bool,
+# non-object) is not something the server produced. Deliberately NOT imported
+# from ``mnemos``: this script carries no package dependency.
+MAX_CLASSIFIER_VERSION_KEY = "secret_field_classifiers"
+MAX_CLASSIFIER_VERSION = 1
+
 
 def _decode_metadata(raw: Any) -> dict[str, Any]:
     if raw is None:
@@ -140,6 +149,17 @@ def find_suspicious_keys(metadata: Mapping[str, Any]) -> list[str]:
         else:
             if not _spans_mask_anything(value):
                 problems.append(f"{key}:masks_nothing")
+
+    if MAX_CLASSIFIER_VERSION_KEY in metadata:
+        marker = metadata[MAX_CLASSIFIER_VERSION_KEY]
+        if not isinstance(marker, Mapping) or not marker:
+            problems.append(f"{MAX_CLASSIFIER_VERSION_KEY}:not_a_field_map")
+        else:
+            for field, version in marker.items():
+                if isinstance(version, bool) or not isinstance(version, int):
+                    problems.append(f"{MAX_CLASSIFIER_VERSION_KEY}.{field}:not_a_version")
+                elif version < 1 or version > MAX_CLASSIFIER_VERSION:
+                    problems.append(f"{MAX_CLASSIFIER_VERSION_KEY}.{field}:unknown_version({version!r})")
 
     stamped = metadata.get("secret_classified_at")
     if stamped is not None and stamped not in SERVER_CLASSIFIED_AT:
