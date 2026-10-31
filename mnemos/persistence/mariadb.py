@@ -112,6 +112,10 @@ _LOG = logging.getLogger(__name__)
 # The width is filled in by ``_init_ddls(embedding_dim)`` from the active
 # settings (config.toml included) at open() time, never from the environment at
 # import time: the DDL and the runtime guard must agree on the same value.
+# The placeholder ``{vector_column}`` therefore appears in exactly one DDL entry
+# (``_DDL_MEMORY_EMBEDDINGS``) and is substituted by string replacement rather
+# than ``str.format`` so the literal ``{``/``}``-free DDL bodies stay untouched;
+# ``test_mariadb_ddl_placeholder_renders`` pins that contract.
 _VECTOR_COLUMN_TEMPLATE = "VECTOR({embedding_dim}) NOT NULL"
 
 _DDL_MEMORIES = """\

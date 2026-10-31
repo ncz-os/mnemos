@@ -322,3 +322,34 @@ def test_embedding_dimension_mismatch_table(configured, column, warns: bool) -> 
     """Table-driven: one message shape for every backend's column reading."""
     message = schema.embedding_dimension_mismatch(configured, column)
     assert (message is not None) is warns
+
+
+# ─── MariaDB/MySQL DDL placeholder (robustness of the render step) ───────────
+#
+# Regression: ``_init_ddls`` injects the configured width through the single
+# literal placeholder ``{vector_column}``. A typo'd or duplicated placeholder
+# silently produced a malformed CREATE TABLE. Assert the contract directly:
+# exactly one DDL entry carries the placeholder, and no rendered statement
+# keeps a ``{...}`` token.
+
+
+def test_mariadb_ddl_placeholder_renders():
+    holders = [ddl for ddl in mariadb._INIT_DDLS if "{vector_column}" in ddl]
+    assert len(holders) == 1, f"expected exactly one DDL carrying {{vector_column}}, got {len(holders)}"
+    assert holders[0] is mariadb._DDL_MEMORY_EMBEDDINGS
+
+    rendered = mariadb._init_ddls(1024)
+    assert len(rendered) == len(mariadb._INIT_DDLS)
+    for stmt in rendered:
+        assert "{vector_column}" not in stmt
+        assert "{" not in stmt, f"unrendered template token left in DDL: {stmt[:200]!r}"
+    embeddings = next(s for s in rendered if "memory_embeddings" in s)
+    assert "VECTOR(1024) NOT NULL" in embeddings
+    assert "VECTOR INDEX (embedding)" in embeddings
+
+
+def test_mariadb_ddl_placeholder_renders_mysql_too():
+    holders = [ddl for ddl in mysql._INIT_DDLS if "{vector_column}" in ddl]
+    assert len(holders) == 1, f"expected exactly one DDL carrying {{vector_column}}, got {len(holders)}"
+    for stmt in mysql._init_ddls(768):
+        assert "{" not in stmt, f"unrendered template token left in DDL: {stmt[:200]!r}"

@@ -426,3 +426,33 @@ def test_ood_gate_enabled_env(monkeypatch):
     monkeypatch.delenv("MNEMOS_SEMANTIC_OOD_GATE", raising=False)
     memories_handler._reload_static_settings()
     assert memories_handler.ood_gate_enabled() is True
+
+
+def test_static_setting_never_returns_none_on_invalid_env(monkeypatch):
+    """Regression: an invalid env value must surface the default, never None.
+
+    ``effective_semantic_margin_floor`` is typed ``-> float`` and is fed
+    straight into ``is_ood_result_set``'s numeric comparisons; a ``None``
+    leaking out of the static reader raised ``TypeError`` on every search.
+    """
+    for name, getter, default in (
+        (
+            "MNEMOS_SEMANTIC_MARGIN_FLOOR",
+            memories_handler.effective_semantic_margin_floor,
+            DEFAULT_SEMANTIC_MARGIN_FLOOR,
+        ),
+        ("MNEMOS_SEMANTIC_FLOOR", memories_handler.effective_semantic_floor, DEFAULT_SEMANTIC_FLOOR),
+    ):
+        for bad in ("garbage", "", "nan", "inf", "-inf"):
+            _set(monkeypatch, name, bad)
+            got = getter()
+            assert got is not None, f"{name}={bad!r} leaked None"
+            assert isinstance(got, float)
+            assert got == default
+        monkeypatch.delenv(name, raising=False)
+        memories_handler._reload_static_settings()
+        assert getter() == default
+
+    # A valid 0.0 is a *value*, not the "invalid" sentinel.
+    _set(monkeypatch, "MNEMOS_SEMANTIC_MARGIN_FLOOR", "0.0")
+    assert memories_handler.effective_semantic_margin_floor() == 0.0
