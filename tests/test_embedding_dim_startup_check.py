@@ -333,6 +333,7 @@ def test_embedding_dimension_mismatch_table(configured, column, warns: bool) -> 
 # keeps a ``{...}`` token.
 
 
+@pytest.mark.filterwarnings("ignore:.*is marked with '\\@pytest.mark.asyncio'.*:pytest.PytestWarning")
 def test_mariadb_ddl_placeholder_renders():
     holders = [ddl for ddl in mariadb._INIT_DDLS if "{vector_column}" in ddl]
     assert len(holders) == 1, f"expected exactly one DDL carrying {{vector_column}}, got {len(holders)}"
@@ -348,8 +349,18 @@ def test_mariadb_ddl_placeholder_renders():
     assert "VECTOR INDEX (embedding)" in embeddings
 
 
+@pytest.mark.filterwarnings("ignore:.*is marked with '\\@pytest.mark.asyncio'.*:pytest.PytestWarning")
 def test_mariadb_ddl_placeholder_renders_mysql_too():
     holders = [ddl for ddl in mysql._INIT_DDLS if "{vector_column}" in ddl]
     assert len(holders) == 1, f"expected exactly one DDL carrying {{vector_column}}, got {len(holders)}"
-    for stmt in mysql._init_ddls(768):
+    # MySQL keeps the vector column inline on ``memories`` (MariaDB moved it to
+    # ``memory_embeddings``), so anchor on that table and on the rendered width
+    # rather than on MariaDB's table name.
+    assert holders[0] is mysql._DDL_MEMORIES
+    rendered = mysql._init_ddls(768)
+    assert len(rendered) == len(mysql._INIT_DDLS)
+    for stmt in rendered:
         assert "{" not in stmt, f"unrendered template token left in DDL: {stmt[:200]!r}"
+    memories = next(s for s in rendered if "CREATE TABLE IF NOT EXISTS memories" in s)
+    assert "VECTOR(768)" in memories
+    assert "embedding_dim" not in memories
