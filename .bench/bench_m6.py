@@ -1,4 +1,11 @@
-"""Microbenchmark for the M6 rate limiters. Run: python3 .bench/bench_m6.py"""
+"""Microbenchmark for the M6 rate limiters.
+
+Run against the base and this branch with the same interpreter:
+    python3 .bench/bench_m6.py
+The base has no ``_expired`` cursor, so the second half pokes the base's list
+shape on purpose: it measures "50k unused stamps in front of the window".
+"""
+import collections
 import statistics
 import time
 
@@ -28,14 +35,17 @@ def bench_inprocess() -> tuple[float, float, int]:
     every stamp forever on the base (the list is only rebuilt, never
     trimmed), so each call copies a list that only grows."""
     waste = InProcessRateLimiter("bench", rpm=10**9)
-    stale = [0.0] * 50_000
+    stale = [time.monotonic() - 3600.0] * 50_000
     steadies = [InProcessRateLimiter("bench", rpm=10**9) for _ in range(500)]
     for lim in steadies:
         lim.is_allowed()
     small = statistics.median(
         _time(lim.is_allowed, n=1) for lim in steadies
     )
-    waste._timestamps = stale
+    if isinstance(waste._timestamps, collections.deque):
+        waste._timestamps.extend(stale)
+    else:
+        waste._timestamps = list(stale)
     used = len(waste._timestamps)
     large = _time(waste.is_allowed, n=500)
     return small, large / small, used
