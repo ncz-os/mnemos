@@ -74,6 +74,11 @@ from mnemos.persistence.mysql import (
     _MysqlTransaction,
     _boosted_rank_supersession_sort_key,
     _content_hash,
+    _ensure_embedding_column_dim,
+    _ensure_mysql_columns,
+    _ensure_mysql_federation_journal,
+    _ensure_mysql_oauth_schema,
+    _ensure_mysql_webhook_schema,
     _fetch_all_dicts,
     _is_unique_violation,
     _is_vec_distance_unsupported,
@@ -401,19 +406,6 @@ CREATE TABLE IF NOT EXISTS morpheus_extract_run_memories (
 """
 
 
-def _init_ddls(embedding_dim: int | None = None) -> list[str]:
-    """Render the inline schema with the configured vector width.
-
-    ``embedding_dim`` is resolved from the live settings by the caller; when
-    omitted (scripts, tests) it falls back to ``resolve_embedding_dim(None)``
-    so the DDL and the runtime guard still share one reader.
-    """
-    if embedding_dim is None:
-        embedding_dim = resolve_embedding_dim()
-    vector_column = _VECTOR_COLUMN_TEMPLATE.format(embedding_dim=int(embedding_dim))
-    return [ddl.replace("{vector_column}", vector_column) for ddl in _INIT_DDLS]
-
-
 _INIT_DDLS = [
     _DDL_MEMORIES,
     _DDL_MEMORY_TAGS,
@@ -447,6 +439,19 @@ _INIT_DDLS = [
     _DDL_MORPHEUS_EXTRACT_RUN_MEMORIES,
     _DDL_MORPHEUS_EXTRACT_FAILURES,
 ]
+
+
+def _init_ddls(embedding_dim: int | None = None) -> list[str]:
+    """Render the inline schema with the configured vector width.
+
+    ``embedding_dim`` is resolved from the live settings by the caller; when
+    omitted (scripts, tests) it falls back to ``resolve_embedding_dim(None)``
+    so the DDL and the runtime guard still share one reader.
+    """
+    if embedding_dim is None:
+        embedding_dim = resolve_embedding_dim()
+    vector_column = _VECTOR_COLUMN_TEMPLATE.format(embedding_dim=int(embedding_dim))
+    return [ddl.replace("{vector_column}", vector_column) for ddl in _INIT_DDLS]
 
 
 def _parse_mariadb_dsn(dsn: str) -> dict[str, Any]:
@@ -1424,6 +1429,91 @@ class MariadbBackend(MysqlBackend):
                     record.get("payload_json"),
                 ),
             )
+
+    async def open(self) -> None:
+        """Validate pool connectivity and apply UTC + init DDL.
+
+        Mirrors ``MysqlBackend.open`` (UTC session setting, inline schema,
+        idempotent column backfill) but renders the DDL from the *live*
+        settings instead of MySQL's import-time module state, and runs the M8
+        dimension check against ``memory_embeddings.embedding`` rather than
+        ``memories.embedding`` — MariaDB keeps embeddings in the join table.
+        """
+        if self._closed or self._pool is None:
+            return
+        try:
+            async with self._pool.acquire() as conn:
+                async with conn.cursor() as cursor:
+                    await cursor.execute("SET time_zone = '+00:00'")
+                    await cursor.execute("SELECT 1")
+                    embedding_dim = resolve_embedding_dim(self._settings)
+                    for ddl in _init_ddls(embedding_dim):
+                        await cursor.execute(ddl)
+                await _ensure_embedding_column_dim(
+                    conn,
+                    table=self._embedding_column_target[0],
+                    column=self._embedding_column_target[1],
+                    embedding_dim=embedding_dim,
+                    label=".".join(self._embedding_column_target),
+                )
+                await _ensure_mysql_oauth_schema(conn)
+                await _ensure_mysql_webhook_schema(conn)
+                await _ensure_mysql_federation_journal(conn)
+                await _ensure_mysql_columns(
+                    conn,
+                    "memories",
+                    {
+                        "federation_remote_updated": "federation_remote_updated DATETIME(6)",
+                        "consolidated_at": "consolidated_at DATETIME(6)",
+                        "federation_last_pushed_at": "federation_last_pushed_at DATETIME(6)",
+                        "federation_push_peer": "federation_push_peer VARCHAR(512)",
+                        "morpheus_run_id": "morpheus_run_id CHAR(36)",
+                        "source_memories": "source_memories JSON",
+                        "provenance": "provenance VARCHAR(64)",
+                        "triples_extracted_at": "triples_extracted_at DATETIME(6)",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "kg_triples",
+                    {"extracted_by_run_id": "extracted_by_run_id CHAR(36)"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "memory_branches",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "entities",
+                    {
+                        "owner_id": "owner_id VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "namespace": "namespace VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "deleted_at": "deleted_at TIMESTAMP(6) NULL",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "sessions",
+                    {
+                        "namespace": "namespace VARCHAR(256) NOT NULL DEFAULT 'default'",
+                        "deleted_at": "deleted_at TIMESTAMP(6) NULL",
+                    },
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "session_messages",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await _ensure_mysql_columns(
+                    conn,
+                    "session_memory_injections",
+                    {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                await conn.commit()
+        except Exception:
+            _LOG.exception("MariadbBackend.open failed while provisioning the required schema")
+            raise
 
 
 __all__ = [
