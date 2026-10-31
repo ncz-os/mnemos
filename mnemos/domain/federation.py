@@ -23,7 +23,7 @@ import os
 import threading
 import weakref
 from datetime import datetime, timezone
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, NamedTuple, Optional, Tuple, Union
 
 import httpx
 
@@ -230,6 +230,136 @@ class FederationSyncError(Exception):
     """A peer feed failed after schema preflight and the failure was recorded."""
 
 
+def _peer_field(peer: Any, key: str, default: Any = None) -> Any:
+    """Read an optional federation_peers column without exploding on old rows.
+
+    M12 added columns (consecutive_failures, rows_last_sync, ...) that rows
+    created before the migration — and the test doubles standing in for a
+    repository — may not carry.
+    """
+    try:
+        value = peer[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
+
+
+def _utcnow() -> datetime:
+    """Wall clock for lag maths. Indirected so tests can pin it."""
+    return datetime.now(timezone.utc)
+
+
+def _local_embedding_fingerprint() -> Dict[str, Optional[Any]]:
+    """This node's embedder identity: which model produces vectors, at what width.
+
+    Two nodes only agree on a vector if both the model *and* the dimension
+    match — the same model name at a different width, or two models at the
+    same width, both produce vectors that are meaningless to the other side.
+    Either value may be None when the instance routes embedding over HTTP
+    without setting MNEMOS_EMBED_HTTP_MODEL, or has no inference config;
+    None means "unresolved", which callers must treat as unverifiable rather
+    than as a match.
+    """
+    embed_model: Optional[str] = None
+    embed_dim: Optional[int] = None
+    try:
+        from mnemos.core.config import embed_http_model_override, get_settings
+
+        settings = get_settings()
+        embed_model = (
+            embed_http_model_override()
+            or (getattr(settings.providers, "inference_embed_model", "") or "").strip()
+            or None
+        )
+        dim = getattr(settings.database, "embedding_dim", None)
+        embed_dim = int(dim) if dim else None
+    except Exception:
+        embed_model = None
+        embed_dim = None
+    return {"embed_model": embed_model, "embed_dim": embed_dim}
+
+
+def fingerprint_mismatch_reason(local: Mapping[str, Any], peer: Mapping[str, Any]) -> Optional[str]:
+    """Why copying ``peer``'s vectors into ``local``'s space is unsafe, if it is.
+
+    Returns None only when both sides are known and agree. An unknown value on
+    either side is reported as unverifiable — never as compatible (the same
+    fail-closed rule ``_store_memories`` applies per row).
+    """
+    local_model = local.get("embed_model")
+    local_dim = local.get("embed_dim")
+    peer_model = peer.get("embed_model")
+    peer_dim = peer.get("embed_dim")
+    if not local_model or not local_dim:
+        return f"local embedder unresolved (embed_model={local_model} embed_dim={local_dim}); cannot verify peer vectors"
+    if not peer_model or not peer_dim:
+        return f"peer embedder unresolved (embed_model={peer_model} embed_dim={peer_dim}); cannot verify peer vectors"
+    if peer_model != local_model or peer_dim != local_dim:
+        return (
+            f"embed_dim/embed_model mismatch: peer embed_model={peer_model} embed_dim={peer_dim} "
+            f"local embed_model={local_model} embed_dim={local_dim}"
+        )
+    return None
+
+
+async def post_peer_fingerprint(
+    base_url: str,
+    auth_token: str,
+    fingerprint: Mapping[str, Any],
+    *,
+    client: Any | None = None,
+) -> Dict[str, Any]:
+    """Announce our embedder fingerprint to the peer before a sync.
+
+    The *source* is the only side that can decide whether the vectors it is
+    about to ship are usable by this replica, so the replica states its
+    fingerprint and the peer answers. A 412 is a durable rejection of the
+    sync (the peer will keep refusing until one side changes model or width);
+    anything else that is not a 2xx is treated as unverifiable.
+
+    Peers that pre-date this endpoint answer 404/405 and have no fingerprint
+    to compare — we report ``ok: True`` with ``supported: False`` and the
+    per-row dimension guard in ``_store_memories`` still protects the space.
+    """
+    url = base_url.rstrip("/") + "/v1/federation/fingerprint"
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    owns_client = client is None
+    if owns_client:
+        client, _ = await make_safe_client(
+            url,
+            timeout=10.0,
+            allow_private=_federation_allow_private(),
+        )
+    try:
+        resp = await client.post(url, json=dict(fingerprint), headers=headers)
+    finally:
+        if owns_client:
+            await client.aclose()
+    if resp.status_code in (404, 405):
+        return {"ok": True, "supported": False, "status": resp.status_code}
+    if resp.status_code == 412:
+        reason = "fingerprint rejected by peer (412)"
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        if isinstance(body, dict) and body.get("detail"):
+            reason = str(body["detail"])
+        return {"ok": False, "supported": True, "status": 412, "reason": reason}
+    if resp.status_code >= 400:
+        return {
+            "ok": False,
+            "supported": True,
+            "status": resp.status_code,
+            "reason": f"fingerprint exchange failed: http {resp.status_code}",
+        }
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+    return {"ok": True, "supported": True, "status": resp.status_code, "body": body}
+
+
 async def _check_peer_schema(
     base_url: str,
     auth_token: str,
@@ -239,8 +369,13 @@ async def _check_peer_schema(
 
     Returns a dict — never raises. Shape:
         {"ok": True,  "mnemos_version": str, "schema_signature": str,
-         "migrations_fingerprint": str|None}
+         "migrations_fingerprint": str|None, "embed_model": str|None,
+         "embed_dim": int|None}
         {"ok": False, "transient": bool, "reason": str}
+
+    ``embed_model``/``embed_dim`` are the peer's embedder fingerprint. Older
+    peers omit them; they come back as None, which callers must read as
+    "unverifiable", never as "matches".
 
     `ok=False` + `transient=False` means the peer responded but is
     durably incompatible (4xx, missing fields). Strict mode MUST
@@ -312,6 +447,11 @@ async def _check_peer_schema(
                     "transient": False,
                     "reason": "missing mnemos_version or schema_signature",
                 }
+            embed_dim = data.get("embed_dim")
+            try:
+                embed_dim = int(embed_dim) if embed_dim is not None else None
+            except (TypeError, ValueError):
+                embed_dim = None
             return {
                 "ok": True,
                 "mnemos_version": mnemos_version,
@@ -319,6 +459,10 @@ async def _check_peer_schema(
                 # Optional — older v3.4 builds may not return it; treat
                 # as None and skip fingerprint comparison if absent.
                 "migrations_fingerprint": data.get("migrations_fingerprint"),
+                # M12 item 2 — embedder fingerprint. None on peers older
+                # than this release; callers must not read that as a match.
+                "embed_model": data.get("embed_model") or None,
+                "embed_dim": embed_dim,
             }
     # Codex review-round-4 finding #2 — expand transient envelope to
     # include the rest of httpx's retryable transport errors. Keep
@@ -465,7 +609,7 @@ async def _sync_peer_locked(
 
     _local_parts = _local_v.split(".")
     local_signature = f"{_local_parts[0]}.{_local_parts[1]}" if len(_local_parts) >= 2 else _local_v
-    local_fingerprint = _local_migrations_fingerprint()
+    local_migrations_fingerprint = _local_migrations_fingerprint()
     schema_resp = await _check_peer_schema(
         peer["base_url"],
         peer["auth_token"],
@@ -475,10 +619,16 @@ async def _sync_peer_locked(
     schema_abort_reason: Optional[str] = None
     schema_abort_kind: Optional[str] = None  # 'incompat'|'unverifiable'|'transient'
     peer_version: Optional[str] = None
+    peer_fingerprint: Dict[str, Any] = {"embed_model": None, "embed_dim": None}
+    local_fingerprint = _local_embedding_fingerprint()
     if schema_resp["ok"]:
+        peer_fingerprint = {
+            "embed_model": schema_resp.get("embed_model"),
+            "embed_dim": schema_resp.get("embed_dim"),
+        }
         peer_version = schema_resp["mnemos_version"]
         peer_signature = schema_resp["schema_signature"]
-        peer_fingerprint = schema_resp.get("migrations_fingerprint")
+        peer_migrations_fingerprint = schema_resp.get("migrations_fingerprint")
         # Compatibility is decided on the MAJOR version, not major.minor.
         # Requiring an exact major.minor match meant a 6.0 peer refused a 6.1
         # peer outright, so every rolling upgrade broke federation across the
@@ -506,12 +656,12 @@ async def _sync_peer_locked(
                 peer_version,
                 _local_v,
             )
-        elif local_fingerprint == "":
+        elif local_migrations_fingerprint == "":
             # We can't compute our own fingerprint (e.g. test rig
             # without a db/ directory). Falling back to signature-only
             # is the only option — accept.
             pass
-        elif peer_fingerprint is None:
+        elif peer_migrations_fingerprint is None:
             # Codex review-round-6 finding #1 — peer at same major.minor
             # but doesn't expose migrations_fingerprint. Treat as
             # unverifiable in strict (peer might be a forked v3.4 with
@@ -523,10 +673,10 @@ async def _sync_peer_locked(
                 f"verify same-minor schema drift"
             )
             schema_abort_kind = "unverifiable"
-        elif peer_fingerprint != local_fingerprint:
+        elif peer_migrations_fingerprint != local_migrations_fingerprint:
             schema_abort_reason = (
                 f"migrations fingerprint mismatch within {local_signature}: "
-                f"peer={peer_fingerprint} local={local_fingerprint} "
+                f"peer={peer_migrations_fingerprint} local={local_migrations_fingerprint} "
                 f"(peer={peer_version} local={_local_v})"
             )
             schema_abort_kind = "incompat"
@@ -584,7 +734,13 @@ async def _sync_peer_locked(
     # Non-strict-abort paths: still record what we learned about the
     # peer so operators have visibility into "last seen version X".
     async with backend.transactional() as tx:
-        await repo.update_peer_schema_check(tx, peer_id, peer_version)
+        await repo.update_peer_schema_check(
+            tx,
+            peer_id,
+            peer_version,
+            embed_model=peer_fingerprint["embed_model"],
+            embed_dim=peer_fingerprint["embed_dim"],
+        )
 
     if schema_abort_reason is not None:
         # compat_mode == 'permissive' falls through to here.
@@ -599,6 +755,43 @@ async def _sync_peer_locked(
             peer["name"],
             local_signature,
         )
+
+    # M12 item 2 — embedder fingerprint preflight. Independent of the schema
+    # check: two nodes can agree on schema and still embed into different
+    # spaces (768-d nomic vs 1024-d bge-m3), in which case copying vectors
+    # would silently poison the replica's index. The peer is the side that
+    # would send them, so it decides; a 412 is a durable refusal, an
+    # unreachable peer is not (the per-row guard in _store_memories still
+    # keeps foreign vectors out either way).
+    fingerprint_status: Optional[str] = None
+    if schema_resp["ok"]:
+        try:
+            verdict = await post_peer_fingerprint(peer["base_url"], peer["auth_token"], local_fingerprint)
+        except Exception as e:  # network/SSRF — unverifiable, not a rejection
+            logger.warning("federation: peer %s fingerprint exchange failed: %s", peer["name"], e)
+            verdict = {"ok": True, "supported": True, "reason": f"fingerprint exchange failed: {type(e).__name__}"}
+        if not verdict.get("ok"):
+            reason = str(verdict.get("reason") or "embedder fingerprint rejected")
+            async with backend.transactional() as tx:
+                await repo.record_schema_abort(
+                    tx,
+                    peer_id=peer_id,
+                    peer_version=peer_version,
+                    cursor_before=cursor_before,
+                    error=reason,
+                    is_transient=False,
+                )
+                await repo.record_consecutive_failures(
+                    tx,
+                    peer_id,
+                    int(_peer_field(peer, "consecutive_failures", 0) or 0) + 1,
+                )
+            logger.error("federation: peer %s — fingerprint abort: %s", peer["name"], reason)
+            raise FederationSchemaIncompatible(f"federation peer {peer['name']}: {reason}")
+        if verdict.get("supported", True):
+            local_reason = fingerprint_mismatch_reason(local_fingerprint, peer_fingerprint)
+            if local_reason:
+                fingerprint_status = f"copy_embeddings disabled: {local_reason}"
 
     async with backend.transactional() as tx:
         log_id = await repo.create_sync_log(tx, peer_id, cursor_before)
@@ -664,6 +857,8 @@ async def _sync_peer_locked(
         peer_copy_embeddings = bool(ce) if ce is not None else False
     except (KeyError, IndexError, TypeError):
         peer_copy_embeddings = False
+    # Accumulates per-sync why vectors were or were not adopted (M12 items 1/2).
+    embedding_status: Optional[Dict[str, Any]] = {} if peer_copy_embeddings else None
 
     try:
         feed_url = peer["base_url"].rstrip("/") + "/v1/federation/feed"
@@ -698,6 +893,8 @@ async def _sync_peer_locked(
                         batch,
                         backend=backend,
                         counters=embed_counters,
+                        embed_status=embedding_status,
+                        local_fingerprint=local_fingerprint,
                     )
                     if journal_enabled and next_cursor is not None:
                         # F-2: bootstrap the peer cursor from the first
@@ -749,6 +946,42 @@ async def _sync_peer_locked(
         )
         rows_without_embedding = 0
 
+    # M12 item 1 — per-peer lag. lag_seconds is how far behind the peer's
+    # newest applied event this replica is right now: the age of the cursor
+    # we hold, measured against our own clock at the end of the pass. It
+    # only means anything after a successful pass, so a failed pull keeps
+    # the previous sample (stale lag is itself the signal, see
+    # last_error/consecutive_failures) rather than pretend it is zero.
+    lag_fields: Optional[Dict[str, Any]] = None
+    embed_status: Optional[str] = None
+    if not err:
+        cursor_ts = (
+            cursor_persisted.astimezone(timezone.utc)
+            if getattr(cursor_persisted, "tzinfo", None) is not None
+            else (cursor_persisted.replace(tzinfo=timezone.utc) if cursor_persisted is not None else None)
+        )
+        now = _utcnow()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        lag_seconds = None
+        if cursor_ts is not None:
+            lag_seconds = round(max(0.0, (now - cursor_ts).total_seconds()), 3)
+        if embedding_status is not None:
+            embed_status = embedding_status.get("reason") or (
+                "copy_embeddings ok"
+                if embedding_status.get("copied")
+                else ("copy_embeddings idle: no vectors in feed" if embedding_status.get("checked") else None)
+            )
+        if fingerprint_status and not embed_status:
+            embed_status = fingerprint_status
+        lag_fields = {
+            "last_cursor_ts": cursor_ts,
+            "lag_seconds": lag_seconds,
+            "rows_pulled": total_pulled,
+            "rows_last_sync": total_pulled,
+            "embedding_status": embed_status,
+        }
+
     async with backend.transactional() as tx:
         await repo.finish_sync_log(
             tx,
@@ -764,8 +997,17 @@ async def _sync_peer_locked(
         )
         if err:
             await repo.record_sync_error(tx, peer_id, err)
+            await repo.record_consecutive_failures(
+                tx,
+                peer_id,
+                int(_peer_field(peer, "consecutive_failures", 0) or 0) + 1,
+            )
         else:
             await repo.record_sync_success(tx, peer_id, cursor_persisted, total_pulled)
+            await repo.record_sync_lag(tx, peer_id, **(lag_fields or {}))
+            # Reset only after a pass that actually succeeded — a schema or
+            # fingerprint refusal above is still a failure and never gets here.
+            await repo.record_consecutive_failures(tx, peer_id, 0)
 
     if err:
         raise FederationSyncError(f"federation sync with {peer['name']} failed: {err}")
@@ -1009,6 +1251,9 @@ async def _store_memories(
     memories: List[Dict[str, Any]],
     backend: Optional[FederationBackend] = None,
     counters: Optional[Dict[str, int]] = None,
+    *,
+    embed_status: Optional[Dict[str, Any]] = None,
+    local_fingerprint: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[int, int]:
     """Upsert a batch. Returns (newly_inserted, updated_existing).
 
@@ -1060,7 +1305,15 @@ async def _store_memories(
     existing_markers = await marker_fetch(tx, local_ids) if callable(marker_fetch) else {}
     # v6.1 F-1.4: model match preflight. Skip embedding when peer's model
     # doesn't match ours — store the row content as before.
-    local_embed_model, embed_dim_expected = _local_embed_fingerprint() if backend is not None else (None, None)
+    local_embed_model: Optional[str] = None
+    embed_dim_expected: Optional[int] = None
+    if backend is not None:
+        # M12 item 2: the caller may have resolved the fingerprint once for the
+        # whole pass (the sync_peer handshake does); otherwise resolve it here.
+        # Either way it is the same identity the fail-closed gate below uses.
+        fingerprint = local_fingerprint if local_fingerprint is not None else _local_embedding_fingerprint()
+        local_embed_model = fingerprint.get("embed_model")
+        embed_dim_expected = fingerprint.get("embed_dim")
     for mem in memories:
         remote_id = mem.get("id")
         if not remote_id or not isinstance(remote_id, str):
@@ -1271,6 +1524,20 @@ async def _store_memories(
             emb_b64 = mem.get("embedding")
             emb_model = mem.get("embedding_model")
             emb_dim = mem.get("embedding_dim")
+
+            def _note_embed_status(reason: Optional[str]) -> None:
+                # M12 item 1/2 — the operator sees *why* vectors were or
+                # were not copied on /federation/status, not just a log line.
+                if embed_status is None:
+                    return
+                embed_status["checked"] = int(embed_status.get("checked") or 0) + 1
+                if reason is None:
+                    embed_status["copied"] = int(embed_status.get("copied") or 0) + 1
+                else:
+                    embed_status["skipped"] = int(embed_status.get("skipped") or 0) + 1
+                    if not embed_status.get("reason"):
+                        embed_status["reason"] = reason
+
             logger.info(
                 "[federation/embed] check %s emb_b64_len=%d emb_model=%s emb_dim=%s local_model=%s local_dim=%s",
                 local_id,
@@ -1313,6 +1580,10 @@ async def _store_memories(
                         local_embed_model,
                         embed_dim_expected,
                     )
+                    _note_embed_status(
+                        f"copy_embeddings disabled: local embedder unresolved "
+                        f"(embed_model={local_embed_model} embed_dim={embed_dim_expected})"
+                    )
                 elif emb_model != local_embed_model:
                     embed_declined += 1
                     logger.warning(
@@ -1321,6 +1592,11 @@ async def _store_memories(
                         emb_model,
                         local_embed_model,
                     )
+                    _note_embed_status(
+                        f"copy_embeddings disabled: embed_model/embed_dim mismatch "
+                        f"(peer embed_model={emb_model} embed_dim={emb_dim} "
+                        f"local embed_model={local_embed_model} embed_dim={embed_dim_expected})"
+                    )
                 elif not emb_dim or emb_dim != embed_dim_expected:
                     embed_declined += 1
                     logger.warning(
@@ -1328,6 +1604,11 @@ async def _store_memories(
                         local_id,
                         emb_dim,
                         embed_dim_expected,
+                    )
+                    _note_embed_status(
+                        f"copy_embeddings disabled: embed_model/embed_dim mismatch "
+                        f"(peer embed_model={emb_model} embed_dim={emb_dim} "
+                        f"local embed_model={local_embed_model} embed_dim={embed_dim_expected})"
                     )
                 else:
                     try:
@@ -1347,6 +1628,7 @@ async def _store_memories(
                         if not embed_dim_expected or len(vec) == embed_dim_expected:
                             await backend.memories.upsert_memory_embedding(tx, local_id, vec)
                             logger.info("[federation/embed] upsert OK %s", local_id)
+                            _note_embed_status(None)
                         else:
                             logger.warning(
                                 "[federation/embed] dim mismatch %s vec=%d expected=%d",
@@ -1354,12 +1636,17 @@ async def _store_memories(
                                 len(vec),
                                 embed_dim_expected,
                             )
+                            _note_embed_status(
+                                f"copy_embeddings disabled: embed_dim mismatch "
+                                f"(payload vec={len(vec)} local embed_dim={embed_dim_expected})"
+                            )
                     except Exception:
                         logger.warning(
                             "[federation/embed] failed to decode/store %s",
                             local_id,
                             exc_info=True,
                         )
+                        _note_embed_status("copy_embeddings disabled: peer vector undecodable")
             else:
                 # F-5: the peer sent no vector at all (it did not opt into
                 # ``copy_embeddings``). The applied row carries no vector,

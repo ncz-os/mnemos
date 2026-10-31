@@ -1467,6 +1467,41 @@ class FederationPeer(BaseModel):
     # embeddings, so the corpus silently loses semantic recall. This is
     # the per-peer number that makes that gap visible.
     rows_without_embedding: int = 0
+    # M12 item 1 — per-peer lag/health, sampled at the end of each sync pass.
+    # All optional: a peer that has never synced has no sample, and rows
+    # created before migration 0067 do not carry the columns.
+    last_cursor_ts: Optional[str] = Field(
+        None,
+        description="Newest remote event time (the sync cursor) this replica has applied.",
+    )
+    lag_seconds: Optional[float] = Field(
+        None,
+        description="Age of last_cursor_ts at the end of the last successful sync, in seconds.",
+    )
+    consecutive_failures: int = Field(
+        0,
+        description="Failed sync passes since the last success (0 after a success).",
+    )
+    rows_last_sync: Optional[int] = Field(
+        None,
+        description="Rows moved by the last successful sync pass.",
+    )
+    # M12 item 2 — embedder fingerprint and why vectors were/weren't copied.
+    peer_embed_model: Optional[str] = Field(
+        None,
+        description="Embedding model the peer advertises via /v1/federation/schema.",
+    )
+    peer_embed_dim: Optional[int] = Field(
+        None,
+        description="Embedding dimension the peer advertises via /v1/federation/schema.",
+    )
+    embedding_status: Optional[str] = Field(
+        None,
+        description=(
+            "Human-readable reason the last sync did or did not copy vectors, e.g. "
+            "'copy_embeddings disabled: embed_model/embed_dim mismatch (...)'."
+        ),
+    )
     created: str
     updated: str
 

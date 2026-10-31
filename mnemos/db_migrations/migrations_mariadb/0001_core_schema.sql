@@ -73,6 +73,16 @@ CREATE TABLE IF NOT EXISTS federation_peers (
     peer_mnemos_version  VARCHAR(128),
     last_schema_check_at TIMESTAMP(6) NULL,
     copy_embeddings      BOOLEAN      NOT NULL DEFAULT FALSE,
+    -- M12 items 1/2: per-peer lag/health sample, peer embedder
+    -- fingerprint, and why vectors were/weren't copied.
+
+    last_cursor_ts       TIMESTAMP(6) NULL,
+    lag_seconds          DOUBLE       NULL,
+    rows_last_sync       INT          NULL,
+    consecutive_failures INT          NOT NULL DEFAULT 0,
+    peer_embed_model     VARCHAR(256) NULL,
+    peer_embed_dim       INT          NULL,
+    embedding_status     TEXT         NULL,
     created              TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated              TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),

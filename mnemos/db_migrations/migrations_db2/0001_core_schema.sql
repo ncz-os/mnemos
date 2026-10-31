@@ -193,6 +193,16 @@ CREATE TABLE federation_peers (
     compat_mode VARCHAR(20) DEFAULT 'strict' NOT NULL,
     peer_mnemos_version VARCHAR(50),
     last_schema_check_at TIMESTAMP,
+    -- M12 items 1/2: per-peer lag/health sample, peer embedder
+    -- fingerprint, and why vectors were/weren't copied.
+
+    last_cursor_ts TIMESTAMP,
+    lag_seconds DOUBLE,
+    rows_last_sync BIGINT,
+    consecutive_failures INTEGER DEFAULT 0 NOT NULL,
+    peer_embed_model VARCHAR(200),
+    peer_embed_dim INTEGER,
+    embedding_status CLOB,
     created TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
     updated TIMESTAMP DEFAULT CURRENT TIMESTAMP NOT NULL,
     CONSTRAINT federation_peer_interval_min CHECK (sync_interval_secs >= 30)

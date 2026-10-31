@@ -606,7 +606,16 @@ CREATE TABLE IF NOT EXISTS federation_peers (
   -- whether /v1/federation/feed payload includes embedding bytes.
   -- Default 0 preserves v6.0 wire format. See
   -- docs/v6.1-federation-embeddings-copy.md.
-  copy_embeddings INTEGER NOT NULL DEFAULT 0
+  copy_embeddings INTEGER NOT NULL DEFAULT 0,
+  -- M12 items 1/2: per-peer lag/health sample, peer embedder
+  -- fingerprint, and why vectors were/weren't copied.
+  last_cursor_ts TIMESTAMP,
+  lag_seconds DOUBLE PRECISION,
+  rows_last_sync INTEGER,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  peer_embed_model TEXT,
+  peer_embed_dim INTEGER,
+  embedding_status TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_federation_peers_enabled

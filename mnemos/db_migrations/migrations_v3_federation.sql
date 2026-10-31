@@ -24,6 +24,15 @@ CREATE TABLE IF NOT EXISTS federation_peers (
     last_error          TEXT,
     last_error_at       TIMESTAMPTZ,
     total_pulled        BIGINT       NOT NULL DEFAULT 0,
+    -- M12 items 1/2: per-peer lag/health sample, peer embedder
+    -- fingerprint, and why vectors were/weren't copied.
+    last_cursor_ts TIMESTAMPTZ,
+    lag_seconds DOUBLE PRECISION,
+    rows_last_sync INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    peer_embed_model VARCHAR2(200),
+    peer_embed_dim NUMBER,
+    embedding_status VARCHAR2(1000),
     created             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 
