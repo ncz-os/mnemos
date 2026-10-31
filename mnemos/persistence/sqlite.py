@@ -185,8 +185,9 @@ SQLITE_MIGRATION_FILES = [
     "0069_federation_sync_skipped_deleted.sql",
     # FB103: expression index behind GET /v1/memories?meta=job_id:X.
     "migrations_v7_3_memory_metadata_eq_index_sqlite.sql",
-    # M12 items 1/2: federation_peers lag/health columns + peer fingerprint.
-    "migrations_replica_health_sqlite.sql",
+    # M12 items 1/2: federation_peers lag/health columns + peer fingerprint
+    # (SQLite mirror of 0071_federation_replica_health).
+    "migrations_v7_4_federation_replica_health_sqlite.sql",
 ]
 
 
