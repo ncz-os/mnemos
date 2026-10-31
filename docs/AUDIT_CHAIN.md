@@ -46,6 +46,12 @@ export MNEMOS_AUDIT_CHAIN=required
 export MNEMOS_AUDIT_ROOT_PRIVKEY="$(python -c 'import os, base64; print(base64.b64encode(os.urandom(32)).decode())')"
 ```
 
+`MNEMOS_AUDIT_CHAIN` accepts `off` (the default), `on` and `required`. The
+boolean spellings `1` / `true` / `yes` mean **on** and `0` / `false` / `no`
+mean **off**, so an operator who writes `MNEMOS_AUDIT_CHAIN=1` gets an
+audited deployment rather than a silently disabled one. An unrecognised
+value logs a warning naming the accepted values and is treated as `off`.
+
 Set `MNEMOS_REQUIRE_AUDIT_CHAIN_KEY=YES` to refuse API startup when the
 chain is enabled but `MNEMOS_AUDIT_ROOT_PRIVKEY` is missing or invalid.
 Without this opt-in, startup emits a warning and `/v1/audit/health` reports
