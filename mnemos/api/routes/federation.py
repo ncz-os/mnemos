@@ -20,6 +20,7 @@ from mnemos.api.errors import database_disconnected_detail, is_db_disconnect as 
 from mnemos.api.persistence_helpers import require_federation_backend
 from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain import federation as _fed
+from mnemos.domain import replication_digest as _fed_digest
 from mnemos.domain.federation import native_bridge as _native_federation
 from mnemos.domain.models import (
     FederationConsolidationEvent,
@@ -38,6 +39,90 @@ from mnemos.domain.models import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/federation", tags=["federation"])
+
+
+# ── Per-peer Prometheus gauges (decision M12 item 1) ────────────────────────
+#
+# Labelled by peer NAME, not id: the name is the operator-facing identity and
+# it is what appears in alerts and dashboards, while the UUID changes when a
+# peer is re-registered. Gauges (not counters) because these are "what is true
+# right now" — lag can shrink, a failure streak resets, and a scraper that
+# misses a scrape still sees the current value.
+#
+# Soft-optional like core.observability: a deployment without
+# prometheus_client (the tests' bare venv is one) still serves /status, it just
+# has no gauges to publish.
+try:  # pragma: no cover - import-time branch, both sides covered across envs
+    from prometheus_client import Gauge as _Gauge
+
+    FEDERATION_PEER_GAUGES = {
+        "lag_seconds": _Gauge(
+            "mnemos_federation_peer_lag_seconds",
+            "Age of the newest remote event this replica has applied, in seconds.",
+            ["peer"],
+        ),
+        "consecutive_failures": _Gauge(
+            "mnemos_federation_peer_consecutive_failures_total",
+            "Consecutive failed sync passes for this peer (0 after a success).",
+            ["peer"],
+        ),
+        "rows_last_sync": _Gauge(
+            "mnemos_federation_peer_rows_last_sync",
+            "Rows moved by this peer's last successful sync pass.",
+            ["peer"],
+        ),
+        "embedding_status": _Gauge(
+            "mnemos_federation_peer_embedding_copy_enabled",
+            "1 when vectors may be copied from this peer, 0 when disabled.",
+            ["peer"],
+        ),
+    }
+    _PROMETHEUS_AVAILABLE = True
+except Exception:  # pragma: no cover
+    FEDERATION_PEER_GAUGES = {}
+    _PROMETHEUS_AVAILABLE = False
+
+
+def federation_status_values(peer: FederationPeer) -> dict:
+    """The M12 item 1/2 fields of one peer, as plain values.
+
+    One projection feeds both the metric labels and any caller that wants the
+    numbers without a pydantic model; keeping it in one place stops the gauge
+    and the JSON from drifting apart.
+    """
+    embedding_status = getattr(peer, "embedding_status", None)
+    return {
+        "last_cursor_ts": getattr(peer, "last_cursor_ts", None),
+        "lag_seconds": getattr(peer, "lag_seconds", None),
+        "last_error": getattr(peer, "last_error", None),
+        "consecutive_failures": int(getattr(peer, "consecutive_failures", 0) or 0),
+        "rows_last_sync": getattr(peer, "rows_last_sync", None),
+        "embedding_status": embedding_status,
+        # True only for a *healthy* status: no sample at all ("never checked",
+        # "cannot verify") is copied nowhere, and an explicit "disabled" reason
+        # is a refusal. Anything else means the fingerprints matched.
+        "embedding_copy_enabled": bool(
+            embedding_status and not embedding_status.startswith("copy_embeddings disabled")
+        ),
+    }
+
+
+def sync_federation_metrics(values_by_peer) -> None:
+    """Publish the per-peer gauges from ``federation_status_values`` output."""
+    for peer_name, values in values_by_peer:
+        for key, gauge in FEDERATION_PEER_GAUGES.items():
+            value = values.get(key)
+            if key == "embedding_status":
+                if values.get("embedding_status") is None:
+                    continue
+                value = 1.0 if values.get("embedding_copy_enabled") else 0.0
+            elif value is None:
+                # No sample yet (peer never synced). Leave the series unset
+                # rather than reporting a healthy-looking zero.
+                continue
+            elif isinstance(value, bool):
+                value = 1.0 if value else 0.0
+            gauge.labels(peer=peer_name).set(float(value))
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -78,27 +163,48 @@ def _to_peer(row, *, rows_without_embedding: int = 0) -> FederationPeer:
             return None
         return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
+    def _num(value):
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _int(value, default=0):
+        number = _num(value)
+        return default if number is None else int(number)
+
     last_schema = _opt("last_schema_check_at")
+    peer_embed_dim = _opt("peer_embed_dim")
     return FederationPeer(
-        id=str(row["id"]),
-        name=row["name"],
-        base_url=row["base_url"],
-        namespace_filter=_as_list(row["namespace_filter"]),
-        category_filter=_as_list(row["category_filter"]),
-        enabled=bool(row["enabled"]),
-        sync_interval_secs=row["sync_interval_secs"],
-        last_sync_at=_iso(row["last_sync_at"]),
-        last_sync_cursor=_iso(row["last_sync_cursor"]),
-        last_error=row["last_error"],
-        last_error_at=_iso(row["last_error_at"]),
-        total_pulled=row["total_pulled"],
+        id=str(_opt("id")),
+        name=_opt("name", ""),
+        base_url=_opt("base_url", ""),
+        namespace_filter=_as_list(_opt("namespace_filter")),
+        category_filter=_as_list(_opt("category_filter")),
+        enabled=bool(_opt("enabled", False)),
+        sync_interval_secs=_int(_opt("sync_interval_secs"), 300),
+        last_sync_at=_iso(_opt("last_sync_at")),
+        last_sync_cursor=_iso(_opt("last_sync_cursor")),
+        last_error=_opt("last_error"),
+        last_error_at=_iso(_opt("last_error_at")),
+        total_pulled=_int(_opt("total_pulled"), 0),
         compat_mode=_opt("compat_mode", "strict"),
         peer_mnemos_version=_opt("peer_mnemos_version"),
         last_schema_check_at=_iso(last_schema),
         # F-5: the peer's rows that carry no embedding.
         rows_without_embedding=int(rows_without_embedding or 0),
-        created=_iso(row["created"]) or "",
-        updated=_iso(row["updated"]) or "",
+        # M12 items 1/2: lag/health sample, peer embedder fingerprint.
+        last_cursor_ts=_iso(_opt("last_cursor_ts")),
+        lag_seconds=_num(_opt("lag_seconds")),
+        consecutive_failures=_int(_opt("consecutive_failures"), 0),
+        rows_last_sync=(lambda value: None if value is None else int(value))(_num(_opt("rows_last_sync"))),
+        peer_embed_model=_opt("peer_embed_model"),
+        peer_embed_dim=(lambda value: None if value is None else int(value))(_num(peer_embed_dim)),
+        embedding_status=_opt("embedding_status"),
+        created=_iso(_opt("created")) or "",
+        updated=_iso(_opt("updated")) or "",
     )
 
 
@@ -314,14 +420,21 @@ async def federation_schema(
     `schema_signature` to catch branch-skew within a major.minor.
     """
     from mnemos._version import __version__ as _v
-    from mnemos.domain.federation import _local_migrations_fingerprint
+    from mnemos.domain.federation import _local_embedding_fingerprint, _local_migrations_fingerprint
 
     parts = _v.split(".")
     major_minor = f"{parts[0]}.{parts[1]}" if len(parts) >= 2 else _v
+    fingerprint = _local_embedding_fingerprint()
     return {
         "mnemos_version": _v,
         "schema_signature": major_minor,
         "migrations_fingerprint": _local_migrations_fingerprint(),
+        # M12 item 2 — which embedder produces this node's vectors. A replica
+        # whose width/model differs must not copy them; the value is null
+        # when the instance cannot resolve its own embedder, and a replica
+        # must read null as "unverifiable", never as "matches".
+        "embed_model": fingerprint.get("embed_model"),
+        "embed_dim": fingerprint.get("embed_dim"),
         # Optional informational fields — peers may inspect to decide
         # whether their schema matches enough to pull. Not used as a
         # hard gate yet.
@@ -576,12 +689,118 @@ async def federation_status(_: UserContext = Depends(require_root)):
             logger.exception("[federation/status] could not count rows without embedding")
             without_embedding = {}
     peers = [_to_peer(r, rows_without_embedding=without_embedding.get(r["name"], 0)) for r in rows]
+    # M12 item 1 — keep the labelled gauges in step with the payload so a
+    # scraper sees the same numbers whether or not a sync just ran.
+    if _PROMETHEUS_AVAILABLE:
+        sync_federation_metrics([(p.name, federation_status_values(p)) for p in peers])
     return FederationStatusResponse(
         count=len(peers),
         enabled_count=sum(1 for p in peers if p.enabled),
         error_count=sum(1 for p in peers if p.last_error),
         peers=peers,
     )
+
+
+# ── Protocol: anti-entropy digest (decision M12 item 4) ─────────────────────
+
+# One digest answers for the whole namespace; this bounds the rows read so a
+# very large corpus degrades to a partial digest (which shows up as differing
+# buckets and a bounded repair) instead of an unbounded query.
+_DIGEST_ROW_LIMIT = 100_000
+
+
+@router.get("/digest")
+async def federation_digest(
+    _: Optional[UserContext] = Depends(_require_federation_role),
+    namespace: Optional[str] = Query(None, description="Namespace to digest; omit for all"),
+    bucket_size: Optional[int] = Query(
+        None,
+        ge=_fed_digest.MIN_BUCKET_SIZE,
+        le=_fed_digest.MAX_BUCKET_SIZE,
+        alias="bucket",
+        description="Number of hash buckets (rows are bucketed by SHA-256 of their id).",
+    ),
+    ids: Optional[str] = Query(
+        None,
+        description=(
+            "Optional comma-separated memory ids. When given, the response is "
+            "re-folded to those ids so a repairing replica gets the expected "
+            "root for the buckets it is about to re-pull instead of a second "
+            "whole-corpus answer."
+        ),
+    ),
+):
+    """Cheap summary of a namespace: hash buckets over (id, content_hash, updated).
+
+    A replica diffs this against its own digest and re-pulls only the ids of
+    the buckets whose Merkle roots differ — see
+    ``mnemos.domain.replication_digest`` and ``mnemos.domain.anti_entropy``.
+    The rows come from the same visibility predicate the feed uses, so a
+    bucket can only ever describe rows the caller is allowed to see.
+    """
+    backend = require_federation_backend()
+    try:
+        async with backend.transactional() as tx:
+            # Exact row shape for digesting: id, stored content_hash, and the
+            # wire timestamp. A replica stores the *wire* `updated` (not its
+            # own receive time) as federation_remote_updated, so hashing that
+            # column on both sides makes the buckets comparable.
+            rows = await backend.federation.list_namespace_digest_rows(
+                tx,
+                namespace=namespace,
+                limit=_DIGEST_ROW_LIMIT,
+            )
+    except NotImplementedError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        if _is_db_disconnect(e):
+            raise HTTPException(status_code=503, detail=database_disconnected_detail(e))
+        raise
+
+    # Resolve the width once, before it is echoed back: the document's
+    # bucket_size and the bucket labels must describe the same partitioning
+    # (omitted => the shared default, not "every row in bucket 0").
+    width = _fed_digest.normalize_bucket_size(bucket_size)
+    rows = [
+        r
+        for r in rows
+        if namespace is None or (r.get("namespace") if isinstance(r, dict) else r["namespace"]) == namespace
+    ]
+    document = _fed_digest.build_namespace_digest(rows, bucket_size=width, namespace=namespace)
+    if ids:
+        wanted = [item.strip() for item in ids.split(",") if item.strip()]
+        buckets = _fed_digest.filter_digest_by_namespace(document["buckets"], wanted, bucket_size=width)
+        document = {**document, "row_count": sum(b["count"] for b in buckets), "buckets": buckets}
+    return document
+
+
+# ── Protocol: embedder fingerprint handshake (decision M12 item 2) ───────────
+
+
+@router.post("/fingerprint")
+async def federation_fingerprint(
+    request: Request,
+    _: UserContext = Depends(_require_federation_role),
+):
+    """A replica announces its embedder before pulling vectors from us.
+
+    412 means "your space and mine disagree; I will keep refusing until one
+    of us is re-embedded" — the replica treats that as a durable sync abort
+    instead of silently importing vectors it cannot compare. 200 means the
+    caller may pull with copy_embeddings.
+    """
+    try:
+        incoming = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="fingerprint body must be JSON")
+    if not isinstance(incoming, dict):
+        raise HTTPException(status_code=400, detail="fingerprint body must be a JSON object")
+    local = _fed._local_embedding_fingerprint()
+    reason = _fed.fingerprint_mismatch_reason(local, incoming)
+    if reason:
+        logger.warning("federation: fingerprint handshake rejected: %s", reason)
+        raise HTTPException(status_code=412, detail=reason)
+    return {"ok": True, "embed_model": local.get("embed_model"), "embed_dim": local.get("embed_dim")}
 
 
 # ── Protocol: serving peers pulling from us ──────────────────────────────────
