@@ -54,15 +54,23 @@ import subprocess
 import sys
 from typing import Any, Iterable, Iterator, Mapping
 
-# Stamps the server is allowed to write into ``secret_classified_at``.
+# Stamps the server is allowed to write into ``secret_classified_at``. Kept in
+# lockstep with every ``classified_at=`` literal passed to
+# ``classify_persisted_text_fields`` in the tree: a missing entry flags
+# perfectly normal rows as forged, and a false positive in a security audit
+# costs an operator real time. ``import`` / ``migration`` were never written by
+# any caller; ``federation`` as a bare stamp is ``federation_pull``.
 SERVER_CLASSIFIED_AT = {
     "ingest",
     "bulk_ingest",
     "patch",
-    "import",
+    "document_import",
+    "session_ingest",
+    "mpf_record_import",
+    "mpf_compression_import",
+    "mpf_compression_manifest",
     "federation_nats",
-    "federation",
-    "migration",
+    "federation_pull",
 }
 
 SPAN_KEYS = ("secret_redact_fields", "secret_redact_spans")
@@ -125,6 +133,10 @@ def find_suspicious_keys(metadata: Mapping[str, Any]) -> list[str]:
             for field, spans in value.items():
                 if not _spans_mask_anything(spans):
                     problems.append(f"{key}.{field}:masks_nothing")
+            if not value:
+                # The server only writes this map when it found spans, so an
+                # empty object is a blanked marker, not a clean row.
+                problems.append(f"{key}:empty")
         else:
             if not _spans_mask_anything(value):
                 problems.append(f"{key}:masks_nothing")

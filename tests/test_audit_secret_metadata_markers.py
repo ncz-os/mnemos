@@ -69,3 +69,31 @@ def test_scan_reports_ids_without_content(capsys):
     report = json.loads(out[0])
     assert report["id"] == "planted-1"
     assert "secret_redact_fields.content:masks_nothing" in report["problems"]
+
+
+def test_every_server_classified_at_literal_in_tree_is_allowlisted():
+    """The audit must not flag rows the server itself wrote.
+
+    ``SERVER_CLASSIFIED_AT`` is a hand-maintained copy of every
+    ``classified_at=`` literal in the tree. An earlier revision listed only
+    ingest/bulk_ingest/patch/import/federation_nats/federation/migration, so
+    every document-import, session-ingest and MPF row was reported as forged
+    (false positives) and the real ``federation_pull`` stamp was not
+    recognised at all.
+    """
+    import re
+
+    mod = _load()
+    root = _SCRIPT.parents[1] / "mnemos"
+    literal = re.compile(r"""classified_at\s*=\s*["']([a-z0-9_]+)["']""")
+    found: set[str] = set()
+    for path in root.rglob("*.py"):
+        found.update(literal.findall(path.read_text(encoding="utf-8")))
+    assert found, "no classified_at literals found; the scan is broken"
+    assert found <= mod.SERVER_CLASSIFIED_AT, sorted(found - mod.SERVER_CLASSIFIED_AT)
+
+
+def test_flags_empty_redact_fields_map():
+    """The server never writes an empty map, so one is a blanked marker."""
+    mod = _load()
+    assert mod.find_suspicious_keys({"secret_redact_fields": {}}) == ["secret_redact_fields:empty"]
