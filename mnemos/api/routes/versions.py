@@ -1,4 +1,5 @@
 """Memory version history, diff, and revert endpoints."""
+
 import difflib
 import json
 import logging
@@ -12,6 +13,7 @@ from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
+from mnemos.api.routes.memories import _should_frame_data, _should_redact_secrets
 from mnemos.domain.models import MemoryItem, row_to_memory as _row_to_memory
 from mnemos.persistence.types import MEMORY_COLS
 
@@ -42,7 +44,7 @@ class MemoryVersion(BaseModel):
     source_agent: Optional[str] = None
     snapshot_at: str
     snapshot_by: Optional[str] = None
-    change_type: str   # create | update | delete
+    change_type: str  # create | update | delete
 
 
 class VersionSummary(BaseModel):
@@ -50,7 +52,7 @@ class VersionSummary(BaseModel):
     snapshot_at: str
     snapshot_by: Optional[str] = None
     change_type: str
-    content_preview: str   # first 120 chars
+    content_preview: str  # first 120 chars
     branch: Optional[str] = None  # branch name (Phase 3 DAG)
 
 
@@ -58,12 +60,27 @@ class DiffResponse(BaseModel):
     memory_id: str
     from_version: int
     to_version: int
-    diff: str   # unified diff text; empty string if identical
+    diff: str  # unified diff text; empty string if identical
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _row_to_version(row) -> MemoryVersion:
+
+def _row_to_version(row, *, redact_secrets: bool = False, frame_data: bool = False) -> MemoryVersion:
+    """Build a ``MemoryVersion`` from a ``memory_versions`` row.
+
+    M2 (code-health decisions 2026-10-31): version snapshots carry the SAME
+    text the live memory does, so they go through the SAME redact-at-retrieval
+    gate (``_should_redact_secrets`` / ``row_to_memory``). Before this, a
+    non-root caller who could GET a memory and see ``[REDACTED]`` could walk
+    the version log and read the same credential in plaintext.
+
+    ``redact_secrets`` / ``frame_data`` default to ``False`` (full, verbatim
+    content) so a forgotten caller fails toward content correctness, not
+    silent masking; every history route passes them explicitly from the route
+    gates. Masking reuses the spans recorded at ingest
+    (``redact_field_with_stored``), exactly like the live-row path.
+    """
     raw_meta = row.get("metadata")
     if isinstance(raw_meta, str):
         try:
@@ -72,15 +89,31 @@ def _row_to_version(row) -> MemoryVersion:
             raw_meta = None
     elif not isinstance(raw_meta, dict):
         raw_meta = None
+
+    content = row["content"]
+    verbatim_content = row.get("verbatim_content")
+    if redact_secrets:
+        from mnemos.core.secret_detection import redact_field_with_stored
+
+        content = redact_field_with_stored(content, raw_meta, "content")
+        if verbatim_content is not None:
+            verbatim_content = redact_field_with_stored(verbatim_content, raw_meta, "verbatim_content")
+    if frame_data:
+        from mnemos.core.injection_defense import defend
+
+        content = defend(content)
+        if verbatim_content is not None:
+            verbatim_content = defend(verbatim_content)
+
     return MemoryVersion(
         id=str(row["id"]),
         memory_id=row["memory_id"],
         version_num=row["version_num"],
-        content=row["content"],
+        content=content,
         category=row["category"],
         subcategory=row.get("subcategory"),
         metadata=raw_meta,
-        verbatim_content=row.get("verbatim_content"),
+        verbatim_content=verbatim_content,
         owner_id=row["owner_id"],
         namespace=row["namespace"],
         permission_mode=row["permission_mode"],
@@ -97,12 +130,12 @@ def _row_to_version(row) -> MemoryVersion:
 async def _assert_memory_exists(conn, memory_id: str) -> None:
     """Raise 404 if memory_id has no version history (i.e. never existed)."""
     row = await conn.fetchrow(
-        "SELECT 1 FROM memory_versions "
-        "WHERE memory_id = $1 AND deleted_at IS NULL LIMIT 1",
+        "SELECT 1 FROM memory_versions WHERE memory_id = $1 AND deleted_at IS NULL LIMIT 1",
         memory_id,
     )
     if not row:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+
 
 async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> None:
     """Tenancy gate for version-history reads.
@@ -125,16 +158,19 @@ async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> No
         return
 
     from mnemos.core.visibility import read_visibility_predicate
+
     vis_clause, vis_params = read_visibility_predicate(
-        user.user_id, list(user.group_ids), start_param_idx=2,
+        user.user_id,
+        list(user.group_ids),
+        start_param_idx=2,
     )
     # $1 = memory_id; $2..$N = visibility params; $N+1 = namespace
     ns_ph = f"${len(vis_params) + 2}"
     row = await conn.fetchrow(
-        f"SELECT 1 FROM memories WHERE id = $1 "
-        f"AND deleted_at IS NULL AND {vis_clause} "
-        f"AND namespace = {ns_ph} LIMIT 1",
-        memory_id, *vis_params, user.namespace,
+        f"SELECT 1 FROM memories WHERE id = $1 AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph} LIMIT 1",
+        memory_id,
+        *vis_params,
+        user.namespace,
     )
     if not row:
         # 404 (not 403) keeps cross-tenant existence invisible.
@@ -142,6 +178,7 @@ async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> No
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
 
 @router.get("/memories/{memory_id}/versions", response_model=List[VersionSummary])
 async def list_versions(
@@ -172,8 +209,11 @@ async def list_versions(
         else:
             # Shared snapshot visibility includes group mode and ACL grants.
             from mnemos.core.visibility import version_visibility_predicate
+
             vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, user.group_ids, start_param_idx=3,
+                user.user_id,
+                user.group_ids,
+                start_param_idx=3,
             )
             ns_ph = f"${len(vis_params) + 3}"
             rows = await conn.fetch(
@@ -181,19 +221,33 @@ async def list_versions(
                 f"FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
                 f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph} "
                 f"ORDER BY version_num ASC",
-                memory_id, branch, *vis_params, user.namespace,
+                memory_id,
+                branch,
+                *vis_params,
+                user.namespace,
             )
-    return [
-        VersionSummary(
-            version_num=r["version_num"],
-            snapshot_at=r["snapshot_at"].isoformat(),
-            snapshot_by=r.get("snapshot_by"),
-            change_type=r["change_type"],
-            content_preview=r["content"][:120],
-            branch=r.get("branch"),
+    # M2: the preview is the first 120 chars of the SAME snapshot text, so it
+    # has to be masked like every other history read (a short credential near
+    # the top of the row fits entirely in a raw preview).
+    redact = _should_redact_secrets(user, namespace=user.namespace)
+    summaries = []
+    for r in rows:
+        preview = r["content"] or ""
+        if redact:
+            from mnemos.core.secret_detection import redact_content
+
+            preview = redact_content(preview)
+        summaries.append(
+            VersionSummary(
+                version_num=r["version_num"],
+                snapshot_at=r["snapshot_at"].isoformat(),
+                snapshot_by=r.get("snapshot_by"),
+                change_type=r["change_type"],
+                content_preview=preview[:120],
+                branch=r.get("branch"),
+            )
         )
-        for r in rows
-    ]
+    return summaries
 
 
 @router.get("/memories/{memory_id}/versions/{version_num}", response_model=MemoryVersion)
@@ -215,13 +269,18 @@ async def get_version(
                 "snapshot_at, snapshot_by, change_type "
                 "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 "
                 "AND branch = $3 AND deleted_at IS NULL",
-                memory_id, version_num, branch,
+                memory_id,
+                version_num,
+                branch,
             )
         else:
             # Per-snapshot tenancy on the row itself.
             from mnemos.core.visibility import version_visibility_predicate
+
             vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, user.group_ids, start_param_idx=4,
+                user.user_id,
+                user.group_ids,
+                start_param_idx=4,
             )
             ns_ph = f"${len(vis_params) + 4}"
             row = await conn.fetchrow(
@@ -231,14 +290,23 @@ async def get_version(
                 "snapshot_at, snapshot_by, change_type "
                 f"FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3 "
                 f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
-                memory_id, version_num, branch, *vis_params, user.namespace,
+                memory_id,
+                version_num,
+                branch,
+                *vis_params,
+                user.namespace,
             )
     if not row:
         raise HTTPException(
             status_code=404,
             detail=f"Version {version_num} not found for memory {memory_id} on branch '{branch}'",
         )
-    return _row_to_version(row)
+    # M2: history reads honour the same redaction/framing gate as the live row.
+    return _row_to_version(
+        row,
+        redact_secrets=_should_redact_secrets(user, namespace=row.get("namespace")),
+        frame_data=_should_frame_data(user),
+    )
 
 
 @router.get("/memories/{memory_id}/diff", response_model=DiffResponse)
@@ -261,22 +329,39 @@ async def diff_versions(
                 "SELECT version_num, content FROM memory_versions "
                 "WHERE memory_id = $1 AND version_num = ANY($2::int[]) "
                 "AND branch = $3 AND deleted_at IS NULL",
-                memory_id, [from_version, to_version], branch,
+                memory_id,
+                [from_version, to_version],
+                branch,
             )
         else:
             from mnemos.core.visibility import version_visibility_predicate
+
             vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, user.group_ids, start_param_idx=4,
+                user.user_id,
+                user.group_ids,
+                start_param_idx=4,
             )
             ns_ph = f"${len(vis_params) + 4}"
             rows = await conn.fetch(
                 f"SELECT version_num, content FROM memory_versions "
                 f"WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3 "
                 f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
-                memory_id, [from_version, to_version], branch,
-                *vis_params, user.namespace,
+                memory_id,
+                [from_version, to_version],
+                branch,
+                *vis_params,
+                user.namespace,
             )
-    versions = {r["version_num"]: r["content"] for r in rows}
+    # M2: diff the MASKED text, not the raw snapshots. Diffing raw content
+    # leaked the credential in the "+ lines" of the diff even though the
+    # caller could not read it via get_version.
+    redact = _should_redact_secrets(user, namespace=user.namespace)
+    if redact:
+        from mnemos.core.secret_detection import redact_content
+
+        versions = {r["version_num"]: redact_content(r["content"] or "") for r in rows}
+    else:
+        versions = {r["version_num"]: r["content"] for r in rows}
     if from_version not in versions:
         raise HTTPException(status_code=404, detail=f"Version {from_version} not found on branch '{branch}'")
     if to_version not in versions:
@@ -285,11 +370,14 @@ async def diff_versions(
     # Ensure trailing newline so unified_diff doesn't concatenate last lines
     a = (versions[from_version] + "\n").splitlines(keepends=True)
     b = (versions[to_version] + "\n").splitlines(keepends=True)
-    diff_lines = list(difflib.unified_diff(
-        a, b,
-        fromfile=f"{branch}/v{from_version}",
-        tofile=f"{branch}/v{to_version}",
-    ))
+    diff_lines = list(
+        difflib.unified_diff(
+            a,
+            b,
+            fromfile=f"{branch}/v{from_version}",
+            tofile=f"{branch}/v{to_version}",
+        )
+    )
     return DiffResponse(
         memory_id=memory_id,
         from_version=from_version,
@@ -326,12 +414,17 @@ async def revert_memory(
                 "snapshot_at, snapshot_by, change_type "
                 "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 "
                 "AND branch = $3 AND deleted_at IS NULL",
-                memory_id, version_num, branch,
+                memory_id,
+                version_num,
+                branch,
             )
         else:
             from mnemos.core.visibility import version_visibility_predicate
+
             vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, user.group_ids, start_param_idx=4,
+                user.user_id,
+                user.group_ids,
+                start_param_idx=4,
             )
             ns_ph = f"${len(vis_params) + 4}"
             ver_row = await conn.fetchrow(
@@ -341,7 +434,11 @@ async def revert_memory(
                 "snapshot_at, snapshot_by, change_type "
                 f"FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3 "
                 f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
-                memory_id, version_num, branch, *vis_params, user.namespace,
+                memory_id,
+                version_num,
+                branch,
+                *vis_params,
+                user.namespace,
             )
         if not ver_row:
             raise HTTPException(
@@ -372,9 +469,11 @@ async def revert_memory(
             # row lock for main.
             if branch != "main":
                 from mnemos.api.routes.dag import _branch_advisory_lock_key
+
                 _lock_key = _branch_advisory_lock_key(memory_id, branch)
                 await conn.execute(
-                    "SELECT pg_advisory_xact_lock($1)", _lock_key,
+                    "SELECT pg_advisory_xact_lock($1)",
+                    _lock_key,
                 )
 
             # Authorize against the live row — atomic with the write
@@ -382,8 +481,7 @@ async def revert_memory(
             # ordering above.
             if is_root(user):
                 live = await conn.fetchrow(
-                    f"SELECT {MEMORY_COLS} FROM memories "
-                    "WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
+                    f"SELECT {MEMORY_COLS} FROM memories WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
                     memory_id,
                 )
             else:
@@ -391,7 +489,9 @@ async def revert_memory(
                     f"SELECT {MEMORY_COLS} FROM memories "
                     "WHERE id=$1 AND owner_id=$2 AND namespace=$3 "
                     "AND deleted_at IS NULL FOR UPDATE",
-                    memory_id, user.user_id, user.namespace,
+                    memory_id,
+                    user.user_id,
+                    user.namespace,
                 )
             if live is None:
                 raise HTTPException(
@@ -474,9 +574,7 @@ async def revert_memory(
                 # GUC and let mnemos_version_snapshot create the
                 # revert version row + advance memory_branches HEAD
                 # for main. Preserves the live-row/main-HEAD invariant.
-                await conn.execute(
-                    "SELECT set_config('mnemos.current_branch', 'main', true)"
-                )
+                await conn.execute("SELECT set_config('mnemos.current_branch', 'main', true)")
                 try:
                     row = await conn.fetchrow(
                         "UPDATE memories SET "
@@ -501,6 +599,7 @@ async def revert_memory(
                 # → row order, matching merge_branch).
                 import hashlib as _hashlib_local
                 import time as _time_local
+
                 # Get current HEAD for parent linkage and target
                 # tenancy. Lock the branch row first, then require
                 # non-root callers to see the resolved HEAD snapshot
@@ -510,18 +609,17 @@ async def revert_memory(
                     "SELECT head_version_id FROM memory_branches "
                     "WHERE memory_id = $1 AND name = $2 "
                     "AND deleted_at IS NULL FOR UPDATE",
-                    memory_id, branch,
+                    memory_id,
+                    branch,
                 )
-                if (
-                    target_branch_row is None
-                    or target_branch_row["head_version_id"] is None
-                ):
+                if target_branch_row is None or target_branch_row["head_version_id"] is None:
                     raise HTTPException(
                         status_code=404,
                         detail=f"Branch '{branch}' not found",
                     )
                 target_head_id = target_branch_row["head_version_id"]
                 from mnemos.core.visibility import _assert_target_head_visible
+
                 await _assert_target_head_visible(
                     conn,
                     target_head_id,
@@ -542,7 +640,8 @@ async def revert_memory(
                     WHERE id = $1 AND memory_id = $2
                       AND deleted_at IS NULL
                     """,
-                    target_head_id, memory_id,
+                    target_head_id,
+                    memory_id,
                 )
                 if target_head is None:
                     logger.error(
@@ -564,12 +663,12 @@ async def revert_memory(
                     "SELECT COALESCE(MAX(version_num), 0) + 1 "
                     "FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
                     "AND deleted_at IS NULL",
-                    memory_id, branch,
+                    memory_id,
+                    branch,
                 )
                 revert_hash = _hashlib_local.sha256(
                     f"{memory_id}|{next_version_num}|{ver_row['content']}|"
-                    f"revert-to-v{version_num}-{int(_time_local.time() * 1_000_000)}"
-                    .encode()
+                    f"revert-to-v{version_num}-{int(_time_local.time() * 1_000_000)}".encode()
                 ).hexdigest()
                 new_version_id = await conn.fetchval(
                     """
@@ -589,24 +688,38 @@ async def revert_memory(
                     )
                     RETURNING id
                     """,
-                    memory_id, next_version_num,
-                    ver_row["content"], ver_row["category"], ver_row["subcategory"],
-                    meta_str, ver_row["verbatim_content"],
-                    target_head["owner_id"], target_head["namespace"],
+                    memory_id,
+                    next_version_num,
+                    ver_row["content"],
+                    ver_row["category"],
+                    ver_row["subcategory"],
+                    meta_str,
+                    ver_row["verbatim_content"],
+                    target_head["owner_id"],
+                    target_head["namespace"],
                     target_head["permission_mode"],
-                    ver_row["source_model"], ver_row["source_provider"],
-                    ver_row["source_session"], ver_row["source_agent"],
-                    branch, revert_hash, target_head_id, user.user_id,
+                    ver_row["source_model"],
+                    ver_row["source_provider"],
+                    ver_row["source_session"],
+                    ver_row["source_agent"],
+                    branch,
+                    revert_hash,
+                    target_head_id,
+                    user.user_id,
                 )
                 await conn.execute(
                     "UPDATE memory_branches SET head_version_id = $1 "
                     "WHERE memory_id = $2 AND name = $3 AND deleted_at IS NULL",
-                    new_version_id, memory_id, branch,
+                    new_version_id,
+                    memory_id,
+                    branch,
                 )
                 row = live  # live row unchanged; return the existing live state
 
-    logger.info(
-        f"[VERSION] Reverted {memory_id} to v{version_num} on branch '{branch}' "
-        f"by {user.user_id or 'default'}"
+    logger.info(f"[VERSION] Reverted {memory_id} to v{version_num} on branch '{branch}' by {user.user_id or 'default'}")
+    # M2: the revert response returns the LIVE row — same redaction gate as GET.
+    return _row_to_memory(
+        row,
+        redact_secrets=_should_redact_secrets(user, namespace=row.get("namespace")),
+        frame_data=_should_frame_data(user),
     )
-    return _row_to_memory(row)

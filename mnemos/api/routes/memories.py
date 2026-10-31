@@ -2328,7 +2328,14 @@ async def update_memory(
             msg_id=f"{memory_id}.updated.{updated_suffix}",
         )
     await _invalidate_caches_after_mutation()
-    return _row_to_memory(row)
+    # M2: the PATCH response returns the live row, so it goes through the same
+    # redact-at-retrieval gate as GET. Without this the caller that planted a
+    # marker could also read the credential back out of its own response.
+    return _row_to_memory(
+        row,
+        redact_secrets=_should_redact_secrets(user, namespace=row.get("namespace")),
+        frame_data=_should_frame_data(user),
+    )
 
 
 @router.delete("/memories/{memory_id}", status_code=204)

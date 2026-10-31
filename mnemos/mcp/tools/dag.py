@@ -13,6 +13,7 @@ import logging
 from datetime import date, datetime
 from typing import Any
 
+from mnemos.api.routes.memories import _should_redact_secrets
 from mnemos.core.auth_context import UserContext
 
 from ._runtime import (
@@ -27,6 +28,24 @@ from ._runtime import (
     _tool,
 )
 from ._security import _mcp_enforce_write_rate_limit
+
+
+def _redact_history_content(content: str, user: UserContext) -> str:
+    """M2: mask credential spans in MCP history content before returning it.
+
+    The MCP ``checkout_memory`` / ``diff_memory_commits`` tools read the same
+    ``memory_versions`` text as the HTTP history routes, so they go through
+    the same gate. ``fetch_*_commit*`` rows do not carry ``metadata``, so
+    masking recomputes the classifier instead of reusing stored spans —
+    stricter, never weaker. Non-root is always masked; root is masked on the
+    default path, matching ``GET /v1/memories/{id}``.
+    """
+    if not _should_redact_secrets(user):
+        return content
+    from mnemos.core.secret_detection import redact_content
+
+    return redact_content(content)
+
 
 logger = logging.getLogger(__name__)
 BRANCH_MEMORY_RATE_LIMIT_PER_MINUTE = 30
@@ -56,7 +75,10 @@ async def tool_log_memory(
     safe_id = _safe_path_segment(memory_id, label="memory_id")
     _safe_path_segment(branch, label="branch")
     limit = _bounded_int(
-        limit, label="limit", minimum=1, maximum=MCP_DEFAULT_LIMIT_MAX,
+        limit,
+        label="limit",
+        minimum=1,
+        maximum=MCP_DEFAULT_LIMIT_MAX,
     )
     if user is None:
         commits = await _rest_get(
@@ -161,9 +183,7 @@ async def tool_branch_memory(
 
     try:
         async with backend.transactional() as tx:
-            return await backend.memory_branches.create_memory_branch(
-                tx, memory_id, name, from_commit, user
-            )
+            return await backend.memory_branches.create_memory_branch(tx, memory_id, name, from_commit, user)
 
     except Exception as e:
         logger.error(f"[MCP] branch_memory failed: {e}", exc_info=True)
@@ -224,9 +244,11 @@ async def tool_diff_memory_commits(
             if not commit_a_row or not commit_b_row:
                 return {"success": False, "error": "One or both commits not found"}
 
+            # M2: diff the MASKED text -- a raw diff prints the credential in
+            # the added lines even when get_version would mask it.
             diff = difflib.unified_diff(
-                commit_a_row["content"].splitlines(keepends=True),
-                commit_b_row["content"].splitlines(keepends=True),
+                _redact_history_content(commit_a_row["content"], user).splitlines(keepends=True),
+                _redact_history_content(commit_b_row["content"], user).splitlines(keepends=True),
                 fromfile=f"{commit_a[:8]} (v{commit_a_row['version_num']})",
                 tofile=f"{commit_b[:8]} (v{commit_b_row['version_num']})",
                 lineterm="",
@@ -304,7 +326,7 @@ async def tool_checkout_memory(
                     "timestamp": _memory_log_timestamp(row["snapshot_at"]),
                     "author": row["snapshot_by"],
                 },
-                "content": row["content"],
+                "content": _redact_history_content(row["content"], user),
             }
 
     except Exception as e:
