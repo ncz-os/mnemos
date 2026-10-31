@@ -143,6 +143,15 @@ class _FakeMemoryRepo:
         )
         return self._resolve("bump_recall_and_get_memory", None)
 
+    async def bump_recall_counts(self, tx, memory_ids):
+        self.calls.append(
+            (
+                "bump_recall_counts",
+                {"memory_ids": list(memory_ids)},
+            )
+        )
+        return self._resolve("bump_recall_counts", 0)
+
     async def backfill_missing_content_hashes(self, tx, *, batch_size=500, apply=False):
         self.calls.append(("backfill_missing_content_hashes", {"batch_size": batch_size, "apply": apply}))
         return self._resolve("backfill_missing_content_hashes", 0)

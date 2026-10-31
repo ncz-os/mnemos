@@ -857,6 +857,34 @@ class MemoryRepository(ABC):
         """Increment recall counters for one memory and return it."""
         ...
 
+    @abstractmethod
+    async def bump_recall_counts(
+        self,
+        tx: Transaction,
+        memory_ids: Sequence[str],
+    ) -> int:
+        """Increment recall counters for a whole hit set in ONE statement.
+
+        Search returns N hits; the recall-frequency bump must cost one
+        round-trip, not N. This is the batch form of
+        :meth:`bump_recall_and_get_memory` and exists because the
+        previous route-level implementation hand-wrote Postgres-only
+        SQL (``WHERE id = ANY($1::text[])``) through the backend-neutral
+        ``backend.transactional()`` seam: on SQLite / MySQL / MariaDB /
+        Oracle / Db2 that statement raises, the error is swallowed, and
+        recall counters never move on any backend except Postgres.
+
+        Implementations must:
+          * issue a single UPDATE for the whole id set,
+          * skip rows that are soft-deleted (``deleted_at IS NOT NULL``)
+            or archived (``archived_at IS NOT NULL``),
+          * bump ``recall_count`` by 1 and stamp ``last_recalled_at``,
+          * return the number of rows actually updated.
+
+        An empty ``memory_ids`` is a no-op that returns 0.
+        """
+        ...
+
     async def backfill_missing_content_hashes(
         self,
         tx: Transaction,

@@ -1,0 +1,389 @@
+"""Recall-counter parity (M3) and dead search-cache removal (M4).
+
+M3 — the recall-frequency bump
+-------------------------------
+``/v1/memories/search`` bumps ``recall_count`` / ``last_recalled_at`` for
+the rows it returned.  The bump used to be hand-written Postgres SQL
+(``WHERE id = ANY($1::text[])``, ``now()``) executed through the
+backend-neutral ``backend.transactional()`` seam.  On SQLite / MySQL /
+MariaDB / Oracle / Db2 that statement raises; the route swallowed the
+error, so **recall counters never moved on any backend except
+Postgres**.
+
+The fix routes the bump through the persistence ABC
+(``backend.memories.bump_recall_counts``) and schedules it with the
+lifecycle's tracked-background registry (``_schedule_background``)
+instead of a bare ``asyncio.create_task`` that keeps no reference.
+
+M4 — the dead search cache
+--------------------------
+The per-user search cache was wired to ``_lc._cache``, which the
+lifecycle hard-wires to ``None``: there is no Redis in the runtime, so
+every cache read missed and every cache write went nowhere.  What it did
+NOT cost nothing: every search read the visibility epoch
+(``_vis_epoch_current`` — a NATS-KV round-trip) and folded it into a
+27-field cache key that was then thrown away.
+
+These tests pin:
+  * the SQLite parity contract (search → ``recall_count`` rises),
+  * that the bump goes through the ABC and not through raw SQL,
+  * that the bump is scheduled as a TRACKED background task,
+  * that a search performs NO visibility-epoch read,
+  * that the endpoint docstring no longer advertises response caching.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+
+import mnemos.core.lifecycle as _lc
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import memories as memories_handler
+from mnemos.domain.models import MemorySearchRequest
+from mnemos.persistence import SqliteBackend
+from mnemos.persistence import sqlite as storage
+
+
+# ── helpers ─────────────────────────────────────────────────────────────────
+
+
+def _root() -> UserContext:
+    return UserContext(
+        user_id="admin",
+        group_ids=[],
+        role="root",
+        namespace="default",
+        authenticated=True,
+    )
+
+
+async def _empty_decay(_backend):
+    return {}
+
+
+def _hit_row(memory_id: str) -> dict:
+    """A minimal searchable memory row for the fake backend."""
+    return {
+        "id": memory_id,
+        "content": f"{memory_id} content",
+        "category": "facts",
+        "subcategory": None,
+        "created": "2026-06-14T00:00:00+00:00",
+        "updated": "2026-06-14T00:00:00+00:00",
+        "metadata": {},
+        "quality_rating": 75,
+        "compressed_content": None,
+        "verbatim_content": None,
+        "owner_id": "admin",
+        "group_id": None,
+        "namespace": "default",
+        "permission_mode": 600,
+        "source_model": None,
+        "source_provider": None,
+        "source_session": None,
+        "source_agent": None,
+        "archived_at": None,
+        "consolidated_into": None,
+        "recall_count": 0,
+        "last_recalled_at": None,
+    }
+
+
+@pytest.fixture
+def _no_decay(monkeypatch):
+    monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay)
+
+
+def _sqlite_settings():
+    return SimpleNamespace(database=SimpleNamespace(embedding_dim=3))
+
+
+async def _insert(backend, tx, memory_id: str, content: str) -> None:
+    when = datetime.now(timezone.utc)
+    await backend.memories.insert_memory(
+        tx,
+        memory_id=memory_id,
+        content=content,
+        category="facts",
+        subcategory=None,
+        metadata_json="{}",
+        quality_rating=75,
+        owner_id="admin",
+        namespace="default",
+        permission_mode=600,
+        source_model=None,
+        source_provider=None,
+        source_session=None,
+        source_agent=None,
+        verbatim_content=content,
+        created=when,
+        updated=when,
+    )
+
+
+async def _recall_count(backend, tx, memory_id: str) -> int:
+    row = await storage._fetch_one(
+        tx.conn,
+        "SELECT recall_count FROM memories WHERE id = ?",
+        (memory_id,),
+    )
+    if row is None:
+        return -1
+    return int(row["recall_count"] if isinstance(row, dict) else row[0])
+
+
+# ── M3: the bump actually moves the counters on SQLite ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sqlite_search_bumps_recall_count(tmp_path, monkeypatch, _no_decay):
+    """A search over SQLite must raise ``recall_count`` on the hit rows.
+
+    This is the parity test the bug report asks for.  On the base
+    revision the bump issued Postgres-only SQL through the neutral
+    transaction seam; SQLite rejected it, the route swallowed the
+    error, and ``recall_count`` stayed at 0 forever.
+    """
+    backend = SqliteBackend(tmp_path / "recall-parity.sqlite3", _sqlite_settings())
+    await backend.open()
+    monkeypatch.setattr(memories_handler, "_backend_or_503", lambda: backend)
+    monkeypatch.setattr(_lc, "_cache", None)
+    monkeypatch.setattr(_lc, "_persistence_backend", backend)
+
+    try:
+        async with backend.transactional() as tx:
+            await _insert(backend, tx, "mem-hit", "parsnip planted row")
+            await _insert(backend, tx, "mem-miss", "unrelated zucchini row")
+            assert await _recall_count(backend, tx, "mem-hit") == 0
+
+        response = await memories_handler.search_memories(
+            MemorySearchRequest(query="parsnip", semantic=False, min_score=0.0),
+            user=_root(),
+        )
+        # The bump is fire-and-forget: let the scheduled task run.
+        for _ in range(50):
+            await asyncio.sleep(0)
+            async with backend.transactional() as tx:
+                if await _recall_count(backend, tx, "mem-hit") > 0:
+                    break
+
+        assert [m.id for m in response.memories] == ["mem-hit"]
+        async with backend.transactional() as tx:
+            assert await _recall_count(backend, tx, "mem-hit") == 1
+            assert await _recall_count(backend, tx, "mem-miss") == 0
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_bump_recall_counts_skips_deleted_and_archived(tmp_path):
+    """The repository method must not bump soft-deleted / archived rows."""
+    backend = SqliteBackend(tmp_path / "recall-skip.sqlite3", _sqlite_settings())
+    await backend.open()
+    try:
+        async with backend.transactional() as tx:
+            await _insert(backend, tx, "mem-live", "live row")
+            await _insert(backend, tx, "mem-deleted", "deleted row")
+            await _insert(backend, tx, "mem-archived", "archived row")
+            await storage._execute(
+                tx.conn,
+                "UPDATE memories SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
+                ("mem-deleted",),
+            )
+            await storage._execute(
+                tx.conn,
+                "UPDATE memories SET archived_at = CURRENT_TIMESTAMP WHERE id = ?",
+                ("mem-archived",),
+            )
+
+            bumped = await backend.memories.bump_recall_counts(
+                tx,
+                ["mem-live", "mem-deleted", "mem-archived", "mem-absent"],
+            )
+
+            assert bumped == 1
+            assert await _recall_count(backend, tx, "mem-live") == 1
+            assert await _recall_count(backend, tx, "mem-deleted") == 0
+            assert await _recall_count(backend, tx, "mem-archived") == 0
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_bump_recall_counts_empty_id_set_is_a_noop(tmp_path):
+    backend = SqliteBackend(tmp_path / "recall-empty.sqlite3", _sqlite_settings())
+    await backend.open()
+    try:
+        async with backend.transactional() as tx:
+            assert await backend.memories.bump_recall_counts(tx, []) == 0
+    finally:
+        await backend.close()
+
+
+@pytest.mark.asyncio
+async def test_bump_recall_counts_is_abc_level_not_route_sql(monkeypatch):
+    """The route must call the repository, never hand-written SQL.
+
+    The base revision called ``tx.conn.execute(...)`` with Postgres-only
+    SQL from inside the route.  That is the defect: it works on exactly
+    one backend and is swallowed on the other five.
+    """
+    from tests._fake_backend import install_fake_backend
+
+    backend = install_fake_backend(monkeypatch)
+    await memories_handler._bump_recall_counters(["mem_a", "mem_b"])
+
+    names = [name for name, _kw in backend.memories.calls]
+    assert "bump_recall_counts" in names
+    assert "bump_recall_and_get_memory" not in names
+    call = next(kw for name, kw in backend.memories.calls if name == "bump_recall_counts")
+    assert call["memory_ids"] == ["mem_a", "mem_b"]
+
+
+@pytest.mark.asyncio
+async def test_bump_is_scheduled_as_a_tracked_background_task(monkeypatch):
+    """The bump must be scheduled through ``_schedule_background``.
+
+    A bare ``asyncio.create_task`` keeps no reference: the event loop
+    may garbage-collect the task mid-flight (the bump silently never
+    lands) and graceful shutdown cannot await it.
+
+    This fails on the base revision, which calls
+    ``asyncio.create_task(_bump_recall_counters(hit_ids))`` directly.
+    """
+    from tests._fake_backend import install_fake_backend
+
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.configure_return("fts_search", [_hit_row("mem_hit")])
+    scheduled: list = []
+
+    def _capture(coro):
+        # Record the coroutine WITHOUT handing it to the real scheduler:
+        # awaiting it here is enough to drain it and to observe that the
+        # bump ran.
+        scheduled.append(coro)
+        return None
+
+    monkeypatch.setattr(_lc, "_schedule_background", _capture)
+    monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay)
+
+    await memories_handler.search_memories(
+        MemorySearchRequest(query="anything", semantic=False),
+        user=_root(),
+    )
+
+    # The bump went through the lifecycle's tracked scheduler, not a
+    # bare asyncio.create_task.
+    assert len(scheduled) == 1
+    # Drain the scheduled coroutine so no "never awaited" warning fires.
+    for coro in scheduled:
+        await coro
+
+    # The search itself must not have called the bump inline; the
+    # scheduled bump did.
+    names = [name for name, _kw in backend.memories.calls]
+    assert names.count("bump_recall_counts") == 1
+    assert names.index("bump_recall_counts") > names.index("fts_search")
+
+
+def test_search_handler_schedules_the_bump_through_the_lifecycle(monkeypatch):
+    """Source-level pin: no bare ``asyncio.create_task`` for the bump."""
+    source = inspect.getsource(memories_handler.search_memories)
+    code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+    assert "asyncio.create_task" not in code
+    assert "_schedule_background" in code
+
+
+@pytest.mark.asyncio
+async def test_bump_recall_counters_swallows_backend_failure(monkeypatch, caplog):
+    """A failing bump must never break the search path.
+
+    The base revision also swallowed failures, but it did so around
+    hand-written SQL.  Here the failure comes from the repository, and
+    the route must still swallow it (recall counters are observability,
+    not user-content correctness).
+    """
+    from tests._fake_backend import install_fake_backend
+
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.configure_raise("bump_recall_counts", RuntimeError("boom"))
+
+    # No exception expected.
+    await memories_handler._bump_recall_counters(["mem_x"])
+
+    names = [name for name, _kw in backend.memories.calls]
+    assert "bump_recall_counts" in names
+
+
+# ── M4: the dead search cache is gone ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_search_does_not_read_the_visibility_epoch(monkeypatch, _no_decay):
+    """A search must NOT read the visibility epoch.
+
+    The epoch existed only to key the search cache.  With the cache
+    gone, the per-search epoch read is a pure cost — a NATS-KV
+    round-trip on every single search.
+
+    The test fails on the base revision (the epoch IS read) and passes
+    once the read is deleted.
+    """
+    from tests._fake_backend import install_fake_backend
+
+    install_fake_backend(monkeypatch)
+
+    calls: list[int] = []
+
+    async def _tracking_epoch_current() -> int:
+        calls.append(1)
+        return 0
+
+    monkeypatch.setattr(_lc, "_vis_epoch_current", _tracking_epoch_current)
+    monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay)
+
+    await memories_handler.search_memories(
+        MemorySearchRequest(query="epoch probe", semantic=False),
+        user=_root(),
+    )
+
+    assert calls == [], "search must not read the visibility epoch"
+
+
+def test_search_endpoint_docstring_does_not_advertise_response_caching():
+    """The docstring must not promise a 5-minute response cache."""
+    doc = (inspect.getdoc(memories_handler.search_memories) or "").lower()
+    assert "5-minute" not in doc
+    assert "response caching" not in doc
+    assert "cached" not in doc
+    assert "caching" not in doc
+
+
+def test_search_handler_source_has_no_cache_key_build():
+    """The 27-field cache-key build must be gone from the handler."""
+    source = inspect.getsource(memories_handler.search_memories)
+    # Strip comments so a prose mention of the removed machinery does not
+    # read as live code.
+    code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
+    assert "_get_cache_key" not in code
+    assert "_lc._cache" not in code
+    assert "cache_key" not in code
+    assert "setex" not in code
+
+
+def test_invalidate_caches_after_mutation_has_no_search_scan():
+    """The ``SCAN MATCH "mnemos:search:*"`` sweep is dead code.
+
+    It only ever matched keys of a cache that never existed
+    (``_lc._cache`` is hard-wired to ``None``).  The visibility-epoch
+    bump it also performs must STAY: the MCP principal-context cache
+    subscribes to it.
+    """
+    source = inspect.getsource(memories_handler._invalidate_caches_after_mutation)
+    assert "scan_iter" not in source
+    assert "_vis_epoch_get_incr" in source

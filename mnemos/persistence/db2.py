@@ -1785,6 +1785,32 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             await _call(cursor.close)
         return await self.get_memory(tx, memory_id, visibility=visibility)
 
+    async def bump_recall_counts(
+        self,
+        tx: Any,
+        memory_ids: Sequence[str],
+    ) -> int:
+        ids = [str(memory_id) for memory_id in memory_ids]
+        if not ids:
+            return 0
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            placeholders = ", ".join(["?"] * len(ids))
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET "
+                "recall_count = COALESCE(recall_count, 0) + 1, "
+                "last_recalled_at = CURRENT TIMESTAMP "
+                f"WHERE id IN ({placeholders}) "
+                "AND deleted_at IS NULL "
+                "AND archived_at IS NULL",
+                tuple(ids),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
     async def fetch_memory_log(
         self,
         tx: Any,

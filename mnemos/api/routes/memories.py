@@ -27,7 +27,6 @@ from mnemos.core.config import runtime_env_value_stripped
 from mnemos.core.ids import new_memory_id
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.lifecycle import (
-    _get_cache_key,
     _get_embedding,
 )
 from mnemos.core.security import is_root
@@ -599,24 +598,27 @@ async def _publish_bulk_created_events(events: list[dict], source_node: str) -> 
 
 
 async def _invalidate_caches_after_mutation() -> None:
-    """Drop /stats + per-user search cache entries on any memory write.
+    """Invalidate read-side caches after any memory write.
 
-    Also bumps the visibility epoch so that in-flight search writes land
-    under the old epoch (orphaned) rather than leaking stale visibility into
-    the new epoch — closing the write-after-invalidate (TOCTOU) window
-    (mnemos-#<issue>).
+    The per-user SEARCH cache is gone: it was wired to ``_lc._cache``,
+    which the lifecycle hard-wires to ``None`` (no Redis in the
+    runtime), so every read missed and every write went nowhere. With
+    it goes the ``SCAN MATCH "mnemos:search:*"`` invalidation sweep
+    that only ever matched keys of a cache that never existed.
+
+    The ``/stats`` cache entry (``stats:global:v2``) is still dropped:
+    it belongs to the stats surface, not the search surface.
+
+    The visibility epoch is STILL bumped here: the MCP
+    principal-context cache (role / namespace — authorization inputs)
+    subscribes to it, so a revoke must advance the epoch even though
+    search no longer reads one.
     """
-    if not _lc._cache:
-        return
-    try:
-        await _lc._cache.delete("stats:global:v2")
+    if _lc._cache:
         try:
-            async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                await _lc._cache.delete(_k)
+            await _lc._cache.delete("stats:global:v2")
         except Exception:
             pass
-    except Exception:
-        pass
     try:
         await _lc._vis_epoch_get_incr()  # bump; errors silently
     except Exception:
@@ -764,18 +766,23 @@ async def _bump_recall_counters(memory_ids: list) -> None:
 
     Single UPDATE for the whole hit set, so search hits with N memories
     cost one DB round-trip not N.
+
+    The UPDATE is issued by the persistence repository
+    (``backend.memories.bump_recall_counts``), NOT by hand-written SQL
+    here. The previous implementation ran Postgres-only SQL
+    (``WHERE id = ANY($1::text[])``, ``now()``) through the
+    backend-neutral ``backend.transactional()`` seam: on SQLite / MySQL /
+    MariaDB / Oracle / Db2 that statement raises, the error is swallowed
+    by the ``except`` below, and recall counters therefore NEVER moved on
+    every backend except Postgres. Routing through the ABC is what makes
+    the counters move everywhere.
     """
     if not memory_ids:
         return
     try:
         backend = _backend_or_503()
         async with backend.transactional() as tx:
-            await tx.conn.execute(
-                "UPDATE memories "
-                "SET recall_count = recall_count + 1, last_recalled_at = now() "
-                "WHERE id = ANY($1::text[]) AND deleted_at IS NULL AND archived_at IS NULL",
-                list(memory_ids),
-            )
+            await backend.memories.bump_recall_counts(tx, list(memory_ids))
     except Exception as e:
         logger.warning(f"[RECALL] bump failed for {len(memory_ids)} ids: {e}")
 
@@ -1253,7 +1260,10 @@ async def search_memories(
     request: MemorySearchRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    """Search memories with optional 5-minute response caching."""
+    """Search memories.
+
+    Results are computed per request — there is no response cache.
+    """
     # Secret vault (release-blocking 2026-06-13): include_secrets is
     # root-only and MUST be enforced BEFORE any cache-key construction,
     # cache read, or cache write. The cache key encodes
@@ -1291,13 +1301,12 @@ async def search_memories(
     request_limit = min(request.limit, _profile_caps[search_profile], 500)
     _log_search_phase(search_trace_id, search_started_at, "parse")
 
-    # v3.1.2 Tier 3: pin owner_id + namespace to the caller's identity
-    # for non-root searches. Previously request.namespace was caller-
+    # v3.1.2 Tier 3: pin the namespace to the caller's identity for
+    # non-root searches. Previously request.namespace was caller-
     # controlled (a non-root user could search any namespace) and
     # owner_id was never passed at all. Root callers may pass any
     # namespace / owner to support cross-tenant audit.
     if is_root(user):
-        search_owner_id = None  # no owner filter for root
         search_namespace = request.namespace  # honor caller's request
     else:
         if request.include_archived:
@@ -1305,7 +1314,6 @@ async def search_memories(
                 status_code=403,
                 detail="include_archived requires root",
             )
-        search_owner_id = user.user_id
         # If the caller asked for a different namespace than theirs,
         # reject explicitly — don't silently scope and hide rows.
         if request.namespace and request.namespace != user.namespace:
@@ -1315,80 +1323,23 @@ async def search_memories(
             )
         search_namespace = user.namespace
 
-    # Cache key MUST include user.user_id and the EFFECTIVE namespace +
-    # owner_id — the server-resolved filter values, not the caller's
-    # raw request. Using request.namespace (possibly None) would create
-    # duplicate cache entries for identical result sets.
-    # Cache key must include the caller's group_ids — search visibility
-    # now depends on group membership (slice 2.1), so caching by
-    # user_id alone would either leak rows after a group revoke or
-    # hide rows after a group grant for the cache TTL window.
+    # No response cache. The per-user search cache was wired to
+    # ``_lc._cache``, which the lifecycle hard-wires to ``None`` (there is
+    # no Redis in the runtime), so every cache read missed and every
+    # cache write went nowhere. The machinery around it was not free:
+    # each search read the visibility epoch (``_vis_epoch_current``,
+    # a NATS-KV round-trip) and folded it into a 27-field cache key that
+    # was then thrown away. That per-search epoch read is gone with the
+    # cache it existed to key.
     #
-    # Round-8 fix: pass RAW values (no `or ""` truthy-coalescing).
-    # The query helpers distinguish None (no SQL predicate) from ""
-    # (predicate with empty value); collapsing both to "" before
-    # serialization aliases distinct semantics. JSON encoding inside
-    # _get_cache_key now preserves None as null vs "" as "" so the
-    # digest reflects the request's actual filter shape.
-    # v6.3 TOCTOU guard: fold a monotonic visibility epoch into the cache key
-    # so an in-flight cache write after a bump lands under the old epoch
-    # (orphaned, never read).  Bump is triggered by every visibility-narrowing
-    # mutation (delete, archive, ACL revoke, permission-mode tighten).
-    try:
-        _epoch = await _lc._vis_epoch_current()
-    except Exception:
-        _epoch = 0
-    cache_key = _get_cache_key(
-        "search",
-        user.user_id,
-        user.namespace,
-        request.query,
-        request_limit,
-        request.category,
-        request.subcategory,
-        sorted(request.tags or []),
-        "semantic" if request.semantic else "fts",
-        request.source_provider,
-        request.source_model,
-        request.source_agent,
-        search_namespace,
-        search_owner_id,
-        bool(request.include_secrets),  # vault opt-in -> distinct cache bucket
-        bool(request.operational),  # framing opt-in -> distinct (unframed) cache bucket
-        sorted(user.group_ids),  # list, not pre-serialized string
-        request.include_archived,
-        bool(request.exclude_superseded),
-        bool(request.current_only),
-        request.boost_recency,
-        request.recency_weight,
-        search_profile.value,  # v6.2 M-2.2.3: distinct cache per profile
-        # UAT 2026-06-13: floor changes the result set. Resolve to the
-        # EFFECTIVE clamped floor (caller min_score or the env/default)
-        # BEFORE keying so equivalent floors (e.g. 2.0 and 1.0, or -1.0
-        # and 0.0) share one cache entry instead of fragmenting it.
-        (max(0.0, min(1.0, float(request.min_score))) if request.min_score is not None else effective_semantic_floor()),
-        _resolve_margin_floor(request.min_margin),
-        # Master OOD-gate flag participates in the key: toggling
-        # MNEMOS_SEMANTIC_OOD_GATE must NOT serve a stale gated/ungated
-        # result from before the flip (ngc-review 2026-06-13).
-        ood_gate_enabled(),
-        _epoch,  # v6.3 TOCTOU guard — epoch at read time
-    )
-
-    if _lc._cache and not request.include_compressed:
-        try:
-            cached = await _lc._cache.get(cache_key)
-            if cached:
-                logger.debug(f"[CACHE] /memories/search hit for '{request.query[:30]}'")
-                _log_search_phase(search_trace_id, search_started_at, "serialize")
-                return MemoryListResponse(**json.loads(cached))
-        except Exception as e:
-            logger.warning(f"[CACHE] search read error: {e}")
+    # The visibility epoch is still bumped on visibility-narrowing
+    # mutations -- see ``_invalidate_caches_after_mutation`` -- because
+    # the MCP principal-context cache subscribes to it.
 
     backend = _backend_or_503()
     semantic_boosted_order = False
-    # Root callers can search across namespaces (search_owner_id is
-    # None); non-root callers are pinned. The visibility factory
+    # Root callers can search across namespaces (no namespace pin);
+    # non-root callers are pinned. The visibility factory
     # rejects namespace=None for non-root, which the namespace 403
     # check above already prevents reaching.
     #
@@ -1647,9 +1598,14 @@ async def search_memories(
     # Fire-and-forget recall-frequency bump for the hit set.
     # Doesn't block the response; failure here is logged and ignored
     # (recall counters are observability, not user-content correctness).
+    #
+    # Scheduled through the lifecycle's tracked-background registry, not a
+    # bare ``asyncio.create_task``: a bare task keeps no reference, so the
+    # event loop may garbage-collect it mid-flight (the bump silently never
+    # lands) and nothing can await it during graceful shutdown.
     if memories:
         hit_ids = [m.id for m in memories]
-        asyncio.create_task(_bump_recall_counters(hit_ids))
+        _lc._schedule_background(_bump_recall_counters(hit_ids))
 
     compression_applied = False
     compression_metadata = {}
@@ -1678,23 +1634,8 @@ async def search_memories(
     )
     _log_search_phase(search_trace_id, search_started_at, "serialize")
 
-    if _lc._cache and not request.include_compressed and not compression_applied:
-        try:
-            # v6.2 M-2.2.3: per-profile cache TTL. fast/balanced 5min;
-            # deep 30s (less cacheable per spec — reranker scoring drifts
-            # faster as memories churn).
-            _profile_ttl = {
-                SearchProfile.FAST: 300,
-                SearchProfile.BALANCED: 300,
-                SearchProfile.DEEP: 30,
-            }
-            await _lc._cache.setex(
-                cache_key,
-                _profile_ttl[search_profile],
-                response.model_dump_json(),
-            )
-        except Exception as e:
-            logger.warning(f"[CACHE] search write error: {e}")
+    # No response-cache write: the search cache is gone (see the note
+    # above the backend lookup). Search responses are computed per request.
 
     return response
 
