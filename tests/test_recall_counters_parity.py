@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import typing
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -387,3 +389,57 @@ def test_invalidate_caches_after_mutation_has_no_search_scan():
     source = inspect.getsource(memories_handler._invalidate_caches_after_mutation)
     assert "scan_iter" not in source
     assert "_vis_epoch_get_incr" in source
+
+
+# ── M3: the new ABC method is callable on every backend repository ─────────
+
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name"),
+    [
+        ("mnemos.persistence.sqlite", "SqliteMemoryRepository"),
+        ("mnemos.persistence.postgres", "PostgresMemoryRepository"),
+        ("mnemos.persistence.mysql", "MysqlMemoryRepository"),
+        ("mnemos.persistence.mariadb", "MariadbMemoryRepository"),
+        ("mnemos.persistence.oracle", "OracleMemoryRepository"),
+        ("mnemos.persistence.db2", "Db2MemoryRepository"),
+    ],
+)
+def test_bump_recall_counts_signature_resolves_on_every_backend(module_name, class_name):
+    """``bump_recall_counts`` must be resolvable on all six backends.
+
+    ``typing.get_type_hints`` resolves each annotation BY NAME against the
+    defining module's globals, so an annotation that referenced an
+    unimported name raises ``NameError`` here. This pins the real contract
+    the class body already depends on: ``Sequence`` comes from
+    ``collections.abc`` (the convention used throughout
+    ``mnemos/persistence/``, including ``base.py``), not ``typing``.
+
+    It also proves MariaDB really is covered: it inherits the batch bump
+    from ``MysqlMemoryRepository`` rather than declaring its own.
+    """
+    import importlib
+
+    mod = importlib.import_module(module_name)
+    repo_cls = getattr(mod, class_name)
+
+    assert hasattr(repo_cls, "bump_recall_counts"), f"{class_name} cannot bump recall counts"
+
+    hints = typing.get_type_hints(repo_cls.bump_recall_counts)
+    assert hints["memory_ids"] == Sequence[str]
+    assert "return" in hints and hints["return"] is int
+
+
+@pytest.mark.asyncio
+async def test_bump_recall_counts_executes_not_just_resolves(tmp_path):
+    """Invoke the method for real: a missing ``Sequence`` name would blow up
+    at CALL time, which a signature-only check would not catch."""
+    backend = SqliteBackend(tmp_path / "recall-exec.sqlite3", _sqlite_settings())
+    await backend.open()
+    try:
+        async with backend.transactional() as tx:
+            await _insert(backend, tx, "mem-exec", "executor row")
+            assert await backend.memories.bump_recall_counts(tx, ["mem-exec"]) == 1
+            assert await _recall_count(backend, tx, "mem-exec") == 1
+    finally:
+        await backend.close()
