@@ -16,11 +16,20 @@ from __future__ import annotations
 
 import re
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
-from mnemos.persistence import mariadb, mysql, schema
+# The helpers below (the shared mismatch wording and the Oracle/Db2 catalog
+# checks) do not exist on the base commit; skip the whole module there instead
+# of failing collection, so the file can be run against either tree to show
+# which tests are regressions.
+schema = pytest.importorskip("mnemos.persistence.schema")
+for _required in ("embedding_dimension_mismatch", "check_oracle_embedding_dim", "check_db2_embedding_dim"):
+    if not hasattr(schema, _required):
+        pytest.skip(f"M8 helper {_required} is not present on this tree", allow_module_level=True)
+
+from mnemos.persistence import mariadb, mysql  # noqa: E402
 from mnemos.persistence.mariadb import MariadbBackend
 from mnemos.persistence.mysql import MysqlBackend
 
