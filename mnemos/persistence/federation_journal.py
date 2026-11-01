@@ -76,20 +76,32 @@ def _limit(ops: _Ops, limit: int) -> str:
     return f" FETCH FIRST {value} ROWS ONLY" if ops.dialect in {"oracle", "db2"} else f" LIMIT {value}"
 
 
-async def _publish(ops: _Ops, memory_id=None):
+async def _publish(ops: _Ops, memory_id=None, *, memory_ids=None):
     """Assign cursor positions after commit, without blocking source writers.
 
     An identity allocated by an uncommitted mutation may be lower than an
     already published ID. That is harmless: it gets a higher published sequence
     on a later poll, so a consumer never advances past an invisible event.
+
+    ``memory_ids`` narrows the sweep to a known set of rows. Redispatch uses it
+    so it publishes *its own* events and never claims a concurrent publisher's
+    pending outbox row -- a global sweep would report those as re-advertised.
     """
     await ops.execute("UPDATE federation_change_clock SET value = value WHERE id = 1")
+    where = ""
+    params: list[Any] = []
+    if memory_ids is not None:
+        ids_in = [str(mid) for mid in memory_ids]
+        if not ids_in:
+            return
+        where = " AND memory_id IN (" + ",".join("?" for _ in ids_in) + ")"
+        params = ids_in
+    elif memory_id is not None:
+        where = " AND memory_id = ?"
+        params = [memory_id]
     pending = await ops.fetchall(
-        "SELECT event_id FROM federation_changes WHERE seq IS NULL"
-        + (" AND memory_id = ?" if memory_id is not None else "")
-        + " ORDER BY event_id"
-        + _limit(ops, 256),
-        *((memory_id,) if memory_id is not None else ()),
+        "SELECT event_id FROM federation_changes WHERE seq IS NULL" + where + " ORDER BY event_id" + _limit(ops, 256),
+        *params,
     )
     if not pending:
         return
@@ -379,6 +391,22 @@ async def save_peer_cursor(tx, peer_id, cursor_value, filter_signature):
         )
 
 
+def _redispatch_eligible_predicate() -> str:
+    """The feed's own export predicate, as an unaliased ``memories`` filter.
+
+    ``redispatch_memory_ids`` re-advertises CURRENT STATE, so the only rows it
+    may publish are the ones the live feed itself would serve. Reusing
+    ``eligible_for_federation`` is what keeps the two definitions from
+    drifting: it already carries the ``federation_source IS NULL`` loop-guard,
+    the lifecycle exclusions, the vault credential boundary and the world-read
+    gate. Hand-writing a subset of those terms (the round-1 defect) let a vault
+    row through and published a revocation as live content.
+    """
+    from mnemos.core.eligibility import eligible_for_federation
+
+    return eligible_for_federation("")
+
+
 async def redispatch_memory_ids(tx, memory_ids):
     """Append a fresh, publishable change for each id that needs re-serving.
 
@@ -400,14 +428,15 @@ async def redispatch_memory_ids(tx, memory_ids):
     if not ids:
         return 0
     ops = _ops(tx)
-    await ops.execute("UPDATE federation_change_clock SET value = value WHERE id = 1")
     placeholders = ",".join("?" for _ in ids)
     rows = await ops.fetchall(
         "SELECT id, namespace, category, permission_mode, updated FROM memories "
-        f"WHERE id IN ({placeholders}) AND deleted_at IS NULL AND archived_at IS NULL "
-        "AND consolidated_into IS NULL AND federation_source IS NULL",
+        f"WHERE id IN ({placeholders}) AND " + _redispatch_eligible_predicate(),
         *ids,
     )
+    if not rows:
+        # Nothing to publish: no clock touch, no write lock on the journal.
+        return 0
     for row in rows:
         public = 1 if (federation_feed_include_private() or int(row.get("permission_mode") or 0) % 10 >= 4) else 0
         await ops.execute(
@@ -430,5 +459,5 @@ async def redispatch_memory_ids(tx, memory_ids):
     # never see a replayed event that happened to land on N. _publish bumps
     # the clock by the number of rows it assigns, so the re-advertised events
     # are strictly after every sequence already handed out.
-    await _publish(ops)
+    await _publish(ops, memory_ids=[row["id"] for row in rows])
     return len(rows)

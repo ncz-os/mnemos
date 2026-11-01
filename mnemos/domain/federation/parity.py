@@ -192,37 +192,24 @@ async def _populations(
             "null_embedding": sorted(null_embedding),
         }
 
-    if source_ids is not None:
-        exportable: dict[str, str | None] = (
-            {str(k): v for k, v in source_ids.items()}
-            if hasattr(source_ids, "items")
-            else {str(mid): None for mid in source_ids}
-        )
-    else:
-        exportable = await _source_keyset(backend, namespaces=namespaces, categories=categories, page_size=page_size)
-    if source_ids is not None:
-        exportable_count = len(exportable)
-    else:
-        async with backend.transactional() as tx:
-            exportable_count = await backend.federation.count_exportable_rows(
-                tx, namespaces=namespaces, categories=categories
-            )
-    # Exportable ids this node's feed cannot serve: the journal triggers
-    # (0062/0064) only journal rows whose ``federation_source`` is NULL, so a
-    # row replicated here from another peer is counted by CHARON's export
-    # definition but has no publishable event. A replica can never receive it,
-    # so it is reported as ``unreachable`` rather than a permanent ``missing``.
-    # Only meaningful where this node IS the source (it can serve the peer):
-    # there, "exportable but not on my feed" is a real, permanent gap. A
-    # caller that supplies ``source_ids`` has already read the population
-    # elsewhere, so this node is not the source and must not re-derive it.
-    if source_ids is not None:
-        unreachable: list[str] = []
-    elif replicated:
-        unreachable = []
-    else:
-        served = await _feed_ids(backend, namespaces=namespaces, categories=categories, page_size=page_size)
-        unreachable = sorted(set(exportable) - served)
+    exportable = (
+        {str(k): v for k, v in source_ids.items()}
+        if isinstance(source_ids, Mapping)
+        else {str(mid): None for mid in source_ids}
+    )
+    exportable_count = len(exportable)
+    # "Exportable but unservable" is the F-15 eligibility gap: the journal
+    # triggers (0062/0064) only journal rows whose ``federation_source`` is
+    # NULL, so a row replicated from another peer is counted by CHARON's
+    # export definition but has no publishable event. It is only observable on
+    # the node that OWNS the journal, and this branch is the caller-supplied
+    # case (the population was read elsewhere), so no gap can be attributed
+    # from here: enumerating this node's own federated rows -- none of them
+    # publishable -- would mislabel every missing id as unservable. The gap is
+    # documented in ``eligible_for_federation_export`` and pinned by
+    # ``test_export_definition_is_a_superset_of_the_feed``; closing it needs a
+    # trigger change on all six backends and is out of scope here.
+    unreachable: list[str] = []
 
     missing = sorted(mid for mid in exportable if mid not in replicated and mid not in unreachable)
     extra = sorted(mid for mid in replicated if mid not in exportable)
@@ -295,8 +282,6 @@ async def replica_parity(
     stale = populations["stale"]
     null_embedding = populations["null_embedding"]
     unreachable = populations["unreachable"]
-    exportable_count = populations["exportable_count"]
-    replicated = populations["replicated"]
     source_available = populations["source_available"]
 
     counts = {
@@ -311,7 +296,7 @@ async def replica_parity(
     hint = None
     if missing:
         hint = (
-            "POST /v1/federation/peers/{peer_id}/reconcile with apply=true re-pulls the missing ids "
+            f"POST /v1/federation/peers/{peer_id}/reconcile with apply=true re-pulls the missing ids "
             "through the source journal (dry-run when apply is false)"
         )
     return {
@@ -404,6 +389,7 @@ async def reconcile_peer(
         "requested": requested,
         "restored": 0,
         "failed": [],
+        "missing_before": report["missing"]["count"],
         "remaining": report["missing"]["count"],
     }
     if not apply or not requested:

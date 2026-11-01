@@ -17,7 +17,9 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -155,6 +157,13 @@ async def mutate(backend, sql: str, *params) -> int:
 
     async with backend.transactional() as tx:
         return await _Ops(tx, transaction_dialect(tx)).execute(sql, *params)
+
+
+async def _commit(backend) -> None:
+    """Close and reopen, committing whatever the last statement left open."""
+    db_path = backend._db_path
+    await backend.close()
+    await backend.open(Path(db_path))
 
 
 async def fetch(backend, sql: str, *params) -> list:
@@ -543,3 +552,401 @@ async def test_parity_endpoint_reports_and_reconcile_dry_run(synced):
         _ph.backend_or_503 = real
 
     assert await fetch(synced.replica, "SELECT id FROM memories WHERE id = ?", "fed:pythia:gone") == []
+
+
+# ── regressions: round-2 review of the F-15 delivery ────────────────────────
+#
+# Each test below pins one review finding, verified at the source first. The
+# round-1 code is kept in ``git show`` shape rather than copied here, so the
+# assertion messages say what the old behaviour did.
+#
+# ``_redispatch`` skips the tenant scope a node is not its own source (a
+# replica's by-id path 404s such an id), so the scope tests drive the source
+# directly -- which is the node that owns the journal anyway.
+
+
+class _RecorderCursor:
+    """A DB-API cursor that records every statement without reaching a DB."""
+
+    rowcount = 0
+    description = None
+
+    def __init__(self, sink: list[tuple[str, Any]]):
+        self._sink = sink
+
+    async def execute(self, sql, params=None):
+        self._sink.append((sql, params))
+
+    async def fetchall(self):
+        return []
+
+    async def fetchone(self):
+        return None
+
+    async def close(self):
+        return None
+
+
+class _RecorderConn:
+    def __init__(self, sink):
+        self._sink = sink
+
+    def cursor(self):
+        return _RecorderCursor(self._sink)
+
+    def execute(self, sql, params=None):
+        self._sink.append((sql, params))
+        return SimpleNamespace(lastrowid=0)
+
+
+class _RecorderTx:
+    def __init__(self, sink):
+        self.conn = _RecorderConn(sink)
+
+
+async def journal_committed(source) -> None:
+    """Let the source's next transaction see every write so far.
+
+    ``BEGIN IMMEDIATE`` writes are committed by the context manager -- this is
+    a readability alias for the tests below, not a second connection.
+    """
+
+
+def _redispatch_calls(sink: list[tuple[str, Any]]) -> list[str]:
+    return [sql for sql, _ in sink if sql.lstrip().upper().startswith("UPDATE FEDERATION_CHANGE_CLOCK")]
+
+
+async def _journal_rows(source, memory_ids: list[str]) -> dict[str, dict]:
+    placeholders = ",".join("?" for _ in memory_ids)
+    rows = await fetch(
+        source,
+        "SELECT memory_id, MAX(seq) AS seq, COUNT(*) AS n FROM federation_changes "
+        f"WHERE memory_id IN ({placeholders}) GROUP BY memory_id",
+        *memory_ids,
+    )
+    return {r["memory_id"]: {"seq": r["seq"], "n": int(r["n"])} for r in rows}
+
+
+async def _journal_pending(source, memory_ids: list[str]) -> dict[str, int]:
+    placeholders = ",".join("?" for _ in memory_ids)
+    rows = await fetch(
+        source,
+        "SELECT memory_id, COUNT(*) AS n FROM federation_changes "
+        f"WHERE memory_id IN ({placeholders}) AND seq IS NULL GROUP BY memory_id",
+        *memory_ids,
+    )
+    return {r["memory_id"]: int(r["n"]) for r in rows}
+
+
+async def _journal_clock(source) -> int:
+    rows = await fetch(source, "SELECT value FROM federation_change_clock WHERE id = 1")
+    return int(rows[0]["value"])
+
+
+@pytest.mark.asyncio
+async def test_redispatch_refuses_a_row_outside_the_feed_scope(synced):
+    """A row the feed cannot serve must not receive a live journal event.
+
+    ``redispatch_memory_ids`` guarded only ``deleted/archived/consolidated/
+    federation_source`` and hardcoded ``new_exportable = 1``. A vault row
+    passed that guard and was published as live data, i.e. a credential
+    boundary replayed as content. The guard is now the predicate the feed,
+    the by-id route and ``fetch_source_export_keyset_page`` already share.
+
+    Scope caveat, verified against the source rather than assumed: a
+    non-vault namespace (``private-scope`` here) is still exportable in the
+    LAN posture -- ``eligible_for_federation`` excludes only ``vault``, and
+    nothing in this repository drops a namespace without an explicit scope
+    filter. Round-1's claim that such a row is "out of scope" is disproved
+    here, so this test does not assert it; it asserts the vault refusal,
+    which is real, and pins the namespace behaviour so a future scope change
+    has to update this test deliberately.
+    """
+    await insert(synced.source, "vaulted", "never federates", namespace="vault")
+    await insert(synced.source, "elsewhere", "non-vault namespace", namespace="private-scope")
+    await insert(synced.source, "servable", "ordinary fact")
+
+    async with synced.source.transactional() as tx:
+        served = await synced.source.federation.redispatch_federation_journal(
+            tx, memory_ids=["vaulted", "elsewhere", "servable"]
+        )
+    journal = await _journal_rows(synced.source, ["vaulted", "elsewhere", "servable"])
+    assert "vaulted" not in journal, journal
+    assert journal["servable"]["seq"] is not None, journal
+    # The vault row is the one real exclusion; ``elsewhere`` is published.
+    assert served == 2, journal
+    assert journal["elsewhere"]["seq"] is not None, journal
+
+
+@pytest.mark.asyncio
+async def test_redispatch_does_not_claim_another_publishers_pending_event(synced):
+    """It publishes *its* ids, not every event a publisher left pending.
+
+    ``_publish`` assigns sequences to up to 256 globally pending outbox rows
+    and returns nothing. Reporting "one per event it assigned" made a single
+    redispatch claim a concurrent publisher's event, so neither the caller
+    nor the reconcile failure accounting could tell what was re-advertised.
+    """
+    await insert(synced.source, "left-pending", "publisher stopped before publish")
+    pending_before = await _journal_pending(synced.source, ["left-pending"])
+    assert pending_before.get("left-pending") == 1, "the outbox trigger did not fire"
+
+    await insert(synced.source, "asked-for", "explicitly re-advertised")
+    async with synced.source.transactional() as tx:
+        served = await synced.source.federation.redispatch_federation_journal(tx, memory_ids=["asked-for"])
+    assert served == 1
+
+    pending_after = await _journal_pending(synced.source, ["left-pending"])
+    assert pending_after.get("left-pending") == 1, "another publisher's event was claimed"
+
+
+@pytest.mark.asyncio
+async def test_redispatch_with_no_work_does_not_touch_the_clock(synced):
+    """A no-op must not write (LOW, confirmed).
+
+    ``redispatch_memory_ids`` opened with ``UPDATE federation_change_clock SET
+    value = value WHERE id = 1`` -- a pure write lock on the single journal
+    clock row -- and nothing between it and the next statement read it.
+
+    The recorder below satisfies the ``_Ops`` interface ``redispatch`` uses
+    (``conn.execute``/``cursor``), so the empty call reaches the same code
+    path a real transaction would. The refused-id leg reads the clock
+    *outside* the write transaction: ``SqliteBackend.transactional`` holds a
+    non-reentrant lock, so a nested ``transactional()`` here would deadlock
+    rather than test anything.
+    """
+    sink: list[tuple[str, Any]] = []
+    tx = _RecorderTx(sink)
+    from mnemos.persistence.federation_journal import redispatch_memory_ids
+
+    assert await redispatch_memory_ids(tx, []) == 0
+    assert sink == [], sink
+
+    # Refused ids are the same case: nothing to publish, nothing to lock.
+    await insert(synced.source, "vaulted", "never federates", namespace="vault")
+    before = await _journal_clock(synced.source)
+    async with synced.source.transactional() as real_tx:
+        assert await synced.source.federation.redispatch_federation_journal(real_tx, memory_ids=["vaulted"]) == 0
+    assert await _journal_clock(synced.source) == before
+
+
+@pytest.mark.asyncio
+async def test_redispatch_reports_only_ids_it_published(synced):
+    """The count is per-id, not per-assigned-event."""
+    await insert(synced.source, "one", "first")
+    await insert(synced.source, "two", "second")
+    await insert(synced.source, "vaulted", "never federates", namespace="vault")
+    async with synced.source.transactional() as tx:
+        served = await synced.source.federation.redispatch_federation_journal(
+            tx, memory_ids=["one", "two", "vaulted", "missing-entirely"]
+        )
+    assert served == 2
+    journal = await _journal_rows(synced.source, ["one", "two"])
+    assert journal["one"]["seq"] is not None and journal["two"]["seq"] is not None
+
+
+@pytest.mark.asyncio
+async def test_parity_without_the_export_set_compares_nothing(synced):
+    """`source_available` -- not "are there exportable rows" -- picks the branch.
+
+    The body chose the source-comparison branch by asking whether *this*
+    node had any exportable rows, so a replica whose own core was empty
+    compared the whole export set against a replica dict it had just failed
+    to read. Re-deriving the peer's population on a replica is also the full
+    sweep the keyset design exists to avoid. With no ``source_ids`` the
+    report must say the source is unavailable, whatever the local corpus.
+    """
+    await insert(synced.source, "a", "first", embedding=[0.1] * EMBED_DIM)
+    await insert(synced.source, "b", "second", embedding=[0.1] * EMBED_DIM)
+    await sync(synced.replica, synced.peer["id"])
+
+    report = await replica_parity(synced.replica, synced.peer["id"], page_size=1)
+    assert report["source"]["available"] is False
+    assert report["source"]["exportable_rows"] is None
+    assert report["missing"]["count"] == 0
+    assert report["extra"]["count"] == 0
+    assert report["unreachable"]["count"] == 0
+
+    # A row the peer no longer serves is not "extra": the replica cannot see
+    # the source's population, and guessing would call every local row extra.
+    await insert(synced.replica, "fed:pythia:ghost", "gone upstream", federation_source="pythia")
+    report = await replica_parity(synced.replica, synced.peer["id"], page_size=1)
+    assert report["source"]["available"] is False
+    assert report["extra"]["count"] == 0
+    assert report["extra"]["sample"] == []
+
+
+@pytest.mark.asyncio
+async def test_parity_recomputes_after_a_local_change(synced):
+    """The report must describe the database now, not a fixed answer.
+
+    Round-1 recomputed the comparison from a dict the first branch had left
+    empty, so the two paths could never disagree and a stale or extra row
+    could not be found on a node that also exported. Extra (peer gone) and
+    stale (content drift) must both fall out of the same comparison.
+
+    The restore leg goes through reconcile, not a bare ``sync``: the
+    receiver's durable fence drops every replayed event it has already
+    applied, so a locally deleted row can only come back via a NEW event --
+    which is the reason F-15 exists. A plain re-sync provably restores
+    nothing (pinned by ``test_reconcile_apply_restores_missing_ids_ignoring_the_fence``).
+    """
+    await insert(synced.source, "kept", "first", embedding=[0.1] * EMBED_DIM)
+    await sync(synced.replica, synced.peer["id"])
+    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:kept")
+
+    ids = await source_export_ids(synced.source)
+    missing = await replica_parity(synced.replica, synced.peer["id"], source_ids=ids)
+    assert missing["missing"]["sample"] == ["kept"]
+
+    # Restore through the journal (a new event), then drift its content: the
+    # same call now says ``in_sync`` and then ``stale``.
+    restored = await reconcile_peer(synced.replica, synced.peer["id"], apply=True, source_ids=ids)
+    assert restored["restored"] == 1
+    clean = await replica_parity(synced.replica, synced.peer["id"], source_ids=ids)
+    assert clean["in_sync"] is True
+    await mutate(synced.replica, "UPDATE memories SET content = ? WHERE id = ?", "drifted", "fed:pythia:kept")
+    drifted = await replica_parity(synced.replica, synced.peer["id"], source_ids=ids)
+    assert drifted["stale"]["sample"] == ["kept"], drifted["stale"]
+
+    # And a peer that no longer exists is an error, not an empty report.
+    await mutate(synced.replica, "DELETE FROM federation_peers WHERE id = ?", synced.peer["id"])
+    with pytest.raises(ValueError):
+        await replica_parity(synced.replica, synced.peer["id"], source_ids=ids)
+
+
+@pytest.mark.asyncio
+async def test_parity_counts_unreachable_only_on_the_source_host(synced):
+    """``unreachable`` describes THIS node's own feed, never the import's.
+
+    Verified against the source: ``replica_parity`` resolves its peer through
+    ``get_sync_peer``, and ``federation_peers`` rows exist only where a peer
+    was registered. A source host has no row for the replica that pulls from
+    it, so running parity *on* the source requires registering one -- the
+    round-1 test skipped that and only ever failed with "peer not found".
+    """
+    await insert(synced.source, "plain", "ordinary fact")
+    await insert(synced.source, "from-elsewhere", "arrived by federation", federation_source="other")
+    await sync(synced.replica, synced.peer["id"])
+
+    # The source's view of its own replica: a peer row pointing back at it.
+    back = await register_peer(synced.source, name="proteus")
+
+    ids = await source_export_ids(synced.source)
+    assert set(ids) == {"plain"}
+
+    from_report = await replica_parity(synced.source, back["id"], source_ids=ids)
+    # The source owns the journal but has not pulled anything yet, so nothing
+    # local is missing: every exportable id is unreachable-less by definition.
+    assert from_report["unreachable"]["count"] == 0
+    assert from_report["in_sync"] is False  # the replica holds nothing yet
+
+    unavailable = await replica_parity(synced.replica, synced.peer["id"])
+    assert unavailable["unreachable"]["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reports_the_missing_count_after_the_run(synced):
+    """``remaining`` describes the replica after the run (MEDIUM, confirmed).
+
+    The post-run report was compared on the wrong axis: without an explicit
+    export set it finds nothing missing by construction, so a run that
+    restored nothing still reported ``remaining: 0``.
+    """
+    await insert(synced.source, "unservable", "was here")
+    await sync(synced.replica, synced.peer["id"])
+    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:unservable")
+    await mutate(
+        synced.source,
+        "UPDATE memories SET deleted_at = ? WHERE id = ?",
+        (NOW + timedelta(days=1)).isoformat(),
+        "unservable",
+    )
+    ids = {"unservable": None}
+
+    result = await reconcile_peer(synced.replica, synced.peer["id"], apply=True, source_ids=ids)
+    assert result["restored"] == 0
+    assert result["failed"] and result["failed"][0]["id"] == "unservable"
+    assert result["missing_before"] == 1
+    assert result["remaining"] == 1, "a failed repair must still be reported as remaining"
+    # And the dry run says the same before anything is applied.
+    dry = await reconcile_peer(synced.replica, synced.peer["id"], apply=False, source_ids=ids)
+    assert dry["remaining"] == 1
+    assert dry["requested"] == ["unservable"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_dry_run_requests_the_whole_population(synced):
+    """A dry run covers every missing id, not just the visible sample."""
+    for i in range(6):
+        await insert(synced.source, f"lost-{i}", f"fact {i}", embedding=[0.1] * EMBED_DIM)
+    await sync(synced.replica, synced.peer["id"])
+    await mutate(synced.replica, "DELETE FROM memories WHERE id LIKE ?", "fed:pythia:lost-%")
+
+    ids = await source_export_ids(synced.source)
+    report = await replica_parity(synced.replica, synced.peer["id"], page_size=2, source_ids=ids)
+    assert report["missing"]["count"] == 6
+    assert len(report["missing"]["sample"]) == 2
+
+    before = len(synced.app.calls)
+    dry = await reconcile_peer(synced.replica, synced.peer["id"], apply=False, page_size=2, source_ids=ids)
+    assert dry["requested"] == [f"lost-{i}" for i in range(6)]
+    assert dry["missing_before"] == 6
+    assert dry["remaining"] == 6
+    assert len(synced.app.calls) == before, "a dry run must not touch the feed"
+
+    capped = await reconcile_peer(synced.replica, synced.peer["id"], apply=False, page_size=2, limit=4, source_ids=ids)
+    assert capped["requested"] == [f"lost-{i}" for i in range(4)]
+    assert capped["remaining"] == 6
+
+
+@pytest.mark.asyncio
+async def test_reconcile_never_requests_an_unreachable_id(synced):
+    """Only ``missing`` is requested -- never an id the feed cannot serve."""
+    await insert(synced.source, "reachable", "fine")
+    await sync(synced.replica, synced.peer["id"])
+    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:reachable")
+    await insert(synced.source, "from-elsewhere", "arrived from another peer", federation_source="other")
+
+    ids = await source_export_ids(synced.source)
+    assert set(ids) == {"reachable"}, ids
+    dry = await reconcile_peer(synced.replica, synced.peer["id"], apply=False, source_ids=ids)
+    assert dry["requested"] == ["reachable"]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_apply_redispatches_then_fetches(synced):
+    """apply=True asks the source over HTTP, then pulls the new event."""
+    await insert(synced.source, "lost", "never arrived", embedding=[0.2] * EMBED_DIM)
+    await sync(synced.replica, synced.peer["id"])
+    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:lost")
+
+    ids = await source_export_ids(synced.source)
+    before = len(synced.app.calls)
+    result = await reconcile_peer(synced.replica, synced.peer["id"], apply=True, source_ids=ids)
+
+    assert result["restored"] == 1, result
+    assert result["failed"] == []
+    urls = [str(url) for url in synced.app.calls[before:]]
+    assert any(url.endswith("/v1/federation/redispatch") for url in urls), urls
+    assert result["remaining"] == 0
+    row = await fetch(synced.replica, "SELECT content FROM memories WHERE id = ?", "fed:pythia:lost")
+    assert row and row[0]["content"] == "never arrived"
+
+
+# ── LOW, confirmed: the hint advertised a literal ``{peer_id}`` ─────────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_hint_names_the_peer(synced):
+    """An operator pasting the hint must not fetch ``/peers/{peer_id}/...``."""
+    await insert(synced.source, "gone", "lost locally")
+    await sync(synced.replica, synced.peer["id"])
+    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:gone")
+
+    ids = await source_export_ids(synced.source)
+    report = await replica_parity(synced.replica, synced.peer["id"], source_ids=ids)
+    hint = report["hint"]
+    assert hint is not None
+    assert "{" not in hint, hint
+    assert f"/v1/federation/peers/{synced.peer['id']}/reconcile" in hint
