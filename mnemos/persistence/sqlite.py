@@ -6638,9 +6638,17 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                 memories_pulled,
                 memories_new,
                 memories_updated,
-                # records_seen is the WIRE count (events_received), and
-                # records_written is the APPLIED count — the same value
-                # memories_pulled carries.
+                # ``records_seen`` is the historical column for the WIRE
+                # count and ``records_written`` the historical column for
+                # the APPLIED count. Both are written alongside the
+                # F-1/F-5 columns for continuity with pre-0067 rows;
+                # nothing reads them, but dropping them would silently
+                # change what an operator sees in an existing
+                # federation_sync_log.
+                #
+                # The APPLIED count is memories_new + memories_updated —
+                # the same value memories_pulled carries, because the
+                # sync only counts rows the fence actually applied.
                 events_received,
                 memories_new + memories_updated,
                 events_received,

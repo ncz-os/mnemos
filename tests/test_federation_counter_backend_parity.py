@@ -289,3 +289,60 @@ async def test_finish_sync_log_binds_each_column_to_the_right_value(
         assert binds.get("records_seen") == 25, (
             f"{dialect}: records_seen must carry the WIRE count (25), got {binds.get('records_seen')!r}"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("dialect", "module", "class_name", "tx_factory"), FINISH_SYNC_LOG_CASES)
+async def test_finish_sync_log_binds_the_legacy_columns_to_their_historical_meaning(
+    dialect: str,
+    module: str,
+    class_name: str,
+    tx_factory: Any,
+) -> None:
+    """The legacy ``records_seen`` / ``records_written`` columns keep their meaning.
+
+    Only SQLite and MySQL/MariaDB have these columns (Postgres, Oracle
+    and Db2 never had them), and nothing in the codebase reads them --
+    they are write-only continuity fields. That makes them easy to
+    mis-bind: a shifted tuple still passes an arity check while writing
+    the wire count into the APPLIED column and vice versa.
+
+    ``records_seen`` is the historical name for the WIRE count, so it
+    carries ``events_received``. ``records_written`` is the historical
+    name for the APPLIED count, so it carries ``memories_new +
+    memories_updated`` -- the same value ``memories_pulled`` carries,
+    because the sync only counts rows the durable sequence fence
+    actually applied.
+    """
+    call = await _capture_finish_sync_log(dialect, module, class_name, tx_factory)
+    sql = call["sql"]
+    params = call["params"]
+    supplied = list(params or ())
+
+    if dialect == "postgres":
+        binds = {column: supplied[int(index) - 1] for column, index in re.findall(r"(\w+)\s*=\s*\$(\d+)", sql)}
+    elif dialect == "oracle":
+        pairs = re.findall(r"(\w+)\s*=\s*:(\w+)", sql)
+        mapping = params if isinstance(params, dict) else {}
+        binds = {column: mapping.get(name) for column, name in pairs}
+    else:
+        binds = dict(zip(_bound_columns(sql, dialect), supplied))
+
+    if "records_seen" not in binds:
+        # Postgres/Oracle/Db2 never had the legacy columns.
+        assert "records_written" not in binds, dialect
+        return
+
+    assert binds["records_seen"] == 25, (
+        f"{dialect}: records_seen is the historical WIRE count and must carry "
+        f"events_received (25), got {binds['records_seen']!r}"
+    )
+    assert binds["records_written"] == 10, (
+        f"{dialect}: records_written is the historical APPLIED count and must carry "
+        f"memories_new + memories_updated (4 + 6 = 10), got {binds['records_written']!r}"
+    )
+    # The legacy APPLIED column and the F-1 applied column must agree.
+    assert binds["records_written"] == binds["memories_pulled"], (
+        f"{dialect}: records_written ({binds['records_written']!r}) and memories_pulled "
+        f"({binds['memories_pulled']!r}) are both the APPLIED count and must be equal"
+    )
