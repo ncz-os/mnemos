@@ -2558,7 +2558,24 @@ class FederationRepository(ABC):
         memories_updated: int,
         error: str | None,
         cursor_after: Any,
-    ) -> None: ...
+        events_received: int = 0,
+        rows_without_embedding: int = 0,
+    ) -> None:
+        """Close out one sync-log row.
+
+        ``memories_pulled`` counts APPLIED rows (``new_n + upd_n``), not
+        wire events: a journal replay emits one wire row per event, so
+        counting wire rows inflated ``federation_peers.total_pulled`` on
+        every replay (the 4.4 M-against-25 k symptom).
+
+        ``events_received`` keeps the wire count visible separately, and
+        ``rows_without_embedding`` records how many of the peer's
+        federated rows still have no vector (F-5) so the embedding gap
+        is visible. That count is the PER-PEER TOTAL at the time of the
+        sync, not a per-sync delta: it covers rows applied by earlier
+        syncs too.
+        """
+        ...
 
     @abstractmethod
     async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None: ...
@@ -2571,6 +2588,17 @@ class FederationRepository(ABC):
         cursor: Any,
         total_pulled: int,
     ) -> None: ...
+
+    @abstractmethod
+    async def count_federated_rows_without_embedding_per_peer(self, tx: Transaction) -> dict[str, int]:
+        """Count federated rows with no embedding, keyed by peer name.
+
+        A replica that copied no vectors is FTS-only: vector search
+        excludes NULL embeddings, so the corpus silently loses semantic
+        recall. This is the per-peer number that
+        ``/v1/federation/status`` exposes as ``rows_without_embedding``.
+        """
+        ...
 
     @abstractmethod
     async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]: ...

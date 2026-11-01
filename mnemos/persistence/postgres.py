@@ -5423,7 +5423,8 @@ class PostgresFederationRepository(FederationRepository):
                 """
             SELECT id::text, started_at, finished_at, memories_pulled,
                    memories_new, memories_updated, error,
-                   cursor_before, cursor_after
+                   cursor_before, cursor_after,
+                   events_received, rows_without_embedding
             FROM federation_sync_log
             WHERE peer_id = $1::uuid
             ORDER BY started_at DESC
@@ -5760,6 +5761,8 @@ class PostgresFederationRepository(FederationRepository):
         memories_updated: int,
         error: str | None,
         cursor_after: Any,
+        events_received: int = 0,
+        rows_without_embedding: int = 0,
     ) -> None:
         await _postgres_tx(tx).conn.execute(
             """
@@ -5769,7 +5772,9 @@ class PostgresFederationRepository(FederationRepository):
                 memories_new = $3,
                 memories_updated = $4,
                 error = $5,
-                cursor_after = $6
+                cursor_after = $6,
+                events_received = $7,
+                rows_without_embedding = $8
             WHERE id = $1::uuid
             """,
             log_id,
@@ -5778,6 +5783,8 @@ class PostgresFederationRepository(FederationRepository):
             memories_updated,
             error,
             cursor_after,
+            events_received,
+            rows_without_embedding,
         )
 
     async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None:
@@ -5812,6 +5819,28 @@ class PostgresFederationRepository(FederationRepository):
             cursor,
             total_pulled,
         )
+
+    async def count_federated_rows_without_embedding_per_peer(self, tx: Transaction) -> dict[str, int]:
+        """Count federated rows with no embedding, grouped by peer name.
+
+        Postgres keeps the vector in the ``memories.embedding`` column
+        (pgvector), so a NULL there is the missing-vector signal. A
+        replica that copied no vectors is FTS-only: vector search
+        excludes NULL embeddings.
+        """
+        rows = await _postgres_tx(tx).conn.fetch(
+            """
+            SELECT federation_source AS peer_name, COUNT(*) AS n
+            FROM memories
+            WHERE federation_source IS NOT NULL
+              AND deleted_at IS NULL
+              AND archived_at IS NULL
+              AND consolidated_into IS NULL
+              AND embedding IS NULL
+            GROUP BY federation_source
+            """
+        )
+        return {str(row["peer_name"]): int(row["n"]) for row in rows}
 
     async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
         return list(
