@@ -17,6 +17,8 @@ from mnemos.core.config import federation_feed_include_private
 from mnemos.persistence.worker_lifecycle import _Ops, transaction_dialect
 
 CURSOR_PREFIX = "journal:"
+# Rows sequenced per ``_publish`` call; bounds the CASE/IN statement size.
+_PUBLISH_BATCH = 256
 
 
 class FeedRows(list):
@@ -86,6 +88,8 @@ async def _publish(ops: _Ops, memory_id=None, *, memory_ids=None):
     ``memory_ids`` narrows the sweep to a known set of rows. Redispatch uses it
     so it publishes *its own* events and never claims a concurrent publisher's
     pending outbox row -- a global sweep would report those as re-advertised.
+
+    Returns how many rows this call sequenced: at most one ``_PUBLISH_BATCH``.
     """
     await ops.execute("UPDATE federation_change_clock SET value = value WHERE id = 1")
     where = ""
@@ -93,18 +97,21 @@ async def _publish(ops: _Ops, memory_id=None, *, memory_ids=None):
     if memory_ids is not None:
         ids_in = [str(mid) for mid in memory_ids]
         if not ids_in:
-            return
+            return 0
         where = " AND memory_id IN (" + ",".join("?" for _ in ids_in) + ")"
         params = ids_in
     elif memory_id is not None:
         where = " AND memory_id = ?"
         params = [memory_id]
     pending = await ops.fetchall(
-        "SELECT event_id FROM federation_changes WHERE seq IS NULL" + where + " ORDER BY event_id" + _limit(ops, 256),
+        "SELECT event_id FROM federation_changes WHERE seq IS NULL"
+        + where
+        + " ORDER BY event_id"
+        + _limit(ops, _PUBLISH_BATCH),
         *params,
     )
     if not pending:
-        return
+        return 0
     value = int(await ops.scalar("SELECT value FROM federation_change_clock WHERE id = 1"))
     ids = [int(row["event_id"]) for row in pending]
     cases = " ".join(f"WHEN ? THEN {index}" for index, _ in enumerate(ids, 1))
@@ -117,6 +124,7 @@ async def _publish(ops: _Ops, memory_id=None, *, memory_ids=None):
         *ids,
     )
     await ops.execute("UPDATE federation_change_clock SET value = ? WHERE id = 1", value + len(ids))
+    return len(ids)
 
 
 async def _current_states(ops, ids, prefer_compressed=False, *, repo=None, include_embedding=False):
@@ -458,6 +466,11 @@ async def redispatch_memory_ids(tx, memory_ids):
     # ``_publish``: a replica whose cursor is already at ``journal:N`` would
     # never see a replayed event that happened to land on N. _publish bumps
     # the clock by the number of rows it assigns, so the re-advertised events
-    # are strictly after every sequence already handed out.
-    await _publish(ops, memory_ids=[row["id"] for row in rows])
+    # are strictly after every sequence already handed out. One _publish call
+    # sequences at most _PUBLISH_BATCH rows, so drain until a short batch:
+    # otherwise ids past the first batch stay pending and the count below
+    # would claim events that were never published.
+    published_ids = [row["id"] for row in rows]
+    while await _publish(ops, memory_ids=published_ids) == _PUBLISH_BATCH:
+        pass
     return len(rows)
