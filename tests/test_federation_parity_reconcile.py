@@ -749,6 +749,52 @@ async def test_redispatch_reports_only_ids_it_published(synced):
 
 
 @pytest.mark.asyncio
+async def test_redispatch_publishes_every_id_beyond_one_publish_batch(synced):
+    """More ids than one ``_publish`` batch must all be sequenced.
+
+    ``_publish`` assigns at most 256 pending rows per call. Redispatch called
+    it once and returned ``len(rows)``, so 300 ids reported 300 re-advertised
+    while 44 events were still pending -- the count lied, and the deferred
+    rows lost the "reserve the sequence now" guarantee the code relies on.
+    """
+    from mnemos.persistence.federation_journal import _ops, _publish
+
+    ids = [f"bulk-{n:03d}" for n in range(300)]
+    async with synced.source.transactional() as tx:
+        ops = _ops(tx)
+        for mid in ids:
+            await ops.execute(
+                "INSERT INTO memories(id, content, category, owner_id, namespace, permission_mode, created, updated) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                mid,
+                f"content {mid}",
+                FACTS,
+                OWNER,
+                "default",
+                644,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            )
+    # Sequence the insert-trigger events first, so only redispatch's own
+    # events are pending and the batch boundary is exactly 300 vs 256.
+    async with synced.source.transactional() as tx:
+        for _ in range(4):
+            await _publish(_ops(tx), memory_ids=ids)
+    assert await _journal_pending(synced.source, ids) == {}
+    clock_before = await _journal_clock(synced.source)
+
+    async with synced.source.transactional() as tx:
+        served = await synced.source.federation.redispatch_federation_journal(tx, memory_ids=ids)
+
+    pending = await _journal_pending(synced.source, ids)
+    assert pending == {}, f"{len(pending)} redispatched ids left unpublished"
+    journal = await _journal_rows(synced.source, ids)
+    republished = [mid for mid in ids if journal[mid]["n"] == 2 and int(journal[mid]["seq"]) > clock_before]
+    assert served == len(republished) == 300
+    assert await _journal_clock(synced.source) == clock_before + 300
+
+
+@pytest.mark.asyncio
 async def test_parity_without_the_export_set_compares_nothing(synced):
     """`source_available` -- not "are there exportable rows" -- picks the branch.
 
