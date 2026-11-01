@@ -709,8 +709,13 @@ class TestStoreMemoriesConcurrency:
         #   - UPDATE succeeds (we're newer)
         executes: list[tuple] = []
         fetchrows: list[tuple] = []
+        # The marker probe selects deleted_at on every backend (F-2), so the
+        # fake row carries it: the replica here is live, not deleted.
         select_results = [
-            {"federation_remote_updated": datetime(2026, 5, 1, tzinfo=timezone.utc)},  # post-conflict refetch
+            {
+                "federation_remote_updated": datetime(2026, 5, 1, tzinfo=timezone.utc),
+                "deleted_at": None,
+            },  # post-conflict refetch
         ]
 
         class _FakeConn:
@@ -788,12 +793,17 @@ class TestStoreMemoriesConcurrency:
                     {
                         "id": "fed:pythia:mem_race",
                         "federation_remote_updated": datetime(2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc),
+                        "deleted_at": None,
                     }
                 ]
 
             async def fetchrow(self, sql, *args):
                 # Existing row: T0 baseline (older than both A and B).
-                return {"federation_remote_updated": datetime(2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc)}
+                # ``deleted_at`` is part of the marker contract (F-2).
+                return {
+                    "federation_remote_updated": datetime(2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc),
+                    "deleted_at": None,
+                }
 
             async def execute(self, sql, *args):
                 execute_calls.append((sql, args))

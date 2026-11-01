@@ -1130,6 +1130,12 @@ async def _store_memories(
             # Refresh after the durable fence, including other events in this batch.
             if mem.get("federation_sequence") is not None:
                 await journal.prepare_versioned_update(tx, peer_name, remote_id)
+            # The re-read stays AFTER the prepare: the fence nulls
+            # ``federation_remote_updated`` so the versioned write supersedes a
+            # source clock that moved backwards or repeats a timestamp. Reading
+            # before it would hand the freshness check the pre-fence value and
+            # drop exactly those events.
+            existing = await repo.fetch_federated_memory_marker(tx, local_id)
         mutation_applied = False
         source_audit_provenance: dict[str, Any] = {}
         primary_eid = mem.get("audit_latest_entry_id")

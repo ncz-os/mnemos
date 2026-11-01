@@ -519,13 +519,15 @@ def test_sqlite_sync_log_writer_updates_and_never_inserts():
     assert "UPDATE federation_sync_log" in region
     assert "INSERT INTO federation_sync_log" not in region
     # Every column the statement sets has a matching bind, and nothing else.
-    # 11 assignments = finished_at (= CURRENT_TIMESTAMP) + 10 bound columns.
+    # 12 assignments = finished_at (= CURRENT_TIMESTAMP) + 11 bound columns
+    # (the 0069 ``skipped_deleted`` counter is the 11th).
     set_columns = region.split("SET", 1)[1].split("WHERE", 1)[0]
     assigned = [line for line in set_columns.splitlines() if "=" in line]
-    assert len(assigned) == 11, assigned
+    assert len(assigned) == 12, assigned
     assert len(assigned) - 1 == region.split("WHERE", 1)[0].count("?")
     assert "events_received = ?" in region
     assert "rows_without_embedding = ?" in region
+    assert "skipped_deleted = ?" in region
 
 
 def test_postgres_ef_search_is_bound_as_text():
