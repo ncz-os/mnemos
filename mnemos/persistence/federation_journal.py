@@ -9,7 +9,7 @@ a still-authorized subscriber the current row, using the same source version.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from typing import Any
 
@@ -377,3 +377,105 @@ async def save_peer_cursor(tx, peer_id, cursor_value, filter_signature):
             cursor_value,
             filter_signature,
         )
+
+
+def _cutoff(days: int) -> datetime:
+    """The retention cutoff, as a tz-aware UTC ``datetime``.
+
+    Never a pre-formatted string: ``_Ops.sql`` only rewrites ``?`` to ``$n``
+    for Postgres, and the column type differs per backend (TEXT on SQLite,
+    TIMESTAMPTZ on Postgres) -- the ``_Ops`` wrapper decides how a
+    ``datetime`` is bound for each dialect.
+    """
+    return datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+
+
+def compaction_sql(dialect: str) -> str:
+    """``DELETE`` superseded journal events; one dialect-valid statement each.
+
+    Two shapes, because the statement cannot be written once:
+
+    * MySQL/MariaDB forbid a correlated subquery that references the table
+      being deleted from (error 1093), so the newest event per memory is
+      materialised by a derived table and the delete joins ``NOT IN``.
+    * Oracle has no ``DELETE FROM t WHERE ...`` over a joined target unless
+      the target is aliased, and Db2 rejects the unaliased form for the same
+      statement, so those two use the ``stale`` alias one level up from the
+      correlation.
+
+    Everything else -- SQLite and Postgres -- takes the plain correlated
+    ``EXISTS``, which is also the shape the SQLite tests exercise.
+    """
+    if dialect == "mysql":
+        return (
+            "DELETE FROM federation_changes WHERE seq IS NOT NULL AND changed_at < ? AND seq NOT IN ("
+            "  SELECT keep_seq FROM ("
+            "    SELECT MAX(seq) AS keep_seq FROM federation_changes "
+            "    WHERE seq IS NOT NULL AND changed_at < ? "
+            "    GROUP BY memory_id"
+            "  ) AS keep"
+            ")"
+        )
+    if dialect in {"oracle", "db2"}:
+        return (
+            "DELETE FROM federation_changes stale "
+            "WHERE stale.seq IS NOT NULL "
+            "AND stale.changed_at < ? "
+            "AND EXISTS ("
+            "  SELECT 1 FROM federation_changes newer "
+            "  WHERE newer.memory_id = stale.memory_id "
+            "  AND newer.seq IS NOT NULL "
+            "  AND newer.seq > stale.seq"
+            ")"
+        )
+    return (
+        "DELETE FROM federation_changes "
+        "WHERE seq IS NOT NULL "
+        "AND changed_at < ? "
+        "AND EXISTS ("
+        "  SELECT 1 FROM federation_changes AS newer "
+        "  WHERE newer.memory_id = federation_changes.memory_id "
+        "  AND newer.seq IS NOT NULL "
+        "  AND newer.seq > federation_changes.seq"
+        ")"
+    )
+
+
+async def compact(tx: Any, *, older_than_days: int = 30) -> int:
+    """F-4: drop superseded journal events, keeping one per memory.
+
+    The feed resolves each memory through its newest published event, so
+    every event except that one contributes nothing to any future consumer
+    and has already been acknowledged by every cursor past it. This deletes
+    those.
+
+    Two guards make it safe to run on a live source:
+
+    * ``seq IS NOT NULL`` -- an unpublished event has not been handed to a
+      consumer yet; ``_publish`` owns draining that backlog and compaction
+      must never race it. Only *published* events are candidates, so the
+      survivor is the newest published event, which is the one the feed
+      already resolves to.
+    * ``changed_at < cutoff`` -- a recent event may still be inside a
+      consumer's in-flight page.
+
+    The newest event is kept *whatever its age*: dropping it would make the
+    memory invisible to a consumer that has not caught up, and a
+    re-appearing row is worse than one extra row per memory.
+
+    Ordered by ``seq``, never by ``event_id``/``changed_at``: the two are
+    independent (``seq`` is assigned at publish time, events can publish out
+    of insertion order), so "the newest published event" is the ``MAX(seq)``
+    the feed itself uses -- see :func:`compaction_sql`.
+
+    Returns the number of events removed. ``0`` when
+    ``MNEMOS_FEDERATION_JOURNAL_COMPACTION`` is off.
+    """
+    from mnemos.core.config import federation_journal_compaction_enabled
+
+    if not federation_journal_compaction_enabled():
+        return 0
+    ops = _ops(tx)
+    cutoff = _cutoff(older_than_days)
+    sql = compaction_sql(ops.dialect)
+    return int(await ops.execute(sql, cutoff, *((cutoff,) if ops.dialect == "mysql" else ())))

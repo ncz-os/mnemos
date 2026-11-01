@@ -1456,6 +1456,12 @@ async def _ensure_mysql_federation_journal(conn: Any, *, separate_embeddings: bo
     sql = (directory / "0062_federation_journal.sql").read_text()
     if separate_embeddings:
         sql = sql.replace(" OR NOT (OLD.embedding <=> NEW.embedding)", "")
+    # F-4: 0067 re-creates fed_journal_update with the narrowed predicate
+    # (no subcategory/updated/source_*). It is replayed here, after 0062,
+    # rather than relying on an ordered migration runner -- this provisioning
+    # path is the one every MySQL/MariaDB node actually takes.
+    sql += (directory / "0067_federation_journal_narrow_trigger.sql").read_text()
+    if separate_embeddings:
         sql += (directory.parent / "mariadb_helpers" / "federation_journal_mariadb_embeddings.sql").read_text()
     async with conn.cursor() as cursor:
         for statement in _split_mysql_statements(sql):
@@ -7291,6 +7297,11 @@ class MysqlFederationRepository(FederationRepository):
         from mnemos.persistence.federation_journal import get_feed_memory
 
         return await get_feed_memory(self, tx, memory_id, namespaces=namespaces, categories=categories)
+
+    async def compact_journal(self, tx, *, older_than_days: int = 30) -> int:
+        from mnemos.persistence.federation_journal import compact
+
+        return await compact(tx, older_than_days=older_than_days)
 
     async def _legacy_get_feed_memory(
         self,

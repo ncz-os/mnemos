@@ -160,6 +160,7 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "0064_federation_journal_dialects.sql",
     "migrations_v7_0_api_keys_key_prefix_sqlite.sql",
     "migrations_v7_0_default_user_seed_sqlite.sql",
+    "migrations_v7_2_federation_journal_narrow_trigger_sqlite.sql",  # F-4: narrowed journal trigger
 ]
 
 

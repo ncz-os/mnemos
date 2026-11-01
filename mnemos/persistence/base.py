@@ -2521,6 +2521,20 @@ class FederationRepository(ABC):
         categories: Sequence[str],
     ) -> Row | None: ...
 
+    async def compact_journal(self, tx: Transaction, *, older_than_days: int = 30) -> int:
+        """F-4: drop superseded federation journal events; return the count.
+
+        The journal accumulates one event per mutation, while the feed
+        collapses each memory's events to its newest published one, so every
+        other event is dead weight every consumer cursor has already passed.
+        Compaction removes those, keeping the event the feed resolves to.
+
+        The default implementation is a no-op returning ``0``; backends that
+        implement the journal override it. A backend that does not override it
+        keeps its full journal, exactly as before F-4.
+        """
+        return 0
+
     @abstractmethod
     async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None: ...
 

@@ -4350,6 +4350,11 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
 
         return await get_feed_memory(self, tx, memory_id, namespaces=namespaces, categories=categories)
 
+    async def compact_journal(self, tx, *, older_than_days: int = 30) -> int:
+        from mnemos.persistence.federation_journal import compact
+
+        return await compact(tx, older_than_days=older_than_days)
+
     async def _legacy_get_feed_memory(
         self,
         tx: Any,

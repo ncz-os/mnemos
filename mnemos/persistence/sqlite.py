@@ -175,6 +175,9 @@ SQLITE_MIGRATION_FILES = [
     # phase 1.5: ModelRegistryRepository tables (model_prices, field obs,
     # benchmarks, curated_routing, health) + nullable price columns.
     "migrations_v7_1_model_registry_repository_sqlite.sql",
+    # F-4: narrow the federation journal update trigger to the columns the
+    # feed actually exports (drops the bookkeeping-only and no-op fires).
+    "migrations_v7_2_federation_journal_narrow_trigger_sqlite.sql",
 ]
 
 
@@ -6505,6 +6508,11 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         from mnemos.persistence.federation_journal import get_feed_memory
 
         return await get_feed_memory(self, tx, memory_id, namespaces=namespaces, categories=categories)
+
+    async def compact_journal(self, tx, *, older_than_days: int = 30) -> int:
+        from mnemos.persistence.federation_journal import compact
+
+        return await compact(tx, older_than_days=older_than_days)
 
     async def _legacy_get_feed_memory(
         self,

@@ -1152,6 +1152,43 @@ def db_ensure_schema() -> None:
     typer.echo(f"Schema ensured for {backend_name}.")
 
 
+@db_app.command("compact-federation-journal")
+def db_compact_federation_journal(
+    older_than_days: int = typer.Option(
+        30,
+        "--older-than-days",
+        help="Only events older than this many days are eligible.",
+        is_flag=False,
+    ),
+) -> None:
+    """Drop superseded federation journal events (F-4).
+
+    Keeps one event per memory -- the one the feed resolves to -- and removes
+    the older ones that every consumer cursor has already passed. Gated by
+    ``MNEMOS_FEDERATION_JOURNAL_COMPACTION`` (default on).
+    """
+    if older_than_days <= 0:
+        typer.echo("ERROR: --older-than-days must be positive.", err=True)
+        raise typer.Exit(2)
+
+    async def _run() -> int:
+        backend, close_backend = await _open_cli_persistence_backend()
+        try:
+            async with backend.transactional() as tx:
+                return await backend.federation.compact_journal(tx, older_than_days=older_than_days)
+        finally:
+            if close_backend:
+                await backend.close()
+
+    try:
+        removed = asyncio.run(_run())
+    except Exception as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo(f"Compacted {removed} federation journal event(s).")
+
+
 @app.command("dump-openapi")
 def dump_openapi(
     output: Optional[str] = typer.Option(

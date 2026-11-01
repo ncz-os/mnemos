@@ -2070,6 +2070,41 @@ def federation_replica_fence_enabled() -> bool:
     return True
 
 
+def federation_journal_compaction_enabled() -> bool:
+    """Whether the federation outbox may be compacted (F-4).
+
+    ``federation_changes`` keeps one row per mutation, forever, while the feed
+    collapses every memory's events to its current state. A local re-embed or
+    a metadata backfill therefore appends dead weight that every consumer
+    cursor has already passed.
+
+    **Defaults to TRUE (the safe side).** Compaction only ever removes events
+    that are (a) older than the retention window and (b) already published --
+    an unpublished event has not reached any consumer yet and is never
+    touched. The newest event per memory is kept, which is exactly the row the
+    feed resolves to, so a compacted journal still describes the current state
+    of every memory once.
+
+    Set ``MNEMOS_FEDERATION_JOURNAL_COMPACTION=0`` for a deployment that needs
+    the full mutation history retained on the host (forensic replay of a
+    peer's event stream). An unrecognised value falls back to compaction
+    enabled with a warning.
+    """
+    raw = runtime_env_value_stripped("MNEMOS_FEDERATION_JOURNAL_COMPACTION").lower()
+    if not raw:
+        return True
+    if raw in {"no", "0", "false", "off"}:
+        return False
+    if raw in {"yes", "1", "true", "on"}:
+        return True
+    logger.warning(
+        "MNEMOS_FEDERATION_JOURNAL_COMPACTION=%r is not a recognised value; expected "
+        "1/true/yes/on or 0/false/no/off. Using the default (compact).",
+        raw,
+    )
+    return True
+
+
 #: ``MNEMOS_AUDIT_CHAIN`` read once at startup — here at settings-build time and
 #: again on every ``reload_settings()`` — and cached, instead of being re-parsed
 #: (and re-warned) on every audited mutation (M7). ``None`` means "not resolved
