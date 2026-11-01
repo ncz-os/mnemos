@@ -150,6 +150,80 @@ def test_narrowed_trigger_no_longer_fires_on_updated(directory, name):
     assert not _fires_on_updated(region), f"{directory}/{name} still fires on: updated"
 
 
+#: Oracle column types for the journaled columns (0001/0045 core schema).
+#: CLOBs need ``DBMS_LOB.COMPARE`` and ``VECTOR`` has no comparison operator,
+#: so each family gets its own value-change spelling.
+ORACLE_CLOB_COLUMNS = ("content", "metadata", "verbatim_content")
+ORACLE_VECTOR_COLUMNS = ("embedding",)
+
+
+def _oracle_narrowed_region() -> str:
+    text = (MIGRATIONS / "migrations_oracle" / "0068_federation_journal_narrow_trigger.sql").read_text()
+    return re.sub(r"\s+", " ", _update_trigger_region(text))
+
+
+def _oracle_value_change_arm(column: str) -> str:
+    """Regex for the arm that is true when both sides are non-NULL and differ."""
+    old, new = rf":OLD\.{column}\b", rf":NEW\.{column}\b"
+    if column in ORACLE_CLOB_COLUMNS:
+        return rf"DBMS_LOB\.COMPARE\(\s*{old}\s*,\s*{new}\s*\)\s*<>\s*0"
+    if column in ORACLE_VECTOR_COLUMNS:
+        return rf"VECTOR_DISTANCE\(\s*{old}\s*,\s*{new}\s*,\s*EUCLIDEAN\s*\)\s*<>\s*0"
+    return rf"{old}\s*<>\s*{new}"
+
+
+@pytest.mark.parametrize("column", KEPT)
+def test_oracle_narrowed_trigger_compares_values_null_safely(column):
+    """Oracle must suppress same-value UPDATEs like the other twins.
+
+    ``UPDATING('col')`` is true whenever ``col`` is in the SET list, even when
+    the value is unchanged, so a writer that rewrites a row with the same
+    content appended a journal event on Oracle that SQLite (``IS NOT``),
+    Postgres (``IS DISTINCT FROM``) and MySQL (``NOT <=>``) all suppress.
+    Each journaled column needs a value comparison plus both NULL-transition
+    arms, because ``<>`` alone is NULL (not true) when either side is NULL.
+    """
+    region = _oracle_narrowed_region()
+    assert re.search(_oracle_value_change_arm(column), region), f"no value comparison for {column}"
+    assert re.search(rf":OLD\.{column} IS NULL AND :NEW\.{column} IS NOT NULL", region), (
+        f"{column}: NULL -> value is not journaled"
+    )
+    assert re.search(rf":OLD\.{column} IS NOT NULL AND :NEW\.{column} IS NULL", region), (
+        f"{column}: value -> NULL is not journaled"
+    )
+
+
+def test_oracle_narrowed_trigger_does_not_gate_on_updating_alone():
+    """``UPDATING('col')`` may only short-circuit a value comparison, never replace one.
+
+    The vector comparison runs as SQL, so ``UPDATING('embedding')`` is allowed
+    as a cheap pre-check in front of it; no other column may use UPDATING.
+    """
+    region = _oracle_narrowed_region()
+    gated = set(re.findall(r"UPDATING\(\s*'(\w+)'\s*\)", region))
+    assert gated <= set(ORACLE_VECTOR_COLUMNS), f"Oracle still gates on UPDATING for: {sorted(gated)}"
+
+
+def test_oracle_narrowed_trigger_never_compares_lobs_or_vectors_with_operators():
+    """A bare ``<>`` on a CLOB/VECTOR is an ORA error or a silent truncation."""
+    region = _oracle_narrowed_region()
+    for column in ORACLE_CLOB_COLUMNS + ORACLE_VECTOR_COLUMNS:
+        assert not re.search(rf":OLD\.{column}\s*(<>|!=|=)\s*:NEW\.{column}\b", region), column
+
+
+def test_oracle_narrowed_trigger_splits_into_one_plsql_block():
+    """The runner must hand Oracle the whole trigger as a single statement."""
+    from mnemos.persistence.schema import split_oracle_statements
+
+    text = (MIGRATIONS / "migrations_oracle" / "0068_federation_journal_narrow_trigger.sql").read_text()
+    statements = split_oracle_statements(text)
+    assert len(statements) == 1, statements
+    body = statements[0]
+    assert "CREATE OR REPLACE TRIGGER fed_journal_update AFTER UPDATE ON memories FOR EACH ROW" in body
+    assert body.rstrip().endswith("END;")
+    assert "INSERT INTO federation_changes" in body
+
+
 def test_mysql_provisioning_replays_the_narrowed_trigger():
     """The MySQL/MariaDB nodes provision the journal in code, not via a runner."""
     source = (Path(__file__).resolve().parents[1] / "mnemos" / "persistence" / "mysql.py").read_text()
