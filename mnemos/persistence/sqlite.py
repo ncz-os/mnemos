@@ -170,6 +170,7 @@ SQLITE_MIGRATION_FILES = [
     "0054_memory_tags.sql",
     "0062_federation_journal.sql",
     "0064_federation_journal_dialects.sql",
+    "0067_federation_sync_counters.sql",
     "migrations_v7_0_api_keys_key_prefix_sqlite.sql",
     "migrations_v7_0_default_user_seed_sqlite.sql",
     # phase 1.5: ModelRegistryRepository tables (model_prices, field obs,
@@ -6295,7 +6296,8 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             """
             SELECT id, started_at, finished_at, memories_pulled,
                    memories_new, memories_updated, error,
-                   cursor_before, cursor_after
+                   cursor_before, cursor_after,
+                   events_received, rows_without_embedding
             FROM federation_sync_log
             WHERE peer_id = ?
             ORDER BY started_at DESC
@@ -6612,6 +6614,8 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         memories_updated: int,
         error: str | None,
         cursor_after: Any,
+        events_received: int = 0,
+        rows_without_embedding: int = 0,
     ) -> None:
         await _execute(
             self._conn(tx),
@@ -6623,6 +6627,8 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                 memories_updated = ?,
                 records_seen = ?,
                 records_written = ?,
+                events_received = ?,
+                rows_without_embedding = ?,
                 status = ?,
                 error = ?,
                 cursor_after = ?
@@ -6632,14 +6638,46 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                 memories_pulled,
                 memories_new,
                 memories_updated,
-                memories_pulled,
+                # records_seen is the WIRE count (events_received), and
+                # records_written is the APPLIED count — the same value
+                # memories_pulled carries.
+                events_received,
                 memories_new + memories_updated,
+                events_received,
+                rows_without_embedding,
                 "error" if error else "ok",
                 error,
                 cursor_after,
                 str(log_id),
             ),
         )
+
+    async def count_federated_rows_without_embedding_per_peer(self, tx: Transaction) -> dict[str, int]:
+        """Count federated rows with no embedding, grouped by peer name.
+
+        SQLite stores the vector in ``memories.embedding`` (JSON text) and
+        mirrors it into ``memory_embeddings``. A row counts as embedded
+        when either carries a value, because the canonical read path
+        falls back between them.
+        """
+        rows = await _fetch_all(
+            self._conn(tx),
+            """
+            SELECT federation_source AS peer_name, COUNT(*) AS n
+            FROM memories
+            WHERE federation_source IS NOT NULL
+              AND deleted_at IS NULL
+              AND archived_at IS NULL
+              AND consolidated_into IS NULL
+              AND embedding IS NULL
+              AND id NOT IN (
+                  SELECT memory_id FROM memory_embeddings
+                  WHERE embedding IS NOT NULL
+              )
+            GROUP BY federation_source
+            """,
+        )
+        return {str(row["peer_name"]): int(row["n"]) for row in rows}
 
     async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None:
         await _execute(
@@ -8106,6 +8144,9 @@ class SqliteBackend:
                 "memories_updated": "memories_updated INTEGER NOT NULL DEFAULT 0",
                 "cursor_before": "cursor_before TEXT",
                 "cursor_after": "cursor_after TEXT",
+                # F-1: wire events vs applied rows, and the F-5 embedding gap.
+                "events_received": "events_received INTEGER NOT NULL DEFAULT 0",
+                "rows_without_embedding": "rows_without_embedding INTEGER NOT NULL DEFAULT 0",
             },
         )
 

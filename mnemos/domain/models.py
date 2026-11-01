@@ -1462,6 +1462,11 @@ class FederationPeer(BaseModel):
     compat_mode: str = "strict"
     peer_mnemos_version: Optional[str] = None
     last_schema_check_at: Optional[str] = None
+    # F-5: how many rows this peer contributed carry NO embedding. A
+    # replica in this state is FTS-only: vector search excludes NULL
+    # embeddings, so the corpus silently loses semantic recall. This is
+    # the per-peer number that makes that gap visible.
+    rows_without_embedding: int = 0
     created: str
     updated: str
 
@@ -1487,6 +1492,18 @@ class FederationSyncLogEntry(BaseModel):
     error: Optional[str] = None
     cursor_before: Optional[str] = None
     cursor_after: Optional[str] = None
+    # F-1: the WIRE count (journal events received) kept separate from
+    # ``memories_pulled`` (rows actually applied). A journal replay
+    # emits one wire row per event, so counting wire rows inflated the
+    # pulled counter on every replay.
+    events_received: int = 0
+    # F-5: how many of this peer's federated rows still carry no
+    # embedding. This is the PER-PEER TOTAL at the time of the sync (the
+    # durable count from the database), not the number of rows this one
+    # sync applied: it covers rows applied by earlier syncs too, so an
+    # operator sees the whole embedding gap for the peer rather than
+    # only the slice the latest poll touched.
+    rows_without_embedding: int = 0
 
 
 class FederationSyncLogResponse(BaseModel):
