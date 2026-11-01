@@ -738,6 +738,71 @@ async def pull_memory_by_id(
     return []
 
 
+async def _repair_locally_damaged_replica(
+    repo: FederationRepository,
+    tx: Transaction,
+    peer_name: str,
+    remote_id: str,
+    mem: Dict[str, Any],
+) -> bool:
+    """F-3: re-open a locally damaged replica when its source replays.
+
+    Called only after ``accept_event`` rejected an already-seen sequence --
+    the normal path for a re-seed, a restored backup, or a peer that
+    re-numbers its journal. A healthy replica answers ``False`` here: nothing
+    to repair, so the replay stays a pure no-op and does not echo back.
+
+    Returns ``True`` only when the row was actually restored, so the caller
+    can count it once. The restore is a single conditional UPDATE, which is
+    what keeps two concurrent consumers from both counting it.
+    """
+    from mnemos.core.config import federation_replica_fence_enabled
+
+    if not federation_replica_fence_enabled():
+        return False
+    restore = getattr(repo, "restore_federated_memory_after_local_damage", None)
+    if not callable(restore):
+        return False
+    # The same caps and classification the normal write path applies, so a
+    # repair can never widen what a peer may store on this host.
+    content = _cap(mem.get("content", ""), FEDERATION_MAX_CONTENT)
+    verbatim = _cap(
+        mem.get("verbatim_content") or mem.get("content", ""),
+        FEDERATION_MAX_CONTENT,
+    )
+    category = _cap(mem.get("category", "federation"), FEDERATION_MAX_NAME)
+    subcategory = _cap(mem.get("subcategory"), FEDERATION_MAX_NAME)
+    namespace = _cap(mem.get("namespace") or "default", FEDERATION_MAX_NAME)
+    meta_raw = mem.get("metadata") or {}
+    if isinstance(meta_raw, dict):
+        meta_raw = {**meta_raw, "federation_remote_id": remote_id}
+    else:
+        meta_raw = {"federation_remote_id": remote_id}
+    classified = classify_persisted_text_fields(
+        content=content,
+        verbatim_content=verbatim,
+        compressed_content=None,
+        metadata=meta_raw,
+        namespace=namespace,
+        classified_at="federation_pull",
+        memory_id=f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}",
+    )
+    metadata_json = json.dumps(dict(classified.metadata))
+    if len(metadata_json) > FEDERATION_MAX_METADATA:
+        metadata_json = json.dumps({"federation_remote_id": remote_id, "_metadata_truncated": True})
+    return await restore(
+        tx,
+        local_id=f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}",
+        peer_name=peer_name,
+        content=content,
+        verbatim_content=verbatim,
+        category=category,
+        subcategory=subcategory,
+        metadata_json=metadata_json,
+        namespace=classified.namespace,
+    )
+
+
 async def _store_memories(
     repo: FederationRepository,
     tx: Transaction,
@@ -803,6 +868,12 @@ async def _store_memories(
                 remote_updated=mem.get("updated") or mem.get("consolidated_at") or mem.get("created"),
                 withdrawn=False,
             ):
+                # F-3: the sequence is already fenced. If a LOCAL sweep
+                # damaged the replica after we applied it (an older build
+                # archived or soft-deleted it), restore the row so this
+                # replay repairs it instead of being discarded forever.
+                if await _repair_locally_damaged_replica(repo, tx, peer_name, remote_id, mem):
+                    upd_n += 1
                 continue
         if mem.get("type") == "consolidation":
             upd_n += await _apply_consolidation_tombstone(repo, tx, peer_name, mem)

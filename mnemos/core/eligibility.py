@@ -20,11 +20,47 @@ def eligible_memory_predicate(alias: str = "m") -> str:
     return qualify_memory_predicate(MEMORY_ELIGIBILITY_PREDICATE, alias)
 
 
+def _replica_fence_enabled() -> bool:
+    """Resolve the F-3 replica fence switch; default ON when unresolvable."""
+    try:
+        from mnemos.core.config import federation_replica_fence_enabled
+
+        return federation_replica_fence_enabled()
+    except Exception:
+        return True
+
+
+def local_sweep_predicate(alias: str = "m") -> str:
+    """F-3 (Fable report F2/F5): the guard every LOCAL sweep must carry.
+
+    A replica (``federation_source IS NOT NULL``) converges only from its
+    source. PERSEPHONE archival, ARTEMIS dedup, MORPHEUS consolidation and the
+    deletion sweeps are local heuristics; rewriting a replica is permanent
+    damage, because the receiver's durable sequence fence
+    (``federation_journal.accept_event``) rejects the source's replay before
+    any write. So each of them ANDs this fragment into its selection.
+
+    Returns an empty string when ``MNEMOS_FEDERATION_REPLICA_FENCE`` is off,
+    which restores the pre-fix selection exactly.
+    """
+    if not _replica_fence_enabled():
+        return ""
+    prefix = f"{alias}." if alias else ""
+    return f"{prefix}federation_source IS NULL"
+
+
+def with_local_sweep_predicate(predicate: str, alias: str = "m") -> str:
+    """AND the replica fence onto an existing predicate."""
+    fence = local_sweep_predicate(alias)
+    return f"{predicate} AND {fence}" if fence else predicate
+
+
 def eligible_for_morpheus(alias: str = "m") -> str:
     predicate = eligible_memory_predicate(alias)
     prefix = f"{alias}." if alias else ""
     vault_literal = VAULT_NAMESPACE.replace("'", "''")
-    return f"{predicate} AND ({prefix}namespace IS NULL OR {prefix}namespace <> '{vault_literal}')"
+    predicate = f"{predicate} AND ({prefix}namespace IS NULL OR {prefix}namespace <> '{vault_literal}')"
+    return with_local_sweep_predicate(predicate, alias)
 
 
 def eligible_for_compression(alias: str = "m", *, reject_private_parent: bool = False) -> str:
@@ -142,5 +178,7 @@ __all__ = [
     "eligible_for_federation_withdrawal",
     "eligible_for_morpheus",
     "eligible_memory_predicate",
+    "local_sweep_predicate",
     "qualify_memory_predicate",
+    "with_local_sweep_predicate",
 ]

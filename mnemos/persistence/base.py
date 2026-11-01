@@ -2578,21 +2578,40 @@ class FederationRepository(ABC):
     @abstractmethod
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None: ...
 
-    async def fetch_federated_memory_markers(
+    async def restore_federated_memory_after_local_damage(
         self,
         tx: Transaction,
-        local_ids: Sequence[str],
-    ) -> dict[str, Row]:
-        """Fetch page markers, with a compatibility fallback for backends.
+        *,
+        local_id: str,
+        peer_name: str,
+        content: str,
+        verbatim_content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        namespace: str,
+    ) -> bool:
+        """F-3: undo LOCAL lifecycle damage on a replica whose source replayed.
 
-        Backends with a native set-membership query should override this.
+        A replica must never be rewritten by a local sweep, but an older build
+        did exactly that (PERSEPHONE archival, ARTEMIS/MORPHEUS consolidation,
+        the deletion sweeps), and a receiver's durable sequence fence then
+        rejects the source's replay before any write -- so the row could only
+        come back from a full re-seed. When a fenced sequence IS replayed, this
+        restores the row to the state its source asserts: the source's content
+        plus a live, unarchived, unconsolidated lifecycle.
+
+        It is deliberately narrow and idempotent: one conditional UPDATE, only
+        on a row that still belongs to ``peer_name``, and only when the row is
+        actually damaged -- so a replay of a row the replica already holds
+        stays a pure no-op (no second count, no ``updated`` bump that would
+        echo back to the peer, and no write at all).
+
+        The default implementation is a no-op returning ``False``; backends
+        that can express it override it. A backend that does not override it
+        keeps the fence semantics it had before F-3.
         """
-        markers: dict[str, Row] = {}
-        for local_id in local_ids:
-            row = await self.fetch_federated_memory_marker(tx, local_id)
-            if row is not None:
-                markers[local_id] = row
-        return markers
+        return False
 
     @abstractmethod
     async def insert_federated_memory(

@@ -1365,9 +1365,10 @@ class PostgresMemoryRepository(MemoryRepository):
         namespace: str | None = None,
     ) -> list[Row]:
         conn = _postgres_tx(tx).conn
+        fence = _eligibility.local_sweep_predicate("") or "TRUE"
         return list(
             await conn.fetch(
-                """
+                f"""
             SELECT
                 owner_id,
                 namespace,
@@ -1385,6 +1386,7 @@ class PostgresMemoryRepository(MemoryRepository):
                   AND consolidated_into IS NULL
                   AND content_hash IS NOT NULL
                   AND ($1::text IS NULL OR namespace=$1)
+                  AND {fence}
             ) candidates
             GROUP BY owner_id, namespace, content_hash, normalized_content
             HAVING COUNT(*) > 1
@@ -1403,8 +1405,11 @@ class PostgresMemoryRepository(MemoryRepository):
     ) -> int:
         if not duplicate_ids:
             return 0
+        # F-3: a replica is never a consolidation target, and never redirected
+        # into a local canonical row -- its lifecycle belongs to its source.
+        fence = _eligibility.local_sweep_predicate("") or "TRUE"
         result = await _postgres_tx(tx).conn.execute(
-            """
+            f"""
             UPDATE memories
             SET consolidated_into = $1,
                 consolidated_at = NOW(),
@@ -1415,12 +1420,14 @@ class PostgresMemoryRepository(MemoryRepository):
               AND deleted_at IS NULL
               AND archived_at IS NULL
               AND consolidated_into IS NULL
+              AND {fence}
               AND EXISTS (
                   SELECT 1 FROM memories
                   WHERE id = $1
                     AND deleted_at IS NULL
                     AND archived_at IS NULL
                     AND consolidated_into IS NULL
+                    AND {fence}
               )
             """,
             canonical_id,
@@ -5855,6 +5862,50 @@ class PostgresFederationRepository(FederationRepository):
         )
         return {str(row["id"]): row for row in rows}
 
+    async def restore_federated_memory_after_local_damage(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        peer_name: str,
+        content: str,
+        verbatim_content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        namespace: str,
+    ) -> bool:
+        """F-3: restore a replica that a LOCAL sweep damaged, in place."""
+        result = await _postgres_tx(tx).conn.execute(
+            """
+            UPDATE memories
+               SET content = $3,
+                   verbatim_content = $4,
+                   category = $5,
+                   subcategory = $6,
+                   metadata = $7::jsonb,
+                   namespace = $8,
+                   deleted_at = NULL,
+                   archived_at = NULL,
+                   consolidated_into = NULL,
+                   consolidated_at = NULL
+             WHERE id = $1
+               AND federation_source = $2
+               AND (deleted_at IS NOT NULL
+                    OR archived_at IS NOT NULL
+                    OR consolidated_into IS NOT NULL)
+            """,
+            local_id,
+            peer_name,
+            content,
+            verbatim_content,
+            category,
+            subcategory,
+            metadata_json,
+            namespace,
+        )
+        return _pg_result_count(result) > 0
+
     async def insert_federated_memory(
         self,
         tx: Transaction,
@@ -6825,6 +6876,9 @@ class PostgresMorpheusRepository(MorpheusRepository):
         memories_consolidated = 0
         clusters_consolidated = 0
         eligibility_clause = _eligibility.eligible_for_morpheus("")
+        # F-3: MORPHEUS rewrites permission_mode and metadata -- a local,
+        # derived decision -- so it must never touch a replica.
+        fence_clause = f"AND {_eligibility.local_sweep_predicate('')}" if _eligibility.local_sweep_predicate("") else ""
         for cluster in clusters:
             member_ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
             if len(member_ids) < min_size:
@@ -6837,6 +6891,7 @@ class PostgresMorpheusRepository(MorpheusRepository):
                       FROM memories
                      WHERE id = ANY($1::text[])
                        AND {eligibility_clause}
+                       {fence_clause}
                        AND ($2::text IS NULL OR namespace = $2)
                      FOR UPDATE
                     """,
@@ -6900,6 +6955,7 @@ class PostgresMorpheusRepository(MorpheusRepository):
                      WHERE id = $1
                        AND deleted_at IS NULL AND archived_at IS NULL
                        AND consolidated_into IS NULL AND morpheus_run_id IS NULL
+                       {fence_clause}
                        AND ($4::text IS NULL OR namespace = $4)
                     """,
                     member_id,

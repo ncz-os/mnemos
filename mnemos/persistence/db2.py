@@ -32,6 +32,7 @@ from functools import lru_cache
 from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
+from mnemos.core import eligibility as _eligibility
 from mnemos.core.config import db2_text_search_override, db2_vector_index_override
 from mnemos.core import webhook_constants
 from mnemos.core.secret_detection import VAULT_NAMESPACE
@@ -2006,6 +2007,9 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 "consolidated_into IS NULL",
                 "content_hash IS NOT NULL",
             ]
+            fence = _eligibility.local_sweep_predicate("")
+            if fence:
+                where.append(fence)
             params_list: list[Any] = []
             if namespace is not None:
                 where.append("namespace = ?")
@@ -2055,6 +2059,9 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         try:
             placeholders = ",".join("?" for _ in duplicate_ids)
             params_list = list(duplicate_ids) + [canonical_id]
+            # F-3: a replica's lifecycle belongs to its source.
+            fence = _eligibility.local_sweep_predicate("")
+            duplicate_guard = f"AND {fence}" if fence else ""
             await _call(
                 cursor.execute,
                 f"""
@@ -2063,6 +2070,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                  WHERE id IN ({placeholders})
                    AND id != ?
                    AND deleted_at IS NULL
+                   {duplicate_guard}
                 """,
                 tuple(params_list),
             )
@@ -3704,6 +3712,58 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 (local_id,),
             )
             return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def restore_federated_memory_after_local_damage(
+        self,
+        tx: Any,
+        *,
+        local_id: str,
+        peer_name: str,
+        content: str,
+        verbatim_content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        namespace: str,
+    ) -> bool:
+        """F-3: restore a replica that a LOCAL sweep damaged, in place."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE memories
+                   SET content = ?,
+                       verbatim_content = ?,
+                       category = ?,
+                       subcategory = ?,
+                       metadata = ?,
+                       namespace = ?,
+                       deleted_at = NULL,
+                       archived_at = NULL,
+                       consolidated_into = NULL,
+                       consolidated_at = NULL
+                 WHERE id = ?
+                   AND federation_source = ?
+                   AND (deleted_at IS NOT NULL
+                        OR archived_at IS NOT NULL
+                        OR consolidated_into IS NOT NULL)
+                """,
+                (
+                    content,
+                    verbatim_content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    namespace,
+                    local_id,
+                    peer_name,
+                ),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
         finally:
             await _call(cursor.close)
 

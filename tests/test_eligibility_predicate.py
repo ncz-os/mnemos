@@ -75,9 +75,11 @@ def _canonical_ids(rows=ROWS) -> list[str]:
 def test_canonical_memory_eligibility_predicate_filters_universal_exclusions():
     assert MEMORY_ELIGIBILITY_PREDICATE == ("deleted_at IS NULL AND archived_at IS NULL AND consolidated_into IS NULL")
     assert _canonical_ids() == ["active", "private_parent", "vault"]
+    # F-3: MORPHEUS is a local heuristic and must skip replicas; the fence is
+    # part of the shared predicate rather than a per-call afterthought.
     assert eligible_for_morpheus("m") == (
         "m.deleted_at IS NULL AND m.archived_at IS NULL AND m.consolidated_into IS NULL "
-        "AND (m.namespace IS NULL OR m.namespace <> 'vault')"
+        "AND (m.namespace IS NULL OR m.namespace <> 'vault') AND m.federation_source IS NULL"
     )
 
 
@@ -85,11 +87,12 @@ def test_morpheus_eligibility_rejects_vault_rows():
     with sqlite3.connect(":memory:") as conn:
         conn.execute(
             "CREATE TABLE memories (id TEXT, deleted_at TEXT, archived_at TEXT, "
-            "consolidated_into TEXT, permission_mode INTEGER, namespace TEXT)"
+            "consolidated_into TEXT, permission_mode INTEGER, namespace TEXT, "
+            "federation_source TEXT)"
         )
         conn.executemany(
             "INSERT INTO memories VALUES (:id, :deleted_at, :archived_at, "
-            ":consolidated_into, :permission_mode, :namespace)",
+            ":consolidated_into, :permission_mode, :namespace, NULL)",
             ROWS,
         )
         selected = [

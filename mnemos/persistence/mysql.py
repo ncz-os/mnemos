@@ -2830,6 +2830,9 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
             "consolidated_into IS NULL",
             "content_hash IS NOT NULL",
         ]
+        fence = _eligibility.local_sweep_predicate("")
+        if fence:
+            where.append(fence)
         params: list[Any] = []
         if namespace is not None:
             where.append("namespace = %s")
@@ -2877,13 +2880,19 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
             # Canonical must exist and be active. Mirrors the Postgres EXISTS
             # guard; MySQL forbids referencing the UPDATE target table in a
             # subquery (error 1093), so the canonical check runs as its own SELECT.
-            await cursor.execute(
+            # F-3: a replica is never a consolidation target, and never
+            # redirected into a local canonical row.
+            fence = _eligibility.local_sweep_predicate("")
+            canonical_guard = (
                 "SELECT 1 FROM memories WHERE id = %s AND deleted_at IS NULL "
-                "AND archived_at IS NULL AND consolidated_into IS NULL",
-                (canonical_id,),
+                "AND archived_at IS NULL AND consolidated_into IS NULL"
             )
+            if fence:
+                canonical_guard += f" AND {fence}"
+            await cursor.execute(canonical_guard, (canonical_id,))
             if await cursor.fetchone() is None:
                 return 0
+            duplicate_guard = f"AND {fence}" if fence else ""
             # Redirect duplicates to the canonical id + soft-delete, matching
             # Postgres/SQLite so federation consolidation tombstones can emit.
             await cursor.execute(
@@ -2898,6 +2907,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
                    AND deleted_at IS NULL
                    AND archived_at IS NULL
                    AND consolidated_into IS NULL
+                   {duplicate_guard}
                 """,
                 (canonical_id, *ids, canonical_id),
             )
@@ -7501,6 +7511,53 @@ class MysqlFederationRepository(FederationRepository):
                 (local_id,),
             )
             return await _fetchone_dict(cursor)
+
+    async def restore_federated_memory_after_local_damage(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        peer_name: str,
+        content: str,
+        verbatim_content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        namespace: str,
+    ) -> bool:
+        """F-3: restore a replica that a LOCAL sweep damaged, in place."""
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                UPDATE memories
+                   SET content = %s,
+                       verbatim_content = %s,
+                       category = %s,
+                       subcategory = %s,
+                       metadata = %s,
+                       namespace = %s,
+                       deleted_at = NULL,
+                       archived_at = NULL,
+                       consolidated_into = NULL,
+                       consolidated_at = NULL
+                 WHERE id = %s
+                   AND federation_source = %s
+                   AND (deleted_at IS NOT NULL
+                        OR archived_at IS NOT NULL
+                        OR consolidated_into IS NOT NULL)
+                """,
+                (
+                    content,
+                    verbatim_content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    namespace,
+                    local_id,
+                    peer_name,
+                ),
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
 
     async def insert_federated_memory(
         self,

@@ -2326,6 +2326,9 @@ class OracleMemoryRepository(MemoryRepository):
                 "consolidated_into IS NULL",
                 "content_hash IS NOT NULL",
             ]
+            fence = _eligibility.local_sweep_predicate("")
+            if fence:
+                where.append(fence)
             params: dict[str, Any] = {}
             if namespace is not None:
                 where.append("namespace = :ns")
@@ -2365,6 +2368,9 @@ class OracleMemoryRepository(MemoryRepository):
         try:
             placeholders, params = _in_placeholders(duplicate_ids, "dup")
             params["canonical_id"] = canonical_id
+            # F-3: a replica's lifecycle belongs to its source.
+            fence = _eligibility.local_sweep_predicate("")
+            duplicate_guard = f"AND {fence}" if fence else ""
             await _call(
                 cursor.execute,
                 f"""
@@ -2373,6 +2379,7 @@ class OracleMemoryRepository(MemoryRepository):
                  WHERE id IN ({placeholders})
                    AND id != :canonical_id
                    AND deleted_at IS NULL
+                   {duplicate_guard}
                 """,
                 params,
             )
@@ -7459,6 +7466,58 @@ class OracleFederationRepository(FederationRepository):
                 {"id": local_id},
             )
             return await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+
+    async def restore_federated_memory_after_local_damage(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        peer_name: str,
+        content: str,
+        verbatim_content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        namespace: str,
+    ) -> bool:
+        """F-3: restore a replica that a LOCAL sweep damaged, in place."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                UPDATE memories
+                   SET content = :content,
+                       verbatim_content = :verbatim,
+                       category = :category,
+                       subcategory = :subcategory,
+                       metadata = :metadata,
+                       namespace = :namespace,
+                       deleted_at = NULL,
+                       archived_at = NULL,
+                       consolidated_into = NULL,
+                       consolidated_at = NULL
+                 WHERE id = :id
+                   AND federation_source = :peer
+                   AND (deleted_at IS NOT NULL
+                        OR archived_at IS NOT NULL
+                        OR consolidated_into IS NOT NULL)
+                """,
+                {
+                    "content": content,
+                    "verbatim": verbatim_content,
+                    "category": category,
+                    "subcategory": subcategory,
+                    "metadata": metadata_json,
+                    "namespace": namespace,
+                    "id": local_id,
+                    "peer": peer_name,
+                },
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0) > 0
         finally:
             await _call(cursor.close)
 

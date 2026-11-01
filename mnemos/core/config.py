@@ -2030,6 +2030,46 @@ def session_secret_required() -> bool:
     return runtime_env_value_stripped("MNEMOS_REQUIRE_SESSION_SECRET").lower() in {"yes", "1", "true"}
 
 
+def federation_replica_fence_enabled() -> bool:
+    """Whether local lifecycle workers must leave federated (replica) rows alone.
+
+    A replica row (``federation_source IS NOT NULL``) is a copy: its content,
+    lifecycle and visibility belong to the peer that authored it. The local
+    PERSEPHONE archival sweep, ARTEMIS content-hash dedup, MORPHEUS
+    consolidation and the local deletion sweeps are all *local heuristics* --
+    they must not rewrite a replica, because the source never re-sends a row
+    whose journal sequence the receiver has already fenced. On the PROTEUS
+    replica that produced rows that answered ``404`` on the by-id path until a
+    full re-seed.
+
+    **Defaults to TRUE (the safe side).** With the fence on, a local sweep
+    skips replicas, and replaying an already-fenced source sequence repairs a
+    replica that an older build damaged locally (see
+    ``mnemos.domain.federation._store_memories``).
+
+    Set ``MNEMOS_FEDERATION_REPLICA_FENCE=0`` only for a deployment that
+    deliberately reconciles replicas locally and has accepted that a damaged
+    replica can only be recovered by a re-seed. The pre-fix selection is
+    restored exactly -- this is a whole switch, not a half fence.
+
+    An unrecognised value falls back to the safe side (fence ON) with a
+    warning: a typo must never silently re-enable the damage.
+    """
+    raw = runtime_env_value_stripped("MNEMOS_FEDERATION_REPLICA_FENCE").lower()
+    if not raw:
+        return True  # unset: the safe side
+    if raw in {"no", "0", "false", "off"}:
+        return False
+    if raw in {"yes", "1", "true", "on"}:
+        return True
+    logger.warning(
+        "MNEMOS_FEDERATION_REPLICA_FENCE=%r is not a recognised value; expected "
+        "1/true/yes/on or 0/false/no/off. Using the default (fence replica rows).",
+        raw,
+    )
+    return True
+
+
 #: ``MNEMOS_AUDIT_CHAIN`` read once at startup — here at settings-build time and
 #: again on every ``reload_settings()`` — and cached, instead of being re-parsed
 #: (and re-warned) on every audited mutation (M7). ``None`` means "not resolved

@@ -261,6 +261,20 @@ def _scope(column: str) -> str:
     return f"{column} = ? AND (? IS NULL OR namespace = ?)"
 
 
+def _replica_fence(alias: str = "") -> str:
+    """F-3: ```` AND federation_source IS NULL`` for the deletion sweeps.
+
+    A replica (``federation_source IS NOT NULL``) is a copy owned by its peer.
+    Its source never re-sends it -- the receiver's sequence fence rejects the
+    replay -- so a local soft/hard delete of a replica is unrecoverable.
+    Empty when ``MNEMOS_FEDERATION_REPLICA_FENCE`` is off.
+    """
+    from mnemos.core.eligibility import local_sweep_predicate
+
+    fence = local_sweep_predicate(alias)
+    return f" AND {fence}" if fence else ""
+
+
 async def _claim(ops: _Ops, *, hard: bool) -> dict[str, Any] | None:
     if hard:
         where = "status = 'soft_deleted' AND restore_by < ?"
@@ -351,8 +365,10 @@ async def _soft_delete(ops: _Ops, user_id: str, namespace: str | None, at: datet
     counts: dict[str, int] = {}
     await _audit_scope(ops, user_id, namespace, "deleted_at IS NULL", "delete")
     for table, owner_col in _OWNER_TABLES:
+        # F-3: a replica's lifecycle belongs to its source, not to a local sweep.
+        fence = _replica_fence() if table == "memories" else ""
         counts[table] = await ops.execute(
-            f"UPDATE {table} SET deleted_at = ? WHERE {_scope(owner_col)} AND deleted_at IS NULL",
+            f"UPDATE {table} SET deleted_at = ? WHERE {_scope(owner_col)} AND deleted_at IS NULL{fence}",
             at,
             user_id,
             namespace,
@@ -410,8 +426,9 @@ async def restore_soft_deleted_target(
     counts: dict[str, int] = {}
     await _audit_scope(ops, user_id, namespace, "deleted_at = ?", "update", soft_deleted_at)
     for table, owner_col in _OWNER_TABLES:
+        fence = _replica_fence() if table == "memories" else ""
         counts[table] = await ops.execute(
-            f"UPDATE {table} SET deleted_at = NULL WHERE {_scope(owner_col)} AND deleted_at = ?",
+            f"UPDATE {table} SET deleted_at = NULL WHERE {_scope(owner_col)} AND deleted_at = ?{fence}",
             user_id,
             namespace,
             namespace,
@@ -439,7 +456,8 @@ async def _hard_delete_scope(ops: _Ops, request: dict[str, Any]) -> dict[str, in
         # snapshot trigger from preserving rows being irreversibly erased.
         await ops.execute("SET LOCAL mnemos.suppress_version_snapshot = '1'")
     memories = await ops.fetchall(
-        f"SELECT id, content, owner_id, namespace FROM memories WHERE {_scope('owner_id')} AND deleted_at IS NOT NULL",
+        f"SELECT id, content, owner_id, namespace FROM memories WHERE {_scope('owner_id')} "
+        f"AND deleted_at IS NOT NULL{_replica_fence()}",
         user_id,
         namespace,
         namespace,
@@ -490,8 +508,10 @@ async def _hard_delete_scope(ops: _Ops, request: dict[str, Any]) -> dict[str, in
         namespace,
     )
     for table, owner_col in _OWNER_TABLES:
+        # F-3: never hard-delete a replica; it would have to be re-seeded.
+        fence = _replica_fence() if table == "memories" else ""
         counts[table] = await ops.execute(
-            f"DELETE FROM {table} WHERE {_scope(owner_col)} AND deleted_at IS NOT NULL",
+            f"DELETE FROM {table} WHERE {_scope(owner_col)} AND deleted_at IS NOT NULL{fence}",
             user_id,
             namespace,
             namespace,
@@ -660,10 +680,13 @@ async def sweep_for_archival(
         ops = _Ops(tx, dialect)
         # Fetch ids one at a time through the common cursor wrapper so result
         # metadata is normalized to lower-case mapping keys on enterprise DBs.
+        # F-3: PERSEPHONE replaces the body with an archive marker. On a
+        # replica that destroys the only copy the receiver will ever get --
+        # the source's journal sequence is already fenced. Skip replicas.
         base_sql = (
             "SELECT id FROM memories WHERE deleted_at IS NULL AND archived_at IS NULL "
             "AND consolidated_into IS NULL AND (last_recalled_at IS NULL OR last_recalled_at < ?) "
-            "AND created < ? AND namespace = ? ORDER BY created ASC"
+            "AND created < ? AND namespace = ?" + _replica_fence() + " ORDER BY created ASC"
         )
         if dialect in {"mysql", "postgres"}:
             claim_sql = base_sql + " LIMIT ? FOR UPDATE SKIP LOCKED"

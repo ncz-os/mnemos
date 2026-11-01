@@ -2008,6 +2008,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         if namespace is not None:
             namespace_clause = "AND namespace = ?"
             params.append(namespace)
+        fence = _eligibility.local_sweep_predicate("")
+        fence_clause = f"AND {fence}" if fence else ""
         rows = await _fetch_all(
             self._conn(tx),
             """
@@ -2031,13 +2033,14 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                   AND consolidated_into IS NULL
                   AND content_hash IS NOT NULL
                   {namespace_clause}
+                  {fence_clause}
                 ORDER BY owner_id ASC, namespace ASC, content_hash ASC,
                          created DESC, quality_rating DESC, id DESC
             )
             GROUP BY owner_id, namespace, content_hash, normalized_content
             HAVING COUNT(*) > 1
             ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC
-            """.format(namespace_clause=namespace_clause),
+            """.format(namespace_clause=namespace_clause, fence_clause=fence_clause),
             params,
         )
         normalized: list[dict[str, Any]] = []
@@ -2060,6 +2063,10 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             return 0
         params: list[Any] = [canonical_id, *duplicate_ids, canonical_id, canonical_id]
         placeholders = _placeholders(duplicate_ids)
+        # F-3: a replica is never a consolidation target, and never redirected
+        # into a local canonical row -- its lifecycle belongs to its source.
+        fence = _eligibility.local_sweep_predicate("")
+        fence_clause = f"AND {fence}" if fence else ""
         return await _execute_count(
             self._conn(tx),
             f"""
@@ -2073,12 +2080,14 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
               AND deleted_at IS NULL
               AND archived_at IS NULL
               AND consolidated_into IS NULL
+              {fence_clause}
               AND EXISTS (
                   SELECT 1 FROM memories
                   WHERE id = ?
                     AND deleted_at IS NULL
                     AND archived_at IS NULL
                     AND consolidated_into IS NULL
+                    {fence_clause}
               )
             """,
             params,
@@ -3309,6 +3318,10 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
         min_size = int(run_row["cluster_min_size"])
         namespace = run_row["namespace"]
         eligibility_clause = _eligibility.eligible_for_morpheus("")
+        # F-3: MORPHEUS rewrites permission_mode and metadata -- a local,
+        # derived decision -- so it must never touch a replica.
+        sweep_fence = _eligibility.local_sweep_predicate("")
+        fence_clause = f"AND {sweep_fence}" if sweep_fence else ""
         audit_path = '$."pre_consolidate_permission_mode"'
         memories_consolidated = 0
         clusters_consolidated = 0
@@ -3325,6 +3338,7 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
                   FROM memories
                  WHERE id IN ({placeholders})
                    AND {eligibility_clause}
+                   {fence_clause}
                    AND (? IS NULL OR namespace = ?)
                 """,
                 (*member_ids, namespace, namespace),
@@ -3363,17 +3377,18 @@ class SqliteMorpheusRepository(_SqliteRepository, MorpheusRepository):
                     continue
                 cluster_count += await _execute_count(
                     conn,
-                    """
+                    f"""
                     UPDATE memories
                        SET consolidated_into = ?, consolidated_at = CURRENT_TIMESTAMP,
                            permission_mode = ?, morpheus_run_id = ?,
                            metadata = CASE
-                               WHEN json_type(COALESCE(metadata, '{}'), ?) IS NOT NULL
-                               THEN COALESCE(metadata, '{}')
-                               ELSE json_set(COALESCE(metadata, '{}'), ?, permission_mode)
+                               WHEN json_type(COALESCE(metadata, '{{}}'), ?) IS NOT NULL
+                               THEN COALESCE(metadata, '{{}}')
+                               ELSE json_set(COALESCE(metadata, '{{}}'), ?, permission_mode)
                            END
                      WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL
                        AND consolidated_into IS NULL AND morpheus_run_id IS NULL
+                       {fence_clause}
                        AND (? IS NULL OR namespace = ?)
                     """,
                     (
@@ -6701,6 +6716,60 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             self._conn(tx),
             "SELECT federation_remote_updated FROM memories WHERE id = ?",
             (local_id,),
+        )
+
+    async def restore_federated_memory_after_local_damage(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        peer_name: str,
+        content: str,
+        verbatim_content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        namespace: str,
+    ) -> bool:
+        """F-3: restore a replica that a LOCAL sweep damaged, in place.
+
+        Narrow by design: one conditional UPDATE, only while the row still
+        belongs to ``peer_name``, and only when the row is actually damaged
+        (so a healthy replica is a pure no-op and does not echo back).
+        """
+        return (
+            await _execute_count(
+                self._conn(tx),
+                """
+            UPDATE memories
+               SET content = ?,
+                   verbatim_content = ?,
+                   category = ?,
+                   subcategory = ?,
+                   metadata = ?,
+                   namespace = ?,
+                   deleted_at = NULL,
+                   archived_at = NULL,
+                   consolidated_into = NULL,
+                   consolidated_at = NULL
+             WHERE id = ?
+               AND federation_source = ?
+               AND (deleted_at IS NOT NULL
+                    OR archived_at IS NOT NULL
+                    OR consolidated_into IS NOT NULL)
+            """,
+                (
+                    content,
+                    verbatim_content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    namespace,
+                    local_id,
+                    peer_name,
+                ),
+            )
+            > 0
         )
 
     async def insert_federated_memory(
