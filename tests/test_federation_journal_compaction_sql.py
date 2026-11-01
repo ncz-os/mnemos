@@ -111,11 +111,36 @@ def test_narrowed_trigger_drops_the_bookkeeping_columns(directory, name):
         assert column not in region, f"{directory}/{name} still fires on: {column}"
 
 
+def _fires_on_updated(region: str) -> bool:
+    """True when the update trigger references the ``updated`` column."""
+    return "updated)" in region.replace("federation_remote_updated)", "")
+
+
+#: The pre-narrowing triggers, each of which DOES fire on ``updated`` -- one
+#: per dialect spelling: ``OLD.updated::text`` (Postgres), ``UPDATING('updated')``
+#: (Oracle), an ``UPDATE OF ...,updated,...`` list (Db2), ``OLD.updated <=>``
+#: (MySQL) and ``OLD.updated IS NOT`` (SQLite).
+WIDE_TRIGGER_FILES = [
+    ("migrations", "0064_federation_journal_dialects.sql"),
+    ("migrations_oracle", "0064_federation_journal_dialects.sql"),
+    ("migrations_db2", "0064_federation_journal_dialects.sql"),
+    ("migrations_mysql", "0064_federation_journal_dialects.sql"),
+    ("migrations_sqlite", "0064_federation_journal_dialects.sql"),
+]
+
+
+@pytest.mark.parametrize("directory,name", WIDE_TRIGGER_FILES)
+def test_updated_guard_sees_every_dialect_spelling(directory, name):
+    """The guard must flag a trigger that fires on ``updated``, however spelled."""
+    region = _update_trigger_region((MIGRATIONS / directory / name).read_text())
+    assert _fires_on_updated(region), f"{directory}/{name}: the guard missed a trigger on updated"
+
+
 @pytest.mark.parametrize("directory,name", TRIGGER_FILES)
 def test_narrowed_trigger_no_longer_fires_on_updated(directory, name):
     """``updated`` is re-stamped by every writer; it must not be a trigger."""
     region = _update_trigger_region((MIGRATIONS / directory / name).read_text())
-    assert "updated)" not in region.replace("federation_remote_updated)", "")
+    assert not _fires_on_updated(region), f"{directory}/{name} still fires on: updated"
 
 
 def test_mysql_provisioning_replays_the_narrowed_trigger():
