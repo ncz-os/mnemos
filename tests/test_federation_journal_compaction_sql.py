@@ -234,8 +234,7 @@ def test_narrowed_trigger_sorts_after_every_migration_it_depends_on(paths_fn):
     for dependency in NARROWED_DEPENDS_ON:
         assert dependency in names, f"{paths_fn} does not apply {dependency}"
         assert ours > numbered[dependency], (
-            f"{NARROWED_NUMBERED} ({ours}) must be numbered above "
-            f"{dependency} ({numbered[dependency]})"
+            f"{NARROWED_NUMBERED} ({ours}) must be numbered above {dependency} ({numbered[dependency]})"
         )
     # And it must still be applied after them in the real, sorted order.
     assert names.index(NARROWED_NUMBERED) > names.index(NARROWED_DEPENDS_ON[0])
