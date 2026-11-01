@@ -950,3 +950,68 @@ async def test_reconcile_hint_names_the_peer(synced):
     assert hint is not None
     assert "{" not in hint, hint
     assert f"/v1/federation/peers/{synced.peer['id']}/reconcile" in hint
+
+
+# ── ABC-first: every backend implements the F-15 surface ────────────────────
+#
+# F-15 added four methods to ``FederationRepository``. SQLite got them; the
+# other five backends did not, so their repositories could not be
+# instantiated at all (``TypeError: Can't instantiate abstract class ...``).
+# The SQLite-only tests could never catch that, so this pins the ABC
+# contract for every concrete backend repository without needing a driver.
+
+F15_REPOSITORY_METHODS = (
+    "fetch_parity_page",
+    "fetch_source_export_keyset_page",
+    "count_exportable_rows",
+    "redispatch_federation_journal",
+)
+
+
+def _concrete_federation_repositories():
+    from mnemos.persistence.db2 import Db2FederationRepository
+    from mnemos.persistence.mariadb import MariadbFederationRepository
+    from mnemos.persistence.mysql import MysqlFederationRepository
+    from mnemos.persistence.oracle import OracleFederationRepository
+    from mnemos.persistence.postgres import PostgresFederationRepository
+    from mnemos.persistence.sqlite import SqliteFederationRepository
+
+    return {
+        "sqlite": SqliteFederationRepository,
+        "postgres": PostgresFederationRepository,
+        "oracle": OracleFederationRepository,
+        "db2": Db2FederationRepository,
+        "mysql": MysqlFederationRepository,
+        "mariadb": MariadbFederationRepository,
+    }
+
+
+def test_every_backend_repository_implements_the_f15_surface() -> None:
+    """A new FederationRepository abstract method must reach all six backends."""
+    gaps = {}
+    for name, repository in _concrete_federation_repositories().items():
+        missing = sorted(set(getattr(repository, "__abstractmethods__", frozenset())))
+        if missing:
+            gaps[name] = missing
+    assert not gaps, f"repositories cannot be instantiated (unimplemented ABC methods): {gaps}"
+
+
+@pytest.mark.parametrize("backend", sorted(_concrete_federation_repositories()))
+def test_every_backend_declares_its_own_f15_methods(backend: str) -> None:
+    """Each backend must define the methods, not merely inherit a stub.
+
+    ``Db2`` and ``MariaDB`` legitimately reuse another backend's SQL (Db2
+    inherits Oracle; MariaDB inherits MySQL), so an inherited *concrete*
+    implementation is accepted -- what must never happen is a backend that
+    resolves the name to the ABC's own ``...`` body.
+    """
+    from mnemos.persistence.base import FederationRepository
+
+    repository = _concrete_federation_repositories()[backend]
+    for method in F15_REPOSITORY_METHODS:
+        resolved = getattr(repository, method, None)
+        assert resolved is not None, f"{backend} is missing {method}"
+        assert resolved is not getattr(FederationRepository, method, None), (
+            f"{backend} resolves {method} to the abstract base, not an implementation"
+        )
+        assert callable(resolved), f"{backend}.{method} must be callable"

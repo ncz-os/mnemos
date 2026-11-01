@@ -7720,6 +7720,120 @@ class OracleFederationRepository(FederationRepository):
 
         return await feed_query(self, tx, **kwargs)
 
+    # ── F-15 parity / reconcile (read-only, keyset-paged) ────────────────
+
+    async def fetch_parity_page(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        # ``remote_id`` is derived from the local key (``fed:<peer>:<id>``)
+        # rather than taken from metadata, so a replica and its source agree
+        # on identity even when the receiver never wrote the metadata column.
+        # The peer filter is applied by the caller (``parity._replica_keyset``
+        # compares ``peer_name`` after the page).
+        where = "WHERE m.federation_source IS NOT NULL"
+        params: dict[str, Any] = {"limit": max(1, int(limit))}
+        if after_id is not None:
+            where += " AND m.id > :after_id"
+            params["after_id"] = after_id
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id AS local_id, m.federation_source AS peer_name,
+                       SUBSTR(m.id, LENGTH(m.federation_source) + 6) AS remote_id,
+                       m.content_hash AS content_hash,
+                       CASE WHEN me.memory_id IS NULL THEN 0 ELSE 1 END AS has_embedding
+                  FROM memories m
+                  LEFT JOIN memory_embeddings me ON me.memory_id = m.id
+                  {where}
+                 ORDER BY m.id ASC
+                 FETCH FIRST :limit ROWS ONLY
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_source_export_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        query_parts = [_eligibility.eligible_for_federation("m")]
+        params: dict[str, Any] = {"limit": max(1, int(limit))}
+        if after_id is not None:
+            query_parts.append("m.id > :after_id")
+            params["after_id"] = after_id
+        for column, values in (("namespace", namespaces), ("category", categories)):
+            if values:
+                bind_names = []
+                for index, value in enumerate(values):
+                    name = f"{column}_{index}"
+                    bind_names.append(f":{name}")
+                    params[name] = value
+                query_parts.append(f"m.{column} IN ({', '.join(bind_names)})")
+        where_clause = " AND ".join(query_parts)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id AS id, m.content_hash AS content_hash
+                  FROM memories m
+                 WHERE {where_clause}
+                 ORDER BY m.id ASC
+                 FETCH FIRST :limit ROWS ONLY
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def count_exportable_rows(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+    ) -> int:
+        query_parts = [_eligibility.eligible_for_federation("m")]
+        params: dict[str, Any] = {}
+        for column, values in (("namespace", namespaces), ("category", categories)):
+            if values:
+                bind_names = []
+                for index, value in enumerate(values):
+                    name = f"{column}_{index}"
+                    bind_names.append(f":{name}")
+                    params[name] = value
+                query_parts.append(f"m.{column} IN ({', '.join(bind_names)})")
+        where_clause = " AND ".join(query_parts)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(cursor.execute, f"SELECT COUNT(*) FROM memories m WHERE {where_clause}", params)
+            row = await _call(cursor.fetchone)
+            return int((row[0] if row else 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def redispatch_federation_journal(self, tx: Transaction, *, memory_ids: Sequence[str]) -> int:
+        from mnemos.persistence.federation_journal import redispatch_memory_ids
+
+        return await redispatch_memory_ids(tx, memory_ids)
+
     async def _legacy_feed_query(
         self,
         tx: Transaction,

@@ -6133,6 +6133,102 @@ class PostgresFederationRepository(FederationRepository):
         )
         return _pg_result_count(result)
 
+    # ── F-15 parity / reconcile (read-only, keyset-paged) ────────────────
+
+    async def fetch_parity_page(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        # ``remote_id`` is derived from the local key (``fed:<peer>:<id>``)
+        # rather than taken from metadata, so a replica and its source agree
+        # on identity even when the receiver never wrote the metadata column.
+        # The peer filter is applied by the caller (``parity._replica_keyset``
+        # compares ``peer_name`` after the page), so this is the whole
+        # ``fed:*`` population in ``local_id`` order.
+        where = "WHERE m.federation_source IS NOT NULL"
+        args: list[Any] = []
+        if after_id is not None:
+            args.append(after_id)
+            where += f" AND m.id > ${len(args)}"
+        args.append(max(1, int(limit)))
+        return await _postgres_tx(tx).conn.fetch(
+            f"""
+            SELECT m.id AS local_id, m.federation_source AS peer_name,
+                   substr(m.id, length(m.federation_source) + 6) AS remote_id,
+                   m.content_hash AS content_hash,
+                   CASE WHEN me.memory_id IS NULL THEN 0 ELSE 1 END AS has_embedding
+            FROM memories m
+            LEFT JOIN memory_embeddings me ON me.memory_id = m.id
+            {where}
+            ORDER BY m.id ASC
+            LIMIT ${len(args)}
+            """,
+            *args,
+        )
+
+    async def fetch_source_export_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        query_parts = [_eligibility.eligible_for_federation("m")]
+        args: list[Any] = []
+        if after_id is not None:
+            args.append(after_id)
+            query_parts.append(f"m.id > ${len(args)}")
+        if namespaces:
+            args.append(list(namespaces))
+            query_parts.append(f"m.namespace = ANY(${len(args)})")
+        if categories:
+            args.append(list(categories))
+            query_parts.append(f"m.category = ANY(${len(args)})")
+        args.append(max(1, int(limit)))
+        where_clause = " AND ".join(query_parts)
+        return await _postgres_tx(tx).conn.fetch(
+            f"""
+            SELECT m.id AS id, m.content_hash AS content_hash
+            FROM memories m
+            WHERE {where_clause}
+            ORDER BY m.id ASC
+            LIMIT ${len(args)}
+            """,
+            *args,
+        )
+
+    async def count_exportable_rows(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+    ) -> int:
+        query_parts = [_eligibility.eligible_for_federation("m")]
+        args: list[Any] = []
+        if namespaces:
+            args.append(list(namespaces))
+            query_parts.append(f"m.namespace = ANY(${len(args)})")
+        if categories:
+            args.append(list(categories))
+            query_parts.append(f"m.category = ANY(${len(args)})")
+        where_clause = " AND ".join(query_parts)
+        value = await _postgres_tx(tx).conn.fetchval(
+            f"SELECT COUNT(*) FROM memories m WHERE {where_clause}",
+            *args,
+        )
+        return int(value or 0)
+
+    async def redispatch_federation_journal(self, tx: Transaction, *, memory_ids: Sequence[str]) -> int:
+        from mnemos.persistence.federation_journal import redispatch_memory_ids
+
+        return await redispatch_memory_ids(tx, memory_ids)
+
 
 class PostgresStateRepository(StateRepository):
     """state.value is now TEXT on PG (migrations_v4_2_state_value_text.sql).
