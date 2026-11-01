@@ -373,3 +373,151 @@ def test_the_capped_routes_still_declare_a_default() -> None:
 
     assert "Query(50, ge=1, le=500)" in inspect.getsource(sessions.get_session_history)
     assert "Query(50, ge=1, le=500)" in inspect.getsource(federation.peer_sync_log)
+
+
+# ── The FastAPI ``Query`` symbol must be in scope in both route modules ───
+#
+# The capped routes call ``Query(...)`` at import time to build their
+# parameter defaults. If ``Query`` were not imported into the module
+# namespace, importing the route module raises ``NameError`` and the
+# whole API fails to load. These assertions pin the import so a future
+# refactor that drops or renames it fails loudly HERE rather than at
+# production boot.
+
+
+def test_the_sessions_route_module_imports_fastapi_query() -> None:
+    """``mnemos/api/routes/sessions.py`` must import ``Query``.
+
+    ``get_session_history`` evaluates ``Query(50, ge=1, le=500)`` while
+    the module is being imported. A missing ``Query`` import is a
+    ``NameError`` at import time, which takes the entire API down --
+    not just the sessions routes.
+    """
+    from mnemos.api.routes import sessions
+
+    assert hasattr(sessions, "Query"), (
+        "mnemos/api/routes/sessions.py must import Query from fastapi -- "
+        "get_session_history evaluates Query(...) at module import time."
+    )
+    assert sessions.Query is not None
+
+
+def test_the_federation_route_module_imports_fastapi_query() -> None:
+    """``mnemos/api/routes/federation.py`` must import ``Query``."""
+    from mnemos.api.routes import federation
+
+    assert hasattr(federation, "Query"), (
+        "mnemos/api/routes/federation.py must import Query from fastapi -- "
+        "peer_sync_log evaluates Query(...) at module import time."
+    )
+    assert federation.Query is not None
+
+
+def test_the_capped_route_defaults_are_resolved_query_objects() -> None:
+    """The cap must be a real FastAPI ``Query`` with the bounds.
+
+    Asserting on the resolved default (not on the source text) proves
+    the bound survives into the OpenAPI schema -- which is what the
+    runtime actually enforces.
+
+    The bounds live in ``Query.metadata`` as pydantic constraint
+    objects (``Ge``/``Le``); their exact attribute names differ
+    between pydantic versions, so the assertion reads the constraint
+    values off the metadata list rather than depending on a specific
+    attribute name.
+    """
+    import inspect
+
+    from mnemos.api.routes import federation, sessions
+
+    for fn, name, expected_min, expected_max in (
+        (sessions.get_session_history, "limit", 1, 500),
+        (sessions.get_session_history, "offset", 0, None),
+        (federation.peer_sync_log, "limit", 1, 500),
+    ):
+        default = inspect.signature(fn).parameters[name].default
+        assert type(default).__name__ == "Query", (
+            f"{fn.__module__}.{fn.__name__}.{name} must default to a fastapi.Query; got {default!r}"
+        )
+        bounds = set()
+        for constraint in getattr(default, "metadata", ()):
+            for attr in ("ge", "le"):
+                value = getattr(constraint, attr, None)
+                if value is not None:
+                    bounds.add(value)
+        assert expected_min in bounds, (
+            f"{fn.__module__}.{fn.__name__}.{name} is missing the lower "
+            f"bound {expected_min}; bounds found: {sorted(bounds)}"
+        )
+        if expected_max is not None:
+            assert expected_max in bounds, (
+                f"{fn.__module__}.{fn.__name__}.{name} is missing the upper "
+                f"bound {expected_max}; bounds found: {sorted(bounds)}"
+            )
+
+
+def test_the_schema_module_imports_the_hnsw_index_options_constant() -> None:
+    """``mnemos/persistence/schema.py`` must import
+    ``HNSW_INDEX_OPTIONS_SQL``.
+
+    The constant is referenced in two places: the legacy ivfflat ->
+    hnsw rewrite inside ``render_migration_sql`` and the runtime shape
+    repair inside ``_ensure_postgres_embedding_shape``. A missing
+    import is a ``NameError`` in either path -- the first during
+    migration rendering (database initialisation), the second during
+    the index repair (runtime startup).
+    """
+    from mnemos.persistence import schema
+
+    assert hasattr(schema, "HNSW_INDEX_OPTIONS_SQL"), (
+        "mnemos/persistence/schema.py must import HNSW_INDEX_OPTIONS_SQL "
+        "from mnemos.persistence.vector_tuning -- it is referenced by "
+        "render_migration_sql and _ensure_postgres_embedding_shape."
+    )
+    assert "m = 16" in schema.HNSW_INDEX_OPTIONS_SQL
+    assert "ef_construction = 64" in schema.HNSW_INDEX_OPTIONS_SQL
+
+
+def test_the_hnsw_index_options_constant_resolves_at_both_reference_sites() -> None:
+    """Exercise BOTH reference sites of the constant end to end.
+
+    ``render_migration_sql`` runs the ivfflat -> hnsw rewrite; the
+    shape repair runs when the live index is not HNSW. Both must emit
+    the options, which is only possible if the constant is in scope.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from mnemos.persistence.schema import _ensure_postgres_embedding_shape, render_migration_sql
+
+    repo_root = Path(__file__).resolve().parents[1]
+
+    # Site 1: render_migration_sql.
+    rendered = render_migration_sql(
+        repo_root / "mnemos" / "db_migrations" / "migrations.sql",
+        backend="postgres",
+        embedding_dim=1024,
+    )
+    assert "WITH (m = 16, ef_construction = 64)" in rendered
+
+    # Site 2: _ensure_postgres_embedding_shape, repair branch.
+    class _Conn:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        async def fetchval(self, query: str, *args: object) -> object:
+            if "format_type" in query:
+                return "vector(1024)"
+            if "am.amname" in query:
+                return "ivfflat"  # force the repair branch
+            if "COUNT(*)" in query:
+                return 0
+            return None
+
+        async def execute(self, statement: str, *args: object) -> str:
+            self.statements.append(" ".join(statement.split()))
+            return "OK"
+
+    conn = _Conn()
+    asyncio.run(_ensure_postgres_embedding_shape(conn, 1024))
+    assert any("WITH (m = 16, ef_construction = 64)" in stmt for stmt in conn.statements), conn.statements

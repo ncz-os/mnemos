@@ -469,3 +469,109 @@ def test_the_other_backends_do_not_emit_pgvector_knobs() -> None:
         src = (REPO_ROOT / "mnemos" / "persistence" / f"{module_name}.py").read_text()
         assert "hnsw.ef_search" not in src, module_name
         assert "hnsw.iterative_scan" not in src, module_name
+
+
+# ── The DDL sites must have the constant in scope ──────────────────────────
+#
+# Every HNSW DDL site interpolates ``HNSW_INDEX_OPTIONS_SQL``. A module
+# that references the constant without importing it raises ``NameError``
+# at the moment the DDL is built -- which for the installer means the
+# Postgres index rebuild fails, and for the schema module means the
+# migration render or the runtime index repair fails. These assertions
+# pin the import so the failure surfaces in the test suite rather than
+# during database initialisation.
+
+
+def test_the_schema_module_has_the_hnsw_options_constant_in_scope() -> None:
+    """``mnemos/persistence/schema.py`` must import the constant.
+
+    It is referenced by ``render_migration_sql`` (the ivfflat -> hnsw
+    rewrite) and by ``_ensure_postgres_embedding_shape`` (the runtime
+    index repair). Both are exercised at database-initialisation time,
+    so a missing import is a hard startup failure.
+    """
+    from mnemos.persistence import schema
+
+    assert hasattr(schema, "HNSW_INDEX_OPTIONS_SQL"), (
+        "mnemos/persistence/schema.py must import HNSW_INDEX_OPTIONS_SQL from mnemos.persistence.vector_tuning."
+    )
+    assert "m = 16" in schema.HNSW_INDEX_OPTIONS_SQL
+    assert "ef_construction = 64" in schema.HNSW_INDEX_OPTIONS_SQL
+
+
+def test_the_installer_module_has_the_hnsw_options_constant_in_scope() -> None:
+    """``mnemos/installer/db.py`` must import the constant.
+
+    The installer's HNSW index rebuild interpolates it into the psql
+    command; a missing import makes the rebuild fail at install time.
+    """
+    from mnemos.installer import db as installer_db
+
+    assert hasattr(installer_db, "HNSW_INDEX_OPTIONS_SQL"), (
+        "mnemos/installer/db.py must import HNSW_INDEX_OPTIONS_SQL from mnemos.persistence.vector_tuning."
+    )
+
+
+def test_the_postgres_module_has_the_vector_tuning_helpers_in_scope() -> None:
+    """``mnemos/persistence/postgres.py`` must import the helpers.
+
+    ``semantic_search`` calls ``hnsw_ef_search_for`` and
+    ``pgvector_version_at_least`` on every query; a missing import is a
+    ``NameError`` that turns every semantic search into a 500.
+    """
+    from mnemos.persistence import postgres
+
+    for name in ("hnsw_ef_search_for", "pgvector_version_at_least", "PGVECTOR_ITERATIVE_SCAN_MIN_VERSION"):
+        assert hasattr(postgres, name), (
+            f"mnemos/persistence/postgres.py must import {name} from mnemos.persistence.vector_tuning."
+        )
+
+
+def test_the_postgres_semantic_search_path_resolves_its_tuning_helpers() -> None:
+    """Execute the tuning path end to end against a fake connection.
+
+    This proves the helpers are not merely imported but actually
+    reachable from the query path -- the same code the fleet runs.
+    """
+    from unittest.mock import MagicMock
+
+    from mnemos.core.auth_context import UserContext
+    from mnemos.persistence.postgres import PostgresMemoryRepository, PostgresTransaction
+    from mnemos.persistence.visibility import VisibilityFilter
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, tuple]] = []
+
+        async def execute(self, sql: str, *args: object) -> str:
+            self.calls.append((" ".join(sql.split()), args))
+            return "OK"
+
+        async def fetch(self, sql: str, *args: object) -> list:
+            self.calls.append((" ".join(sql.split()), args))
+            return []
+
+        async def fetchval(self, query: str, *args: object) -> object:
+            self.calls.append((" ".join(query.split()), args))
+            if "pg_extension" in query:
+                return "0.8.0"
+            return None
+
+    import asyncio
+
+    conn = _Conn()
+    repo = PostgresMemoryRepository()
+    root = UserContext(user_id="root", group_ids=[], role="root", namespace="root-ns", authenticated=True)
+    asyncio.run(
+        repo.semantic_search(
+            PostgresTransaction(conn, MagicMock()),
+            embedding=[0.1, 0.2, 0.3],
+            limit=10,
+            visibility=VisibilityFilter.for_read(root, namespace=None),
+        )
+    )
+    ef = [c for c in conn.calls if "hnsw.ef_search" in c[0]]
+    iterative = [c for c in conn.calls if "hnsw.iterative_scan" in c[0]]
+    assert len(ef) == 1, conn.calls
+    assert ef[0][1] == ("100",)
+    assert len(iterative) == 1, conn.calls
