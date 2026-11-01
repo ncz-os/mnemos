@@ -11,7 +11,7 @@ Source: Fable federation report (2026-10-31, commit 0073bb4), F-8 PERF vec:
     has no vector index DDL, every search is an exact scan
     (``oracle.py:2326-2337``) (S)."
 
-Re-verified against ARGONAS master 68d5891a (48 commits newer than the
+Re-verified against master 68d5891a (48 commits newer than the
 report's 0073bb4). What the report said and what the tree actually
 looked like:
 

@@ -11,7 +11,7 @@
 --    (`routes/sessions.py:268`) and federation log
 --    (`routes/federation.py:559`) (S)."
 --
--- Re-verified against ARGONAS master 68d5891a: the three index findings
+-- Re-verified against master 68d5891a: the three index findings
 -- all still held.
 --
 -- 1. `(updated, id)` partial index.

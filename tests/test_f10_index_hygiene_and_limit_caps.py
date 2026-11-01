@@ -11,7 +11,7 @@ Source: Fable federation report (2026-10-31, commit 0073bb4), F-10 PERF db:
     (``routes/sessions.py:268``) and federation log
     (``routes/federation.py:559``) (S)."
 
-Re-verified against ARGONAS master 68d5891a (48 commits newer than the
+Re-verified against master 68d5891a (48 commits newer than the
 report's 0073bb4). What the report said and what the tree looked like:
 
 * "Postgres keyset paths have none" — CONFIRMED. Postgres had NO index

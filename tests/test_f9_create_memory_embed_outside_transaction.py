@@ -7,7 +7,7 @@ Source: Fable federation report (2026-10-31, commit 0073bb4), F-9 PERF api:
     ``:1814`` embed inside the transaction, holding a pool connection
     or the SQLite global lock) (S)."
 
-Re-verified against ARGONAS master 68d5891a (48 commits newer than the
+Re-verified against master 68d5891a (48 commits newer than the
 report's 0073bb4): the embedding call lived at
 ``mnemos/api/routes/memories.py`` inside the
 ``async with backend.transactional() as tx:`` block, while
