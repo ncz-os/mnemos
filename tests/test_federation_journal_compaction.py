@@ -451,3 +451,84 @@ def test_postgres_compaction_keeps_the_newest_published_event_whatever_its_age()
     # the old row is the newest *compactable* event and must survive too:
     # deleting it would leave a consumer without any published event.
     assert survivors == [1, 2], f"old published event was dropped: {survivors}"
+
+
+def test_postgres_compaction_resolves_to_the_feed_s_ordered_max_seq():
+    """The survivor must be the row the feed's ``MAX(seq)`` names -- in order.
+
+    The text pinned above is run through SQLite, so it can prove *which* rows
+    survive but not *how* they were chosen. A statement that returns the right
+    set here could still be wrong on the one thing compaction exists for: the
+    feed serves each memory through ``MAX(seq)`` (``_current_states``) and
+    orders the feed by ``e.seq`` (``feed_query``); a compaction that keeps
+    "some published row" instead of that one -- for instance an unordered
+    ``LIMIT``/``MAX`` selection, or a survivor picked from the insertion order
+    ``event_id`` rather than the publish order ``seq`` -- passes the shape
+    test and then retires the newest event.
+
+    So this asserts the ordering directly against the same rows with
+    ``seq`` deliberately out of insertion order: the survivor of every memory
+    is its ``MAX(seq)`` published row, no more and no fewer.
+    """
+    import sqlite3
+
+    from mnemos.persistence.federation_journal import compaction_sql
+
+    sql = compaction_sql("postgres")
+    db = sqlite3.connect(":memory:")
+    # ``seq`` is not the rowid: publish order and insertion order are
+    # independent on a live source, which is the case under test.
+    db.execute("CREATE TABLE federation_changes(seq INTEGER, memory_id TEXT, changed_at INTEGER)")
+    # Publish order (``seq``) is the reverse of insertion order here, which is
+    # the normal case on a live source (``_publish`` assigns ``seq`` to a
+    # backlog on a later poll). A survivor chosen by insertion order would
+    # therefore be the wrong event. Two memories, so a group-by that loses the
+    # partition also fails. ``m1`` carries one unpublished (``seq IS NULL``)
+    # row that compaction must not use as a keeper.
+    rows = [
+        (None, "m1", 10),  # unpublished: never a keeper, never removed
+        (4, "m1", 10),  # m1 MAX(seq)
+        (3, "m2", 10),  # m2 MAX(seq)
+        (2, "m1", 10),
+        (1, "m2", 10),
+        (1, "m1", 10),
+    ]
+    db.executemany("INSERT INTO federation_changes(seq, memory_id, changed_at) VALUES(?,?,?)", rows)
+
+    db.execute(sql, (100, 100))
+    survivors = sorted(row[0] for row in db.execute("SELECT seq FROM federation_changes WHERE seq IS NOT NULL"))
+
+    # m1 -> MAX(seq) = 4 (not 2, the first-inserted published row);
+    # m2 -> MAX(seq) = 3 (not 1).
+    assert survivors == [3, 4], f"compaction did not keep the MAX(seq) of each memory: {survivors}"
+    # And no unpublished event was touched.
+    pending = db.execute("SELECT COUNT(*) FROM federation_changes WHERE seq IS NULL").fetchone()[0]
+    assert pending == 1
+
+
+def test_postgres_compaction_selects_by_seq_not_by_changed_at_or_insertion_order():
+    """Pin *how* the survivor is chosen, so a rewrite cannot regress it silently.
+
+    This pins the mechanism the task's review claimed was missing. The
+    shipped statement is a correlated ``EXISTS`` on ``newer.seq > seq`` --
+    it names neither ``MAX(changed_at)`` nor any rowid/insertion-order
+    tiebreak, so "keep some arbitrary published row" is not a shape it can
+    produce. Asserting on the text is legitimate here because the *choice of
+    column* is the invariant: an equivalent rewrite is still acceptable as
+    long as it discriminates on ``seq``.
+    """
+    from mnemos.persistence.federation_journal import compaction_sql
+
+    sql = compaction_sql("postgres")
+    lowered = " ".join(sql.lower().split())
+
+    # The keeper is decided by a strictly greater publish sequence...
+    assert "newer.seq > federation_changes.seq" in lowered
+    # ...partitioned per memory, so each memory keeps its own newest event...
+    assert "newer.memory_id = federation_changes.memory_id" in lowered
+    # ...and only a *compactable* successor retires a row, so a recent
+    # in-flight event cannot cause the newest old event to be dropped.
+    assert "newer.changed_at < ?" in lowered
+    # And it must never fall back to the timestamp column as the keeper key.
+    assert "max(changed_at)" not in lowered
+    assert "event_id" not in lowered
