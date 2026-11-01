@@ -243,31 +243,76 @@ def _numeric_migrations(names):
     return seen
 
 
+#: Number collisions that predate the uniqueness check, frozen by exact name.
+#: Each pair is already applied on deployed nodes, so renumbering is not an
+#: option; anything outside this set that shares a number is a regression.
+KNOWN_DUPLICATE_MIGRATIONS = frozenset(
+    {
+        "0010_hive_mind.sql",
+        "0010_morpheus_extract_run_memories.sql",
+        "0011_hive_mind_extended_columns.sql",
+        "0011_mcp_audit_log.sql",
+        "0039_knemon_dispatch_rule_refresh.sql",
+        "0039_subscription_plan_current_limits.sql",
+        "0061c_morpheus_runs_parity.sql",
+        "0061d_morpheus_phase_parity.sql",
+        "0067_federation_sync_counters.sql",
+        "0067_memory_index_hygiene.sql",
+    }
+)
+
+
+def _first_misordered(numbered):
+    """Index of the first migration not numbered above its predecessor, else None."""
+    keys = [number for number, _ in numbered]
+    return next(
+        (i for i in range(1, len(keys)) if keys[i] < keys[i - 1]),
+        None,
+    )
+
+
+def test_numbering_check_rejects_a_duplicate_number():
+    """A reused number must fail the check, not just a decreasing one."""
+    numbered = _numeric_migrations(["0001_a.sql", "0002_b.sql", "0002_c.sql", "0003_d.sql"])
+    assert _first_misordered(numbered) == 2
+
+
+def test_numbering_check_rejects_a_decreasing_number():
+    numbered = [(1, "0001_a.sql"), (3, "0003_c.sql"), (2, "0002_b.sql")]
+    assert _first_misordered(numbered) == 2
+
+
+def test_numbering_check_tolerates_only_the_frozen_collisions():
+    """The pre-existing pairs pass; a third file on one of their numbers does not."""
+    frozen = _numeric_migrations(["0066_x.sql", "0067_federation_sync_counters.sql", "0067_memory_index_hygiene.sql"])
+    assert _first_misordered(frozen) is None
+    third = _numeric_migrations(
+        ["0067_federation_sync_counters.sql", "0067_memory_index_hygiene.sql", "0067_new_thing.sql"]
+    )
+    assert _first_misordered(third) == 2
+
+
 @pytest.mark.parametrize(
     "paths_fn",
     ["postgres_migration_paths", "oracle_migration_paths", "db2_migration_paths"],
 )
 def test_numbered_migrations_are_applied_in_numeric_order(paths_fn):
-    """Existence is not enough: the shipped order must be numeric.
+    """Existence is not enough: the shipped order must be numeric and unique.
 
     ``sorted()`` over the directory is *lexicographic*, so a migration that
     reuses a number (``0067_new_thing``/``0067_another_thing``) lands next to
     it and a later ``0068`` still sorts last -- but a *duplicate* number also
     makes the relative order depend on the rest of the filename, so the
     narrowed trigger could silently be applied before the trigger it replaces.
-    This asserts the whole sequence is non-decreasing by number, which the
-    older existence check on 0062/0068 alone could not see.
+    This asserts the whole sequence is strictly increasing by number, apart
+    from the frozen ``KNOWN_DUPLICATE_MIGRATIONS``.
     """
     from mnemos.persistence import schema
 
     names = [path.name for path in getattr(schema, paths_fn)()]
     numbered = _numeric_migrations(names)
     assert numbered, f"{paths_fn} returned no numbered migrations"
-    keys = [number for number, _ in numbered]
-    first_bad = next(
-        (i for i in range(1, len(keys)) if keys[i] < keys[i - 1]),
-        None,
-    )
+    first_bad = _first_misordered(numbered)
     assert first_bad is None, (
         f"{paths_fn} applies {numbered[first_bad][1]} after {numbered[first_bad - 1][1]}: "
         "migration numbers must stay unique and ordered"
