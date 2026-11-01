@@ -1520,6 +1520,8 @@ class MariadbBackend(MysqlBackend):
                     {
                         "events_received": "events_received INT NOT NULL DEFAULT 0",
                         "rows_without_embedding": "rows_without_embedding INT NOT NULL DEFAULT 0",
+                        # F-2: inbound events a locally soft-deleted replica skipped.
+                        "skipped_deleted": "skipped_deleted INT NOT NULL DEFAULT 0",
                     },
                 )
                 await _ensure_mysql_columns(

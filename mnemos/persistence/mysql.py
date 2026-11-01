@@ -863,6 +863,7 @@ CREATE TABLE IF NOT EXISTS federation_sync_log (
     records_written   INT          NOT NULL DEFAULT 0,
     events_received      INT       NOT NULL DEFAULT 0,
     rows_without_embedding INT      NOT NULL DEFAULT 0,
+    skipped_deleted      INT       NOT NULL DEFAULT 0,
     error             TEXT,
     cursor_before     TEXT,
     cursor_after      TEXT,
@@ -7099,7 +7100,8 @@ class MysqlFederationRepository(FederationRepository):
                 SELECT id, started_at, finished_at, memories_pulled,
                        memories_new, memories_updated, error,
                        cursor_before, cursor_after,
-                       events_received, rows_without_embedding
+                       events_received, rows_without_embedding,
+                       skipped_deleted
                   FROM federation_sync_log
                  WHERE peer_id = %s
                  ORDER BY started_at DESC
@@ -7441,6 +7443,7 @@ class MysqlFederationRepository(FederationRepository):
         cursor_after: Any,
         events_received: int = 0,
         rows_without_embedding: int = 0,
+        skipped_deleted: int = 0,
     ) -> None:
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
@@ -7454,6 +7457,7 @@ class MysqlFederationRepository(FederationRepository):
                        records_written = %s,
                        events_received = %s,
                        rows_without_embedding = %s,
+                       skipped_deleted = %s,
                        status = %s,
                        error = %s,
                        cursor_after = %s
@@ -7479,6 +7483,7 @@ class MysqlFederationRepository(FederationRepository):
                     memories_new + memories_updated,
                     events_received,
                     rows_without_embedding,
+                    skipped_deleted,
                     "error" if error else "ok",
                     error,
                     cursor_after,
@@ -8735,6 +8740,8 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                     {
                         "events_received": "events_received INT NOT NULL DEFAULT 0",
                         "rows_without_embedding": "rows_without_embedding INT NOT NULL DEFAULT 0",
+                        # F-2: inbound events a locally soft-deleted replica skipped.
+                        "skipped_deleted": "skipped_deleted INT NOT NULL DEFAULT 0",
                     },
                 )
                 await _ensure_mysql_columns(

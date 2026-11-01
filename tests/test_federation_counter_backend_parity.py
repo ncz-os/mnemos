@@ -90,6 +90,10 @@ class _PostgresConn:
     async def execute(self, sql: str, *args: Any) -> None:
         self._calls.append({"sql": sql, "params": args})
 
+    async def fetchrow(self, sql: str, *args: Any) -> Any:
+        self._calls.append({"sql": sql, "params": args})
+        return None
+
 
 # ── placeholder counting per dialect ────────────────────────────────────────
 
@@ -200,6 +204,7 @@ async def _capture_finish_sync_log(
         cursor_after="cursor-pos-2",
         events_received=25,
         rows_without_embedding=3,
+        skipped_deleted=2,
     )
     assert calls, f"{dialect}: finish_sync_log issued no statement"
     return calls[0]
@@ -284,6 +289,9 @@ async def test_finish_sync_log_binds_each_column_to_the_right_value(
     assert binds.get("rows_without_embedding") == 3, (
         f"{dialect}: rows_without_embedding must carry 3, got {binds.get('rows_without_embedding')!r}"
     )
+    assert binds.get("skipped_deleted") == 2, (
+        f"{dialect}: skipped_deleted must carry 2, got {binds.get('skipped_deleted')!r}"
+    )
     # records_seen is the historical name for the wire count.
     if "records_seen" in binds:
         assert binds.get("records_seen") == 25, (
@@ -346,3 +354,127 @@ async def test_finish_sync_log_binds_the_legacy_columns_to_their_historical_mean
         f"{dialect}: records_written ({binds['records_written']!r}) and memories_pulled "
         f"({binds['memories_pulled']!r}) are both the APPLIED count and must be equal"
     )
+
+
+# ── F-2: the soft-deleted replica marker, per dialect ──────────────────────
+#
+# ``fetch_federated_memory_marker`` is the receiver's existence probe: it
+# decides "insert" vs "update" for every inbound event. Postgres, MySQL and
+# Db2 filtered ``deleted_at IS NULL`` out of it, so a replica this node had
+# soft-deleted looked ABSENT — the insert-or-ignore wrote nothing, the row
+# stayed deleted, and the event disappeared with no counter anywhere. SQLite
+# never had the filter, so the two families disagreed. The probe must return
+# the row, deleted or not, on every dialect (the deleted STATE travels back
+# so the receiver can tell).
+
+MARKER_CASES = (
+    pytest.param(
+        "sqlite",
+        "mnemos.persistence.sqlite",
+        "SqliteFederationRepository",
+        lambda calls: __import__("mnemos.persistence.sqlite", fromlist=["SqliteTransaction"]).SqliteTransaction(
+            _SqliteConn(calls)
+        ),
+        id="sqlite",
+    ),
+    pytest.param(
+        "mysql",
+        "mnemos.persistence.mysql",
+        "MysqlFederationRepository",
+        lambda calls: __import__("mnemos.persistence.mysql", fromlist=["_MysqlTransaction"])._MysqlTransaction(
+            _MySqlConn(calls)
+        ),
+        id="mysql",
+    ),
+    pytest.param(
+        "mariadb",
+        "mnemos.persistence.mariadb",
+        "MariadbFederationRepository",
+        lambda calls: __import__("mnemos.persistence.mariadb", fromlist=["_MysqlTransaction"])._MysqlTransaction(
+            _MySqlConn(calls)
+        ),
+        id="mariadb",
+    ),
+    pytest.param(
+        "postgres",
+        "mnemos.persistence.postgres",
+        "PostgresFederationRepository",
+        lambda calls: __import__("mnemos.persistence.postgres", fromlist=["PostgresTransaction"]).PostgresTransaction(
+            _PostgresConn(calls), None
+        ),
+        id="postgres",
+    ),
+    pytest.param(
+        "oracle",
+        "mnemos.persistence.oracle",
+        "OracleFederationRepository",
+        lambda calls: SimpleNamespace(conn=_AwaitableCursorConn(calls)),
+        id="oracle",
+    ),
+    pytest.param(
+        "db2",
+        "mnemos.persistence.db2",
+        "Db2FederationRepository",
+        lambda calls: SimpleNamespace(conn=_AwaitableCursorConn(calls)),
+        id="db2",
+    ),
+)
+
+
+async def _capture_marker(dialect: str, module: str, class_name: str, tx_factory: Any) -> str:
+    """Run one backend's marker lookup against a fake cursor, return the SQL."""
+    calls: list[dict[str, Any]] = []
+    module_obj = __import__(module, fromlist=[class_name])
+    repo = getattr(module_obj, class_name)()
+    await repo.fetch_federated_memory_marker(tx_factory(calls), "fed:pythia:m1")
+    assert calls, f"{dialect}: fetch_federated_memory_marker issued no statement"
+    return calls[0]["sql"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("dialect", "module", "class_name", "tx_factory"), MARKER_CASES)
+async def test_marker_lookup_does_not_hide_a_soft_deleted_replica(
+    dialect: str,
+    module: str,
+    class_name: str,
+    tx_factory: Any,
+) -> None:
+    """No dialect may filter ``deleted_at`` out of the existence probe.
+
+    A soft-deleted replica is still a row. Filtering it out makes the
+    receiver try an insert the primary key refuses, and the inbound event is
+    then applied by nobody and counted by nothing (the SQLite-vs-Postgres
+    divergence this pins).
+    """
+    sql = await _capture_marker(dialect, module, class_name, tx_factory)
+    assert "deleted_at is null" not in " ".join(sql.lower().split()), (
+        f"{dialect}: the marker lookup must not filter on deleted_at:\n{sql}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("dialect", "module", "class_name", "tx_factory"), MARKER_CASES)
+async def test_marker_lookup_returns_the_deleted_state(
+    dialect: str,
+    module: str,
+    class_name: str,
+    tx_factory: Any,
+) -> None:
+    """The probe must carry the lifecycle state so the receiver can tell."""
+    sql = " ".join((await _capture_marker(dialect, module, class_name, tx_factory)).split()).lower()
+    assert "deleted_at" in sql, f"{dialect}: the marker must select deleted_at:\n{sql}"
+    assert "archived_at" in sql, f"{dialect}: the marker must select archived_at:\n{sql}"
+    assert "consolidated_into" in sql, f"{dialect}: the marker must select consolidated_into:\n{sql}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("dialect", "module", "class_name", "tx_factory"), FINISH_SYNC_LOG_CASES)
+async def test_finish_sync_log_writes_the_skipped_deleted_column(
+    dialect: str,
+    module: str,
+    class_name: str,
+    tx_factory: Any,
+) -> None:
+    """``skipped_deleted`` must be a real column of the sync-log write."""
+    call = await _capture_finish_sync_log(dialect, module, class_name, tx_factory)
+    assert "skipped_deleted" in call["sql"], f"{dialect}: finish_sync_log must write skipped_deleted"

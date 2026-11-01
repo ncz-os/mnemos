@@ -5531,7 +5531,8 @@ class PostgresFederationRepository(FederationRepository):
             SELECT id::text, started_at, finished_at, memories_pulled,
                    memories_new, memories_updated, error,
                    cursor_before, cursor_after,
-                   events_received, rows_without_embedding
+                   events_received, rows_without_embedding,
+                   skipped_deleted
             FROM federation_sync_log
             WHERE peer_id = $1::uuid
             ORDER BY started_at DESC
@@ -5875,6 +5876,7 @@ class PostgresFederationRepository(FederationRepository):
         cursor_after: Any,
         events_received: int = 0,
         rows_without_embedding: int = 0,
+        skipped_deleted: int = 0,
     ) -> None:
         await _postgres_tx(tx).conn.execute(
             """
@@ -5886,7 +5888,8 @@ class PostgresFederationRepository(FederationRepository):
                 error = $5,
                 cursor_after = $6,
                 events_received = $7,
-                rows_without_embedding = $8
+                rows_without_embedding = $8,
+                skipped_deleted = $9
             WHERE id = $1::uuid
             """,
             log_id,
@@ -5897,6 +5900,7 @@ class PostgresFederationRepository(FederationRepository):
             cursor_after,
             events_received,
             rows_without_embedding,
+            skipped_deleted,
         )
 
     async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None:

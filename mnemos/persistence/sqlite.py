@@ -179,6 +179,8 @@ SQLITE_MIGRATION_FILES = [
     # F-4: narrow the federation journal update trigger to the columns the
     # feed actually exports (drops the bookkeeping-only and no-op fires).
     "migrations_v7_2_federation_journal_narrow_trigger_sqlite.sql",
+    # F-2: count the inbound events a locally soft-deleted replica skipped.
+    "0069_federation_sync_skipped_deleted.sql",
 ]
 
 
@@ -6639,6 +6641,7 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         cursor_after: Any,
         events_received: int = 0,
         rows_without_embedding: int = 0,
+        skipped_deleted: int = 0,
     ) -> None:
         await _execute(
             self._conn(tx),
@@ -6652,6 +6655,7 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                 records_written = ?,
                 events_received = ?,
                 rows_without_embedding = ?,
+                skipped_deleted = ?,
                 status = ?,
                 error = ?,
                 cursor_after = ?
@@ -6676,6 +6680,7 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                 memories_new + memories_updated,
                 events_received,
                 rows_without_embedding,
+                skipped_deleted,
                 "error" if error else "ok",
                 error,
                 cursor_after,
@@ -8307,6 +8312,8 @@ class SqliteBackend:
                 # F-1: wire events vs applied rows, and the F-5 embedding gap.
                 "events_received": "events_received INTEGER NOT NULL DEFAULT 0",
                 "rows_without_embedding": "rows_without_embedding INTEGER NOT NULL DEFAULT 0",
+                # F-2: inbound events a locally soft-deleted replica skipped.
+                "skipped_deleted": "skipped_deleted INTEGER NOT NULL DEFAULT 0",
             },
         )
 

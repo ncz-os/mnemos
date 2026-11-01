@@ -2574,6 +2574,7 @@ class FederationRepository(ABC):
         cursor_after: Any,
         events_received: int = 0,
         rows_without_embedding: int = 0,
+        skipped_deleted: int = 0,
     ) -> None:
         """Close out one sync-log row.
 
@@ -2588,6 +2589,13 @@ class FederationRepository(ABC):
         is visible. That count is the PER-PEER TOTAL at the time of the
         sync, not a per-sync delta: it covers rows applied by earlier
         syncs too.
+
+        ``skipped_deleted`` is a per-sync DELTA: how many inbound events
+        targeted a replica this node has SOFT-DELETED locally, so the
+        write was not applied and the replica stayed deleted. It is
+        counted rather than swallowed because the row is otherwise
+        invisible — a soft-deleted replica is excluded from every read
+        path, so the divergence has no other number in the system.
         """
         ...
 

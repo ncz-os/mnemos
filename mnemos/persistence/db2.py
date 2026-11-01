@@ -4089,7 +4089,8 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 SELECT id, started_at, finished_at, memories_pulled,
                        memories_new, memories_updated, error,
                        cursor_before, cursor_after,
-                       events_received, rows_without_embedding
+                       events_received, rows_without_embedding,
+                       skipped_deleted
                   FROM federation_sync_log
                  WHERE peer_id = ?
                  ORDER BY started_at DESC
@@ -4132,6 +4133,7 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         cursor_after: Any,
         events_received: int = 0,
         rows_without_embedding: int = 0,
+        skipped_deleted: int = 0,
     ) -> None:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -4147,7 +4149,8 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                     error = ?,
                     cursor_after = ?,
                     events_received = ?,
-                    rows_without_embedding = ?
+                    rows_without_embedding = ?,
+                    skipped_deleted = ?
                  WHERE id = ?
                 """,
                 (
@@ -4158,6 +4161,7 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                     cursor_after,
                     events_received,
                     rows_without_embedding,
+                    skipped_deleted,
                     log_id,
                 ),
             )

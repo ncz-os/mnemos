@@ -7320,7 +7320,8 @@ class OracleFederationRepository(FederationRepository):
                 SELECT id, started_at, finished_at, memories_pulled,
                        memories_new, memories_updated, error,
                        cursor_before, cursor_after,
-                       events_received, rows_without_embedding
+                       events_received, rows_without_embedding,
+                       skipped_deleted
                   FROM federation_sync_log
                  WHERE peer_id = :peer_id
                  ORDER BY started_at DESC
@@ -7363,6 +7364,7 @@ class OracleFederationRepository(FederationRepository):
         cursor_after: Any,
         events_received: int = 0,
         rows_without_embedding: int = 0,
+        skipped_deleted: int = 0,
     ) -> None:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -7378,7 +7380,8 @@ class OracleFederationRepository(FederationRepository):
                     error = :err,
                     cursor_after = :cur_after,
                     events_received = :events,
-                    rows_without_embedding = :no_embedding
+                    rows_without_embedding = :no_embedding,
+                    skipped_deleted = :skipped
                  WHERE id = :id
                 """,
                 {
@@ -7390,6 +7393,7 @@ class OracleFederationRepository(FederationRepository):
                     "cur_after": cursor_after,
                     "events": events_received,
                     "no_embedding": rows_without_embedding,
+                    "skipped": skipped_deleted,
                 },
             )
         finally:

@@ -1,0 +1,254 @@
+"""Live-Postgres leg of the soft-deleted-replica accounting regression.
+
+``tests/test_federation_soft_deleted_marker.py`` proves the behaviour on
+SQLite; the Postgres-family defect is that ``fetch_federated_memory_marker``
+filtered ``deleted_at IS NULL`` (``mnemos/persistence/postgres.py:5976-5991``),
+so on a replica running Postgres a locally soft-deleted row looked ABSENT to
+the receiver: the existence probe said ``None``, ``insert_federated_memory``'s
+``ON CONFLICT (id) DO NOTHING`` wrote nothing because the row is still there,
+the re-read after the losing insert also said ``None``, and the event vanished
+with the sync log reporting a clean run.
+
+This module drives the *real* receiver (``_store_memories``) end to end
+against a live Postgres, in a throwaway schema, and asserts the two things the
+task names: the row stays deleted (no auto-undelete) and the sync counters
+report the skip.
+
+Skipped unless ``MNEMOS_TEST_DB`` points at a reachable Postgres, the same
+gate ``tests/test_streaming_export.py`` uses for its live leg. On an
+environment without Postgres the dialect SQL is still pinned statically by
+``tests/test_federation_counter_backend_parity.py``.
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+
+pytestmark = [
+    pytest.mark.skipif(
+        not os.environ.get("MNEMOS_TEST_DB"),
+        reason="MNEMOS_TEST_DB required for the live PostgreSQL federation leg",
+    ),
+    pytest.mark.asyncio,
+]
+
+# The columns the federation receiver touches on ``memories``. The production
+# table is much wider; this is the minimal shape the touched statements bind.
+_MEMORIES_DDL = """
+CREATE TABLE {schema}.memories (
+    id TEXT PRIMARY KEY,
+    content TEXT,
+    category TEXT,
+    subcategory TEXT,
+    metadata JSONB,
+    verbatim_content TEXT,
+    quality_rating INTEGER,
+    owner_id TEXT,
+    namespace TEXT,
+    permission_mode INTEGER,
+    source_model TEXT,
+    source_provider TEXT,
+    source_session TEXT,
+    source_agent TEXT,
+    federation_source TEXT,
+    federation_remote_updated TIMESTAMPTZ,
+    created TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ
+)
+"""
+
+_SYNC_LOG_DDL = """
+CREATE TABLE {schema}.federation_sync_log (
+    id UUID PRIMARY KEY,
+    peer_id UUID NOT NULL,
+    direction TEXT NOT NULL DEFAULT 'pull',
+    status TEXT NOT NULL DEFAULT 'started',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at TIMESTAMPTZ,
+    memories_pulled INTEGER NOT NULL DEFAULT 0,
+    memories_new INTEGER NOT NULL DEFAULT 0,
+    memories_updated INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    cursor_before TEXT,
+    cursor_after TEXT,
+    events_received INTEGER NOT NULL DEFAULT 0,
+    rows_without_embedding INTEGER NOT NULL DEFAULT 0,
+    skipped_deleted INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+_PEERS_DDL = """
+CREATE TABLE {schema}.federation_peers (
+    id UUID PRIMARY KEY,
+    name TEXT NOT NULL,
+    total_pulled BIGINT NOT NULL DEFAULT 0
+)
+"""
+
+
+async def _open():
+    """A PostgresBackend over a throwaway schema; returns ``(backend, pool)``."""
+    asyncpg = pytest.importorskip("asyncpg")
+    from mnemos.persistence.postgres import PostgresBackend
+
+    dsn = os.environ["MNEMOS_TEST_DB"]
+    schema = "fed_softdel_" + uuid.uuid4().hex
+    admin = await asyncpg.connect(dsn)
+    try:
+        await admin.execute(f"CREATE SCHEMA {schema}")
+        for ddl in (_MEMORIES_DDL, _SYNC_LOG_DDL, _PEERS_DDL):
+            await admin.execute(ddl.format(schema=schema))
+    finally:
+        await admin.close()
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2, server_settings={"search_path": schema})
+    backend = PostgresBackend(pool, SimpleNamespace())
+    await backend.open()
+    return backend, pool
+
+
+async def _row(backend, local_id):
+    async with backend.transactional() as tx:
+        return await tx.conn.fetchrow(
+            "SELECT id, content, deleted_at FROM memories WHERE id = $1",
+            local_id,
+        )
+
+
+async def _soft_delete(backend, local_id):
+    async with backend.transactional() as tx:
+        await tx.conn.execute(
+            "UPDATE memories SET deleted_at = $2 WHERE id = $1",
+            local_id,
+            datetime(2020, 1, 10, tzinfo=timezone.utc),
+        )
+
+
+async def _finish_log(backend, *, log_id, peer_id):
+    async with backend.transactional() as tx:
+        await backend.federation.finish_sync_log(
+            tx,
+            log_id=log_id,
+            memories_pulled=0,
+            memories_new=0,
+            memories_updated=0,
+            error=None,
+            cursor_after=None,
+            events_received=1,
+            rows_without_embedding=0,
+            skipped_deleted=1,
+        )
+        return await tx.conn.fetchrow(
+            "SELECT events_received, skipped_deleted FROM federation_sync_log WHERE id = $1::uuid",
+            log_id,
+        )
+
+
+async def test_postgres_marker_returns_the_soft_deleted_replica() -> None:
+    """The existence probe must see a soft-deleted replica, state included."""
+    backend, pool = await _open()
+    try:
+        local_id = "fed:pythia:m1"
+        async with backend.transactional() as tx:
+            await tx.conn.execute(
+                """
+                INSERT INTO memories (id, content, category, owner_id, namespace, permission_mode,
+                                      federation_source, federation_remote_updated, deleted_at)
+                VALUES ($1, 'facts v1', 'facts', 'federation', 'default', 644,
+                        'pythia', $2, $2)
+                """,
+                local_id,
+                datetime(2020, 1, 1, tzinfo=timezone.utc),
+            )
+        async with backend.transactional() as tx:
+            marker = await backend.federation.fetch_federated_memory_marker(tx, local_id)
+        assert marker is not None, (
+            "a soft-deleted replica is still a row: hiding it from the marker lookup is what "
+            "makes the receiver try an insert the primary key refuses"
+        )
+        assert marker["deleted_at"] is not None
+        assert marker["federation_remote_updated"] is not None
+
+        async with backend.transactional() as tx:
+            markers = await backend.federation.fetch_federated_memory_markers(tx, [local_id])
+        assert local_id in markers, "the batch marker lookup must agree with the single-row one"
+    finally:
+        await pool.close()
+
+
+async def test_postgres_receiver_counts_a_locally_soft_deleted_replica() -> None:
+    """Pull, soft-delete on the replica, apply a newer source revision.
+
+    The row must stay deleted and the counters must report the skip, exactly
+    as the SQLite leg asserts — the two backends must not disagree.
+    """
+    from mnemos.domain import federation as fed
+
+    backend, pool = await _open()
+    try:
+        peer_name = "pythia"
+        local_id = f"fed:{peer_name}:m1"
+        peer_id = uuid.uuid4()
+        async with backend.transactional() as tx:
+            await tx.conn.execute(
+                "INSERT INTO federation_peers (id, name) VALUES ($1::uuid, $2)",
+                str(peer_id),
+                peer_name,
+            )
+
+        first = [
+            {
+                "id": "m1",
+                "content": "facts v1",
+                "category": "facts",
+                "namespace": "default",
+                "created": "2020-01-01T00:00:00Z",
+                "updated": "2020-01-01T00:00:00Z",
+                "federation_sequence": 1,
+            }
+        ]
+        second = [
+            {
+                "id": "m1",
+                "content": "facts v2",
+                "category": "facts",
+                "namespace": "default",
+                "created": "2020-01-01T00:00:00Z",
+                "updated": "2020-01-02T00:00:00Z",
+                "federation_sequence": 2,
+            }
+        ]
+
+        async with backend.transactional() as tx:
+            new_n, upd_n = await fed._store_memories(tx, peer_name, first, backend=backend)
+        assert (new_n, upd_n) == (1, 0)
+
+        row = await _row(backend, local_id)
+        assert row["deleted_at"] is None
+
+        await _soft_delete(backend, local_id)
+
+        counters: dict[str, int] = {}
+        async with backend.transactional() as tx:
+            new_n, upd_n = await fed._store_memories(tx, peer_name, second, backend=backend, counters=counters)
+        assert (new_n, upd_n) == (0, 0), "a deleted replica must not be counted as applied"
+        assert counters.get("skipped_deleted") == 1, (
+            f"the receiver must count the soft-deleted skip, got counters={counters!r}"
+        )
+
+        row = await _row(backend, local_id)
+        assert row["deleted_at"] is not None, "the receiver must not auto-undelete a locally deleted replica"
+        assert row["content"] == "facts v1"
+
+        # And the counter reaches the sync log through the ABC.
+        async with backend.transactional() as tx:
+            log_id = await backend.federation.create_sync_log(tx, str(peer_id), None)
+        logged = await _finish_log(backend, log_id=log_id, peer_id=str(peer_id))
+        assert logged["skipped_deleted"] == 1
+    finally:
+        await pool.close()
