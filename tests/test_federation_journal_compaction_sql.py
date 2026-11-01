@@ -52,6 +52,39 @@ def _update_trigger_region(text: str) -> str:
     return text[start:end] if end != -1 else text[start:]
 
 
+def _mentions_column(region: str, column: str) -> bool:
+    """True when ``column`` appears in ``region`` as a whole identifier."""
+    return column in region
+
+
+@pytest.mark.parametrize(
+    "region,column",
+    [
+        # A longer identifier that merely contains the column name is not it.
+        ("OLD.subcategory IS NOT NEW.subcategory", "category"),
+        ("OLD.verbatim_content IS NOT NEW.verbatim_content", "content"),
+        ("UPDATING('subcategory')", "category"),
+        ("new_category,old_category", "category"),
+    ],
+)
+def test_column_match_rejects_a_longer_identifier(region, column):
+    assert not _mentions_column(region, column)
+
+
+@pytest.mark.parametrize(
+    "region,column",
+    [
+        ("OLD.category IS NOT NEW.category", "category"),
+        (":OLD.content <> :NEW.content", "content"),
+        ("UPDATING('category')", "category"),
+        ("OF federation_source,content,category ON", "content"),
+        ("OLD.category::text IS DISTINCT FROM", "category"),
+    ],
+)
+def test_column_match_accepts_the_column_itself(region, column):
+    assert _mentions_column(region, column)
+
+
 @pytest.mark.parametrize("directory,name", TRIGGER_FILES)
 def test_narrowed_trigger_exists(directory, name):
     assert (MIGRATIONS / directory / name).is_file()
@@ -61,7 +94,7 @@ def test_narrowed_trigger_exists(directory, name):
 def test_narrowed_trigger_keeps_the_exported_columns(directory, name):
     region = _update_trigger_region((MIGRATIONS / directory / name).read_text())
     for column in KEPT:
-        assert column in region, f"{directory}/{name} dropped a fed column: {column}"
+        assert _mentions_column(region, column), f"{directory}/{name} dropped a fed column: {column}"
 
 
 @pytest.mark.parametrize("directory,name", TRIGGER_FILES)
