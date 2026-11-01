@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from mnemos.core.config import db2_vector_indexing_override, embedding_dim_env
+from mnemos.persistence.vector_tuning import HNSW_INDEX_OPTIONS_SQL
 
 _LOG = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -260,9 +261,14 @@ def render_migration_sql(path: Path, *, backend: str, embedding_dim: int) -> str
         sql = sql.replace(needle, value)
     if backend == "postgres" and path.name == "migrations.sql":
         sql = re.sub(r"embedding\s+vector\(\s*\d+\s*\)", f"embedding vector({embedding_dim})", sql)
+        # The ivfflat -> hnsw rewrite (legacy safety net: no shipped
+        # migration uses ivfflat any more) must also carry the HNSW
+        # build options, otherwise a rewritten index would silently
+        # fall back to the extension defaults -- exactly what F-8
+        # (2026-10-31) sets out to avoid.
         sql = re.sub(
             r"USING\s+ivfflat\s*\(\s*embedding\s+vector_cosine_ops\s*\)",
-            "USING hnsw (embedding vector_cosine_ops)",
+            f"USING hnsw (embedding vector_cosine_ops) {HNSW_INDEX_OPTIONS_SQL}",
             sql,
             flags=re.IGNORECASE,
         )
@@ -672,7 +678,8 @@ async def _ensure_postgres_embedding_shape(conn: Any, embedding_dim: int) -> Non
     if index_method != "hnsw":
         await conn.execute("DROP INDEX IF EXISTS idx_memories_embedding")
         await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops)"
+            "CREATE INDEX IF NOT EXISTS idx_memories_embedding "
+            f"ON memories USING hnsw (embedding vector_cosine_ops) {HNSW_INDEX_OPTIONS_SQL}"
         )
 
 
