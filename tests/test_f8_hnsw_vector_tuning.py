@@ -709,6 +709,69 @@ def test_the_iterative_scan_constant_is_defined_and_exported() -> None:
     assert vector_tuning.pgvector_version_at_least("0.8.0", vector_tuning.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION)
     assert not vector_tuning.pgvector_version_at_least("0.7.4", vector_tuning.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION)
 
+    # The constant must be usable as a MINIMUM argument, i.e. it has to be
+    # comparable against the parsed integer version components. A string
+    # tuple ('0', '8') would satisfy a bare equality check but raise
+    # TypeError inside the comparison on every real version string.
+    assert all(isinstance(part, int) for part in vector_tuning.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION), (
+        "PGVECTOR_ITERATIVE_SCAN_MIN_VERSION must be an int tuple: "
+        "pgvector_version_at_least compares it against parsed integer "
+        "version components, and a string tuple raises TypeError."
+    )
+
+    # Both import paths must work -- a test may reach for either module.
+    from mnemos.persistence.postgres import PGVECTOR_ITERATIVE_SCAN_MIN_VERSION as from_postgres
+    from mnemos.persistence.vector_tuning import PGVECTOR_ITERATIVE_SCAN_MIN_VERSION as from_tuning
+
+    assert from_postgres is from_tuning is vector_tuning.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION
+
+
+def test_the_vector_tuning_all_lists_every_public_name() -> None:
+    """``__all__`` must cover every public name the module defines.
+
+    A name that exists but is missing from ``__all__`` still imports
+    fine, so the gap is invisible until something checks the export
+    surface. Pinning it here means "the constant is not exported"
+    cannot become true without a test failing.
+    """
+    from mnemos.persistence import vector_tuning
+
+    public = {name for name in dir(vector_tuning) if not name.startswith("_")}
+    # ``annotations`` is the ``from __future__ import annotations``
+    # artefact, not a name this module defines.
+    public.discard("annotations")
+
+    assert not (public - set(vector_tuning.__all__)), (
+        f"these public names are missing from vector_tuning.__all__: {sorted(public - set(vector_tuning.__all__))}"
+    )
+    # And nothing in __all__ may be absent from the module.
+    assert not (set(vector_tuning.__all__) - public), (
+        f"these names are in __all__ but not defined: {sorted(set(vector_tuning.__all__) - public)}"
+    )
+
+
+def test_the_postgres_module_reexports_the_tuning_constants() -> None:
+    """``postgres.py`` must expose the tuning constants it imports.
+
+    ``semantic_search`` and ``_apply_hnsw_query_tuning`` read these
+    from the module namespace, and the tests reach for them through
+    ``postgres`` as well. If the import is dropped the names vanish
+    from the module and the search path breaks with a NameError.
+    """
+    from mnemos.persistence import postgres, vector_tuning
+
+    for name in (
+        "PGVECTOR_ITERATIVE_SCAN_MIN_VERSION",
+        "hnsw_ef_search_for",
+        "pgvector_version_at_least",
+    ):
+        assert hasattr(postgres, name), (
+            f"mnemos/persistence/postgres.py must import {name} from mnemos.persistence.vector_tuning."
+        )
+        assert getattr(postgres, name) is getattr(vector_tuning, name), (
+            f"postgres.{name} must be the SAME object as vector_tuning.{name}, not a copy."
+        )
+
 
 def test_the_test_modules_have_no_forward_references() -> None:
     """No test may reference a module-level name defined further down.
