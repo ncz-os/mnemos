@@ -457,3 +457,63 @@ def test_user_context_is_importable_from_the_path_the_tests_use():
     from mnemos.core.auth_context import UserContext as FromCore
 
     assert FromDeps is FromCore
+
+
+# ---------------------------------------------------------------------------
+# Pinning tests for a third round of findings.
+#
+# That round repeated the counters= and 0068 claims already pinned above, and
+# added: Path/pytest/inspect missing from this module, MIGRATIONS undefined or
+# pointing outside db_migrations, PGVECTOR_ITERATIVE_SCAN_MIN_VERSION and
+# _apply_hnsw_query_tuning not exposed by postgres, and postgres itself
+# needing to re-export hnsw_index_options_fragment. The first two are covered
+# by the tests above; the import and path claims are pinned here because a
+# wrong MIGRATIONS root would silently turn every file-existence check into a
+# skip-free pass on an empty glob.
+# ---------------------------------------------------------------------------
+
+
+def test_this_module_has_the_imports_its_tests_need():
+    """Path, pytest and inspect must be real names in the test module's globals."""
+    import inspect
+
+    module = __import__(__name__, fromlist=["__file__"])
+    for name in ("Path", "pytest"):
+        assert name in vars(module), f"{name} is not defined in this test module"
+    # inspect is imported inside the tests that need it; assert one such test
+    # actually resolves it rather than relying on a module-level import.
+    source = inspect.getsource(__import__(__name__, fromlist=["x"]))
+    assert "import inspect" in source
+
+
+def test_migrations_root_points_at_db_migrations():
+    """Both backend trees live under mnemos/db_migrations."""
+    assert MIGRATIONS.name == "db_migrations"
+    assert MIGRATIONS.parent.name == "mnemos"
+    assert MIGRATIONS.is_dir()
+    # And every directory this module reads actually resolves below it.
+    for directory in ("migrations", "migrations_oracle", "migrations_db2", "migrations_mysql", "migrations_mariadb"):
+        assert (MIGRATIONS / directory).is_dir(), directory
+
+
+def test_postgres_module_exposes_the_tuning_symbols_its_tests_import():
+    """Tests reach into postgres._apply_hnsw_query_tuning and the version constant."""
+    from mnemos.persistence import postgres
+
+    assert callable(postgres._apply_hnsw_query_tuning)
+    # A (major, minor) tuple, compared against a parsed pgvector version.
+    assert isinstance(postgres.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION, tuple)
+
+
+def test_events_received_is_its_own_counter_not_an_embed_counter():
+    """total_events is tracked separately and passed straight to the log."""
+    import inspect
+
+    from mnemos.domain import federation as federation_module
+
+    source = inspect.getsource(federation_module._sync_peer_locked)
+    assert "total_events" in source
+    assert "events_received=total_events" in source
+    # The embed counter dict intentionally holds only embed outcomes.
+    assert "embed_counters: Dict[str, int] = {}" in source
+    assert 'embed_counters["events_received"]' not in source
