@@ -263,12 +263,19 @@ KNOWN_DUPLICATE_MIGRATIONS = frozenset(
 
 
 def _first_misordered(numbered):
-    """Index of the first migration not numbered above its predecessor, else None."""
-    keys = [number for number, _ in numbered]
-    return next(
-        (i for i in range(1, len(keys)) if keys[i] < keys[i - 1]),
-        None,
-    )
+    """Index of the first migration not numbered above its predecessor, else None.
+
+    Strict: an equal number is a collision, not an ordering, unless both files
+    are one of the frozen ``KNOWN_DUPLICATE_MIGRATIONS``.
+    """
+    for i in range(1, len(numbered)):
+        (prev_number, prev_name), (number, name) = numbered[i - 1], numbered[i]
+        if number > prev_number:
+            continue
+        if number == prev_number and {prev_name, name} <= KNOWN_DUPLICATE_MIGRATIONS:
+            continue
+        return i
+    return None
 
 
 def test_numbering_check_rejects_a_duplicate_number():
