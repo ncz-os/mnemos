@@ -649,6 +649,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0048_memory_versions_visibility.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0054_memory_tags.sql",
         repo_path / "mnemos" / "db_migrations" / "migrations" / "0065_api_keys_key_prefix.sql",
+        repo_path / "mnemos" / "db_migrations" / "migrations" / "0067_memory_index_hygiene.sql",
     ]
 
     if selected_components:
