@@ -8,6 +8,7 @@ production.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -53,8 +54,14 @@ def _update_trigger_region(text: str) -> str:
 
 
 def _mentions_column(region: str, column: str) -> bool:
-    """True when ``column`` appears in ``region`` as a whole identifier."""
-    return column in region
+    """True when ``column`` appears in ``region`` as a whole identifier.
+
+    A plain substring test lets ``subcategory`` stand in for ``category`` and
+    ``verbatim_content`` for ``content``, so a dialect that dropped the
+    shorter column would still pass. ``\\b`` treats ``_`` as a word
+    character, which is exactly the identifier boundary SQL uses here.
+    """
+    return re.search(rf"\b{re.escape(column)}\b", region) is not None
 
 
 @pytest.mark.parametrize(
