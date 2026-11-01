@@ -517,3 +517,69 @@ def test_events_received_is_its_own_counter_not_an_embed_counter():
     # The embed counter dict intentionally holds only embed outcomes.
     assert "embed_counters: Dict[str, int] = {}" in source
     assert 'embed_counters["events_received"]' not in source
+
+
+# ---------------------------------------------------------------------------
+# Pinning tests for a fourth round of findings.
+#
+# That round repeated the counters=, rows_without_embedding, pytest and
+# MIGRATIONS claims, and added three that had not been raised before: that an
+# event loop is not weakrefable, so the WeakKeyDictionary lock registry would
+# raise TypeError; that _apply_hnsw_query_tuning does not take
+# pgvector_version; and that PGVECTOR_ITERATIVE_SCAN_MIN_VERSION is missing
+# from vector_tuning.__all__. The first two are pinned here because they are
+# runtime properties a refactor could break with no test noticing.
+# ---------------------------------------------------------------------------
+
+
+def test_peer_lock_registry_works_and_releases_dead_loops():
+    """The weakref registry must bind, isolate loops, and not leak.
+
+    A WeakKeyDictionary keyed by the event loop is only sound if a loop is
+    weakrefable at all; if it were not, every _peer_sync_lock call would raise
+    TypeError. This also pins the two behaviours the registry exists for: one
+    lock per loop, and a finished loop's locks are dropped.
+    """
+    import asyncio
+    import weakref
+
+    from mnemos.domain import federation as federation_module
+
+    async def _acquire(peer: str):
+        loop = asyncio.get_running_loop()
+        weakref.ref(loop)  # raises TypeError if loops are not weakrefable
+        lock = federation_module._peer_sync_lock(peer)
+        async with lock:  # must be acquirable on THIS loop
+            pass
+        return lock
+
+    first = asyncio.run(_acquire("pin-peer"))
+    second = asyncio.run(_acquire("pin-peer"))
+    assert first is not second, "the registry is not keyed by loop"
+
+    # Two calls inside one loop return the same lock.
+    async def _same():
+        return federation_module._peer_sync_lock("pin-peer") is federation_module._peer_sync_lock("pin-peer")
+
+    assert asyncio.run(_same()), "the lock is not stable within a loop"
+    # Both loops are gone, so the weak registry holds nothing.
+    assert len(federation_module._SYNC_LOCKS) == 0, "finished loops were not collected"
+
+
+def test_apply_hnsw_query_tuning_accepts_pgvector_version():
+    """The helper gates iterative_scan on the version, so it must take it."""
+    import inspect
+
+    from mnemos.persistence import postgres
+
+    params = inspect.signature(postgres._apply_hnsw_query_tuning).parameters
+    assert "pgvector_version" in params, list(params)
+    assert "limit" in params, list(params)
+
+
+def test_vector_tuning_exports_the_version_constant():
+    """Consumers compare against it, so it belongs in __all__."""
+    from mnemos.persistence import vector_tuning
+
+    assert "PGVECTOR_ITERATIVE_SCAN_MIN_VERSION" in vector_tuning.__all__
+    assert vector_tuning.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION == (0, 8)
