@@ -377,3 +377,58 @@ async def save_peer_cursor(tx, peer_id, cursor_value, filter_signature):
             cursor_value,
             filter_signature,
         )
+
+
+async def redispatch_memory_ids(tx, memory_ids):
+    """Append a fresh, publishable change for each id that needs re-serving.
+
+    F-15 reconcile: the receiver's durable fence drops any event whose
+    sequence it already applied, so a replica that lost a row locally can
+    never re-apply the original one. Publishing a NEW event for the current
+    state -- stamped in the source's clock order by the next ``_publish`` --
+    is how the row becomes reachable again without touching the fence, the
+    receiver, or the diagnostic history.
+
+    Only the current state of an exportable row is re-advertised: a row that
+    left the feed (deleted, archived, consolidated, vault, or became private
+    offsite) already produces its own withdrawal/consolidation event, and
+    re-advertising it would mislabel a revocation as live data. Rows with
+    ``federation_source`` set are skipped for the same reason they are never
+    on the feed: they have no publishable event to replay.
+    """
+    ids = [str(mid) for mid in memory_ids if mid]
+    if not ids:
+        return 0
+    ops = _ops(tx)
+    await ops.execute("UPDATE federation_change_clock SET value = value WHERE id = 1")
+    placeholders = ",".join("?" for _ in ids)
+    rows = await ops.fetchall(
+        "SELECT id, namespace, category, permission_mode, updated FROM memories "
+        f"WHERE id IN ({placeholders}) AND deleted_at IS NULL AND archived_at IS NULL "
+        "AND consolidated_into IS NULL AND federation_source IS NULL",
+        *ids,
+    )
+    for row in rows:
+        public = 1 if (federation_feed_include_private() or int(row.get("permission_mode") or 0) % 10 >= 4) else 0
+        await ops.execute(
+            "INSERT INTO federation_changes(memory_id,changed_at,old_namespace,old_category,"
+            "old_public,old_exportable,new_namespace,new_category,new_public,new_exportable) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            row["id"],
+            datetime.now(timezone.utc).isoformat(),
+            row.get("namespace"),
+            row.get("category"),
+            public,
+            1,
+            row.get("namespace"),
+            row.get("category"),
+            public,
+            1,
+        )
+    # Reserve the sequences here rather than leaving them to the next
+    # ``_publish``: a replica whose cursor is already at ``journal:N`` would
+    # never see a replayed event that happened to land on N. _publish bumps
+    # the clock by the number of rows it assigns, so the re-advertised events
+    # are strictly after every sequence already handed out.
+    await _publish(ops)
+    return len(rows)

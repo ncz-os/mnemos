@@ -68,6 +68,38 @@ def eligible_for_federation(alias: str = "m", *, include_private: bool | None = 
     )
 
 
+def eligible_for_federation_export(alias: str = "m", *, include_private: bool | None = None) -> str:
+    """DOCUMENTATION-ONLY mirror of what CHARON's export counts (F-15).
+
+    ``fetch_visible_export_memory_ids`` filters ``deleted_at IS NULL``, owner,
+    namespace and non-vault -- it has no ``federation_source`` term. So a row
+    that arrived here from another peer, with ``archived_at`` set, or with
+    ``consolidated_into`` set, is exportable by CHARON's definition but is
+    NOT served by ``eligible_for_federation`` above.
+
+    That difference is deliberate for the two lifecycle cases (an archived or
+    consolidated row is a revocation, not live content) and is a real gap for
+    the ``federation_source`` case: the federation journal triggers
+    (0062/0064) only journal rows whose ``federation_source`` IS NULL, so such
+    a row has no publishable event and can never be served at all.
+
+    This function exists so the two definitions are diffable in one place and
+    so ``tests/test_federation_parity_reconcile.py`` can assert the gap
+    explicitly. It is not wired into any query path: closing the
+    ``federation_source`` case needs a trigger change on all six backends and
+    is out of scope for F-15. ``replica_parity`` reports those rows as
+    ``unreachable`` rather than as a permanent ``missing`` deficit.
+    """
+    prefix = f"{alias}." if alias else ""
+    vault_literal = VAULT_NAMESPACE.replace("'", "''")
+    world_read = "" if _federation_include_private(include_private) else f"AND ({prefix}permission_mode % 10) >= 4 "
+    return (
+        f"{prefix}deleted_at IS NULL "
+        f"{world_read}"
+        f"AND ({prefix}namespace IS NULL OR {prefix}namespace <> '{vault_literal}')"
+    )
+
+
 def eligible_for_federation_tombstone(alias: str = "m", *, include_private: bool | None = None) -> str:
     prefix = f"{alias}." if alias else ""
     vault_literal = VAULT_NAMESPACE.replace("'", "''")
@@ -138,6 +170,7 @@ __all__ = [
     "MEMORY_ELIGIBILITY_PREDICATE",
     "eligible_for_compression",
     "eligible_for_federation",
+    "eligible_for_federation_export",
     "eligible_for_federation_tombstone",
     "eligible_for_federation_withdrawal",
     "eligible_for_morpheus",
