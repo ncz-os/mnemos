@@ -123,11 +123,11 @@ def _install_pull(monkeypatch, batches):
     monkeypatch.setattr(fed, "_pull_batch", fake_pull)
 
 
-def _page(rows, *, cursor="journal:9"):
+def _page(rows, *, cursor="journal:9", has_more=False):
     return {
         "memories": rows,
         "next_cursor": fed._encode_feed_cursor(fed._parse_cursor_timestamp("2020-01-05T00:00:00Z"), cursor),
-        "has_more": False,
+        "has_more": has_more,
     }
 
 
@@ -303,3 +303,60 @@ async def test_live_replica_still_updates_after_a_deleted_sibling(backend, monke
 
     peer_row = await _peer_row(backend, peer["id"])
     assert peer_row["total_pulled"] == 3, "applied rows only: 2 from the first sync + 1 update"
+
+
+@pytest.mark.asyncio
+async def test_skipped_deleted_accumulates_across_pages_in_one_sync(backend, monkeypatch):
+    """Pin: the per-sync skip count sums EVERY page, not just the last one.
+
+    ``_store_memories`` reports each batch's delta through a shared
+    ``counters`` dict that it overwrites on every call, so the pull loop has
+    to settle the delta into a running total per page
+    (``mnemos/domain/federation.py`` in ``_sync_peer_locked``). This drives
+    two pages in a single sync with UNEQUAL skip counts (1 on the first,
+    2 on the second) and asserts the sync log records the sum, 3.
+
+    Unequal page sizes matter: with equal deltas a "read the dict once at
+    the end" implementation lands on the same number by coincidence and the
+    test would pass against a broken loop. Verified: this reads 1 + 2 = 3,
+    and a variant with 2 skips on page 1 and 0 on page 2 records 2 (the
+    per-page reads), not 0.
+    """
+    peer = await _make_peer(backend)
+    ids = [f"m{i}" for i in range(1, 5)]
+    _install_pull(
+        monkeypatch,
+        [
+            _page([_wire_row(rid, sequence=index + 1) for index, rid in enumerate(ids)], cursor="journal:4"),
+            # Second sync: TWO pages in one pull, with UNEQUAL skip counts
+            # (one deleted replica on page 1, two on page 2).
+            _page(
+                [_wire_row("m1", content="v2", sequence=10, updated="2020-01-02T00:00:00Z")],
+                cursor="journal:10",
+                has_more=True,
+            ),
+            _page(
+                [
+                    _wire_row("m2", content="v2", sequence=11, updated="2020-01-02T00:00:00Z"),
+                    _wire_row("m3", content="v2", sequence=12, updated="2020-01-02T00:00:00Z"),
+                ],
+                cursor="journal:12",
+                has_more=False,
+            ),
+        ],
+    )
+
+    await fed.sync_peer(backend, peer["id"])
+    for rid in ("m1", "m2", "m3"):
+        await _soft_delete(backend, f"fed:pythia:{rid}")
+
+    pulled, new, updated = await fed.sync_peer(backend, peer["id"])
+    assert (pulled, new, updated) == (0, 0, 0), "every event targets a soft-deleted replica; none applies"
+
+    log = await _sync_log(backend, peer["id"])
+    assert log[0]["skipped_deleted"] == 0, "the bootstrap sync applied live rows; nothing was skipped"
+    assert log[-1]["skipped_deleted"] == 3, (
+        "skips must accumulate across pages within one sync (1 + 2 = 3); "
+        f"got skipped_deleted={log[-1]['skipped_deleted']!r}"
+    )
+    assert log[-1]["events_received"] == 3, "both pages' events are wire events"
