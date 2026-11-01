@@ -457,10 +457,9 @@ def test_the_capped_route_defaults_are_resolved_query_objects() -> None:
 
 
 def test_the_schema_module_imports_the_hnsw_index_options_constant() -> None:
-    """``mnemos/persistence/schema.py`` must import
-    ``HNSW_INDEX_OPTIONS_SQL``.
+    """``mnemos/persistence/schema.py`` must import the options helper.
 
-    The constant is referenced in two places: the legacy ivfflat ->
+    The helper is referenced in two places: the legacy ivfflat ->
     hnsw rewrite inside ``render_migration_sql`` and the runtime shape
     repair inside ``_ensure_postgres_embedding_shape``. A missing
     import is a ``NameError`` in either path -- the first during
@@ -469,13 +468,13 @@ def test_the_schema_module_imports_the_hnsw_index_options_constant() -> None:
     """
     from mnemos.persistence import schema
 
-    assert hasattr(schema, "HNSW_INDEX_OPTIONS_SQL"), (
-        "mnemos/persistence/schema.py must import HNSW_INDEX_OPTIONS_SQL "
+    assert hasattr(schema, "hnsw_index_options_fragment"), (
+        "mnemos/persistence/schema.py must import hnsw_index_options_fragment "
         "from mnemos.persistence.vector_tuning -- it is referenced by "
         "render_migration_sql and _ensure_postgres_embedding_shape."
     )
-    assert "m = 16" in schema.HNSW_INDEX_OPTIONS_SQL
-    assert "ef_construction = 64" in schema.HNSW_INDEX_OPTIONS_SQL
+    assert "m = 16" in schema.hnsw_index_options_fragment()
+    assert "ef_construction = 64" in schema.hnsw_index_options_fragment()
 
 
 def test_the_hnsw_index_options_constant_resolves_at_both_reference_sites() -> None:

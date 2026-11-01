@@ -8,7 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from mnemos.persistence.vector_tuning import HNSW_INDEX_OPTIONS_SQL
+from mnemos.persistence.vector_tuning import hnsw_index_options_fragment
 
 from .wizard import Config, default_components_for_profile
 
@@ -849,7 +849,7 @@ def _ensure_postgres_embedding_hnsw_index(config: Config) -> bool:
         rc, _, err = _psql_superuser(
             "DROP INDEX IF EXISTS idx_memories_embedding; "
             "CREATE INDEX IF NOT EXISTS idx_memories_embedding "
-            f"ON memories USING hnsw (embedding vector_cosine_ops) {HNSW_INDEX_OPTIONS_SQL};",
+            f"ON memories USING hnsw (embedding vector_cosine_ops){hnsw_index_options_fragment()};",
             dbname=config.db_name,
             timeout=120,
         )

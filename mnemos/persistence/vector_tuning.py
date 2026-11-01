@@ -75,6 +75,7 @@ __all__ = [
     "PGVECTOR_ITERATIVE_SCAN_MIN_VERSION",
     "HNSW_INDEX_OPTIONS_SQL",
     "hnsw_ef_search_for",
+    "hnsw_index_options_fragment",
     "pgvector_version_at_least",
 ]
 
@@ -113,7 +114,31 @@ ORACLE_HAS_VECTOR_INDEX_DDL: bool = False
 #: constants above so every DDL site (the legacy PG bootstrap migration,
 #: the runtime shape repair in ``mnemos/persistence/schema.py`` and the
 #: installer's index rebuild) declares the same build parameters.
+#:
+#: This is the BARE clause -- it has no leading space. Call sites must
+#: separate it from the preceding SQL token themselves. Use
+#: :func:`hnsw_index_options_fragment` to get a fragment that is always
+#: correctly separated, rather than hand-concatenating.
 HNSW_INDEX_OPTIONS_SQL: str = f"WITH (m = {HNSW_INDEX_M}, ef_construction = {HNSW_INDEX_EF_CONSTRUCTION})"
+
+
+def hnsw_index_options_fragment() -> str:
+    """Return the HNSW options clause with a guaranteed leading space.
+
+    The bare :data:`HNSW_INDEX_OPTIONS_SQL` is ``WITH (m = 16,
+    ef_construction = 64)`` with no leading space. A DDL site that
+    concatenates it directly after ``vector_cosine_ops)`` produces
+    ``vector_cosine_ops)WITH (...)`` -- invalid Postgres syntax that
+    fails the index build at install time, with a confusing error.
+
+    This helper returns the clause with the separating space already
+    applied, so a call site writes::
+
+        f"... USING hnsw (embedding vector_cosine_ops){hnsw_index_options_fragment()}"
+
+    and cannot get the spacing wrong.
+    """
+    return f" {HNSW_INDEX_OPTIONS_SQL}"
 
 
 def hnsw_ef_search_for(limit: int) -> int:

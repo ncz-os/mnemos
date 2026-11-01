@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from mnemos.core.config import db2_vector_indexing_override, embedding_dim_env
-from mnemos.persistence.vector_tuning import HNSW_INDEX_OPTIONS_SQL
+from mnemos.persistence.vector_tuning import hnsw_index_options_fragment
 
 _LOG = logging.getLogger(__name__)
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -268,7 +268,7 @@ def render_migration_sql(path: Path, *, backend: str, embedding_dim: int) -> str
         # (2026-10-31) sets out to avoid.
         sql = re.sub(
             r"USING\s+ivfflat\s*\(\s*embedding\s+vector_cosine_ops\s*\)",
-            f"USING hnsw (embedding vector_cosine_ops) {HNSW_INDEX_OPTIONS_SQL}",
+            f"USING hnsw (embedding vector_cosine_ops){hnsw_index_options_fragment()}",
             sql,
             flags=re.IGNORECASE,
         )
@@ -679,7 +679,7 @@ async def _ensure_postgres_embedding_shape(conn: Any, embedding_dim: int) -> Non
         await conn.execute("DROP INDEX IF EXISTS idx_memories_embedding")
         await conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_memories_embedding "
-            f"ON memories USING hnsw (embedding vector_cosine_ops) {HNSW_INDEX_OPTIONS_SQL}"
+            f"ON memories USING hnsw (embedding vector_cosine_ops){hnsw_index_options_fragment()}"
         )
 
 

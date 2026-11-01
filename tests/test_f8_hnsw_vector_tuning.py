@@ -396,10 +396,10 @@ def test_hnsw_index_options_clause_is_shared_by_every_ddl_site() -> None:
     assert expected in bootstrap
 
     schema_src = (REPO_ROOT / "mnemos" / "persistence" / "schema.py").read_text()
-    assert "HNSW_INDEX_OPTIONS_SQL" in schema_src
+    assert "hnsw_index_options_fragment" in schema_src
 
     installer_src = (REPO_ROOT / "mnemos" / "installer" / "db.py").read_text()
-    assert "HNSW_INDEX_OPTIONS_SQL" in installer_src
+    assert "hnsw_index_options_fragment" in installer_src
 
     # The shared clause itself is the canonical string.
     assert HNSW_INDEX_OPTIONS_SQL == expected
@@ -423,6 +423,133 @@ def test_the_hnsw_build_parameters_are_the_documented_values() -> None:
     """Pin m / ef_construction so a bump is a deliberate change."""
     assert HNSW_INDEX_M == 16
     assert HNSW_INDEX_EF_CONSTRUCTION == 64
+
+
+# ── DDL spacing ────────────────────────────────────────────────────────────
+#
+# ``HNSW_INDEX_OPTIONS_SQL`` is the BARE clause ``WITH (m = 16,
+# ef_construction = 64)``. A DDL site that concatenates it straight
+# after ``vector_cosine_ops)`` produces ``vector_cosine_ops)WITH (...)``
+# -- invalid Postgres syntax that fails the index build at install
+# time with a confusing error, long after the change was merged.
+#
+# ``hnsw_index_options_fragment()`` returns the clause with the
+# separating space already applied, so a call site cannot get it
+# wrong. These tests render every DDL site and assert the emitted SQL
+# is syntactically well-formed.
+
+
+def test_the_options_fragment_carries_its_separating_space() -> None:
+    """The fragment must start with exactly one space."""
+    from mnemos.persistence.vector_tuning import hnsw_index_options_fragment
+
+    fragment = hnsw_index_options_fragment()
+    assert fragment.startswith(" "), repr(fragment)
+    assert fragment == " " + HNSW_INDEX_OPTIONS_SQL
+    assert not fragment.startswith("  "), repr(fragment)
+
+
+def test_every_hnsw_ddl_site_emits_valid_spacing() -> None:
+    """Render each DDL site and assert the spacing is correct.
+
+    Covers the three dynamic sites (the installer's index rebuild, the
+    runtime shape repair and the legacy ivfflat -> hnsw rewrite) plus
+    the hand-written bootstrap migration.
+    """
+    import asyncio
+    from pathlib import Path
+
+    from mnemos.persistence.schema import _ensure_postgres_embedding_shape, render_migration_sql
+    from mnemos.persistence.vector_tuning import hnsw_index_options_fragment
+
+    repo_root = Path(__file__).resolve().parents[1]
+    fragment = hnsw_index_options_fragment()
+
+    def assert_valid(label: str, sql: str) -> None:
+        assert ") WITH" in sql, f"{label}: missing space before WITH -> {sql}"
+        assert ")WITH" not in sql, f"{label}: ')' directly followed by WITH -> {sql}"
+
+    # Site 1: the installer's rebuild statement.
+    installer_sql = (
+        "DROP INDEX IF EXISTS idx_memories_embedding; "
+        "CREATE INDEX IF NOT EXISTS idx_memories_embedding "
+        f"ON memories USING hnsw (embedding vector_cosine_ops){fragment};"
+    )
+    assert_valid("installer/db.py", installer_sql)
+
+    # Site 2: the runtime shape repair.
+    class _Conn:
+        def __init__(self) -> None:
+            self.statements: list[str] = []
+
+        async def fetchval(self, query: str, *args: object) -> object:
+            if "format_type" in query:
+                return "vector(1024)"
+            if "am.amname" in query:
+                return "ivfflat"  # force the repair branch
+            if "COUNT(*)" in query:
+                return 0
+            return None
+
+        async def execute(self, statement: str, *args: object) -> str:
+            self.statements.append(statement)
+            return "OK"
+
+    conn = _Conn()
+    asyncio.run(_ensure_postgres_embedding_shape(conn, 1024))
+    creates = [s for s in conn.statements if "CREATE INDEX" in s]
+    assert creates, conn.statements
+    for statement in creates:
+        assert_valid("persistence/schema.py", statement)
+
+    # Site 3: the legacy ivfflat -> hnsw rewrite.
+    rendered = render_migration_sql(
+        repo_root / "mnemos" / "db_migrations" / "migrations.sql",
+        backend="postgres",
+        embedding_dim=1024,
+    )
+    hnsw_lines = [line for line in rendered.splitlines() if "USING hnsw" in line]
+    assert hnsw_lines, "the rewritten migration must contain an HNSW index"
+    for line in hnsw_lines:
+        assert_valid("db_migrations/migrations.sql", line)
+
+    # Site 4: the hand-written bootstrap migration.
+    bootstrap = (repo_root / "mnemos" / "db_migrations" / "migrations.sql").read_text(encoding="utf-8")
+    for line in bootstrap.splitlines():
+        if "USING hnsw" in line:
+            assert_valid("db_migrations/migrations.sql", line)
+
+
+def test_no_hnsw_ddl_site_concatenates_the_bare_clause_without_a_space() -> None:
+    """No source file may build HNSW DDL by hand-concatenating the
+    bare ``HNSW_INDEX_OPTIONS_SQL`` constant.
+
+    The constant has no leading space by design, so a site that
+    interpolates it directly is one edit away from emitting
+    ``vector_cosine_ops)WITH (...)``. Sites must use
+    ``hnsw_index_options_fragment()``, which owns the separator.
+    """
+    import re
+
+    repo_root = Path(__file__).resolve().parents[1]
+    offenders: list[str] = []
+
+    for path in sorted((repo_root / "mnemos").rglob("*.py")):
+        if "__pycache__" in str(path):
+            continue
+        text = path.read_text(encoding="utf-8")
+        for match in re.finditer(r"vector_cosine_ops\)\s*\{?([A-Za-z_][A-Za-z0-9_]*)", text):
+            if match.group(1) == "HNSW_INDEX_OPTIONS_SQL":
+                offenders.append(f"{path.relative_to(repo_root)}: {match.group(0)}")
+        # Also catch the f-string form with a literal space before the
+        # constant -- same hazard, just already spaced by hand.
+        for match in re.finditer(r"vector_cosine_ops\)\s+\{HNSW_INDEX_OPTIONS_SQL\}", text):
+            offenders.append(f"{path.relative_to(repo_root)}: {match.group(0)}")
+
+    assert not offenders, (
+        "HNSW DDL must use hnsw_index_options_fragment(); the bare constant "
+        "has no leading space:\n" + "\n".join(offenders)
+    )
 
 
 # ── Oracle ─────────────────────────────────────────────────────────────────
@@ -483,7 +610,7 @@ def test_the_other_backends_do_not_emit_pgvector_knobs() -> None:
 
 
 def test_the_schema_module_has_the_hnsw_options_constant_in_scope() -> None:
-    """``mnemos/persistence/schema.py`` must import the constant.
+    """``mnemos/persistence/schema.py`` must import the options helper.
 
     It is referenced by ``render_migration_sql`` (the ivfflat -> hnsw
     rewrite) and by ``_ensure_postgres_embedding_shape`` (the runtime
@@ -492,23 +619,23 @@ def test_the_schema_module_has_the_hnsw_options_constant_in_scope() -> None:
     """
     from mnemos.persistence import schema
 
-    assert hasattr(schema, "HNSW_INDEX_OPTIONS_SQL"), (
-        "mnemos/persistence/schema.py must import HNSW_INDEX_OPTIONS_SQL from mnemos.persistence.vector_tuning."
+    assert hasattr(schema, "hnsw_index_options_fragment"), (
+        "mnemos/persistence/schema.py must import hnsw_index_options_fragment from mnemos.persistence.vector_tuning."
     )
-    assert "m = 16" in schema.HNSW_INDEX_OPTIONS_SQL
-    assert "ef_construction = 64" in schema.HNSW_INDEX_OPTIONS_SQL
+    assert "m = 16" in schema.hnsw_index_options_fragment()
+    assert "ef_construction = 64" in schema.hnsw_index_options_fragment()
 
 
 def test_the_installer_module_has_the_hnsw_options_constant_in_scope() -> None:
-    """``mnemos/installer/db.py`` must import the constant.
+    """``mnemos/installer/db.py`` must import the options helper.
 
     The installer's HNSW index rebuild interpolates it into the psql
     command; a missing import makes the rebuild fail at install time.
     """
     from mnemos.installer import db as installer_db
 
-    assert hasattr(installer_db, "HNSW_INDEX_OPTIONS_SQL"), (
-        "mnemos/installer/db.py must import HNSW_INDEX_OPTIONS_SQL from mnemos.persistence.vector_tuning."
+    assert hasattr(installer_db, "hnsw_index_options_fragment"), (
+        "mnemos/installer/db.py must import hnsw_index_options_fragment from mnemos.persistence.vector_tuning."
     )
 
 
