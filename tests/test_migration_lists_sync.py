@@ -166,6 +166,7 @@ EXPECTED_SQLITE_MIGRATIONS = [
     # benchmarks, curated_routing, health) + nullable price columns.
     "migrations_v7_1_model_registry_repository_sqlite.sql",
     "migrations_v7_2_federation_journal_narrow_trigger_sqlite.sql",  # F-4: narrowed journal trigger
+    "0069_federation_sync_skipped_deleted.sql",  # F-2: soft-deleted replica skip counter
 ]
 
 

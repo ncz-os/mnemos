@@ -7574,7 +7574,7 @@ class MysqlFederationRepository(FederationRepository):
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
-                "SELECT federation_remote_updated FROM memories WHERE id = %s AND deleted_at IS NULL",
+                "SELECT federation_remote_updated, deleted_at FROM memories WHERE id = %s",
                 (local_id,),
             )
             return await _fetchone_dict(cursor)

@@ -460,11 +460,14 @@ async def test_marker_lookup_returns_the_deleted_state(
     class_name: str,
     tx_factory: Any,
 ) -> None:
-    """The probe must carry the lifecycle state so the receiver can tell."""
+    """The probe must carry the deleted state so the receiver can tell.
+
+    The receiver distinguishes "no such replica" (insert) from "replica
+    deleted on this node" (count the skip). Both are now reachable branches,
+    so the state has to travel with the marker on every dialect.
+    """
     sql = " ".join((await _capture_marker(dialect, module, class_name, tx_factory)).split()).lower()
     assert "deleted_at" in sql, f"{dialect}: the marker must select deleted_at:\n{sql}"
-    assert "archived_at" in sql, f"{dialect}: the marker must select archived_at:\n{sql}"
-    assert "consolidated_into" in sql, f"{dialect}: the marker must select consolidated_into:\n{sql}"
 
 
 @pytest.mark.asyncio

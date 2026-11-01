@@ -5979,7 +5979,7 @@ class PostgresFederationRepository(FederationRepository):
 
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         return await _postgres_tx(tx).conn.fetchrow(
-            "SELECT federation_remote_updated FROM memories WHERE id = $1 AND deleted_at IS NULL",
+            "SELECT federation_remote_updated, deleted_at FROM memories WHERE id = $1",
             local_id,
         )
 
@@ -5992,9 +5992,9 @@ class PostgresFederationRepository(FederationRepository):
             return {}
         rows = await _postgres_tx(tx).conn.fetch(
             """
-            SELECT id, federation_remote_updated
+            SELECT id, federation_remote_updated, deleted_at
             FROM memories
-            WHERE id = ANY($1::text[]) AND deleted_at IS NULL
+            WHERE id = ANY($1::text[])
             """,
             list(local_ids),
         )

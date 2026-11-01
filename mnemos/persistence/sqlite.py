@@ -6317,7 +6317,8 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             SELECT id, started_at, finished_at, memories_pulled,
                    memories_new, memories_updated, error,
                    cursor_before, cursor_after,
-                   events_received, rows_without_embedding
+                   events_received, rows_without_embedding,
+                   skipped_deleted
             FROM federation_sync_log
             WHERE peer_id = ?
             ORDER BY started_at DESC
@@ -6773,7 +6774,7 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         return await _fetch_one(
             self._conn(tx),
-            "SELECT federation_remote_updated FROM memories WHERE id = ?",
+            "SELECT federation_remote_updated, deleted_at FROM memories WHERE id = ?",
             (local_id,),
         )
 
@@ -6913,6 +6914,11 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
               federation_remote_updated = ?,
               updated = ?
             WHERE id = ?
+              -- Parity with Postgres/MySQL/Oracle/Db2: a replica this node
+              -- has soft-deleted is never written back by a sync. The
+              -- receiver counts the skip (``skipped_deleted``) and does not
+              -- undelete; that is a policy decision, not a sync side effect.
+              AND deleted_at IS NULL
               AND (
                   federation_remote_updated IS NULL
                   OR federation_remote_updated < ?

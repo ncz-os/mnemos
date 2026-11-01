@@ -2653,7 +2653,12 @@ async def test_db2_federation_fetch_federated_memory_marker_native_tokens() -> N
     await repo.fetch_federated_memory_marker(tx, "mem-1")
     sql = calls[0]["sql"].upper() if calls else ""
     assert "FROM MEMORIES" in sql
-    assert "WHERE ID = ? AND DELETED_AT IS NULL" in sql
+    assert "WHERE ID = ?" in sql
+    # F-2: the existence probe must NOT filter deleted_at — a replica this
+    # node soft-deleted is still a row, and hiding it made the receiver try
+    # an insert the primary key refuses. It selects the state instead.
+    assert "DELETED_AT IS NULL" not in sql
+    assert "SELECT FEDERATION_REMOTE_UPDATED, DELETED_AT" in sql
     assert ":ID" not in sql
 
 

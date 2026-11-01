@@ -7522,9 +7522,9 @@ class OracleFederationRepository(FederationRepository):
             await _call(
                 cursor.execute,
                 """
-                SELECT federation_remote_updated
+                SELECT federation_remote_updated, deleted_at
                   FROM memories
-                 WHERE id = :id AND deleted_at IS NULL
+                 WHERE id = :id
                 """,
                 {"id": local_id},
             )

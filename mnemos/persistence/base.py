@@ -2626,7 +2626,21 @@ class FederationRepository(ABC):
     async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]: ...
 
     @abstractmethod
-    async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None: ...
+    @abstractmethod
+    async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
+        """The replica's current sync state: ``(federation_remote_updated, deleted_at)``.
+
+        MUST NOT filter on ``deleted_at``. This is the receiver's existence
+        probe: ``mnemos.domain.federation._store_memories`` uses it to choose
+        insert-or-update for an inbound event. Hiding a soft-deleted replica
+        here does not skip the write — ``insert_federated_memory`` is
+        insert-or-ignore on the primary key, so the write silently lands
+        nowhere and the row stays deleted with no counter to say so
+        (Postgres/MySQL/Oracle/Db2 used to do exactly that while SQLite did
+        not). The probe returns the row whether or not it is deleted, and
+        carries ``deleted_at`` so the receiver can count the skip.
+        """
+        ...
 
     async def restore_federated_memory_after_local_damage(
         self,

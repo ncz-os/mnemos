@@ -540,6 +540,8 @@ async def peer_sync_log(
             # report zero.
             events_received=_opt_int(r, "events_received"),
             rows_without_embedding=_opt_int(r, "rows_without_embedding"),
+            # F-2: events skipped because the replica is soft-deleted here.
+            skipped_deleted=_opt_int(r, "skipped_deleted"),
         )
         for r in rows
     ]

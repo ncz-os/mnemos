@@ -3705,9 +3705,9 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
             await _call(
                 cursor.execute,
                 """
-                SELECT federation_remote_updated
+                SELECT federation_remote_updated, deleted_at
                   FROM memories
-                 WHERE id = ? AND deleted_at IS NULL
+                 WHERE id = ?
                 """,
                 (local_id,),
             )

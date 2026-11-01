@@ -617,6 +617,10 @@ async def _sync_peer_locked(
     rows_without_embedding = 0
     # F-5: the per-sync embedding counters, filled in by _store_memories.
     embed_counters: Dict[str, int] = {}
+    # F-2: inbound events whose replica this node soft-deleted locally.
+    # Accumulated across pages (each page overwrites the counter with its
+    # own delta), then reported ONCE per sync rather than once per row.
+    total_skipped_deleted = 0
     cursor_request: Optional[datetime | FederationFeedCursor] = cursor_before
     cursor_persisted = cursor_before
     from mnemos.persistence import federation_journal as journal
@@ -707,6 +711,7 @@ async def _sync_peer_locked(
                         )
                 total_events += len(batch)
                 total_pulled += new_n + upd_n
+                total_skipped_deleted += int(embed_counters.get("skipped_deleted", 0))
                 total_new += new_n
                 total_updated += upd_n
                 if next_cursor is not None:
@@ -755,6 +760,7 @@ async def _sync_peer_locked(
             cursor_after=cursor_persisted,
             events_received=total_events,
             rows_without_embedding=rows_without_embedding,
+            skipped_deleted=total_skipped_deleted,
         )
         if err:
             await repo.record_sync_error(tx, peer_id, err)
@@ -778,13 +784,26 @@ async def _sync_peer_locked(
             rows_without_embedding,
         )
 
+    # F-2: inbound events the receiver could not apply because this node
+    # soft-deleted the replica. One line per sync (not one per row): the
+    # count is what an operator needs, and a peer with a large deleted
+    # backlog would otherwise bury the log.
+    if total_skipped_deleted:
+        logger.warning(
+            "federation: peer=%s skipped=%d inbound event(s) for replicas deleted on this node "
+            "(left deleted, not counted as applied — see federation_sync_log.skipped_deleted)",
+            peer["name"],
+            total_skipped_deleted,
+        )
+
     logger.info(
-        "federation: peer=%s pulled=%d new=%d updated=%d events=%d cursor=%s",
+        "federation: peer=%s pulled=%d new=%d updated=%d events=%d skipped_deleted=%d cursor=%s",
         peer["name"],
         total_pulled,
         total_new,
         total_updated,
         total_events,
+        total_skipped_deleted,
         cursor_persisted,
     )
     return total_pulled, total_new, total_updated
@@ -1012,6 +1031,15 @@ async def _store_memories(
 
     Both mean the applied row is not semantically searchable until a
     local re-embed fills it in.
+
+    F-2: when ``counters`` is given it also carries ``skipped_deleted`` —
+    the number of inbound events whose replica this node has SOFT-DELETED
+    locally, so nothing could be applied. The row stays deleted: undeleting
+    a replica is a policy decision (see the repair job), not a side effect
+    of a sync. Before this, a soft-deleted replica was invisible to the
+    existence probe on Postgres/MySQL/Oracle/Db2, the insert-or-ignore
+    wrote nothing, and the event vanished with the sync reporting a clean
+    run.
     """
     from mnemos.persistence import federation_journal as journal
 
@@ -1020,6 +1048,7 @@ async def _store_memories(
     upd_n = 0
     embed_declined = 0
     embed_absent = 0
+    skipped_deleted = 0
     local_ids = [
         f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}"
         for mem in memories
@@ -1077,13 +1106,30 @@ async def _store_memories(
         local_id = f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}"
         remote_updated = _coerce_datetime(mem.get("updated") or mem.get("created"))
 
-        # Check existing
+        # Check existing.
+        #
+        # F-2: this probe has to run BEFORE the versioned-update prepare
+        # below, because that prepare clears ``deleted_at`` (it exists to
+        # supersede the legacy timestamp predicate). Probing afterwards
+        # therefore always reported a live row and the soft-deleted replica
+        # was silently written back. The probe is read-only, so taking it
+        # first changes nothing else.
         existing = existing_markers.get(local_id)
         if journal_enabled:
+            existing = await repo.fetch_federated_memory_marker(tx, local_id)
+            if existing is not None and existing["deleted_at"] is not None:
+                # F-2: this node soft-deleted the replica locally. Every
+                # write path below is a no-op on a deleted row (the update
+                # path requires ``deleted_at IS NULL`` on all six
+                # backends), so without this branch the event is applied by
+                # nobody and counted by nothing. Count it, say so once per
+                # sync, and leave the row deleted — undeleting is a policy
+                # decision, not a side effect of a sync.
+                skipped_deleted += 1
+                continue
             # Refresh after the durable fence, including other events in this batch.
             if mem.get("federation_sequence") is not None:
                 await journal.prepare_versioned_update(tx, peer_name, remote_id)
-            existing = await repo.fetch_federated_memory_marker(tx, local_id)
         mutation_applied = False
         source_audit_provenance: dict[str, Any] = {}
         primary_eid = mem.get("audit_latest_entry_id")
@@ -1163,6 +1209,14 @@ async def _store_memories(
                 # update-when-newer branch so the losing path still applies
                 # a delta if its remote_updated is the freshest.
                 existing = await repo.fetch_federated_memory_marker(tx, local_id)
+
+        if existing is not None and existing["deleted_at"] is not None:
+            # F-2: the journal is disabled here (no durable fence ran), so
+            # the probe is the batch snapshot or the re-read below. Same
+            # rule as the fenced path: count it, do not write, do not
+            # undelete.
+            skipped_deleted += 1
+            continue
 
         if existing is not None:
             # Update only if the inbound remote_updated beats the
@@ -1366,6 +1420,7 @@ async def _store_memories(
     if counters is not None:
         counters["embed_declined"] = embed_declined
         counters["embed_absent"] = embed_absent
+        counters["skipped_deleted"] = skipped_deleted
     return new_n, upd_n
 
 

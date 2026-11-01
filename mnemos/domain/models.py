@@ -1504,6 +1504,12 @@ class FederationSyncLogEntry(BaseModel):
     # operator sees the whole embedding gap for the peer rather than
     # only the slice the latest poll touched.
     rows_without_embedding: int = 0
+    # F-2: inbound events this sync could not apply because the replica
+    # was soft-deleted on THIS node. A per-sync DELTA, unlike the
+    # per-peer totals above. The row stays deleted — undeleting a replica
+    # is a policy decision, not a sync side effect — so this is the only
+    # number that reports the divergence.
+    skipped_deleted: int = 0
 
 
 class FederationSyncLogResponse(BaseModel):
