@@ -366,3 +366,94 @@ def test_vector_tuning_exports_the_hnsw_fragment_the_installer_imports():
     assert "def hnsw_index_options_fragment(" in tuning
     installer = (Path(__file__).resolve().parents[1] / "mnemos" / "installer" / "db.py").read_text()
     assert "from mnemos.persistence.vector_tuning import hnsw_index_options_fragment" in installer
+
+
+# ---------------------------------------------------------------------------
+# Pinning tests for a second round of findings on this branch.
+#
+# That review reported a FederationSyncLogResponse missing the new counters, a
+# ``counters=`` keyword passed to a _store_memories that does not take it,
+# a missing _fetch_all_dicts import, an unused rows_without_embedding, a
+# loop-unsafe peer lock, and a UserContext imported from the wrong module.
+# None hold. These pin the parts a silent regression could break.
+# ---------------------------------------------------------------------------
+
+
+def test_sync_log_models_declare_the_new_counters():
+    """The counters must be on the model the endpoint actually serialises.
+
+    They belong to FederationSyncLogEntry, not to the outer response, which
+    only wraps a list of entries.
+    """
+    from mnemos.domain.models import FederationSyncLogEntry, FederationSyncLogResponse
+
+    entry_fields = FederationSyncLogEntry.model_fields
+    assert "events_received" in entry_fields
+    assert "rows_without_embedding" in entry_fields
+    # Both carry a default so pre-0067 rows (NULL columns) still validate.
+    assert entry_fields["events_received"].default == 0
+    assert entry_fields["rows_without_embedding"].default == 0
+
+    assert "entries" in FederationSyncLogResponse.model_fields
+    # And the entry model round-trips without the new columns supplied.
+    entry = FederationSyncLogEntry(id="1", started_at="now", memories_pulled=0, memories_new=0, memories_updated=0)
+    assert entry.rows_without_embedding == 0
+    assert entry.events_received == 0
+
+
+def test_store_memories_accepts_the_counters_keyword():
+    """sync_peer passes counters= to _store_memories; the signature must allow it."""
+    import inspect
+
+    from mnemos.domain.federation import _store_memories
+
+    params = inspect.signature(_store_memories).parameters
+    assert "counters" in params, list(params)
+    assert params["counters"].default is None
+
+    source = inspect.getsource(_store_memories)
+    assert "def _store_memories(" in source
+    # The one caller inside the module is the sync loop.
+    module_source = inspect.getsource(__import__("mnemos.domain.federation", fromlist=["x"]))
+    assert "_store_memories(" in module_source
+    assert "counters=" in module_source
+
+
+def test_sync_peer_threads_rows_without_embedding_into_the_log():
+    """The counted value must reach finish_sync_log, not be computed and dropped."""
+    import inspect
+
+    from mnemos.domain import federation as federation_module
+
+    source = inspect.getsource(federation_module._sync_peer_locked)
+    assert "count_federated_rows_without_embedding_per_peer" in source
+    assert "rows_without_embedding=rows_without_embedding" in source
+
+
+def test_peer_sync_lock_is_keyed_per_event_loop():
+    """A lock cached globally would be bound to whichever loop awaited it first."""
+    import asyncio
+
+    from mnemos.domain.federation import _peer_sync_lock
+
+    async def _take():
+        return _peer_sync_lock("pin-peer")
+
+    first = asyncio.run(_take())
+    second = asyncio.run(_take())
+    assert first is not second, "the lock registry is not loop-aware"
+
+
+def test_mysql_count_helper_resolves_without_an_extra_import():
+    """_fetch_all_dicts lives in mysql.py; importing it would be a NameError-free no-op."""
+    from mnemos.persistence import mysql as mysql_module
+
+    assert hasattr(mysql_module, "_fetch_all_dicts")
+
+
+def test_user_context_is_importable_from_the_path_the_tests_use():
+    """tests import it from mnemos.api.dependencies, which re-exports the class."""
+    from mnemos.api.dependencies import UserContext as FromDeps
+    from mnemos.core.auth_context import UserContext as FromCore
+
+    assert FromDeps is FromCore
