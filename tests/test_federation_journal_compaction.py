@@ -382,3 +382,37 @@ async def test_compaction_binds_a_datetime_not_a_string(backend):
     cutoff = journal._cutoff(7)
     assert isinstance(cutoff, datetime)
     assert cutoff.tzinfo is not None
+
+
+def test_switches_do_not_raise_when_the_environment_variable_is_unset(monkeypatch):
+    """An unset knob must resolve to the safe default, never crash.
+
+    ``runtime_env_value_stripped`` has a ``""`` default and ``os.environ.get``
+    returns it verbatim, so the helpers' ``.lower()`` always sees a ``str``.
+    Pinned here because a ``None`` default would turn every startup into an
+    ``AttributeError`` the moment the knob is absent -- which is the default
+    configuration.
+    """
+    from mnemos.core.config import (
+        federation_journal_compaction_enabled,
+        federation_replica_fence_enabled,
+        runtime_env_value_stripped,
+    )
+
+    for name in (COMPACTION_ENV, "MNEMOS_FEDERATION_REPLICA_FENCE"):
+        monkeypatch.delenv(name, raising=False)
+        assert isinstance(runtime_env_value_stripped(name), str)
+
+    # Removed (not merely emptied) from the process environment: the shape
+    # that a ``None`` default would break.
+    monkeypatch.delenv(COMPACTION_ENV, raising=False)
+    monkeypatch.delenv("MNEMOS_FEDERATION_REPLICA_FENCE", raising=False)
+    assert federation_journal_compaction_enabled() is True
+    assert federation_replica_fence_enabled() is True
+
+    # Empty and whitespace-only values are "unset" too, not a parse error.
+    for raw in ("", "   "):
+        monkeypatch.setenv(COMPACTION_ENV, raw)
+        monkeypatch.setenv("MNEMOS_FEDERATION_REPLICA_FENCE", raw)
+        assert federation_journal_compaction_enabled() is True
+        assert federation_replica_fence_enabled() is True
