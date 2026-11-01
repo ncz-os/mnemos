@@ -527,6 +527,112 @@ def test_the_postgres_module_has_the_vector_tuning_helpers_in_scope() -> None:
         )
 
 
+def test_the_hnsw_tuning_helper_resolves_its_names_at_runtime() -> None:
+    """``_apply_hnsw_query_tuning`` must resolve all three names.
+
+    Checking ``hasattr(postgres, name)`` proves the names are bound in
+    the module namespace, but not that the function that USES them can
+    reach them. This calls the helper for real against a fake
+    connection and asserts the two transaction-local ``set_config``
+    statements are emitted -- which can only happen if every name in
+    the body resolved.
+
+    A missing import here is not a static-analysis nit: the helper runs
+    on EVERY semantic search, so an unresolved name turns every search
+    into a 500.
+    """
+    import asyncio
+
+    from mnemos.persistence import postgres
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def execute(self, sql: str, *args: object) -> str:
+            self.calls.append(" ".join(sql.split()))
+            return "OK"
+
+        async def fetchval(self, query: str, *args: object) -> object:
+            return "0.8.0" if "pg_extension" in query else None
+
+    conn = _Conn()
+    asyncio.run(postgres._apply_hnsw_query_tuning(conn, limit=10, pgvector_version="0.8.0"))
+
+    assert any("hnsw.ef_search" in call for call in conn.calls), conn.calls
+    assert any("hnsw.iterative_scan" in call for call in conn.calls), conn.calls
+
+
+def test_the_iterative_scan_constant_is_defined_and_exported() -> None:
+    """``PGVECTOR_ITERATIVE_SCAN_MIN_VERSION`` must exist and be usable.
+
+    The constant is the gate for ``hnsw.iterative_scan``: the GUC only
+    exists in pgvector >= 0.8, and setting it on an older extension
+    raises ``unrecognized configuration parameter``. Both the Postgres
+    module and the version comparison in the tuning module read it, so
+    it must be defined once and exported.
+    """
+    from mnemos.persistence import postgres, vector_tuning
+
+    assert vector_tuning.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION == (0, 8)
+    assert "PGVECTOR_ITERATIVE_SCAN_MIN_VERSION" in vector_tuning.__all__
+    assert postgres.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION is vector_tuning.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION
+
+    # The comparison helper must accept the constant's own value.
+    assert vector_tuning.pgvector_version_at_least("0.8.0", vector_tuning.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION)
+    assert not vector_tuning.pgvector_version_at_least("0.7.4", vector_tuning.PGVECTOR_ITERATIVE_SCAN_MIN_VERSION)
+
+
+def test_the_test_modules_have_no_forward_references() -> None:
+    """No test may reference a module-level name defined further down.
+
+    A name defined after its use is only a problem if something
+    evaluates it earlier -- and in a pytest module that is always the
+    test body, never the import. Even so, source order that reads
+    backwards is a trap for the next editor and produces phantom
+    "NameError at import time" review findings. This pins the ordering
+    so the file cannot drift back into it.
+    """
+    import ast
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    offenders: list[str] = []
+
+    for name in (
+        "test_f8_hnsw_vector_tuning.py",
+        "test_f9_create_memory_embed_outside_transaction.py",
+        "test_f10_index_hygiene_and_limit_caps.py",
+    ):
+        path = repo_root / "tests" / name
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        defined: dict[str, int] = {}
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.setdefault(node.name, node.lineno)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        defined.setdefault(target.id, node.lineno)
+
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for sub in ast.walk(node):
+                if (
+                    isinstance(sub, ast.Name)
+                    and isinstance(sub.ctx, ast.Load)
+                    and sub.id in defined
+                    and defined[sub.id] > node.lineno
+                ):
+                    offenders.append(
+                        f"{name}: {node.name}() at line {node.lineno} uses '{sub.id}' defined at line {defined[sub.id]}"
+                    )
+
+    assert not offenders, "forward references found:\n" + "\n".join(offenders)
+
+
 def test_the_postgres_semantic_search_path_resolves_its_tuning_helpers() -> None:
     """Execute the tuning path end to end against a fake connection.
 

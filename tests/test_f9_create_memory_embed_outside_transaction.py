@@ -97,6 +97,14 @@ class _TrackingBackend:
         return getattr(self._inner, name)
 
 
+async def _noop_publish(*args, **kwargs):
+    return None
+
+
+async def _noop_invalidate(*args, **kwargs):
+    return None
+
+
 @pytest.mark.asyncio
 async def test_create_memory_embeds_outside_the_transaction(monkeypatch):
     """The embedding generation must NOT run inside the transaction.
@@ -154,14 +162,6 @@ async def test_create_memory_embeds_outside_the_transaction(monkeypatch):
         "opens so no pool connection and no SQLite global lock is held "
         "while the embedder runs (mirror the bulk_create_memories path)."
     )
-
-
-async def _noop_publish(*args, **kwargs):
-    return None
-
-
-async def _noop_invalidate(*args, **kwargs):
-    return None
 
 
 @pytest.mark.asyncio
