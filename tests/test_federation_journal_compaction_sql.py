@@ -112,8 +112,15 @@ def test_narrowed_trigger_drops_the_bookkeeping_columns(directory, name):
 
 
 def _fires_on_updated(region: str) -> bool:
-    """True when the update trigger references the ``updated`` column."""
-    return "updated)" in region.replace("federation_remote_updated)", "")
+    """True when the update trigger references the ``updated`` column.
+
+    Identifier match, not a literal ``updated)``: that spelling only exists in
+    the MySQL ``<=>`` form, so ``OLD.updated::text``, ``UPDATING('updated')``,
+    an ``UPDATE OF ...,updated,...`` list and ``OLD.updated IS NOT`` all
+    slipped past. ``federation_remote_updated`` and ``updated_at`` are
+    distinct identifiers and do not match.
+    """
+    return _mentions_column(region, "updated")
 
 
 #: The pre-narrowing triggers, each of which DOES fire on ``updated`` -- one
