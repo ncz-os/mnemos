@@ -415,3 +415,47 @@ async def test_fence_off_restores_the_previous_sweeps(backend, monkeypatch):
     ids = [str(mid) for group in groups for mid in group["memory_ids"]]
     assert LOCAL_ID in ids
     assert "local_row" in ids
+
+
+def test_fence_renders_without_a_doubled_conjunction(monkeypatch):
+    """The fence supplies its own ``AND``; no caller may add a second one.
+
+    ``_scope`` ends with ``)`` and the fence starts with ``AND``, so every
+    concatenation site is ``... AND <scope>{fence}``. A fence that also
+    carried a leading conjunction (or a caller that prepended one) would
+    render ``AND AND`` -- invalid SQL on all six backends -- so the rendered
+    statements are checked directly rather than trusting the composition.
+    """
+    from mnemos.persistence import worker_lifecycle
+
+    monkeypatch.setenv(FENCE_ENV, "on")
+    fence = worker_lifecycle._replica_fence()
+    assert fence == " AND federation_source IS NULL"
+    assert not fence.strip().upper().startswith("AND AND")
+
+    scope = worker_lifecycle._scope("owner_id")
+    assert not scope.strip().upper().endswith("AND"), "scope must not end with a conjunction"
+
+    # The exact shapes used by the soft-delete, restore, hard-delete and
+    # archival paths.
+    rendered = [
+        f"UPDATE memories SET deleted_at = ? WHERE {scope} AND deleted_at IS NULL{fence}",
+        f"UPDATE memories SET deleted_at = NULL WHERE {scope} AND deleted_at = ?{fence}",
+        f"SELECT id FROM memories WHERE {scope} AND deleted_at IS NOT NULL{fence}",
+        f"DELETE FROM memories WHERE {scope} AND deleted_at IS NOT NULL{fence}",
+    ]
+    for sql in rendered:
+        collapsed = " ".join(sql.upper().split())
+        assert "AND AND" not in collapsed, sql
+        assert "WHERE AND" not in collapsed, sql
+        assert "FEDERATION_SOURCE IS NULL" in collapsed, sql
+
+
+def test_fence_is_empty_when_the_switch_is_off(monkeypatch):
+    """Off must render exactly nothing -- not ``" AND "`` with no predicate."""
+    from mnemos.persistence import worker_lifecycle
+
+    monkeypatch.setenv(FENCE_ENV, "off")
+    assert worker_lifecycle._replica_fence() == ""
+    sql = f"DELETE FROM memories WHERE {worker_lifecycle._scope('owner_id')} AND deleted_at IS NOT NULL{worker_lifecycle._replica_fence()}"
+    assert sql.rstrip().endswith("deleted_at IS NOT NULL")
