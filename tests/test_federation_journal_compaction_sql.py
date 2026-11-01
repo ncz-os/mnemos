@@ -131,3 +131,23 @@ def test_mysql_provisioning_strips_embedding_from_the_narrowed_trigger():
     assert "OLD.embedding" not in _trigger_bodies(separate_embeddings=True), (
         "the narrowed trigger restored the embedding comparison on a dedicated-embeddings table"
     )
+
+
+def test_postgres_narrowing_runs_after_the_trigger_that_creates_it():
+    """0067 replaces the function body, so it must be applied after 0062.
+
+    ``CREATE OR REPLACE FUNCTION`` swaps the body in place and the trigger
+    binds the function by name, so no ``CREATE TRIGGER`` is needed -- but the
+    ordering is: if 0067 were applied first, 0062's full-width function would
+    overwrite the narrowing.
+    """
+    from mnemos.persistence.schema import postgres_migration_paths
+
+    names = [path.name for path in postgres_migration_paths()]
+    assert "0062_federation_journal.sql" in names
+    assert "0067_federation_journal_narrow_trigger.sql" in names
+    assert names.index("0067_federation_journal_narrow_trigger.sql") > names.index("0062_federation_journal.sql")
+
+    body = (Path("mnemos/db_migrations/migrations/0067_federation_journal_narrow_trigger.sql")).read_text()
+    # The body is replaced, never re-created without a definition.
+    assert "CREATE OR REPLACE FUNCTION fed_journal_update_fn" in body
