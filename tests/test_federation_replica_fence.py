@@ -153,8 +153,7 @@ async def test_replayed_event_restores_a_consolidated_replica(backend):
     )
     await run(
         backend,
-        "UPDATE memories SET consolidated_into = 'local_canonical', deleted_at = CURRENT_TIMESTAMP "
-        "WHERE id = ?",
+        "UPDATE memories SET consolidated_into = 'local_canonical', deleted_at = CURRENT_TIMESTAMP WHERE id = ?",
         LOCAL_ID,
     )
 
@@ -283,8 +282,7 @@ async def test_artemis_dedup_groups_exclude_replicas(backend):
     # The local row is still a candidate when it genuinely has a local twin.
     async with backend.transactional() as tx:
         await _Ops(tx, transaction_dialect(tx)).execute(
-            "UPDATE memories SET id = 'local_row_2', created = '2021-01-01T00:00:00+00:00' "
-            "WHERE id = 'local_row'"
+            "UPDATE memories SET id = 'local_row_2', created = '2021-01-01T00:00:00+00:00' WHERE id = 'local_row'"
         )
     async with backend.transactional() as tx:
         await _Ops(tx, transaction_dialect(tx)).execute(
@@ -298,6 +296,26 @@ async def test_artemis_dedup_groups_exclude_replicas(backend):
     ids = [str(mid) for group in groups for mid in group["memory_ids"]]
     assert {"local_row", "local_row_2"} <= set(ids)
     assert LOCAL_ID not in ids
+
+    # Grouping is only half of it: the fence must not stop the local twin
+    # from actually being consolidated into its local canonical.
+    async with backend.transactional() as tx:
+        merged = await backend.memories.consolidate_duplicate_memories(
+            tx,
+            canonical_id="local_row_2",
+            duplicate_ids=["local_row"],
+        )
+    assert merged == 1
+    async with backend.transactional() as tx:
+        ops = _Ops(tx, transaction_dialect(tx))
+        twin = await ops.fetchone("SELECT consolidated_into, deleted_at FROM memories WHERE id = 'local_row'")
+        canonical = await ops.fetchone("SELECT deleted_at FROM memories WHERE id = 'local_row_2'")
+        replica = await ops.fetchone("SELECT consolidated_into, deleted_at FROM memories WHERE id = ?", LOCAL_ID)
+    assert twin["consolidated_into"] == "local_row_2"
+    assert twin["deleted_at"] is not None
+    assert canonical["deleted_at"] is None
+    assert replica["consolidated_into"] is None
+    assert replica["deleted_at"] is None
 
 
 @pytest.mark.asyncio
@@ -327,16 +345,10 @@ async def test_morpheus_consolidation_skips_replicas(backend):
         await ops.execute(
             "INSERT INTO morpheus_runs (id, owner_id, namespace, status, config, cluster_min_size) "
             "VALUES ('run1', 'default', 'A', 'running', ?, 2)",
-            '{"clusters": [{"cluster_id": "c1", "member_memory_ids": ["local_row", "'
-            + LOCAL_ID
-            + '"]}]}',
+            '{"clusters": [{"cluster_id": "c1", "member_memory_ids": ["local_row", "' + LOCAL_ID + '"]}]}',
         )
-        result = await backend.morpheus.phase_consolidate(
-            tx, run_id="run1", consolidated_permission_mode=600
-        )
-        replica = await ops.fetchone(
-            "SELECT consolidated_into, permission_mode FROM memories WHERE id = ?", LOCAL_ID
-        )
+        result = await backend.morpheus.phase_consolidate(tx, run_id="run1", consolidated_permission_mode=600)
+        replica = await ops.fetchone("SELECT consolidated_into, permission_mode FROM memories WHERE id = ?", LOCAL_ID)
     assert replica["consolidated_into"] is None
     # The cluster fell below cluster_min_size once the replica was excluded.
     assert result.memories_consolidated == 0
