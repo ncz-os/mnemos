@@ -773,6 +773,40 @@ def test_the_postgres_module_reexports_the_tuning_constants() -> None:
         )
 
 
+def test_the_postgres_module_imports_the_tuning_names_from_vector_tuning() -> None:
+    """The three tuning names must come FROM ``vector_tuning``, not be
+    re-defined locally in ``postgres.py``.
+
+    ``hasattr(postgres, name)`` alone would pass even if a local
+    definition shadowed the import -- and a local copy would silently
+    drift from the tuning module's value. Asserting the provenance
+    (the name is bound by an ImportFrom of ``vector_tuning``) is what
+    actually pins the re-export.
+    """
+    import ast
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((repo_root / "mnemos" / "persistence" / "postgres.py").read_text(encoding="utf-8"))
+
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "mnemos.persistence.vector_tuning":
+            for alias in node.names:
+                imported.add(alias.asname or alias.name)
+
+    for name in (
+        "PGVECTOR_ITERATIVE_SCAN_MIN_VERSION",
+        "hnsw_ef_search_for",
+        "pgvector_version_at_least",
+    ):
+        assert name in imported, (
+            f"mnemos/persistence/postgres.py must import {name} from "
+            "mnemos.persistence.vector_tuning (found imports: "
+            f"{sorted(imported)})"
+        )
+
+
 def test_the_test_modules_have_no_forward_references() -> None:
     """No test may reference a module-level name defined further down.
 
