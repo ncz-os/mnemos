@@ -1105,6 +1105,31 @@ class MariadbFederationRepository(MysqlFederationRepository):
     _journal_embedding_sql = "VEC_ToText(journal_embedding.embedding)"
     _journal_embedding_join = " LEFT JOIN memory_embeddings journal_embedding ON journal_embedding.memory_id = m.id"
 
+    async def count_federated_rows_without_embedding_per_peer(self, tx: Transaction) -> dict[str, int]:
+        """Count federated rows with no embedding, grouped by peer name.
+
+        MariaDB has no inline ``memories.embedding`` column -- the vector
+        lives in the ``memory_embeddings`` join table -- so the inherited
+        MySQL query (which filters on ``memories.embedding``) would fail
+        with "unknown column". Count the join table instead.
+        """
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT m.federation_source AS peer_name, COUNT(*) AS n
+                  FROM memories m
+             LEFT JOIN memory_embeddings me ON me.memory_id = m.id
+                 WHERE m.federation_source IS NOT NULL
+                   AND m.deleted_at IS NULL
+                   AND m.archived_at IS NULL
+                   AND m.consolidated_into IS NULL
+                   AND me.embedding IS NULL
+                 GROUP BY m.federation_source
+                """
+            )
+            rows = await _fetch_all_dicts(cursor)
+        return {str(row["peer_name"]): int(row["n"]) for row in rows}
+
     async def _legacy_feed_query(
         self,
         tx: Transaction,
@@ -1481,6 +1506,21 @@ class MariadbBackend(MysqlBackend):
                     conn,
                     "kg_triples",
                     {"extracted_by_run_id": "extracted_by_run_id CHAR(36)"},
+                )
+                # F-1/F-5: wire events vs applied rows, and the embedding
+                # gap. MariaDB has its own ``open()`` (it renders the DDL
+                # from the live settings), so it does not inherit
+                # MysqlBackend.open's backfill — the columns have to be
+                # ensured here too, or the inherited
+                # ``finish_sync_log`` UPDATE fails on an upgraded
+                # database.
+                await _ensure_mysql_columns(
+                    conn,
+                    "federation_sync_log",
+                    {
+                        "events_received": "events_received INT NOT NULL DEFAULT 0",
+                        "rows_without_embedding": "rows_without_embedding INT NOT NULL DEFAULT 0",
+                    },
                 )
                 await _ensure_mysql_columns(
                     conn,

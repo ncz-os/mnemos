@@ -13,12 +13,15 @@ intervals.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import json
 import logging
 import os
+import threading
+import weakref
 from datetime import datetime, timezone
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
@@ -32,6 +35,63 @@ from mnemos.persistence.base import AuditPersistence, FederationPersistence, Fed
 FederationBackend = Union[FederationPersistence, AuditPersistence]
 
 logger = logging.getLogger(__name__)
+
+
+# ── Per-peer sync lock (F-1) ─────────────────────────────────────────────────
+#
+# The manual ``POST /v1/federation/peers/{id}/sync`` route and the
+# background worker both call ``sync_peer`` for the same peer. Without a
+# lock they overlap: both pull the same pages and both apply the same rows,
+# so the applied-row count and the audit trail double. The lock is per
+# peer, so different peers still sync concurrently.
+#
+# The lock is IN-PROCESS only. Two replicas (or a replica plus its
+# source) are separate processes with separate databases; the durable
+# sequence fence in ``federation_receive_state`` is what keeps those
+# idempotent. This lock closes the in-process gap where one node ran
+# two syncs of the same peer at once.
+#
+# The locks are keyed by (event loop, peer id). An ``asyncio.Lock`` binds
+# to the loop that first awaits it under contention, so a single process
+# that serves several loops over its lifetime (a CLI ``asyncio.run`` per
+# command, a test that opens a fresh loop per case, the lifespan worker
+# next to a one-shot CLI) would raise "is bound to a different event
+# loop" on the second loop if the lock were shared. Keying by the running
+# loop keeps each loop's locks independent and keeps the lock object on
+# the loop that will actually await it.
+#
+# The outer map is a WeakKeyDictionary keyed by the event loop, so a
+# finished loop's locks are collected with it. An ``id()``-keyed map
+# would be wrong: CPython reuses ``id()`` values after a loop is
+# garbage-collected, so a NEW loop could inherit the OLD loop's lock and
+# bind it to the wrong loop.
+_SYNC_LOCKS: "weakref.WeakKeyDictionary[Any, Dict[str, asyncio.Lock]]" = weakref.WeakKeyDictionary()
+_SYNC_LOCKS_NO_LOOP: Dict[str, "asyncio.Lock"] = {}
+_SYNC_LOCKS_GUARD = threading.Lock()
+
+
+def _peer_sync_lock(peer_id: str) -> "asyncio.Lock":
+    """Return the in-process lock guarding syncs of one peer."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop: this is not a real sync path (sync_peer is
+        # always awaited). Use a process-wide fallback registry so the
+        # lock is still stable.
+        loop = None
+    with _SYNC_LOCKS_GUARD:
+        if loop is None:
+            registry = _SYNC_LOCKS_NO_LOOP
+        else:
+            registry = _SYNC_LOCKS.get(loop)
+            if registry is None:
+                registry = {}
+                _SYNC_LOCKS[loop] = registry
+        lock = registry.get(peer_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            registry[peer_id] = lock
+        return lock
 
 
 def _federation_allow_private() -> bool:
@@ -376,7 +436,19 @@ async def sync_peer(
     peer.compat_mode == 'strict', abort the sync with a clear error.
     Operators must explicitly set compat_mode='permissive' on a peer
     to allow cross-version sync.
+
+    F-1: the per-peer lock keeps the manual trigger route and the
+    background worker from syncing the same peer at the same time.
     """
+    async with _peer_sync_lock(peer_id):
+        return await _sync_peer_locked(backend, peer_id)
+
+
+async def _sync_peer_locked(
+    backend: FederationBackend,
+    peer_id: str,
+) -> Tuple[int, int, int]:
+    """The body of :func:`sync_peer`, run under the per-peer lock."""
     repo = backend.federation
     async with backend.transactional() as tx:
         peer = await repo.get_sync_peer(tx, peer_id)
@@ -534,6 +606,17 @@ async def sync_peer(
     total_pulled = 0
     total_new = 0
     total_updated = 0
+    # F-1: the WIRE count and the APPLIED count are different numbers. A
+    # journal replay emits one wire row per EVENT, so the same memory
+    # arrives once per mutation; counting wire rows inflated
+    # ``federation_peers.total_pulled`` on every replay (the 4.4 M
+    # against 25 k symptom). ``events_received`` keeps the wire count
+    # visible; ``total_pulled`` counts rows actually applied.
+    total_events = 0
+    # F-5: applied rows that still carry no vector.
+    rows_without_embedding = 0
+    # F-5: the per-sync embedding counters, filled in by _store_memories.
+    embed_counters: Dict[str, int] = {}
     cursor_request: Optional[datetime | FederationFeedCursor] = cursor_before
     cursor_persisted = cursor_before
     from mnemos.persistence import federation_journal as journal
@@ -550,6 +633,23 @@ async def sync_peer(
         saved = await journal.load_peer_cursor(tx, peer_id, filter_signature) if journal_enabled else None
     if saved:
         cursor_request = _decode_feed_cursor(saved)
+        no_journal_cursor = False
+    else:
+        # F-2: no journal cursor for this peer/scope. The request below
+        # goes out as a TIMESTAMP cursor, the source reads it as "no
+        # sequence" and replays EVERY journal event from sequence 0 --
+        # on every poll, forever. That is the mechanism behind the
+        # inflated counter, so say so loudly instead of replaying
+        # silently. The event count is only known once the pages land,
+        # so the count is appended to the summary afterwards.
+        no_journal_cursor = journal_enabled
+        if no_journal_cursor:
+            logger.warning(
+                "federation: peer %s has no journal cursor for this filter scope — "
+                "full replay from seq 0; the cursor is bootstrapped from the "
+                "first successful page",
+                peer["name"],
+            )
     err: Optional[str] = None
 
     # v6.1 F-1: per-peer copy_embeddings flag (added by migration 0028).
@@ -587,15 +687,26 @@ async def sync_peer(
                 if has_more and (next_cursor is None or next_cursor == cursor_request):
                     raise RuntimeError("federation peer returned a non-advancing cursor")
                 async with backend.transactional() as tx:
-                    new_n, upd_n = await _store_memories(repo, tx, peer["name"], batch, backend=backend)
+                    new_n, upd_n = await _store_memories(
+                        repo,
+                        tx,
+                        peer["name"],
+                        batch,
+                        backend=backend,
+                        counters=embed_counters,
+                    )
                     if journal_enabled and next_cursor is not None:
+                        # F-2: bootstrap the peer cursor from the first
+                        # successful page so the NEXT sync resumes from
+                        # here instead of replaying the whole journal.
                         await journal.save_peer_cursor(
                             tx,
                             peer_id,
                             _encode_feed_cursor(next_cursor.updated, next_cursor.memory_id),
                             filter_signature,
                         )
-                total_pulled += len(batch)
+                total_events += len(batch)
+                total_pulled += new_n + upd_n
                 total_new += new_n
                 total_updated += upd_n
                 if next_cursor is not None:
@@ -607,6 +718,32 @@ async def sync_peer(
         err = f"{type(e).__name__}: {e}"
         logger.exception("federation: pull from %s failed", peer["name"])
 
+    if no_journal_cursor:
+        # F-2: now that the pages have landed, the size of the replay is
+        # known. Report it so an operator can see the magnitude of the
+        # full replay instead of only that one happened.
+        logger.warning(
+            "federation: peer %s full replay from seq 0 — %d events received, "
+            "%d rows applied; the cursor is now bootstrapped, the next sync resumes",
+            peer["name"],
+            total_events,
+            total_pulled,
+        )
+
+    # F-5: how many of the applied rows still carry no vector. Counted
+    # per peer from the database (the durable truth), so it survives a
+    # restart and covers rows applied by earlier syncs.
+    try:
+        async with backend.transactional() as tx:
+            without_embedding = await repo.count_federated_rows_without_embedding_per_peer(tx)
+        rows_without_embedding = int(without_embedding.get(peer["name"], 0))
+    except Exception:
+        logger.exception(
+            "federation: could not count rows without embedding for peer %s",
+            peer["name"],
+        )
+        rows_without_embedding = 0
+
     async with backend.transactional() as tx:
         await repo.finish_sync_log(
             tx,
@@ -616,6 +753,8 @@ async def sync_peer(
             memories_updated=total_updated,
             error=err,
             cursor_after=cursor_persisted,
+            events_received=total_events,
+            rows_without_embedding=rows_without_embedding,
         )
         if err:
             await repo.record_sync_error(tx, peer_id, err)
@@ -625,12 +764,27 @@ async def sync_peer(
     if err:
         raise FederationSyncError(f"federation sync with {peer['name']} failed: {err}")
 
+    # F-5: one summary line per sync, so an operator sees the embedding
+    # gap without grepping per-row warnings.
+    embed_declined = int(embed_counters.get("embed_declined", 0))
+    embed_absent = int(embed_counters.get("embed_absent", 0))
+    if embed_declined or embed_absent:
+        logger.warning(
+            "federation: peer=%s embedding gap — declined=%d absent=%d "
+            "rows_without_embedding=%d (rows are FTS-only until re-embedded)",
+            peer["name"],
+            embed_declined,
+            embed_absent,
+            rows_without_embedding,
+        )
+
     logger.info(
-        "federation: peer=%s pulled=%d new=%d updated=%d cursor=%s",
+        "federation: peer=%s pulled=%d new=%d updated=%d events=%d cursor=%s",
         peer["name"],
         total_pulled,
         total_new,
         total_updated,
+        total_events,
         cursor_persisted,
     )
     return total_pulled, total_new, total_updated
@@ -803,12 +957,39 @@ async def _repair_locally_damaged_replica(
     )
 
 
+def _local_embed_fingerprint() -> Tuple[Optional[str], Optional[int]]:
+    """Resolve this node's own embedder fingerprint: (model, dim).
+
+    Prefer the HTTP-backend model env knob when active; fall back to
+    ``settings.providers.inference_embed_model``. The settings field is
+    empty on instances that route embedding via HTTP (a fallback host
+    edge replica points at a fallback host :8090 bge-m3 via
+    ``MNEMOS_EMBED_HTTP_MODEL=bge-m3``).
+
+    Returns ``(None, None)`` when the fingerprint cannot be resolved.
+    An unknown fingerprint is unverifiable, not compatible — see the
+    fail-closed gate in :func:`_store_memories`.
+    """
+    try:
+        from mnemos.core.config import embed_http_model_override, get_settings as _gs
+
+        _s = _gs()
+        model = (
+            embed_http_model_override() or (getattr(_s.providers, "inference_embed_model", "") or "").strip() or None
+        )
+        dim = getattr(_s.database, "embedding_dim", None)
+        return model, dim
+    except Exception:
+        return None, None
+
+
 async def _store_memories(
     repo: FederationRepository,
     tx: Transaction,
     peer_name: str,
     memories: List[Dict[str, Any]],
     backend: Optional[FederationBackend] = None,
+    counters: Optional[Dict[str, int]] = None,
 ) -> Tuple[int, int]:
     """Upsert a batch. Returns (newly_inserted, updated_existing).
 
@@ -817,12 +998,28 @@ async def _store_memories(
     model-match. The embedding is written via the existing memories
     repository ``upsert_memory_embedding`` so the join-table /
     direct-column shapes per backend are handled.
+
+    F-5: when ``counters`` is given, it is updated in place with the
+    per-sync embedding outcome:
+
+    ``embed_declined``
+        the peer sent a vector and the local fingerprint check refused
+        it (model mismatch, dim mismatch, or an unresolved local
+        embedder). Each of those refusals is a WARNING, not a DEBUG line.
+    ``embed_absent``
+        the peer sent no vector at all (the peer did not opt into
+        ``copy_embeddings``), so the applied row carries no vector.
+
+    Both mean the applied row is not semantically searchable until a
+    local re-embed fills it in.
     """
     from mnemos.persistence import federation_journal as journal
 
     journal_enabled = journal.supports_journal(tx)
     new_n = 0
     upd_n = 0
+    embed_declined = 0
+    embed_absent = 0
     local_ids = [
         f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}"
         for mem in memories
@@ -834,27 +1031,7 @@ async def _store_memories(
     existing_markers = await marker_fetch(tx, local_ids) if callable(marker_fetch) else {}
     # v6.1 F-1.4: model match preflight. Skip embedding when peer's model
     # doesn't match ours — store the row content as before.
-    local_embed_model: Optional[str] = None
-    embed_dim_expected: Optional[int] = None
-    if backend is not None:
-        try:
-            from mnemos.core.config import embed_http_model_override, get_settings as _gs
-
-            _s = _gs()
-            # Prefer the HTTP-backend model env knob when active; fall back
-            # to settings.providers.inference_embed_model. The settings
-            # field is empty on instances that route embedding via HTTP
-            # (a fallback host edge replica points at a fallback host :8090 bge-m3 via
-            # MNEMOS_EMBED_HTTP_MODEL=bge-m3).
-            local_embed_model = (
-                embed_http_model_override()
-                or (getattr(_s.providers, "inference_embed_model", "") or "").strip()
-                or None
-            )
-            embed_dim_expected = getattr(_s.database, "embedding_dim", None)
-        except Exception:
-            local_embed_model = None
-            embed_dim_expected = None
+    local_embed_model, embed_dim_expected = _local_embed_fingerprint() if backend is not None else (None, None)
     for mem in memories:
         remote_id = mem.get("id")
         if not remote_id or not isinstance(remote_id, str):
@@ -1061,8 +1238,15 @@ async def _store_memories(
                 # An unknown fingerprint is unverifiable, not compatible. The
                 # content still lands either way; only the vector is declined,
                 # and a local re-embed fills it in the node's own space.
+                #
+                # F-5: these skips used to log at DEBUG, so a replica whose
+                # rows all landed without vectors looked healthy. They are
+                # now WARNINGs and counted, and the per-peer total is
+                # exposed as ``rows_without_embedding`` in
+                # /v1/federation/status.
                 if not local_embed_model or not embed_dim_expected:
-                    logger.debug(
+                    embed_declined += 1
+                    logger.warning(
                         "[federation/embed] skip %s — local embedder unresolved "
                         "(model=%s dim=%s); cannot verify the peer vector, re-embedding locally",
                         local_id,
@@ -1070,14 +1254,16 @@ async def _store_memories(
                         embed_dim_expected,
                     )
                 elif emb_model != local_embed_model:
-                    logger.debug(
+                    embed_declined += 1
+                    logger.warning(
                         "[federation/embed] skip %s — peer model=%s != local %s",
                         local_id,
                         emb_model,
                         local_embed_model,
                     )
                 elif not emb_dim or emb_dim != embed_dim_expected:
-                    logger.debug(
+                    embed_declined += 1
+                    logger.warning(
                         "[federation/embed] skip %s — dim=%s != expected %s",
                         local_id,
                         emb_dim,
@@ -1114,6 +1300,15 @@ async def _store_memories(
                             local_id,
                             exc_info=True,
                         )
+            else:
+                # F-5: the peer sent no vector at all (it did not opt into
+                # ``copy_embeddings``). The applied row carries no vector,
+                # so it is not semantically searchable until a local
+                # re-embed fills it in. Counted, but not a WARNING per
+                # row: this is the expected default posture for a peer
+                # that never opted in, and the per-peer total in
+                # /v1/federation/status is where the gap is reported.
+                embed_absent += 1
 
         # v6.2 M-2.2.1 federation audit write. Replica records each
         # applied inbound write under op="replicate" with writer_id="fed:<peer>"
@@ -1168,6 +1363,9 @@ async def _store_memories(
                         enforce_continuity=True,
                     )
 
+    if counters is not None:
+        counters["embed_declined"] = embed_declined
+        counters["embed_absent"] = embed_absent
     return new_n, upd_n
 
 

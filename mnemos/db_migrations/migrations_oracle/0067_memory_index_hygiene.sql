@@ -1,0 +1,29 @@
+-- migration: 0067_memory_index_hygiene
+-- PostgreSQL-only index hygiene; intentional parity no-op.
+--
+-- F-10 (2026-10-31, Fable federation report) asked for three index
+-- changes on the Postgres `memories` table:
+--   * a `(updated, id)` partial index on `deleted_at IS NULL`,
+--   * a `(namespace, created DESC)` partial index,
+--   * dropping the prefix-redundant `idx_memories_owner_id`.
+--
+-- None of the three applies to Oracle:
+--
+--   * Oracle already carries `idx_memories_updated_cursor ON
+--     memories(deleted_at, updated, id)` (0001_core_schema.sql) and
+--     `idx_memories_feed_cursor ON memories(federation_source,
+--     deleted_at, archived_at, updated, id)`. The keyset pagination
+--     path is already indexed.
+--   * Oracle already carries `idx_memories_owner_ns_created ON
+--     memories(owner_id, namespace, created DESC)`
+--     (0001_core_schema.sql), which serves the namespace-scoped
+--     listing the Postgres composite index is added for.
+--   * Oracle never created `idx_memories_owner_id`; its owner index
+--     is `idx_memories_owner_ns ON memories(owner_id, namespace)`,
+--     which is not a prefix-duplicate of anything.
+--
+-- This file is intentionally empty of executable statements: it exists
+-- so the migration-parity gate (which requires the same basename in
+-- the pg / oracle / db2 directories) stays satisfied, and so the
+-- reasoning above is recorded next to the Postgres change rather than
+-- in a chat log.

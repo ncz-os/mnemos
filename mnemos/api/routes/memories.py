@@ -1310,6 +1310,52 @@ async def create_memory(
     persisted_metadata = _meta or {"source": request.source}
     metadata_json = json.dumps(persisted_metadata)
     delivery_ids: list[str] = []
+    # F-9 (2026-10-31, Fable federation report): generate the embedding
+    # BEFORE the transaction opens, exactly like ``bulk_create_memories``
+    # does with ``_get_embeddings_batch``. Embedding generation runs the
+    # in-process model (50-100 ms on the production host CPU, more on a
+    # cold model load) and must not hold a Postgres pool connection or
+    # the SQLite global ``asyncio.Lock`` for its duration:
+    #
+    #   * Postgres: ``backend.transactional()`` pins one pool connection
+    #     for the whole transaction. Embedding under the transaction
+    #     starves the pool (5 connections / 20 max by default) for the
+    #     whole model round trip.
+    #   * SQLite: the backend funnels every statement through ONE
+    #     connection behind ONE global ``asyncio.Lock`` taken for the
+    #     entire transaction. Embedding under the transaction blocks
+    #     every other SQLite reader and writer in the process.
+    #
+    # The embedding is still written CO-TRANSACTIONALLY: the vector is
+    # passed inline to ``insert_memory`` so the VECTOR column lands in
+    # the same transaction as the row. Moving the *generation* out does
+    # not change what is committed.
+    #
+    # Codex adversarial-review gate (2026-06-05): the embedding
+    # generation (_get_embedding) is separated from the DB write
+    # (upsert_memory_embedding) so that only embedding-generation
+    # errors are silently degraded to NULL. DB write errors (e.g.
+    # constraint violation, disk-full, connection loss) MUST
+    # propagate and roll back the transaction — no partial-commit
+    # NULL vector.
+    #
+    # Codex adversarial-review gate fix (2026-06-05): the initial
+    # gate edit removed the try/except around _get_embedding
+    # entirely, which meant embedding-model failures (OOM, model
+    # load error, etc.) would abort the entire create_memory tx.
+    # Restore the try/except around embedding generation only —
+    # upsert_memory_embedding remains outside so DB write errors
+    # still propagate.
+    try:
+        # F2 (adversarial review 2026-06-28): embed the span-redacted
+        # content, not raw, so secret text never enters the vector index.
+        vec = await _get_embedding(_content_redacted_for_embedding(request.content, _classified))
+    except Exception:
+        logger.exception(
+            "[create_memory] inline embed generation failed for %s; row will be backfilled with embedding later",
+            mem_id,
+        )
+        vec = None
     try:
         async with backend.transactional() as tx:
             await _maybe_set_pg_rls(tx, user)
@@ -1352,32 +1398,10 @@ async def create_memory(
             # row keeps embedding=NULL; the backfill script picks it up
             # on the next pass.
             #
-            # Codex adversarial-review gate (2026-06-05): the embedding
-            # generation (_get_embedding) is separated from the DB write
-            # (upsert_memory_embedding) so that only embedding-generation
-            # errors are silently degraded to NULL. DB write errors (e.g.
-            # constraint violation, disk-full, connection loss) MUST
-            # propagate and roll back the transaction — no partial-commit
-            # NULL vector.
+            # F-9 (2026-10-31): the embedding is generated ABOVE, before
+            # the transaction was opened, so no pool connection and no
+            # SQLite global lock is held while the model runs.
             #
-            # Codex adversarial-review gate fix (2026-06-05): the initial
-            # gate edit removed the try/except around _get_embedding
-            # entirely, which meant embedding-model failures (OOM, model
-            # load error, etc.) would abort the entire create_memory tx.
-            # Restore the try/except around embedding generation only —
-            # upsert_memory_embedding remains outside so DB write errors
-            # still propagate.
-            try:
-                # F2 (adversarial review 2026-06-28): embed the span-redacted
-                # content, not raw, so secret text never enters the vector index.
-                vec = await _get_embedding(_content_redacted_for_embedding(request.content, _classified))
-            except Exception:
-                logger.exception(
-                    "[create_memory] inline embed generation failed for %s; "
-                    "row will be backfilled with embedding later",
-                    mem_id,
-                )
-                vec = None
             # CHILD C v2 (2026-06-06): Embedding is now co-transactional —
             # passed inline to insert_memory so the VECTOR column is written
             # in the same tx. upsert_memory_embedding is kept for backfill
