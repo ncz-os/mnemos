@@ -268,3 +268,101 @@ def test_no_other_migration_reuses_the_narrowed_trigger_number():
         if len(same) > 1:
             clashes[directory] = same
     assert not clashes, f"migration number {ours_number} is reused: {clashes}"
+
+
+# ---------------------------------------------------------------------------
+# Pinning tests for findings raised against an older revision of this branch.
+#
+# A review of this branch reported, among others: an abstract/implementation
+# name mismatch on the sync log, a missing Postgres rows-without-embedding
+# counter, a mismatched SQLite sync-log INSERT, a Postgres ef_search passed as
+# an int, and the narrowed trigger still living at 0067. None of those hold on
+# the current tree; these tests pin the correct state so a regression cannot
+# bring them back silently.
+# ---------------------------------------------------------------------------
+
+_PERSISTENCE = Path(__file__).resolve().parents[1] / "mnemos" / "persistence"
+
+
+def test_sync_log_abstract_and_implementations_share_one_name():
+    """Only ``finish_sync_log`` exists -- there is no ``record_sync_log``.
+
+    A split name would leave the ABC unimplemented and make the repository
+    abstract at instantiation time.
+    """
+    sources = sorted(_PERSISTENCE.glob("*.py"))
+    text = "\n".join(path.read_text() for path in sources)
+    assert "def finish_sync_log" in text
+    assert "def record_sync_log" not in text, "a second sync-log writer name appeared"
+
+    base = (_PERSISTENCE / "base.py").read_text()
+    assert "async def finish_sync_log(" in base
+    # mariadb inherits MysqlFederationRepository: one shared implementation is
+    # correct, a second copy would be the drift this guards against.
+    for backend in ("postgres", "sqlite", "mysql", "oracle", "db2"):
+        body = (_PERSISTENCE / f"{backend}.py").read_text()
+        assert "async def finish_sync_log(" in body, f"{backend} drifted off the ABC name"
+
+
+def test_postgres_implements_the_per_peer_rows_without_embedding_counter():
+    """The counter is abstract, so every backend repository must implement it."""
+    base = (_PERSISTENCE / "base.py").read_text()
+    assert "count_federated_rows_without_embedding_per_peer" in base
+    postgres = (_PERSISTENCE / "postgres.py").read_text()
+    assert "def count_federated_rows_without_embedding_per_peer" in postgres
+
+
+def test_sqlite_sync_log_writer_updates_and_never_inserts():
+    """``finish_sync_log`` is an UPDATE: its placeholders match its columns."""
+    sqlite = (_PERSISTENCE / "sqlite.py").read_text()
+    start = sqlite.index("async def finish_sync_log(")
+    end = sqlite.index("async def count_federated_rows_without_embedding_per_peer", start)
+    region = sqlite[start:end]
+    assert "UPDATE federation_sync_log" in region
+    assert "INSERT INTO federation_sync_log" not in region
+    # Every column the statement sets has a matching bind, and nothing else.
+    # 11 assignments = finished_at (= CURRENT_TIMESTAMP) + 10 bound columns.
+    set_columns = region.split("SET", 1)[1].split("WHERE", 1)[0]
+    assigned = [line for line in set_columns.splitlines() if "=" in line]
+    assert len(assigned) == 11, assigned
+    assert len(assigned) - 1 == region.split("WHERE", 1)[0].count("?")
+    assert "events_received = ?" in region
+    assert "rows_without_embedding = ?" in region
+
+
+def test_postgres_ef_search_is_bound_as_text():
+    """``set_config`` takes text; an int bind would need a cast server-side."""
+    postgres = (_PERSISTENCE / "postgres.py").read_text()
+    start = postgres.index("async def _apply_hnsw_query_tuning(")
+    region = postgres[start : postgres.index("\n\n\n", start)]
+    assert "str(ef_search)" in region, "hnsw.ef_search must be bound as a string"
+
+
+def test_mysql_provisioning_points_at_the_0068_trigger():
+    """The provisioning path names the same file the migration runner ships."""
+    mysql = (_PERSISTENCE / "mysql.py").read_text()
+    assert "0068_federation_journal_narrow_trigger.sql" in mysql
+    assert "0067_federation_journal_narrow_trigger.sql" not in mysql
+    for directory in (
+        "migrations",
+        "migrations_oracle",
+        "migrations_db2",
+        "migrations_mysql",
+        "migrations_mariadb",
+    ):
+        assert (MIGRATIONS / directory / "0068_federation_journal_narrow_trigger.sql").is_file(), directory
+        assert not (MIGRATIONS / directory / "0067_federation_journal_narrow_trigger.sql").exists(), directory
+
+
+def test_federation_status_route_accepts_the_per_peer_counter():
+    """``_to_peer`` carries ``rows_without_embedding`` into the payload."""
+    routes = (Path(__file__).resolve().parents[1] / "mnemos" / "api" / "routes" / "federation.py").read_text()
+    assert "def _to_peer(row, *, rows_without_embedding" in routes
+
+
+def test_vector_tuning_exports_the_hnsw_fragment_the_installer_imports():
+    """The installer imports it at module scope: a missing export is fatal."""
+    tuning = (_PERSISTENCE / "vector_tuning.py").read_text()
+    assert "def hnsw_index_options_fragment(" in tuning
+    installer = (Path(__file__).resolve().parents[1] / "mnemos" / "installer" / "db.py").read_text()
+    assert "from mnemos.persistence.vector_tuning import hnsw_index_options_fragment" in installer
