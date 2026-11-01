@@ -6991,6 +6991,81 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             (local_id, peer_name),
         )
 
+    # ── F-15 parity / reconcile ───────────────────────────────────────────
+
+    async def fetch_parity_page(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        # ``remote_id`` is derived from the local key (``fed:<peer>:<id>``)
+        # rather than taken from metadata, so a replica and its source agree
+        # on identity even when the receiver never wrote the metadata column.
+        where = "WHERE federation_source IS NOT NULL"
+        params: list[Any] = []
+        if after_id is not None:
+            where += " AND id > ?"
+            params.append(after_id)
+        params.append(max(1, int(limit)))
+        return await _fetch_all(
+            self._conn(tx),
+            "SELECT m.id AS local_id, m.federation_source AS peer_name, "
+            "substr(m.id, length(m.federation_source) + 6) AS remote_id, "
+            "m.content_hash AS content_hash, "
+            "CASE WHEN me.memory_id IS NULL THEN 0 ELSE 1 END AS has_embedding "
+            "FROM memories m "
+            "LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
+            f"{where} ORDER BY m.id ASC LIMIT ?",
+            params,
+        )
+
+    async def fetch_source_export_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        where = "WHERE " + _eligibility.eligible_for_federation("m")
+        params: list[Any] = []
+        if after_id is not None:
+            where += " AND m.id > ?"
+            params.append(after_id)
+        for column, values in (("namespace", namespaces), ("category", categories)):
+            if values:
+                where += f" AND m.{column} IN ({_placeholders(values)})"
+                params.extend(values)
+        params.append(max(1, int(limit)))
+        return await _fetch_all(
+            self._conn(tx),
+            f"SELECT m.id AS id, m.content_hash AS content_hash FROM memories m {where} ORDER BY m.id ASC LIMIT ?",
+            params,
+        )
+
+    async def count_exportable_rows(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+    ) -> int:
+        where = "WHERE " + _eligibility.eligible_for_federation("m")
+        params: list[Any] = []
+        for column, values in (("namespace", namespaces), ("category", categories)):
+            if values:
+                where += f" AND m.{column} IN ({_placeholders(values)})"
+                params.extend(values)
+        return int(await _fetch_val(self._conn(tx), f"SELECT COUNT(*) FROM memories m {where}", params) or 0)
+
+    async def redispatch_federation_journal(self, tx: Transaction, *, memory_ids: Sequence[str]) -> int:
+        from mnemos.persistence.federation_journal import redispatch_memory_ids
+
+        return await redispatch_memory_ids(tx, memory_ids)
+
 
 class SqliteStateRepository(_SqliteRepository, StateRepository):
     async def get(

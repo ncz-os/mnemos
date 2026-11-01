@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from pydantic import BaseModel, Field
 
 from mnemos.api.dependencies import UserContext, get_current_user, require_root
 from mnemos.api.errors import database_disconnected_detail, is_db_disconnect as _is_db_disconnect
@@ -812,3 +813,105 @@ async def federation_memory(
     if row is None:
         raise HTTPException(status_code=404, detail="memory not found")
     return _feed_item_from_row(row)
+
+
+class FederationRedispatchRequest(BaseModel):
+    memory_ids: list[str] = Field(default_factory=list, max_length=5000)
+
+
+class FederationRedispatchResponse(BaseModel):
+    requested: int
+    redispatched: int
+
+
+@router.post("/redispatch", response_model=FederationRedispatchResponse)
+async def federation_redispatch(
+    body: FederationRedispatchRequest,
+    _: UserContext = Depends(_require_federation_role),
+):
+    """Re-publish current state for ids a replica lost locally.
+
+    F-15 reconcile. Only the SOURCE can do this: the journal belongs to it,
+    and the receiver's durable sequence fence means the original event can
+    never be re-applied. This appends a new event per id, so the replica's
+    ordinary pull picks the row up again.
+
+    Re-advertising is not a reopen. ``redispatch_memory_ids`` only writes an
+    event for a row that is still exportable and has no ``federation_source``;
+    a withdrawn, archived, consolidated, vault or replicated row yields no
+    event at all, so a revocation can never be replayed as live data.
+    """
+    backend = require_federation_backend()
+
+    try:
+        async with backend.transactional() as tx:
+            redispatched = await backend.federation.redispatch_federation_journal(tx, memory_ids=body.memory_ids)
+    except NotImplementedError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return FederationRedispatchResponse(requested=len(body.memory_ids), redispatched=redispatched)
+
+
+class FederationParityResponse(BaseModel):
+    report: dict[str, Any]
+
+
+class FederationReconcileResponse(BaseModel):
+    result: dict[str, Any]
+
+
+@router.get("/peers/{peer_id}/parity", response_model=FederationParityResponse)
+async def federation_peer_parity(
+    peer_id: str,
+    _: UserContext = Depends(_require_federation_role),
+    page_size: int = Query(500, ge=1, le=5000),
+    namespace: Optional[str] = Query(None, description="Comma-separated namespace filter"),
+    category: Optional[str] = Query(None, description="Comma-separated category filter"),
+):
+    """Compare this node's replica of ``peer_id`` with the source.
+
+    Run on the SOURCE host for a full comparison. Run on a replica and the
+    report says so honestly: ``source.available`` is false and the
+    source-side populations stay empty rather than misreporting the
+    replica's own corpus as the peer's.
+    """
+    from mnemos.domain.federation.parity import replica_parity
+
+    backend = require_federation_backend()
+    namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
+    categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
+    try:
+        report = await replica_parity(
+            backend,
+            peer_id,
+            namespaces=namespaces,
+            categories=categories,
+            page_size=page_size,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return FederationParityResponse(report=report)
+
+
+@router.post("/peers/{peer_id}/reconcile", response_model=FederationReconcileResponse)
+async def federation_peer_reconcile(
+    peer_id: str,
+    _: UserContext = Depends(_require_federation_role),
+    apply: bool = Query(False, description="False (default) is a dry run"),
+    page_size: int = Query(500, ge=1, le=5000),
+    limit: Optional[int] = Query(None, ge=1, description="Cap the ids requested this run"),
+):
+    """Re-pull the ids the parity report calls missing. Dry run by default."""
+    from mnemos.domain.federation.parity import reconcile_peer
+
+    backend = require_federation_backend()
+    try:
+        result = await reconcile_peer(
+            backend,
+            peer_id,
+            apply=apply,
+            page_size=page_size,
+            limit=limit,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return FederationReconcileResponse(result=result)

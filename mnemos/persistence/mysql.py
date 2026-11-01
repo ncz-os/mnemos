@@ -7793,6 +7793,100 @@ class MysqlFederationRepository(FederationRepository):
             )
             return int(cursor.rowcount or 0)
 
+    # ── F-15 parity / reconcile (read-only, keyset-paged) ────────────────
+
+    async def fetch_parity_page(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        # ``remote_id`` is derived from the local key (``fed:<peer>:<id>``)
+        # rather than taken from metadata, so a replica and its source agree
+        # on identity even when the receiver never wrote the metadata column.
+        # The peer filter is applied by the caller (``parity._replica_keyset``
+        # compares ``peer_name`` after the page).
+        where = ["m.federation_source IS NOT NULL"]
+        params: list[Any] = []
+        if after_id is not None:
+            where.append("m.id > %s")
+            params.append(after_id)
+        params.append(max(1, int(limit)))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT m.id AS local_id, m.federation_source AS peer_name,
+                       SUBSTRING(m.id, CHAR_LENGTH(m.federation_source) + 6) AS remote_id,
+                       m.content_hash AS content_hash,
+                       CASE WHEN me.memory_id IS NULL THEN 0 ELSE 1 END AS has_embedding
+                  FROM memories m
+                  LEFT JOIN memory_embeddings me ON me.memory_id = m.id
+                 WHERE {" AND ".join(where)}
+                 ORDER BY m.id ASC
+                 LIMIT %s
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def fetch_source_export_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        where = [_eligibility.eligible_for_federation("m")]
+        params: list[Any] = []
+        if after_id is not None:
+            where.append("m.id > %s")
+            params.append(after_id)
+        for column, values in (("namespace", namespaces), ("category", categories)):
+            if values:
+                where.append(f"m.{column} IN ({', '.join(['%s'] * len(values))})")
+                params.extend(values)
+        params.append(max(1, int(limit)))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT m.id AS id, m.content_hash AS content_hash
+                  FROM memories m
+                 WHERE {" AND ".join(where)}
+                 ORDER BY m.id ASC
+                 LIMIT %s
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def count_exportable_rows(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+    ) -> int:
+        where = [_eligibility.eligible_for_federation("m")]
+        params: list[Any] = []
+        for column, values in (("namespace", namespaces), ("category", categories)):
+            if values:
+                where.append(f"m.{column} IN ({', '.join(['%s'] * len(values))})")
+                params.extend(values)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(f"SELECT COUNT(*) FROM memories m WHERE {' AND '.join(where)}", params)
+            row = await cursor.fetchone()
+            if row is None:
+                return 0
+            return int((row[0] if not isinstance(row, dict) else next(iter(row.values()))) or 0)
+
+    async def redispatch_federation_journal(self, tx: Transaction, *, memory_ids: Sequence[str]) -> int:
+        from mnemos.persistence.federation_journal import redispatch_memory_ids
+
+        return await redispatch_memory_ids(tx, memory_ids)
+
     async def upsert_federated_memory(
         self,
         tx: Transaction,

@@ -19,3 +19,58 @@ Deployment considerations:
 - The journal retains identifiers and scope metadata, never deleted content or credentials. It is a replication mechanism, separate from the signed audit chain.
 
 PostgreSQL migration `0063_version_recreation.sql` allows a stable federated ID to be withdrawn and re-created without colliding with its retained version history. New incarnations extend the previous version counter and predecessor.
+
+## Replica parity and reconcile (F-15)
+
+A replica can lag or lose rows without the journal ever noticing: the cursor
+fenced past them, someone deleted a `fed:<peer>:*` row locally, or a row was
+pulled without its vector. `mnemos.domain.federation.parity` compares a
+replica with its source and offers a dry-run-first repair.
+
+Both sides are read by keyset page — `fetch_source_export_keyset_page` on the
+source and `fetch_parity_page` on the replica — so the sweep is bounded in
+memory and never loads the whole table. Every id is classified exactly once:
+
+| population | meaning |
+| --- | --- |
+| `missing` | exportable on the source, absent from the replica |
+| `extra` | `fed:<peer>:*` on the replica, no longer exportable upstream |
+| `stale` | present on both sides with a different content hash |
+| `null_embedding` | present on the replica without a stored vector |
+| `unreachable` | exportable by the source but never on its feed (see below) |
+
+`sample_truncated` is computed against the same cap that bounds `sample`, so a
+truncated sample never reports as complete.
+
+### The eligibility gap behind the by-id 404
+
+CHARON's export predicate (`eligible_for_federation_export`) and the feed's
+(`eligible_for_federation`) are deliberately not identical:
+
+- The export counts any live, in-scope, non-vault row. It has **no**
+  `federation_source` term.
+- The feed also excludes rows with `federation_source` / `archived_at` /
+  `consolidated_into` set, and the journal triggers only fire for rows whose
+  `federation_source` is NULL.
+
+For archived and consolidated rows the difference is correct: those are
+revocations, not live content. For a row that itself arrived by federation
+there is no publishable event at all, so a replica of a replica can never
+receive it. `replica_parity` reports such ids as `unreachable` rather than as a
+permanent `missing` deficit, because the two have different fixes.
+`tests/test_federation_parity_reconcile.py` pins the gap with
+`test_export_definition_is_a_superset_of_the_feed`, and closing it for the
+`federation_source` case would need a trigger change on all six backends.
+
+### Reconcile
+
+`reconcile_peer(..., apply=False)` is the default and touches neither side.
+With `apply=True` it asks the **source** to re-advertise the missing ids
+(`POST /v1/federation/redispatch`) and then runs an ordinary pull. Only the
+source can do this: the journal is its own, and the receiver's durable
+sequence fence means the original event can never be re-applied. The
+redispatch endpoint publishes a new event per still-exportable id and
+reserves its sequence immediately, so the event lands strictly after every
+sequence already handed out; an event that reused a cursor position would be
+invisible to the replica. Reconcile never deletes or overwrites a replica
+row.

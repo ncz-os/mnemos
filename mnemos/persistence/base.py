@@ -2708,6 +2708,77 @@ class FederationRepository(ABC):
     @abstractmethod
     async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int: ...
 
+    # ── F-15 parity / reconcile (read-only, keyset-paged) ────────────────
+
+    @abstractmethod
+    async def fetch_parity_page(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        """One keyset page of THIS node's ``fed:<peer>:*`` population.
+
+        Returns ``local_id`` (the ``fed:<peer>:<remote_id>`` key),
+        ``remote_id`` (derived from the key, so a receiver and its source
+        agree on identity without trusting a column), ``peer_name``,
+        ``content_hash`` (NULL when the backend has none stored) and
+        ``has_embedding`` (0/1). Ordered by ``local_id`` and resumed with
+        ``after_id`` so a parity sweep never loads the whole population.
+        """
+        ...
+
+    @abstractmethod
+    async def fetch_source_export_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        """One keyset page of the rows a peer is entitled to receive.
+
+        Applies ``eligible_for_federation`` -- the same predicate the live
+        feed and the by-id route use -- and returns ``id`` + the stored
+        ``content_hash`` (NULL when absent) in ``id`` order. The parity
+        report compares this population with a replica's ``fed:*`` rows.
+        """
+        ...
+
+    @abstractmethod
+    async def count_exportable_rows(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+    ) -> int:
+        """Count of ``fetch_source_export_keyset_page``'s population."""
+        ...
+
+    @abstractmethod
+    async def redispatch_federation_journal(
+        self,
+        tx: Transaction,
+        *,
+        memory_ids: Sequence[str],
+    ) -> int:
+        """Give an unpublishable change a NEW sequence so it can be served.
+
+        The receiver's fence rejects an event whose sequence it has already
+        applied, so a replica that lost a row locally can never re-apply
+        the original event. Reconcile appends "serve this id again" to the
+        source's own journal, in the source's own clock order -- no schema
+        change, no diagnostic-history deletion (the F-4 ledger compaction
+        that decides what history to keep is a separate step).
+
+        Returns the number of ids that now have a publishable event.
+        """
+        ...
+
 
 class StateRepository(ABC):
     """State key-value persistence surface."""

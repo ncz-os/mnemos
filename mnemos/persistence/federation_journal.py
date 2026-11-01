@@ -17,6 +17,8 @@ from mnemos.core.config import federation_feed_include_private
 from mnemos.persistence.worker_lifecycle import _Ops, transaction_dialect
 
 CURSOR_PREFIX = "journal:"
+# Rows sequenced per ``_publish`` call; bounds the CASE/IN statement size.
+_PUBLISH_BATCH = 256
 
 
 class FeedRows(list):
@@ -76,23 +78,40 @@ def _limit(ops: _Ops, limit: int) -> str:
     return f" FETCH FIRST {value} ROWS ONLY" if ops.dialect in {"oracle", "db2"} else f" LIMIT {value}"
 
 
-async def _publish(ops: _Ops, memory_id=None):
+async def _publish(ops: _Ops, memory_id=None, *, memory_ids=None):
     """Assign cursor positions after commit, without blocking source writers.
 
     An identity allocated by an uncommitted mutation may be lower than an
     already published ID. That is harmless: it gets a higher published sequence
     on a later poll, so a consumer never advances past an invisible event.
+
+    ``memory_ids`` narrows the sweep to a known set of rows. Redispatch uses it
+    so it publishes *its own* events and never claims a concurrent publisher's
+    pending outbox row -- a global sweep would report those as re-advertised.
+
+    Returns how many rows this call sequenced: at most one ``_PUBLISH_BATCH``.
     """
     await ops.execute("UPDATE federation_change_clock SET value = value WHERE id = 1")
+    where = ""
+    params: list[Any] = []
+    if memory_ids is not None:
+        ids_in = [str(mid) for mid in memory_ids]
+        if not ids_in:
+            return 0
+        where = " AND memory_id IN (" + ",".join("?" for _ in ids_in) + ")"
+        params = ids_in
+    elif memory_id is not None:
+        where = " AND memory_id = ?"
+        params = [memory_id]
     pending = await ops.fetchall(
         "SELECT event_id FROM federation_changes WHERE seq IS NULL"
-        + (" AND memory_id = ?" if memory_id is not None else "")
+        + where
         + " ORDER BY event_id"
-        + _limit(ops, 256),
-        *((memory_id,) if memory_id is not None else ()),
+        + _limit(ops, _PUBLISH_BATCH),
+        *params,
     )
     if not pending:
-        return
+        return 0
     value = int(await ops.scalar("SELECT value FROM federation_change_clock WHERE id = 1"))
     ids = [int(row["event_id"]) for row in pending]
     cases = " ".join(f"WHEN ? THEN {index}" for index, _ in enumerate(ids, 1))
@@ -105,6 +124,7 @@ async def _publish(ops: _Ops, memory_id=None):
         *ids,
     )
     await ops.execute("UPDATE federation_change_clock SET value = ? WHERE id = 1", value + len(ids))
+    return len(ids)
 
 
 async def _current_states(ops, ids, prefer_compressed=False, *, repo=None, include_embedding=False):
@@ -488,3 +508,80 @@ async def compact(tx: Any, *, older_than_days: int = 30) -> int:
     # Every dialect's statement now takes the cutoff twice: the outer
     # candidate filter and the "is there a compactable successor" test.
     return int(await ops.execute(sql, cutoff, cutoff))
+
+
+def _redispatch_eligible_predicate() -> str:
+    """The feed's own export predicate, as an unaliased ``memories`` filter.
+
+    ``redispatch_memory_ids`` re-advertises CURRENT STATE, so the only rows it
+    may publish are the ones the live feed itself would serve. Reusing
+    ``eligible_for_federation`` is what keeps the two definitions from
+    drifting: it already carries the ``federation_source IS NULL`` loop-guard,
+    the lifecycle exclusions, the vault credential boundary and the world-read
+    gate. Hand-writing a subset of those terms (the round-1 defect) let a vault
+    row through and published a revocation as live content.
+    """
+    from mnemos.core.eligibility import eligible_for_federation
+
+    return eligible_for_federation("")
+
+
+async def redispatch_memory_ids(tx, memory_ids):
+    """Append a fresh, publishable change for each id that needs re-serving.
+
+    F-15 reconcile: the receiver's durable fence drops any event whose
+    sequence it already applied, so a replica that lost a row locally can
+    never re-apply the original one. Publishing a NEW event for the current
+    state -- stamped in the source's clock order by the next ``_publish`` --
+    is how the row becomes reachable again without touching the fence, the
+    receiver, or the diagnostic history.
+
+    Only the current state of an exportable row is re-advertised: a row that
+    left the feed (deleted, archived, consolidated, vault, or became private
+    offsite) already produces its own withdrawal/consolidation event, and
+    re-advertising it would mislabel a revocation as live data. Rows with
+    ``federation_source`` set are skipped for the same reason they are never
+    on the feed: they have no publishable event to replay.
+    """
+    ids = [str(mid) for mid in memory_ids if mid]
+    if not ids:
+        return 0
+    ops = _ops(tx)
+    placeholders = ",".join("?" for _ in ids)
+    rows = await ops.fetchall(
+        "SELECT id, namespace, category, permission_mode, updated FROM memories "
+        f"WHERE id IN ({placeholders}) AND " + _redispatch_eligible_predicate(),
+        *ids,
+    )
+    if not rows:
+        # Nothing to publish: no clock touch, no write lock on the journal.
+        return 0
+    for row in rows:
+        public = 1 if (federation_feed_include_private() or int(row.get("permission_mode") or 0) % 10 >= 4) else 0
+        await ops.execute(
+            "INSERT INTO federation_changes(memory_id,changed_at,old_namespace,old_category,"
+            "old_public,old_exportable,new_namespace,new_category,new_public,new_exportable) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            row["id"],
+            datetime.now(timezone.utc).isoformat(),
+            row.get("namespace"),
+            row.get("category"),
+            public,
+            1,
+            row.get("namespace"),
+            row.get("category"),
+            public,
+            1,
+        )
+    # Reserve the sequences here rather than leaving them to the next
+    # ``_publish``: a replica whose cursor is already at ``journal:N`` would
+    # never see a replayed event that happened to land on N. _publish bumps
+    # the clock by the number of rows it assigns, so the re-advertised events
+    # are strictly after every sequence already handed out. One _publish call
+    # sequences at most _PUBLISH_BATCH rows, so drain until a short batch:
+    # otherwise ids past the first batch stay pending and the count below
+    # would claim events that were never published.
+    published_ids = [row["id"] for row in rows]
+    while await _publish(ops, memory_ids=published_ids) == _PUBLISH_BATCH:
+        pass
+    return len(rows)

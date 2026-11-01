@@ -173,6 +173,7 @@ worker_app = typer.Typer(help="Run MNEMOS background workers.", no_args_is_help=
 artemis_app = typer.Typer(help="ARTEMIS corpus maintenance commands.", no_args_is_help=True)
 morpheus_app = typer.Typer(help="MORPHEUS run maintenance commands.", no_args_is_help=True)
 db_app = typer.Typer(help="Database maintenance commands.", no_args_is_help=True)
+federation_app = typer.Typer(help="Federation parity and reconcile commands.", no_args_is_help=True)
 
 
 DOC_IMPORT_EXTENSIONS = {
@@ -1318,6 +1319,59 @@ def dump_openapi(
     typer.echo(f"OpenAPI spec written to {output}")
 
 
+@federation_app.command("parity")
+def federation_parity(
+    peer_id: str = typer.Argument(..., help="Federation peer id"),
+    page_size: int = typer.Option(500, "--page-size", min=1, max=5000),
+    namespace: Optional[str] = typer.Option(None, "--namespace", help="Comma-separated namespaces"),
+    category: Optional[str] = typer.Option(None, "--category", help="Comma-separated categories"),
+) -> None:
+    """Compare this node's replica of PEER_ID with the source."""
+    base, headers = _api_env(require_key=True)
+    params: dict[str, Any] = {"page_size": page_size}
+    if namespace:
+        params["namespace"] = namespace
+    if category:
+        params["category"] = category
+    try:
+        response = httpx.get(
+            f"{base}/v1/federation/peers/{peer_id}/parity",
+            headers=headers,
+            params=params,
+            timeout=120,
+        )
+    except httpx.RequestError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _echo_json_response(response)
+
+
+@federation_app.command("reconcile")
+def federation_reconcile(
+    peer_id: str = typer.Argument(..., help="Federation peer id"),
+    apply: bool = typer.Option(False, "--apply", help="Actually re-pull (default is a dry run)"),
+    page_size: int = typer.Option(500, "--page-size", min=1, max=5000),
+    limit: Optional[int] = typer.Option(None, "--limit", min=1, help="Cap ids requested this run"),
+) -> None:
+    """Re-pull ids the parity report calls missing. Dry run unless --apply."""
+    base, headers = _api_env(require_key=True)
+    params: dict[str, Any] = {"apply": apply, "page_size": page_size}
+    if limit is not None:
+        params["limit"] = limit
+    try:
+        response = httpx.post(
+            f"{base}/v1/federation/peers/{peer_id}/reconcile",
+            headers=headers,
+            params=params,
+            timeout=600,
+        )
+    except httpx.RequestError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _echo_json_response(response)
+
+
+app.add_typer(federation_app, name="federation")
 app.add_typer(serve_app, name="serve")
 app.add_typer(worker_app, name="worker")
 app.add_typer(artemis_app, name="artemis")
