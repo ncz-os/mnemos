@@ -52,7 +52,7 @@ async def _require_federation_role(
     return user
 
 
-def _to_peer(row) -> FederationPeer:
+def _to_peer(row, *, rows_without_embedding: int = 0) -> FederationPeer:
     # compat_mode + peer_mnemos_version + last_schema_check_at landed in
     # migrations_v3_4_federation_compat.sql. Older rows / older test
     # mocks won't have them — fall back rather than KeyError.
@@ -95,6 +95,8 @@ def _to_peer(row) -> FederationPeer:
         compat_mode=_opt("compat_mode", "strict"),
         peer_mnemos_version=_opt("peer_mnemos_version"),
         last_schema_check_at=_iso(last_schema),
+        # F-5: the peer's rows that carry no embedding.
+        rows_without_embedding=int(rows_without_embedding or 0),
         created=_iso(row["created"]) or "",
         updated=_iso(row["updated"]) or "",
     )
@@ -510,7 +512,13 @@ async def trigger_sync(
 async def peer_sync_log(
     peer_id: str,
     _: UserContext = Depends(require_root),
-    limit: int = 50,
+    # F-10 (2026-10-31): the raw ``limit`` was unbounded, so a caller
+    # could ask for an arbitrarily large sync-log page and the
+    # repository would hand it straight to the SQL ``LIMIT``. Cap it at
+    # the query-parameter boundary with FastAPI's ``Query``
+    # constraints -- the same shape the federation feed route already
+    # uses (``Query(100, ge=1, le=500)``).
+    limit: int = Query(50, ge=1, le=500),
 ):
     peer_id = parse_uuid_or_404(peer_id, "peer")
     backend = require_federation_backend()
@@ -527,10 +535,29 @@ async def peer_sync_log(
             error=r["error"],
             cursor_before=_iso_value(r["cursor_before"]),
             cursor_after=_iso_value(r["cursor_after"]),
+            # F-1/F-5: the wire count and the embedding gap. Older rows
+            # (or a backend that has not run the 0067 migration) simply
+            # report zero.
+            events_received=_opt_int(r, "events_received"),
+            rows_without_embedding=_opt_int(r, "rows_without_embedding"),
         )
         for r in rows
     ]
     return FederationSyncLogResponse(count=len(entries), entries=entries)
+
+
+def _opt_int(row, key, default: int = 0) -> int:
+    """Read an optional integer column, tolerating absent columns/None."""
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @router.get("/status", response_model=FederationStatusResponse)
@@ -538,7 +565,15 @@ async def federation_status(_: UserContext = Depends(require_root)):
     backend = require_federation_backend()
     async with backend.transactional() as tx:
         rows = await backend.federation.list_peers(tx)
-    peers = [_to_peer(r) for r in rows]
+        # F-5: how many rows each peer contributed carry no embedding.
+        # A replica in this state is FTS-only, so the gap belongs next
+        # to the peer's other health signals.
+        try:
+            without_embedding = await backend.federation.count_federated_rows_without_embedding_per_peer(tx)
+        except Exception:
+            logger.exception("[federation/status] could not count rows without embedding")
+            without_embedding = {}
+    peers = [_to_peer(r, rows_without_embedding=without_embedding.get(r["name"], 0)) for r in rows]
     return FederationStatusResponse(
         count=len(peers),
         enabled_count=sum(1 for p in peers if p.enabled),

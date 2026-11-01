@@ -861,6 +861,8 @@ CREATE TABLE IF NOT EXISTS federation_sync_log (
     memories_updated  INT          NOT NULL DEFAULT 0,
     records_seen      INT          NOT NULL DEFAULT 0,
     records_written   INT          NOT NULL DEFAULT 0,
+    events_received      INT       NOT NULL DEFAULT 0,
+    rows_without_embedding INT      NOT NULL DEFAULT 0,
     error             TEXT,
     cursor_before     TEXT,
     cursor_after      TEXT,
@@ -7074,7 +7076,8 @@ class MysqlFederationRepository(FederationRepository):
                 """
                 SELECT id, started_at, finished_at, memories_pulled,
                        memories_new, memories_updated, error,
-                       cursor_before, cursor_after
+                       cursor_before, cursor_after,
+                       events_received, rows_without_embedding
                   FROM federation_sync_log
                  WHERE peer_id = %s
                  ORDER BY started_at DESC
@@ -7409,6 +7412,8 @@ class MysqlFederationRepository(FederationRepository):
         memories_updated: int,
         error: str | None,
         cursor_after: Any,
+        events_received: int = 0,
+        rows_without_embedding: int = 0,
     ) -> None:
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
@@ -7420,6 +7425,8 @@ class MysqlFederationRepository(FederationRepository):
                        memories_updated = %s,
                        records_seen = %s,
                        records_written = %s,
+                       events_received = %s,
+                       rows_without_embedding = %s,
                        status = %s,
                        error = %s,
                        cursor_after = %s
@@ -7429,8 +7436,22 @@ class MysqlFederationRepository(FederationRepository):
                     memories_pulled,
                     memories_new,
                     memories_updated,
-                    memories_pulled,
+                    # ``records_seen`` is the historical column for the
+                    # WIRE count and ``records_written`` the historical
+                    # column for the APPLIED count. Both are written
+                    # alongside the F-1/F-5 columns for continuity with
+                    # pre-0067 rows; nothing reads them, but dropping
+                    # them would silently change what an operator sees
+                    # in an existing federation_sync_log.
+                    #
+                    # The APPLIED count is memories_new + memories_updated
+                    # — the same value memories_pulled carries, because
+                    # the sync only counts rows the fence actually
+                    # applied.
+                    events_received,
                     memories_new + memories_updated,
+                    events_received,
+                    rows_without_embedding,
                     "error" if error else "ok",
                     error,
                     cursor_after,
@@ -7472,6 +7493,30 @@ class MysqlFederationRepository(FederationRepository):
                 """,
                 (cursor, cursor, total_pulled, peer_id),
             )
+
+    async def count_federated_rows_without_embedding_per_peer(self, tx: Transaction) -> dict[str, int]:
+        """Count federated rows with no embedding, grouped by peer name.
+
+        MySQL keeps the vector in the inline ``memories.embedding``
+        VECTOR column, so a NULL there is the missing-vector signal.
+        MariaDB has no such column (it uses the ``memory_embeddings``
+        join table) and overrides this method.
+        """
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT federation_source AS peer_name, COUNT(*) AS n
+                  FROM memories
+                 WHERE federation_source IS NOT NULL
+                   AND deleted_at IS NULL
+                   AND archived_at IS NULL
+                   AND consolidated_into IS NULL
+                   AND embedding IS NULL
+                 GROUP BY federation_source
+                """
+            )
+            rows = await _fetch_all_dicts(cursor)
+        return {str(row["peer_name"]): int(row["n"]) for row in rows}
 
     async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
         async with tx.conn.cursor() as cursor:
@@ -8514,6 +8559,15 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                     conn,
                     "kg_triples",
                     {"extracted_by_run_id": "extracted_by_run_id CHAR(36)"},
+                )
+                # F-1/F-5: wire events vs applied rows, and the embedding gap.
+                await _ensure_mysql_columns(
+                    conn,
+                    "federation_sync_log",
+                    {
+                        "events_received": "events_received INT NOT NULL DEFAULT 0",
+                        "rows_without_embedding": "rows_without_embedding INT NOT NULL DEFAULT 0",
+                    },
                 )
                 await _ensure_mysql_columns(
                     conn,

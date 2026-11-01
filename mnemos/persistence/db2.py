@@ -4028,7 +4028,8 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 """
                 SELECT id, started_at, finished_at, memories_pulled,
                        memories_new, memories_updated, error,
-                       cursor_before, cursor_after
+                       cursor_before, cursor_after,
+                       events_received, rows_without_embedding
                   FROM federation_sync_log
                  WHERE peer_id = ?
                  ORDER BY started_at DESC
@@ -4069,6 +4070,8 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         memories_updated: int,
         error: str | None,
         cursor_after: Any,
+        events_received: int = 0,
+        rows_without_embedding: int = 0,
     ) -> None:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -4082,7 +4085,9 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                     memories_new = ?,
                     memories_updated = ?,
                     error = ?,
-                    cursor_after = ?
+                    cursor_after = ?,
+                    events_received = ?,
+                    rows_without_embedding = ?
                  WHERE id = ?
                 """,
                 (
@@ -4091,6 +4096,8 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                     memories_updated,
                     error,
                     cursor_after,
+                    events_received,
+                    rows_without_embedding,
                     log_id,
                 ),
             )
@@ -4140,6 +4147,33 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
             )
         finally:
             await _call(cur.close)
+
+    async def count_federated_rows_without_embedding_per_peer(self, tx: Any) -> dict[str, int]:
+        """Count federated rows with no embedding, grouped by peer name.
+
+        Db2 stores the vector in the ``memories.embedding`` column
+        (VECTOR), so a NULL there is the missing-vector signal.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                """
+                SELECT federation_source AS peer_name, COUNT(*) AS n
+                  FROM memories
+                 WHERE federation_source IS NOT NULL
+                   AND deleted_at IS NULL
+                   AND archived_at IS NULL
+                   AND consolidated_into IS NULL
+                   AND embedding IS NULL
+                 GROUP BY federation_source
+                """,
+            )
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        return {str(row["peer_name"]): int(row["n"]) for row in rows}
 
     async def update_peer_schema_check(
         self,

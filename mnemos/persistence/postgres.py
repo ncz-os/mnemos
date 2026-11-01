@@ -35,6 +35,11 @@ from mnemos.core.visibility import (
 )
 from mnemos.core import eligibility as _eligibility
 from mnemos.persistence.mcp_oauth import MCPOAuthRepositoryMixin
+from mnemos.persistence.vector_tuning import (
+    PGVECTOR_ITERATIVE_SCAN_MIN_VERSION,
+    hnsw_ef_search_for,
+    pgvector_version_at_least,
+)
 from mnemos.persistence.base import (
     POSTGRES_CAPABILITY_DETAILS,
     build_api_key_row,
@@ -113,6 +118,72 @@ def _log_search_phase(
         return
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     logger.info("[search:%s] %s done in %dms", trace_id, phase, elapsed_ms)
+
+
+#: Probe for the installed pgvector extension version. F-8 (2026-10-31):
+#: ``hnsw.iterative_scan`` only exists in pgvector >= 0.8, so the GUC is
+#: gated on the *installed* version rather than assumed.
+_PGVECTOR_VERSION_SQL = "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+
+
+async def _probe_pgvector_version(conn: Any) -> str | None:
+    """Return the installed pgvector ``extversion``, or None if unknown.
+
+    Never raises: a missing extension, a permission error or a
+    connection problem must degrade to "no iterative scan", never to a
+    failed search. The version is a query-time optimisation, not a
+    correctness requirement.
+    """
+    try:
+        version = await conn.fetchval(_PGVECTOR_VERSION_SQL)
+    except Exception:  # pragma: no cover - defensive: any probe failure degrades
+        logger.debug("pgvector version probe failed; iterative scan disabled", exc_info=True)
+        return None
+    if version is None:
+        return None
+    return str(version)
+
+
+async def _apply_hnsw_query_tuning(
+    conn: Any,
+    *,
+    limit: int,
+    pgvector_version: str | None,
+) -> None:
+    """Set the HNSW query knobs for one semantic search (F-8, 2026-10-31).
+
+    Two knobs, both transaction-local (``set_config(..., true)`` is the
+    transaction-scoped form of ``SET LOCAL`` — Postgres' ``SET`` syntax
+    does not accept bind parameters, which is why the codebase uses
+    ``set_config`` everywhere, e.g. ``mnemos/api/memory_mutations.py``):
+
+    * ``hnsw.ef_search = GREATEST(limit*4, 100)`` — widens the ANN
+      candidate window so a selective tenant/category filter still
+      leaves ``limit`` rows behind. Without it pgvector stops after 40
+      candidates and the query can return fewer rows than asked for.
+
+    * ``hnsw.iterative_scan = strict_order`` — only when the installed
+      pgvector is >= 0.8. Older extensions do not know the GUC and
+      raise ``unrecognized configuration parameter``; the version probe
+      is what makes this safe.
+
+    Failure of either knob is non-fatal: the search still runs with the
+    extension defaults. A knob that fails to apply must never turn a
+    search into a 500.
+    """
+    ef_search = hnsw_ef_search_for(limit)
+    try:
+        await conn.execute("SELECT set_config('hnsw.ef_search', $1, true)", str(ef_search))
+    except Exception:  # pragma: no cover - defensive: tuning must never fail a search
+        logger.debug("could not set hnsw.ef_search=%s; using extension default", ef_search, exc_info=True)
+    if pgvector_version_at_least(pgvector_version, PGVECTOR_ITERATIVE_SCAN_MIN_VERSION):
+        try:
+            await conn.execute("SELECT set_config('hnsw.iterative_scan', $1, true)", "strict_order")
+        except Exception:  # pragma: no cover - defensive
+            logger.debug(
+                "could not set hnsw.iterative_scan; using extension default",
+                exc_info=True,
+            )
 
 
 # Optional Rust hot-path accelerator. Loaded lazily so operators do not
@@ -475,6 +546,23 @@ class PostgresMemoryRepository(MemoryRepository):
     # same shape on both backends — surfaced 2026-05-08 by the
     # cross-code audit (#202).
     _expected_embedding_dim: int | None = None
+
+    # F-8 (2026-10-31): the installed pgvector version, probed once and
+    # cached on the repository instance. ``hnsw.iterative_scan`` only
+    # exists in pgvector >= 0.8, so the GUC is gated on the *installed*
+    # version rather than assumed. ``None`` means "not probed yet";
+    # the cached value is set on first use. The probe never raises, so
+    # a failed probe leaves the value at None and the search runs with
+    # the extension defaults.
+    _pgvector_version: str | None = None
+    _pgvector_version_probed: bool = False
+
+    async def _pgvector_version_cached(self, conn: Any) -> str | None:
+        """Return the cached pgvector version, probing it once per repository."""
+        if not self._pgvector_version_probed:
+            self._pgvector_version_probed = True
+            self._pgvector_version = await _probe_pgvector_version(conn)
+        return self._pgvector_version
 
     def _require_dim(self, embedding: Sequence[float], op: str) -> None:
         """Fail loudly if the embedding length doesn't match the
@@ -1560,6 +1648,18 @@ class PostgresMemoryRepository(MemoryRepository):
         # produces a vague DataError. Mirrors SqliteMemoryRepository.
         self._require_dim(embedding, "semantic_search")
         conn = _postgres_tx(tx).conn
+        # F-8 (2026-10-31): widen the HNSW candidate window for THIS
+        # query and, on pgvector >= 0.8, turn on the iterative scan.
+        # Without this the extension default (``hnsw.ef_search = 40``)
+        # caps the ANN candidate pool, and the tenant/category WHERE
+        # clause then post-filters it -- so a query asking for 10 rows
+        # can return fewer than 10. Transaction-local, so the knob does
+        # not leak to the next query on a pooled connection.
+        await _apply_hnsw_query_tuning(
+            conn,
+            limit=limit,
+            pgvector_version=await self._pgvector_version_cached(conn),
+        )
         # $1 is the embedding vector, used in both SELECT (for the
         # similarity score) and ORDER BY. Passing as a parameter (not
         # interpolated) eliminates injection risk from a poisoned
@@ -5423,7 +5523,8 @@ class PostgresFederationRepository(FederationRepository):
                 """
             SELECT id::text, started_at, finished_at, memories_pulled,
                    memories_new, memories_updated, error,
-                   cursor_before, cursor_after
+                   cursor_before, cursor_after,
+                   events_received, rows_without_embedding
             FROM federation_sync_log
             WHERE peer_id = $1::uuid
             ORDER BY started_at DESC
@@ -5760,6 +5861,8 @@ class PostgresFederationRepository(FederationRepository):
         memories_updated: int,
         error: str | None,
         cursor_after: Any,
+        events_received: int = 0,
+        rows_without_embedding: int = 0,
     ) -> None:
         await _postgres_tx(tx).conn.execute(
             """
@@ -5769,7 +5872,9 @@ class PostgresFederationRepository(FederationRepository):
                 memories_new = $3,
                 memories_updated = $4,
                 error = $5,
-                cursor_after = $6
+                cursor_after = $6,
+                events_received = $7,
+                rows_without_embedding = $8
             WHERE id = $1::uuid
             """,
             log_id,
@@ -5778,6 +5883,8 @@ class PostgresFederationRepository(FederationRepository):
             memories_updated,
             error,
             cursor_after,
+            events_received,
+            rows_without_embedding,
         )
 
     async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None:
@@ -5812,6 +5919,28 @@ class PostgresFederationRepository(FederationRepository):
             cursor,
             total_pulled,
         )
+
+    async def count_federated_rows_without_embedding_per_peer(self, tx: Transaction) -> dict[str, int]:
+        """Count federated rows with no embedding, grouped by peer name.
+
+        Postgres keeps the vector in the ``memories.embedding`` column
+        (pgvector), so a NULL there is the missing-vector signal. A
+        replica that copied no vectors is FTS-only: vector search
+        excludes NULL embeddings.
+        """
+        rows = await _postgres_tx(tx).conn.fetch(
+            """
+            SELECT federation_source AS peer_name, COUNT(*) AS n
+            FROM memories
+            WHERE federation_source IS NOT NULL
+              AND deleted_at IS NULL
+              AND archived_at IS NULL
+              AND consolidated_into IS NULL
+              AND embedding IS NULL
+            GROUP BY federation_source
+            """
+        )
+        return {str(row["peer_name"]): int(row["n"]) for row in rows}
 
     async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
         return list(

@@ -64,7 +64,11 @@ CREATE INDEX IF NOT EXISTS idx_memories_task_type ON memories(task_type);
 CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created DESC);
 CREATE INDEX IF NOT EXISTS idx_memories_is_compressed ON memories(is_compressed);
 CREATE INDEX IF NOT EXISTS idx_memories_original_reference ON memories(original_reference);
-CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops);
+-- F-8 (2026-10-31): declare the HNSW build parameters explicitly.
+-- pgvector defaults are m=16 and ef_construction=64; naming them here
+-- makes the index reproducible across standups instead of recording
+-- whatever the extension defaults happened to be on build day.
+CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 
 -- compression_quality_log: Audit trail of all compression operations
 CREATE TABLE IF NOT EXISTS compression_quality_log (

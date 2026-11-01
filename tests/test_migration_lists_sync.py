@@ -90,6 +90,7 @@ EXPECTED_MIGRATIONS = [
     "0048_memory_versions_visibility.sql",
     "0054_memory_tags.sql",
     "0065_api_keys_key_prefix.sql",
+    "0067_memory_index_hygiene.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [
@@ -158,8 +159,12 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "0054_memory_tags.sql",
     "0062_federation_journal.sql",
     "0064_federation_journal_dialects.sql",
+    "0067_federation_sync_counters.sql",
     "migrations_v7_0_api_keys_key_prefix_sqlite.sql",
     "migrations_v7_0_default_user_seed_sqlite.sql",
+    # phase 1.5: ModelRegistryRepository tables (model_prices, field obs,
+    # benchmarks, curated_routing, health) + nullable price columns.
+    "migrations_v7_1_model_registry_repository_sqlite.sql",
 ]
 
 
