@@ -1,0 +1,32 @@
+-- migration: 0067_memory_index_hygiene
+-- PostgreSQL-only index hygiene; intentional parity no-op.
+--
+-- F-10 (2026-10-31, Fable federation report) asked for three index
+-- changes on the Postgres `memories` table:
+--   * a `(updated, id)` partial index on `deleted_at IS NULL`,
+--   * a `(namespace, created DESC)` partial index,
+--   * dropping the prefix-redundant `idx_memories_owner_id`.
+--
+-- None of the three applies to Db2:
+--
+--   * Db2 already carries `idx_memories_updated_cursor ON
+--     memories(deleted_at, updated, id)` (0001_core_schema.sql), so the
+--     keyset pagination path is already indexed.
+--   * Db2 never created `idx_memories_owner_id`; its owner index
+--     (`idx_memories_live_owner_ns ON memories(owner_id, namespace,
+--     deleted_at)`) already carries the namespace column, so it is not
+--     a prefix-duplicate of anything.
+--
+--     The one item Db2 does NOT carry is a `(namespace, created DESC)`
+--     composite. Db2 is an amd64-only backend with a very different
+--     deployment profile from the Postgres fleet (PYTHIA / PROTEUS),
+--     and its `list_memories` path is not the hot keyset-pagination
+--     path the F-10 step targets, so this migration does not widen the
+--     Db2 index set. Adding it is a separate, deliberately-sized
+--     decision for the Db2 profile -- not a silent omission.
+--
+-- This file is intentionally empty of executable statements: it exists
+-- so the migration-parity gate (which requires the same basename in
+-- the pg / oracle / db2 directories) stays satisfied, and so the
+-- reasoning above is recorded next to the Postgres change rather than
+-- in a chat log.

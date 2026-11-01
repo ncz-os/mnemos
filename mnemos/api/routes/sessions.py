@@ -265,8 +265,14 @@ async def add_session_message(
 @router.get("/{session_id}/history", response_model=SessionHistoryResponse)
 async def get_session_history(
     session_id: str,
-    limit: int = 50,
-    offset: int = 0,
+    # F-10 (2026-10-31): the raw ``limit`` was unbounded, so a caller
+    # could ask for an arbitrarily large page (``?limit=100000000``) and
+    # the repository would hand it straight to the SQL ``LIMIT``. Cap it
+    # at the query-parameter boundary with FastAPI's ``Query``
+    # constraints -- the same shape the federation feed route already
+    # uses (``Query(100, ge=1, le=500)``).
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     namespace: Optional[str] = Query(None),
     user: UserContext = Depends(get_current_user),
 ):

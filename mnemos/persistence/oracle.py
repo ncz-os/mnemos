@@ -2398,6 +2398,17 @@ class OracleMemoryRepository(MemoryRepository):
         recency_weight: float = 0.15,
         exclude_superseded: bool = False,
     ) -> list[Row]:
+        # F-8 (2026-10-31): the pgvector HNSW tuning (ef_search /
+        # iterative_scan / m / ef_construction) does NOT apply here.
+        # Oracle has no vector index DDL in this codebase -- there is no
+        # ``CREATE INDEX ... USING hnsw`` equivalent -- so every Oracle
+        # semantic search is an exact scan over the corpus. The
+        # ``VECTOR_DISTANCE(...)`` ordering below is kept bare so that
+        # Oracle 26ai CAN serve top-K from its own native vector index
+        # if the operator creates one out of band, but MNEMOS does not
+        # create or tune one. See
+        # ``mnemos/persistence/vector_tuning.py``
+        # (``ORACLE_HAS_VECTOR_INDEX_DDL``).
         if not embedding:
             return []
         conn = _conn_from_tx(tx)

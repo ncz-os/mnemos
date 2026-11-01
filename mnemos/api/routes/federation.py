@@ -511,7 +511,13 @@ async def trigger_sync(
 async def peer_sync_log(
     peer_id: str,
     _: UserContext = Depends(require_root),
-    limit: int = 50,
+    # F-10 (2026-10-31): the raw ``limit`` was unbounded, so a caller
+    # could ask for an arbitrarily large sync-log page and the
+    # repository would hand it straight to the SQL ``LIMIT``. Cap it at
+    # the query-parameter boundary with FastAPI's ``Query``
+    # constraints -- the same shape the federation feed route already
+    # uses (``Query(100, ge=1, le=500)``).
+    limit: int = Query(50, ge=1, le=500),
 ):
     peer_id = parse_uuid_or_404(peer_id, "peer")
     backend = require_federation_backend()

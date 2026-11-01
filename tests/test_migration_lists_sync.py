@@ -90,6 +90,7 @@ EXPECTED_MIGRATIONS = [
     "0048_memory_versions_visibility.sql",
     "0054_memory_tags.sql",
     "0065_api_keys_key_prefix.sql",
+    "0067_memory_index_hygiene.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [
