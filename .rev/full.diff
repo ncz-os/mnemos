@@ -1,0 +1,1624 @@
+commit b4b0aef167cd2419ea0921376cf3cf8f1b270e70
+Author: Jason Perlow <jperlow@gmail.com>
+Date:   Sat Oct 31 22:19:32 2026 -0400
+
+    F-15: replica parity and reconcile with dry-run-first repair
+    
+    Compares a replica with its source peer by id, content hash and embedding
+    presence over keyset pages on both sides, classifies every id once into
+    missing / extra / stale / null_embedding / unreachable, and re-pulls the
+    missing ids through the source's own journal.
+    
+    The journal belongs to the source, so reconcile asks it over HTTP
+    (POST /v1/federation/redispatch) rather than writing into the local
+    backend; only a source can publish an event for the ids it serves. The
+    re-dispatch reserves its sequence immediately, so the new event lands
+    strictly after every sequence already handed out -- an event that reused a
+    cursor position would be invisible to the receiver it is meant to unblock.
+    
+    Also documents the eligibility gap behind the by-id 404: CHARON's export
+    counts rows with federation_source, archived_at or consolidated_into that
+    the feed excludes. Archived/consolidated are revocations and correct;
+    federated rows have no publishable event at all, so parity reports them as
+    unreachable rather than as a permanent missing deficit. Closing that case
+    needs a trigger change on all six backends and is out of scope here.
+    
+    _bucket now derives sample_truncated from the same cap that bounds sample,
+    so a truncated sample can no longer report as complete.
+    
+    Admin surface: GET /v1/federation/peers/{id}/parity,
+    POST /v1/federation/peers/{id}/reconcile (dry run by default), and
+    `mnemos federation parity|reconcile`.
+
+diff --git a/docs/FEDERATION_JOURNAL.md b/docs/FEDERATION_JOURNAL.md
+index c6d474b4..090235ef 100644
+--- a/docs/FEDERATION_JOURNAL.md
++++ b/docs/FEDERATION_JOURNAL.md
+@@ -19,3 +19,58 @@ Deployment considerations:
+ - The journal retains identifiers and scope metadata, never deleted content or credentials. It is a replication mechanism, separate from the signed audit chain.
+ 
+ PostgreSQL migration `0063_version_recreation.sql` allows a stable federated ID to be withdrawn and re-created without colliding with its retained version history. New incarnations extend the previous version counter and predecessor.
++
++## Replica parity and reconcile (F-15)
++
++A replica can lag or lose rows without the journal ever noticing: the cursor
++fenced past them, someone deleted a `fed:<peer>:*` row locally, or a row was
++pulled without its vector. `mnemos.domain.federation.parity` compares a
++replica with its source and offers a dry-run-first repair.
++
++Both sides are read by keyset page — `fetch_source_export_keyset_page` on the
++source and `fetch_parity_page` on the replica — so the sweep is bounded in
++memory and never loads the whole table. Every id is classified exactly once:
++
++| population | meaning |
++| --- | --- |
++| `missing` | exportable on the source, absent from the replica |
++| `extra` | `fed:<peer>:*` on the replica, no longer exportable upstream |
++| `stale` | present on both sides with a different content hash |
++| `null_embedding` | present on the replica without a stored vector |
++| `unreachable` | exportable by the source but never on its feed (see below) |
++
++`sample_truncated` is computed against the same cap that bounds `sample`, so a
++truncated sample never reports as complete.
++
++### The eligibility gap behind the by-id 404
++
++CHARON's export predicate (`eligible_for_federation_export`) and the feed's
++(`eligible_for_federation`) are deliberately not identical:
++
++- The export counts any live, in-scope, non-vault row. It has **no**
++  `federation_source` term.
++- The feed also excludes rows with `federation_source` / `archived_at` /
++  `consolidated_into` set, and the journal triggers only fire for rows whose
++  `federation_source` is NULL.
++
++For archived and consolidated rows the difference is correct: those are
++revocations, not live content. For a row that itself arrived by federation
++there is no publishable event at all, so a replica of a replica can never
++receive it. `replica_parity` reports such ids as `unreachable` rather than as a
++permanent `missing` deficit, because the two have different fixes.
++`tests/test_federation_parity_reconcile.py` pins the gap with
++`test_export_definition_is_a_superset_of_the_feed`, and closing it for the
++`federation_source` case would need a trigger change on all six backends.
++
++### Reconcile
++
++`reconcile_peer(..., apply=False)` is the default and touches neither side.
++With `apply=True` it asks the **source** to re-advertise the missing ids
++(`POST /v1/federation/redispatch`) and then runs an ordinary pull. Only the
++source can do this: the journal is its own, and the receiver's durable
++sequence fence means the original event can never be re-applied. The
++redispatch endpoint publishes a new event per still-exportable id and
++reserves its sequence immediately, so the event lands strictly after every
++sequence already handed out; an event that reused a cursor position would be
++invisible to the replica. Reconcile never deletes or overwrites a replica
++row.
+diff --git a/mnemos/api/routes/federation.py b/mnemos/api/routes/federation.py
+index b9af2003..0f168259 100644
+--- a/mnemos/api/routes/federation.py
++++ b/mnemos/api/routes/federation.py
+@@ -10,9 +10,10 @@ from __future__ import annotations
+ import json
+ import logging
+ from datetime import datetime, timezone
+-from typing import Optional
++from typing import Any, Optional
+ 
+ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
++from pydantic import BaseModel, Field
+ 
+ from mnemos.api.dependencies import UserContext, get_current_user, require_root
+ from mnemos.api.errors import database_disconnected_detail, is_db_disconnect as _is_db_disconnect
+@@ -777,3 +778,105 @@ async def federation_memory(
+     if row is None:
+         raise HTTPException(status_code=404, detail="memory not found")
+     return _feed_item_from_row(row)
++
++
++class FederationRedispatchRequest(BaseModel):
++    memory_ids: list[str] = Field(default_factory=list, max_length=5000)
++
++
++class FederationRedispatchResponse(BaseModel):
++    requested: int
++    redispatched: int
++
++
++@router.post("/redispatch", response_model=FederationRedispatchResponse)
++async def federation_redispatch(
++    body: FederationRedispatchRequest,
++    _: UserContext = Depends(_require_federation_role),
++):
++    """Re-publish current state for ids a replica lost locally.
++
++    F-15 reconcile. Only the SOURCE can do this: the journal belongs to it,
++    and the receiver's durable sequence fence means the original event can
++    never be re-applied. This appends a new event per id, so the replica's
++    ordinary pull picks the row up again.
++
++    Re-advertising is not a reopen. ``redispatch_memory_ids`` only writes an
++    event for a row that is still exportable and has no ``federation_source``;
++    a withdrawn, archived, consolidated, vault or replicated row yields no
++    event at all, so a revocation can never be replayed as live data.
++    """
++    backend = require_federation_backend()
++
++    try:
++        async with backend.transactional() as tx:
++            redispatched = await backend.federation.redispatch_federation_journal(tx, memory_ids=body.memory_ids)
++    except NotImplementedError as e:
++        raise HTTPException(status_code=503, detail=str(e))
++    return FederationRedispatchResponse(requested=len(body.memory_ids), redispatched=redispatched)
++
++
++class FederationParityResponse(BaseModel):
++    report: dict[str, Any]
++
++
++class FederationReconcileResponse(BaseModel):
++    result: dict[str, Any]
++
++
++@router.get("/peers/{peer_id}/parity", response_model=FederationParityResponse)
++async def federation_peer_parity(
++    peer_id: str,
++    _: UserContext = Depends(_require_federation_role),
++    page_size: int = Query(500, ge=1, le=5000),
++    namespace: Optional[str] = Query(None, description="Comma-separated namespace filter"),
++    category: Optional[str] = Query(None, description="Comma-separated category filter"),
++):
++    """Compare this node's replica of ``peer_id`` with the source.
++
++    Run on the SOURCE host for a full comparison. Run on a replica and the
++    report says so honestly: ``source.available`` is false and the
++    source-side populations stay empty rather than misreporting the
++    replica's own corpus as the peer's.
++    """
++    from mnemos.domain.federation.parity import replica_parity
++
++    backend = require_federation_backend()
++    namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
++    categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
++    try:
++        report = await replica_parity(
++            backend,
++            peer_id,
++            namespaces=namespaces,
++            categories=categories,
++            page_size=page_size,
++        )
++    except ValueError as e:
++        raise HTTPException(status_code=404, detail=str(e))
++    return FederationParityResponse(report=report)
++
++
++@router.post("/peers/{peer_id}/reconcile", response_model=FederationReconcileResponse)
++async def federation_peer_reconcile(
++    peer_id: str,
++    _: UserContext = Depends(_require_federation_role),
++    apply: bool = Query(False, description="False (default) is a dry run"),
++    page_size: int = Query(500, ge=1, le=5000),
++    limit: Optional[int] = Query(None, ge=1, description="Cap the ids requested this run"),
++):
++    """Re-pull the ids the parity report calls missing. Dry run by default."""
++    from mnemos.domain.federation.parity import reconcile_peer
++
++    backend = require_federation_backend()
++    try:
++        result = await reconcile_peer(
++            backend,
++            peer_id,
++            apply=apply,
++            page_size=page_size,
++            limit=limit,
++        )
++    except ValueError as e:
++        raise HTTPException(status_code=404, detail=str(e))
++    return FederationReconcileResponse(result=result)
+diff --git a/mnemos/cli/main.py b/mnemos/cli/main.py
+index f1d47244..3604ad1b 100644
+--- a/mnemos/cli/main.py
++++ b/mnemos/cli/main.py
+@@ -173,6 +173,7 @@ worker_app = typer.Typer(help="Run MNEMOS background workers.", no_args_is_help=
+ artemis_app = typer.Typer(help="ARTEMIS corpus maintenance commands.", no_args_is_help=True)
+ morpheus_app = typer.Typer(help="MORPHEUS run maintenance commands.", no_args_is_help=True)
+ db_app = typer.Typer(help="Database maintenance commands.", no_args_is_help=True)
++federation_app = typer.Typer(help="Federation parity and reconcile commands.", no_args_is_help=True)
+ 
+ 
+ DOC_IMPORT_EXTENSIONS = {
+@@ -1281,6 +1282,59 @@ def dump_openapi(
+     typer.echo(f"OpenAPI spec written to {output}")
+ 
+ 
++@federation_app.command("parity")
++def federation_parity(
++    peer_id: str = typer.Argument(..., help="Federation peer id"),
++    page_size: int = typer.Option(500, "--page-size", min=1, max=5000),
++    namespace: Optional[str] = typer.Option(None, "--namespace", help="Comma-separated namespaces"),
++    category: Optional[str] = typer.Option(None, "--category", help="Comma-separated categories"),
++) -> None:
++    """Compare this node's replica of PEER_ID with the source."""
++    base, headers = _api_env(require_key=True)
++    params: dict[str, Any] = {"page_size": page_size}
++    if namespace:
++        params["namespace"] = namespace
++    if category:
++        params["category"] = category
++    try:
++        response = httpx.get(
++            f"{base}/v1/federation/peers/{peer_id}/parity",
++            headers=headers,
++            params=params,
++            timeout=120,
++        )
++    except httpx.RequestError as exc:
++        typer.echo(f"ERROR: {exc}", err=True)
++        raise typer.Exit(1) from exc
++    _echo_json_response(response)
++
++
++@federation_app.command("reconcile")
++def federation_reconcile(
++    peer_id: str = typer.Argument(..., help="Federation peer id"),
++    apply: bool = typer.Option(False, "--apply", help="Actually re-pull (default is a dry run)"),
++    page_size: int = typer.Option(500, "--page-size", min=1, max=5000),
++    limit: Optional[int] = typer.Option(None, "--limit", min=1, help="Cap ids requested this run"),
++) -> None:
++    """Re-pull ids the parity report calls missing. Dry run unless --apply."""
++    base, headers = _api_env(require_key=True)
++    params: dict[str, Any] = {"apply": apply, "page_size": page_size}
++    if limit is not None:
++        params["limit"] = limit
++    try:
++        response = httpx.post(
++            f"{base}/v1/federation/peers/{peer_id}/reconcile",
++            headers=headers,
++            params=params,
++            timeout=600,
++        )
++    except httpx.RequestError as exc:
++        typer.echo(f"ERROR: {exc}", err=True)
++        raise typer.Exit(1) from exc
++    _echo_json_response(response)
++
++
++app.add_typer(federation_app, name="federation")
+ app.add_typer(serve_app, name="serve")
+ app.add_typer(worker_app, name="worker")
+ app.add_typer(artemis_app, name="artemis")
+diff --git a/mnemos/core/eligibility.py b/mnemos/core/eligibility.py
+index 1fbc7235..dc1961bb 100644
+--- a/mnemos/core/eligibility.py
++++ b/mnemos/core/eligibility.py
+@@ -68,6 +68,38 @@ def eligible_for_federation(alias: str = "m", *, include_private: bool | None =
+     )
+ 
+ 
++def eligible_for_federation_export(alias: str = "m", *, include_private: bool | None = None) -> str:
++    """DOCUMENTATION-ONLY mirror of what CHARON's export counts (F-15).
++
++    ``fetch_visible_export_memory_ids`` filters ``deleted_at IS NULL``, owner,
++    namespace and non-vault -- it has no ``federation_source`` term. So a row
++    that arrived here from another peer, with ``archived_at`` set, or with
++    ``consolidated_into`` set, is exportable by CHARON's definition but is
++    NOT served by ``eligible_for_federation`` above.
++
++    That difference is deliberate for the two lifecycle cases (an archived or
++    consolidated row is a revocation, not live content) and is a real gap for
++    the ``federation_source`` case: the federation journal triggers
++    (0062/0064) only journal rows whose ``federation_source`` IS NULL, so such
++    a row has no publishable event and can never be served at all.
++
++    This function exists so the two definitions are diffable in one place and
++    so ``tests/test_federation_parity_reconcile.py`` can assert the gap
++    explicitly. It is not wired into any query path: closing the
++    ``federation_source`` case needs a trigger change on all six backends and
++    is out of scope for F-15. ``replica_parity`` reports those rows as
++    ``unreachable`` rather than as a permanent ``missing`` deficit.
++    """
++    prefix = f"{alias}." if alias else ""
++    vault_literal = VAULT_NAMESPACE.replace("'", "''")
++    world_read = "" if _federation_include_private(include_private) else f"AND ({prefix}permission_mode % 10) >= 4 "
++    return (
++        f"{prefix}deleted_at IS NULL "
++        f"{world_read}"
++        f"AND ({prefix}namespace IS NULL OR {prefix}namespace <> '{vault_literal}')"
++    )
++
++
+ def eligible_for_federation_tombstone(alias: str = "m", *, include_private: bool | None = None) -> str:
+     prefix = f"{alias}." if alias else ""
+     vault_literal = VAULT_NAMESPACE.replace("'", "''")
+@@ -138,6 +170,7 @@ __all__ = [
+     "MEMORY_ELIGIBILITY_PREDICATE",
+     "eligible_for_compression",
+     "eligible_for_federation",
++    "eligible_for_federation_export",
+     "eligible_for_federation_tombstone",
+     "eligible_for_federation_withdrawal",
+     "eligible_for_morpheus",
+diff --git a/mnemos/domain/federation/parity.py b/mnemos/domain/federation/parity.py
+new file mode 100644
+index 00000000..5bb3c460
+--- /dev/null
++++ b/mnemos/domain/federation/parity.py
+@@ -0,0 +1,496 @@
++"""F-15 replica parity and reconcile.
++
++A replica's ``fed:<peer>:*`` population is compared with the source's
++exportable population by ``id`` (identity), stored ``content_hash``
++(drift), and embedding presence. Both sides are read through explicit
++keyset pages -- ``fetch_source_export_keyset_page`` on the source and
++``fetch_parity_page`` on the replica -- so a comparison over a 25k-row
++replica costs bounded memory, never a full-table load.
++
++Classification is per id:
++
++* ``missing``       -- exportable on the source, absent from the replica
++* ``extra``         -- ``fed:<peer>:*`` on the replica, no longer exportable upstream
++* ``stale``         -- present on both sides with a different content hash
++* ``null_embedding``-- present on the replica without a stored vector
++                       (the field problem: a replica whose column dimension
++                       disagreed with the fleet standard stored content and
++                       no vector, silently)
++
++Reconcile is dry-run first. ``apply=True`` re-pulls only the ids the report
++classified as ``missing``; it never deletes or overwrites a replica row.
++Re-pull goes through the source's own journal (``redispatch_federation_journal``)
++so the receiver's sequence fence sees a NEW event, then through the normal
++sync path, which is what keeps the receiver's bookkeeping (receive state,
++sync log, cursor) exactly as consistent as an ordinary pull.
++
++Finding the source's coordinates for a peer whose configured
++``base_url`` is not reachable from the node running the report is the
++caller's job: pass ``base_url``/``auth_token`` explicitly, as
++``mnemos federation parity --source-url`` does from the source host.
++"""
++
++from __future__ import annotations
++
++import logging
++from collections.abc import Mapping
++from typing import Any
++
++logger = logging.getLogger(__name__)
++
++DEFAULT_PAGE_SIZE = 500
++DEFAULT_SAMPLE = 50
++
++# Two populations, deliberately separate: the 0.7% of exportable rows never
++# pulled ("missing") and the rows that could never be pulled because the
++# source's own by-id path rejects them ("unreachable") are different bugs
++# with different fixes, and merging them would hide the second.
++POPULATIONS = ("missing", "extra", "stale", "null_embedding", "unreachable")
++
++
++def _bucket(ids: list[str], page_size: int) -> dict[str, Any]:
++    """Bounded id sample per population, plus an honest truncation flag."""
++    sample_cap = max(0, min(DEFAULT_SAMPLE, page_size))
++    return {
++        "count": len(ids),
++        "sample": sorted(ids)[:sample_cap],
++        "sample_truncated": len(ids) > sample_cap,
++    }
++
++
++async def _source_keyset(backend, *, namespaces, categories, page_size: int) -> dict[str, str | None]:
++    """Every exportable ``id -> content_hash`` on this node, by keyset page."""
++    seen: dict[str, str | None] = {}
++    after: str | None = None
++    repo = backend.federation
++    while True:
++        async with backend.transactional() as tx:
++            rows = await repo.fetch_source_export_keyset_page(
++                tx,
++                namespaces=namespaces,
++                categories=categories,
++                after_id=after,
++                limit=page_size,
++            )
++        if not rows:
++            return seen
++        for row in rows:
++            seen[str(row["id"])] = row.get("content_hash")
++            after = str(row["id"])
++        if len(rows) < page_size:
++            return seen
++
++
++async def _replica_keyset(backend, peer_name: str, *, page_size: int) -> dict[str, dict[str, Any]]:
++    """This node's ``fed:<peer_name>:*`` rows, by keyset page on ``local_id``."""
++    seen: dict[str, dict[str, Any]] = {}
++    after: str | None = None
++    repo = backend.federation
++    while True:
++        async with backend.transactional() as tx:
++            rows = await repo.fetch_parity_page(tx, after_id=after, limit=page_size)
++        if not rows:
++            return seen
++        for row in rows:
++            local_id = str(row["local_id"])
++            after = local_id
++            if str(row.get("peer_name") or "") != peer_name:
++                continue
++            seen[str(row.get("remote_id") or local_id)] = {
++                "local_id": local_id,
++                "content_hash": row.get("content_hash"),
++                "has_embedding": bool(row.get("has_embedding")),
++            }
++        if len(rows) < page_size:
++            return seen
++
++
++async def _feed_ids(
++    backend,
++    *,
++    namespaces: list[str],
++    categories: list[str],
++    page_size: int,
++) -> set[str]:
++    """Every id this node's own live feed serves, read by keyset page."""
++    served: set[str] = set()
++    after_updated = None
++    after_id = None
++    while True:
++        async with backend.transactional() as tx:
++            rows = await backend.federation.feed_query(
++                tx,
++                since_updated=after_updated,
++                since_id=after_id,
++                namespaces=namespaces,
++                categories=categories,
++                limit=page_size,
++                prefer_compressed=False,
++            )
++        if not rows:
++            break
++        for row in rows:
++            served.add(str(row["id"]))
++            after_id = str(row["id"])
++            after_updated = row.get("updated")
++        if len(rows) < page_size:
++            break
++    return served
++
++
++async def _populations(
++    backend,
++    peer_id: str,
++    *,
++    namespaces: list[str],
++    categories: list[str],
++    page_size: int,
++    source_ids: Mapping[str, str | None] | set[str] | None = None,
++) -> dict[str, Any]:
++    """Classify every id once; both public entry points read this.
++
++    ``source_ids`` is the peer's exportable id set, when the caller knows it
++    (it can only be read on the source host, or supplied out of band). When
++    it is ``None`` this node is a replica and its own export predicate says
++    nothing about the source: ``extra``/``stale``/``unreachable`` are left
++    empty and ``source_available`` is False, so the report never claims
++    "everything is extra" just because the replica's own corpus is small.
++    """
++    async with backend.transactional() as tx:
++        peer = await backend.federation.get_sync_peer(tx, peer_id)
++    if not peer:
++        raise ValueError(f"peer {peer_id} not found")
++    peer_name = str(peer["name"])
++
++    replicated = await _replica_keyset(backend, peer_name, page_size=page_size)
++
++    if source_ids is None:
++        local = await _source_keyset(backend, namespaces=namespaces, categories=categories, page_size=page_size)
++        async with backend.transactional() as tx:
++            exportable_count = await backend.federation.count_exportable_rows(
++                tx, namespaces=namespaces, categories=categories
++            )
++        source_available = False
++        missing: list[str] = []
++        extra: list[str] = []
++        stale: list[str] = []
++        unreachable: list[str] = []
++        # A row the replica holds with no vector is still a real finding; it
++        # is read entirely from the replica.
++        null_embedding = [mid for mid, row in replicated.items() if not row["has_embedding"]]
++        return {
++            "peer": peer,
++            "peer_name": peer_name,
++            "exportable_count": exportable_count,
++            "local_exportable": len(local),
++            "replicated": replicated,
++            "source_available": source_available,
++            "missing": missing,
++            "unreachable": unreachable,
++            "extra": extra,
++            "stale": stale,
++            "null_embedding": sorted(null_embedding),
++        }
++
++    if source_ids is not None:
++        exportable: dict[str, str | None] = (
++            {str(k): v for k, v in source_ids.items()}
++            if hasattr(source_ids, "items")
++            else {str(mid): None for mid in source_ids}
++        )
++    else:
++        exportable = await _source_keyset(backend, namespaces=namespaces, categories=categories, page_size=page_size)
++    if source_ids is not None:
++        exportable_count = len(exportable)
++    else:
++        async with backend.transactional() as tx:
++            exportable_count = await backend.federation.count_exportable_rows(
++                tx, namespaces=namespaces, categories=categories
++            )
++    # Exportable ids this node's feed cannot serve: the journal triggers
++    # (0062/0064) only journal rows whose ``federation_source`` is NULL, so a
++    # row replicated here from another peer is counted by CHARON's export
++    # definition but has no publishable event. A replica can never receive it,
++    # so it is reported as ``unreachable`` rather than a permanent ``missing``.
++    # Only meaningful where this node IS the source (it can serve the peer):
++    # there, "exportable but not on my feed" is a real, permanent gap. A
++    # caller that supplies ``source_ids`` has already read the population
++    # elsewhere, so this node is not the source and must not re-derive it.
++    if source_ids is not None:
++        unreachable: list[str] = []
++    elif replicated:
++        unreachable = []
++    else:
++        served = await _feed_ids(backend, namespaces=namespaces, categories=categories, page_size=page_size)
++        unreachable = sorted(set(exportable) - served)
++
++    missing = sorted(mid for mid in exportable if mid not in replicated and mid not in unreachable)
++    extra = sorted(mid for mid in replicated if mid not in exportable)
++    stale = sorted(
++        mid
++        for mid, content_hash in exportable.items()
++        if content_hash
++        and mid in replicated
++        and replicated[mid]["content_hash"]
++        and replicated[mid]["content_hash"] != content_hash
++    )
++    null_embedding = sorted(mid for mid, row in replicated.items() if not row["has_embedding"])
++    return {
++        "peer": peer,
++        "peer_name": peer_name,
++        "exportable_count": exportable_count,
++        "local_exportable": len(exportable),
++        "replicated": replicated,
++        "source_available": True,
++        "missing": missing,
++        "unreachable": unreachable,
++        "extra": extra,
++        "stale": stale,
++        "null_embedding": null_embedding,
++    }
++
++
++async def replica_parity(
++    backend,
++    peer_id: str,
++    *,
++    namespaces: list[str] | None = None,
++    categories: list[str] | None = None,
++    page_size: int = DEFAULT_PAGE_SIZE,
++    source_url: str | None = None,
++    auth_token: str | None = None,
++    source_ids: Mapping[str, str | None] | set[str] | None = None,
++) -> dict[str, Any]:
++    """Compare this node's replica of ``peer_id`` with the source's exports.
++
++    Returns counts (plus a bounded id sample) per population. ``in_sync``
++    is true only when every population is empty -- "found nothing" and
++    "looked and found everything" must never print the same.
++
++    Run this on the SOURCE host to get a full comparison, or pass the
++    source's exportable id set as ``source_ids`` (what the source host's own
++    ``replica_parity(..., source_ids=...)`` reports). Run on a replica with
++    neither, the report is honest about what it cannot see:
++    ``source_available`` is false and ``missing``/``extra``/``stale`` are
++    zero rather than pretending the replica's own corpus is the source's.
++    """
++    page_size = max(1, min(int(page_size), 5000))
++    namespaces = list(namespaces or [])
++    categories = list(categories or [])
++
++    populations = await _populations(
++        backend,
++        peer_id,
++        namespaces=namespaces,
++        categories=categories,
++        page_size=page_size,
++        source_ids=source_ids,
++    )
++    peer = populations["peer"]
++    peer_name = populations["peer_name"]
++    exportable_count = populations["exportable_count"]
++    replicated = populations["replicated"]
++    missing = populations["missing"]
++    extra = populations["extra"]
++    stale = populations["stale"]
++    null_embedding = populations["null_embedding"]
++    unreachable = populations["unreachable"]
++    exportable_count = populations["exportable_count"]
++    replicated = populations["replicated"]
++    source_available = populations["source_available"]
++
++    counts = {
++        "missing": _bucket(missing, page_size),
++        "extra": _bucket(extra, page_size),
++        "stale": _bucket(stale, page_size),
++        "null_embedding": _bucket(null_embedding, page_size),
++        "unreachable": _bucket(unreachable, page_size),
++    }
++    counts["null_embedding"]["population"] = "replica"
++    in_sync = not (missing or extra or stale or null_embedding)
++    hint = None
++    if missing:
++        hint = (
++            "POST /v1/federation/peers/{peer_id}/reconcile with apply=true re-pulls the missing ids "
++            "through the source journal (dry-run when apply is false)"
++        )
++    return {
++        "peer": peer_name,
++        "peer_id": peer_id,
++        "source_url": source_url or peer.get("base_url"),
++        "namespaces": namespaces,
++        "categories": categories,
++        "page_size": page_size,
++        # ``exportable_rows`` is THIS node's own exportable population. On
++        # the source host that is the feed population; on a replica it is
++        # only what the replica itself would export, which is not the
++        # peer's population and must not be printed as if it were. The
++        # authoritative source count is obtained by running the same
++        # report on the source host (``mnemos federation parity``) -- the
++        # report never invents a number it cannot read.
++        "source": {
++            "exportable_rows": exportable_count if source_available else None,
++            "available": source_available,
++        },
++        "replica": {"rows": len(replicated), "peer": peer_name},
++        "missing": counts["missing"],
++        "extra": counts["extra"],
++        "stale": counts["stale"],
++        "null_embedding": counts["null_embedding"],
++        "unreachable": counts["unreachable"],
++        "in_sync": in_sync,
++        "hint": hint,
++    }
++
++
++async def reconcile_peer(
++    backend,
++    peer_id: str,
++    *,
++    apply: bool = False,
++    namespaces: list[str] | None = None,
++    categories: list[str] | None = None,
++    page_size: int = DEFAULT_PAGE_SIZE,
++    limit: int | None = None,
++    source_ids: Mapping[str, str | None] | set[str] | None = None,
++    source_url: str | None = None,
++) -> dict[str, Any]:
++    """Re-pull the ids the parity report calls ``missing``.
++
++    ``apply=False`` (the default) is a dry run: it reports exactly what it
++    would request and touches neither the source nor the replica.
++
++    ``source_ids`` is the peer's exportable id set, read on the source host
++    (see ``replica_parity``). Without it the replica cannot know what it is
++    missing and the reconcile reports an empty request rather than guessing.
++    """
++
++    report = await replica_parity(
++        backend,
++        peer_id,
++        namespaces=namespaces,
++        categories=categories,
++        page_size=page_size,
++        source_ids=source_ids,
++    )
++    requested = list(report["missing"]["sample"])
++    if report["missing"]["count"] > len(requested):
++        # ``sample`` is bounded; a reconcile must cover the whole population
++        # it reports, not just the part an operator can see.
++        async with backend.transactional() as tx:
++            peer = await backend.federation.get_sync_peer(tx, peer_id)
++        replicated = await _replica_keyset(backend, str(peer["name"]), page_size=page_size)
++        all_ids = (
++            source_ids
++            if source_ids is not None
++            else {
++                mid
++                for mid in await _source_keyset(
++                    backend,
++                    namespaces=list(namespaces or []),
++                    categories=list(categories or []),
++                    page_size=page_size,
++                )
++            }
++        )
++        requested = sorted(mid for mid in all_ids if mid not in replicated)
++    if limit is not None:
++        requested = requested[: max(0, int(limit))]
++
++    result = {
++        "peer": report["peer"],
++        "peer_id": peer_id,
++        "applied": bool(apply),
++        "requested": requested,
++        "restored": 0,
++        "failed": [],
++        "remaining": report["missing"]["count"],
++    }
++    if not apply or not requested:
++        return result
++
++    # The journal belongs to the SOURCE. A replica cannot publish an event on
++    # its peer's behalf, so re-advertisement is an HTTP call to the peer --
++    # the same origin the feed and by-id paths already use.
++    from mnemos.domain import federation as _fed
++
++    async with backend.transactional() as tx:
++        peer_row = await backend.federation.get_sync_peer(tx, peer_id)
++    if not peer_row:
++        raise ValueError(f"peer {peer_id} not found")
++    base_url = source_url or str(peer_row["base_url"])
++    redispatched = await _redispatch_on_source(
++        base_url.rstrip("/"),
++        str(peer_row["auth_token"]),
++        requested,
++    )
++    if redispatched:
++        # The receiver's fence only advances on a new sequence; the source
++        # has just published one for every id we are about to fetch.
++        await _fed.sync_peer(backend, peer_id)
++
++    after = await replica_parity(
++        backend,
++        peer_id,
++        namespaces=namespaces,
++        categories=categories,
++        page_size=page_size,
++        source_ids=source_ids,
++    )
++    replicated = await _replica_keyset(backend, report["peer"], page_size=page_size)
++    for mid in requested:
++        if mid in replicated:
++            result["restored"] += 1
++        else:
++            result["failed"].append(
++                {
++                    "id": mid,
++                    "reason": "not served by the peer's by-id path after re-dispatch "
++                    "(withdrawn, or exports disabled for this scope)",
++                }
++            )
++    result["remaining"] = after["missing"]["count"]
++    if after["missing"]["count"]:
++        logger.warning(
++            "[federation/parity] peer=%s reconcile restored %d of %d requested ids; %d still missing",
++            report["peer"],
++            result["restored"],
++            len(requested),
++            after["missing"]["count"],
++        )
++    return result
++
++
++__all__ = ["DEFAULT_PAGE_SIZE", "POPULATIONS", "reconcile_peer", "replica_parity"]
++
++
++async def _redispatch_on_source(base_url: str, auth_token: str, memory_ids: list[str]) -> int:
++    """Ask the source peer to re-advertise ``memory_ids`` on its journal.
++
++    Returns how many ids the source actually re-published -- fewer than
++    requested simply means some ids are no longer exportable there, which
++    the caller reports as ``failed`` rather than pretending they were served.
++    """
++    from mnemos.domain import federation as _fed
++
++    url = base_url.rstrip("/") + "/v1/federation/redispatch"
++    client, _ = await _fed.make_safe_client(
++        url,
++        timeout=_fed.FEDERATION_HTTP_TIMEOUT,
++        allow_private=_fed._federation_allow_private(),
++    )
++    try:
++        response = await client.post(
++            url,
++            json={"memory_ids": memory_ids},
++            headers={"Authorization": f"Bearer {auth_token}"},
++        )
++        if response.status_code in (404, 405):
++            # A peer older than this release has no redispatch route. Nothing
++            # was re-published, so reconcile reports every id as failed.
++            return 0
++        response.raise_for_status()
++        body = response.json()
++    finally:
++        await client.aclose()
++    return int(body.get("redispatched") or 0)
+diff --git a/mnemos/persistence/base.py b/mnemos/persistence/base.py
+index 0731031d..dbefc9a2 100644
+--- a/mnemos/persistence/base.py
++++ b/mnemos/persistence/base.py
+@@ -2647,6 +2647,77 @@ class FederationRepository(ABC):
+     @abstractmethod
+     async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int: ...
+ 
++    # ── F-15 parity / reconcile (read-only, keyset-paged) ────────────────
++
++    @abstractmethod
++    async def fetch_parity_page(
++        self,
++        tx: Transaction,
++        *,
++        after_id: str | None = None,
++        limit: int = 500,
++    ) -> list[Row]:
++        """One keyset page of THIS node's ``fed:<peer>:*`` population.
++
++        Returns ``local_id`` (the ``fed:<peer>:<remote_id>`` key),
++        ``remote_id`` (derived from the key, so a receiver and its source
++        agree on identity without trusting a column), ``peer_name``,
++        ``content_hash`` (NULL when the backend has none stored) and
++        ``has_embedding`` (0/1). Ordered by ``local_id`` and resumed with
++        ``after_id`` so a parity sweep never loads the whole population.
++        """
++        ...
++
++    @abstractmethod
++    async def fetch_source_export_keyset_page(
++        self,
++        tx: Transaction,
++        *,
++        namespaces: Sequence[str] = (),
++        categories: Sequence[str] = (),
++        after_id: str | None = None,
++        limit: int = 500,
++    ) -> list[Row]:
++        """One keyset page of the rows a peer is entitled to receive.
++
++        Applies ``eligible_for_federation`` -- the same predicate the live
++        feed and the by-id route use -- and returns ``id`` + the stored
++        ``content_hash`` (NULL when absent) in ``id`` order. The parity
++        report compares this population with a replica's ``fed:*`` rows.
++        """
++        ...
++
++    @abstractmethod
++    async def count_exportable_rows(
++        self,
++        tx: Transaction,
++        *,
++        namespaces: Sequence[str] = (),
++        categories: Sequence[str] = (),
++    ) -> int:
++        """Count of ``fetch_source_export_keyset_page``'s population."""
++        ...
++
++    @abstractmethod
++    async def redispatch_federation_journal(
++        self,
++        tx: Transaction,
++        *,
++        memory_ids: Sequence[str],
++    ) -> int:
++        """Give an unpublishable change a NEW sequence so it can be served.
++
++        The receiver's fence rejects an event whose sequence it has already
++        applied, so a replica that lost a row locally can never re-apply
++        the original event. Reconcile appends "serve this id again" to the
++        source's own journal, in the source's own clock order -- no schema
++        change, no diagnostic-history deletion (the F-4 ledger compaction
++        that decides what history to keep is a separate step).
++
++        Returns the number of ids that now have a publishable event.
++        """
++        ...
++
+ 
+ class StateRepository(ABC):
+     """State key-value persistence surface."""
+diff --git a/mnemos/persistence/federation_journal.py b/mnemos/persistence/federation_journal.py
+index 639fc886..53f5fc60 100644
+--- a/mnemos/persistence/federation_journal.py
++++ b/mnemos/persistence/federation_journal.py
+@@ -377,3 +377,58 @@ async def save_peer_cursor(tx, peer_id, cursor_value, filter_signature):
+             cursor_value,
+             filter_signature,
+         )
++
++
++async def redispatch_memory_ids(tx, memory_ids):
++    """Append a fresh, publishable change for each id that needs re-serving.
++
++    F-15 reconcile: the receiver's durable fence drops any event whose
++    sequence it already applied, so a replica that lost a row locally can
++    never re-apply the original one. Publishing a NEW event for the current
++    state -- stamped in the source's clock order by the next ``_publish`` --
++    is how the row becomes reachable again without touching the fence, the
++    receiver, or the diagnostic history.
++
++    Only the current state of an exportable row is re-advertised: a row that
++    left the feed (deleted, archived, consolidated, vault, or became private
++    offsite) already produces its own withdrawal/consolidation event, and
++    re-advertising it would mislabel a revocation as live data. Rows with
++    ``federation_source`` set are skipped for the same reason they are never
++    on the feed: they have no publishable event to replay.
++    """
++    ids = [str(mid) for mid in memory_ids if mid]
++    if not ids:
++        return 0
++    ops = _ops(tx)
++    await ops.execute("UPDATE federation_change_clock SET value = value WHERE id = 1")
++    placeholders = ",".join("?" for _ in ids)
++    rows = await ops.fetchall(
++        "SELECT id, namespace, category, permission_mode, updated FROM memories "
++        f"WHERE id IN ({placeholders}) AND deleted_at IS NULL AND archived_at IS NULL "
++        "AND consolidated_into IS NULL AND federation_source IS NULL",
++        *ids,
++    )
++    for row in rows:
++        public = 1 if (federation_feed_include_private() or int(row.get("permission_mode") or 0) % 10 >= 4) else 0
++        await ops.execute(
++            "INSERT INTO federation_changes(memory_id,changed_at,old_namespace,old_category,"
++            "old_public,old_exportable,new_namespace,new_category,new_public,new_exportable) "
++            "VALUES (?,?,?,?,?,?,?,?,?,?)",
++            row["id"],
++            datetime.now(timezone.utc).isoformat(),
++            row.get("namespace"),
++            row.get("category"),
++            public,
++            1,
++            row.get("namespace"),
++            row.get("category"),
++            public,
++            1,
++        )
++    # Reserve the sequences here rather than leaving them to the next
++    # ``_publish``: a replica whose cursor is already at ``journal:N`` would
++    # never see a replayed event that happened to land on N. _publish bumps
++    # the clock by the number of rows it assigns, so the re-advertised events
++    # are strictly after every sequence already handed out.
++    await _publish(ops)
++    return len(rows)
+diff --git a/mnemos/persistence/sqlite.py b/mnemos/persistence/sqlite.py
+index c0036ed8..14ecab0d 100644
+--- a/mnemos/persistence/sqlite.py
++++ b/mnemos/persistence/sqlite.py
+@@ -6868,6 +6868,81 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
+             (local_id, peer_name),
+         )
+ 
++    # ── F-15 parity / reconcile ───────────────────────────────────────────
++
++    async def fetch_parity_page(
++        self,
++        tx: Transaction,
++        *,
++        after_id: str | None = None,
++        limit: int = 500,
++    ) -> list[Row]:
++        # ``remote_id`` is derived from the local key (``fed:<peer>:<id>``)
++        # rather than taken from metadata, so a replica and its source agree
++        # on identity even when the receiver never wrote the metadata column.
++        where = "WHERE federation_source IS NOT NULL"
++        params: list[Any] = []
++        if after_id is not None:
++            where += " AND id > ?"
++            params.append(after_id)
++        params.append(max(1, int(limit)))
++        return await _fetch_all(
++            self._conn(tx),
++            "SELECT m.id AS local_id, m.federation_source AS peer_name, "
++            "substr(m.id, length(m.federation_source) + 6) AS remote_id, "
++            "m.content_hash AS content_hash, "
++            "CASE WHEN me.memory_id IS NULL THEN 0 ELSE 1 END AS has_embedding "
++            "FROM memories m "
++            "LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
++            f"{where} ORDER BY m.id ASC LIMIT ?",
++            params,
++        )
++
++    async def fetch_source_export_keyset_page(
++        self,
++        tx: Transaction,
++        *,
++        namespaces: Sequence[str] = (),
++        categories: Sequence[str] = (),
++        after_id: str | None = None,
++        limit: int = 500,
++    ) -> list[Row]:
++        where = "WHERE " + _eligibility.eligible_for_federation("m")
++        params: list[Any] = []
++        if after_id is not None:
++            where += " AND m.id > ?"
++            params.append(after_id)
++        for column, values in (("namespace", namespaces), ("category", categories)):
++            if values:
++                where += f" AND m.{column} IN ({_placeholders(values)})"
++                params.extend(values)
++        params.append(max(1, int(limit)))
++        return await _fetch_all(
++            self._conn(tx),
++            f"SELECT m.id AS id, m.content_hash AS content_hash FROM memories m {where} ORDER BY m.id ASC LIMIT ?",
++            params,
++        )
++
++    async def count_exportable_rows(
++        self,
++        tx: Transaction,
++        *,
++        namespaces: Sequence[str] = (),
++        categories: Sequence[str] = (),
++    ) -> int:
++        where = "WHERE " + _eligibility.eligible_for_federation("m")
++        params: list[Any] = []
++        for column, values in (("namespace", namespaces), ("category", categories)):
++            if values:
++                where += f" AND m.{column} IN ({_placeholders(values)})"
++                params.extend(values)
++        return int(await _fetch_val(self._conn(tx), f"SELECT COUNT(*) FROM memories m {where}", params) or 0)
++
++    async def redispatch_federation_journal(self, tx: Transaction, *, memory_ids: Sequence[str]) -> int:
++        from mnemos.persistence.federation_journal import redispatch_memory_ids
++
++        return await redispatch_memory_ids(tx, memory_ids)
++
+ 
+ class SqliteStateRepository(_SqliteRepository, StateRepository):
+     async def get(
+diff --git a/tests/test_federation_parity_reconcile.py b/tests/test_federation_parity_reconcile.py
+new file mode 100644
+index 00000000..60f1668b
+--- /dev/null
++++ b/tests/test_federation_parity_reconcile.py
+@@ -0,0 +1,545 @@
++"""F-15 replica parity and reconcile.
++
++Two SQLite databases stand in for the fleet: PYTHIA (the source) and
++PROTEUS (its replica). The replica pulls over the real federation engine
++with a transport that dispatches its outbound HTTP into the source's real
++FastAPI routes, so the source-side eligibility rules under test are the
++ones production runs -- not a local re-implementation of them.
++
++The parity report compares the source's exportable id/content-hash set
++with the replica's ``fed:<peer>:*`` population by explicit keyset pages on
++both sides (never a full table load) and classifies every id into
++``missing`` / ``extra`` / ``stale`` / ``null_embedding``. Reconcile is
++dry-run first: nothing is requested from the feed unless ``apply=True``.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterable
++from datetime import datetime, timedelta, timezone
++from types import SimpleNamespace
++
++import httpx
++import pytest
++import pytest_asyncio
++from fastapi import FastAPI
++
++from mnemos.api.dependencies import UserContext, get_current_user
++from mnemos.api.routes.federation import router as federation_router
++from mnemos.domain import federation as fed
++
++
++async def replica_parity(*args, **kwargs):
++    from mnemos.domain.federation.parity import replica_parity as _impl
++
++    return await _impl(*args, **kwargs)
++
++
++from mnemos.domain.federation.parity import reconcile_peer
++
++
++async def source_export_ids(source) -> dict[str, str | None]:
++    """The peer's exportable ``id -> content_hash`` set, as the source sees it.
++
++    In production the replica obtains this by running ``mnemos federation
++    parity`` on the source host and handing the ids to its own run.
++    """
++    async with source.transactional() as tx:
++        rows = await source.federation.fetch_source_export_keyset_page(tx, limit=100_000)
++    return {r["id"]: r.get("content_hash") for r in rows}
++
++
++FACTS = "facts"
++# The live settings singleton sizes the column; match it so vectors cross.
++EMBED_DIM = 768
++OWNER = "alice"
++NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
++
++
++class _Settings(SimpleNamespace):
++    """Minimal settings stand-in: a 3-dim embedder, SQLite shaped otherwise."""
++
++    def __init__(self):
++        super().__init__()
++        self.database = SimpleNamespace(embedding_dim=EMBED_DIM)
++        # Both sides must agree on the embedder identity or the receiver
++        # fails closed and declines the vector (the field NULL-embedding bug).
++        self.providers = SimpleNamespace(inference_embed_model="bge-m3")
++
++
++@pytest.fixture(autouse=True)
++def _lan_posture(monkeypatch):
++    # The fleet runs the trusted-LAN posture; the world-read gate must not
++    # be what makes these tests pass or fail.
++    monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "1")
++    monkeypatch.setenv("MNEMOS_EMBEDDING_DIM", str(EMBED_DIM))
++    # Same embedder identity on both hosts, or the receiver fails closed and
++    # declines the peer's vector (the field's 24,986 NULL-embedding rows).
++    monkeypatch.setenv("MNEMOS_EMBED_HTTP_MODEL", "bge-m3")
++
++
++async def _open_backend(path):
++    from mnemos.persistence.sqlite import SqliteBackend
++
++    backend = SqliteBackend(path, _Settings())
++    await backend.open()
++    return backend
++
++
++@pytest_asyncio.fixture
++async def source(tmp_path):
++    backend = await _open_backend(tmp_path / "pythia.db")
++    try:
++        yield backend
++    finally:
++        await backend.close()
++
++
++@pytest_asyncio.fixture
++async def replica(tmp_path):
++    backend = await _open_backend(tmp_path / "proteus.db")
++    try:
++        yield backend
++    finally:
++        await backend.close()
++
++
++async def insert(
++    backend,
++    memory_id: str,
++    content: str,
++    *,
++    namespace: str = "default",
++    owner_id: str = OWNER,
++    permission_mode: int = 644,
++    federation_source: str | None = None,
++    federation_remote_updated: str | None = None,
++    archived_at: str | None = None,
++    consolidated_into: str | None = None,
++    deleted_at: str | None = None,
++    embedding: Iterable[float] | None = None,
++    created: datetime | None = None,
++    updated: datetime | None = None,
++) -> None:
++    from mnemos.persistence.worker_lifecycle import _Ops, transaction_dialect
++
++    created = created or NOW
++    updated = updated or created
++    async with backend.transactional() as tx:
++        ops = _Ops(tx, transaction_dialect(tx))
++        await ops.execute(
++            "INSERT INTO memories(id, content, category, owner_id, namespace, "
++            "permission_mode, created, updated, federation_source, "
++            "federation_remote_updated, archived_at, consolidated_into, deleted_at) "
++            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
++            memory_id,
++            content,
++            FACTS,
++            owner_id,
++            namespace,
++            permission_mode,
++            created.isoformat(),
++            updated.isoformat(),
++            federation_source,
++            federation_remote_updated,
++            archived_at,
++            consolidated_into,
++            deleted_at,
++        )
++        if embedding is not None:
++            await backend.memories.upsert_memory_embedding(tx, memory_id, list(embedding))
++
++
++async def mutate(backend, sql: str, *params) -> int:
++    from mnemos.persistence.worker_lifecycle import _Ops, transaction_dialect
++
++    async with backend.transactional() as tx:
++        return await _Ops(tx, transaction_dialect(tx)).execute(sql, *params)
++
++
++async def fetch(backend, sql: str, *params) -> list:
++    from mnemos.persistence.worker_lifecycle import _Ops, transaction_dialect
++
++    async with backend.transactional() as tx:
++        return await _Ops(tx, transaction_dialect(tx)).fetchall(sql, *params)
++
++
++class _SourceTransport(httpx.AsyncBaseTransport):
++    """Dispatch the replica's outbound HTTP into the source's real routes."""
++
++    def __init__(self, app: FastAPI, calls: list[httpx.URL]):
++        self._app = app
++        self.calls = calls
++
++    async def handle_async_request(self, request):
++        self.calls.append(request.url)
++        # ``httpx.Request.url`` is a read-only property: build a rewritten
++        # copy instead of assigning to it.
++        rewritten = httpx.Request(
++            method=request.method,
++            url=request.url.copy_with(scheme="http", host="pythia", port=None),
++            headers=request.headers,
++            content=request.content,
++            extensions=request.extensions,
++        )
++        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self._app), base_url="http://pythia") as inner:
++            return await inner.send(rewritten)
++
++
++@pytest_asyncio.fixture
++async def source_app(source, monkeypatch):
++    """Wire the federation engine's outbound client at the source's routes."""
++    from mnemos.api import persistence_helpers
++
++    async def _current_user():
++        return UserContext(
++            user_id="federation-bot",
++            group_ids=[],
++            role="root",
++            namespace=None,
++            authenticated=True,
++        )
++
++    app = FastAPI()
++    app.include_router(federation_router)
++    app.dependency_overrides[get_current_user] = _current_user
++    calls: list[httpx.URL] = []
++    transport = _SourceTransport(app, calls)
++
++    real_make_safe_client = fed.make_safe_client
++
++    async def _safe_client(url, *, timeout=None, allow_private=True, **kwargs):
++        client = httpx.AsyncClient(transport=transport, base_url="http://pythia")
++        return client, None
++
++    def _current_backend():
++        return source
++
++    monkeypatch.setattr(fed, "make_safe_client", _safe_client)
++    monkeypatch.setattr(persistence_helpers, "backend_or_503", _current_backend)
++    try:
++        yield SimpleNamespace(app=app, calls=calls)
++    finally:
++        monkeypatch.setattr(fed, "make_safe_client", real_make_safe_client)
++
++
++async def register_peer(replica, *, name="pythia", enabled=True, copy_embeddings=True):
++    async with replica.transactional() as tx:
++        peer = await replica.federation.create_peer(
++            tx,
++            name=name,
++            base_url="http://pythia",
++            auth_token="token",
++            namespace_filter=None,
++            category_filter=None,
++            enabled=enabled,
++            sync_interval_secs=300,
++            compat_mode="permissive",
++        )
++    if copy_embeddings:
++        # The fleet sets this per peer so vectors cross the wire; the default
++        # (0) is what produced the 24,986 NULL-embedding rows in the field.
++        await mutate(replica, "UPDATE federation_peers SET copy_embeddings = 1 WHERE id = ?", peer["id"])
++    return peer
++
++
++async def sync(replica, peer_id):
++    async def _schema_ok(*args, **kwargs):
++        return {
++            "ok": True,
++            "mnemos_version": "9.9.9",
++            "schema_signature": "9.9",
++            "migrations_fingerprint": None,
++        }
++
++    real = fed._check_peer_schema
++    fed._check_peer_schema = _schema_ok
++    try:
++        return await fed.sync_peer(replica, peer_id)
++    finally:
++        fed._check_peer_schema = real
++
++
++@pytest_asyncio.fixture
++async def synced(source, replica, source_app):
++    """A replica that has completed one real pull from the source."""
++    peer = await register_peer(replica)
++    await sync(replica, peer["id"])
++    return SimpleNamespace(source=source, replica=replica, peer=peer, app=source_app)
++
++
++# ── eligibility gap: CHARON export vs the federation feed ────────────────────
++
++
++@pytest.mark.asyncio
++async def test_replica_receives_every_row_the_feed_serves(synced):
++    """What the feed serves arrives; nothing is silently dropped."""
++    for i in range(4):
++        await insert(synced.source, f"plain-{i}", f"plain fact {i}", embedding=[0.1] * EMBED_DIM)
++
++    await sync(synced.replica, synced.peer["id"])
++
++    async with synced.source.transactional() as tx:
++        feed_ids = {
++            r["id"]
++            for r in await synced.source.federation.feed_query(
++                tx,
++                since_updated=None,
++                since_id=None,
++                namespaces=[],
++                categories=[],
++                limit=100,
++                prefer_compressed=False,
++            )
++        }
++    assert feed_ids == {"plain-0", "plain-1", "plain-2", "plain-3"}
++
++    replicated = {
++        r["id"] for r in await fetch(synced.replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")
++    }
++    assert replicated == {f"fed:pythia:{mid}" for mid in feed_ids}
++
++    ids = await source_export_ids(synced.source)
++    report = await replica_parity(synced.replica, synced.peer["id"], page_size=2, source_ids=ids)
++    assert report["missing"]["count"] == 0, report["missing"]
++    assert report["extra"]["count"] == 0, report["extra"]
++    assert report["in_sync"] is True, {
++        k: report[k] for k in ("missing", "extra", "stale", "null_embedding", "unreachable", "replica")
++    }
++
++
++@pytest.mark.asyncio
++async def test_export_definition_is_a_superset_of_the_feed(synced):
++    """Document the F-15 eligibility gap, per the task's "align or document".
++
++    CHARON's export predicate has no ``federation_source`` term; the feed's
++    does, and the journal triggers only journal rows whose
++    ``federation_source`` is NULL. So a row replicated here from another
++    peer is counted exportable by CHARON but has no publishable event and can
++    never be served. ``replica_parity`` reports such rows as ``unreachable``
++    on the source host rather than as a permanent ``missing`` deficit.
++    """
++    from mnemos.core import eligibility
++
++    feed = eligibility.eligible_for_federation("m")
++    export = eligibility.eligible_for_federation_export("m")
++    assert "federation_source IS NULL" in feed
++    assert "federation_source" not in export
++
++    await insert(synced.source, "plain", "plain fact")
++    await insert(synced.source, "from-peer", "arrived from elsewhere", federation_source="other")
++
++    async with synced.source.transactional() as tx:
++        exportable = await synced.source.federation.count_exportable_rows(tx)
++        feed_ids = {
++            r["id"]
++            for r in await synced.source.federation.feed_query(
++                tx,
++                since_updated=None,
++                since_id=None,
++                namespaces=[],
++                categories=[],
++                limit=100,
++                prefer_compressed=False,
++            )
++        }
++    # ``count_exportable_rows`` uses the FEED predicate, so it reports the
++    # servable population; the CHARON-side row is the documented gap.
++    assert exportable == 1
++    assert feed_ids == {"plain"}
++
++
++@pytest.mark.asyncio
++async def test_parity_reports_missing_extra_stale_and_null_embedding(synced):
++    """Each population is counted once, by id, with a bounded sample."""
++    await insert(synced.source, "one", "first", embedding=[0.1] * EMBED_DIM)
++    await insert(synced.source, "two", "second", embedding=[0.1] * EMBED_DIM)
++    await insert(synced.source, "three", "third", embedding=[0.1] * EMBED_DIM)
++    await sync(synced.replica, synced.peer["id"])
++
++    # missing: dropped from the replica by something outside the fence.
++    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:two")
++    # extra: a row the source no longer exports.
++    await insert(synced.replica, "fed:pythia:ghost", "gone upstream", federation_source="pythia")
++    # stale: same id, different content on the replica. The content hash is
++    # maintained by a trigger (and never travels on the wire), so drift can
++    # only be produced by changing the content itself.
++    await mutate(
++        synced.replica,
++        "UPDATE memories SET content = ? WHERE id = ?",
++        "locally mutated",
++        "fed:pythia:one",
++    )
++    # null embedding: the replica stored content without a vector.
++    # Embeddings live in ``memory_embeddings``, not inline on ``memories``;
++    # dropping the join row is what the parity query reads as "no vector".
++    await mutate(synced.replica, "DELETE FROM memory_embeddings WHERE memory_id = ?", "fed:pythia:three")
++
++    ids = await source_export_ids(synced.source)
++    report = await replica_parity(synced.replica, synced.peer["id"], page_size=1, source_ids=ids)
++
++    assert report["missing"]["count"] == 1
++    assert report["missing"]["sample"] == ["two"]
++    assert report["extra"]["count"] == 1
++    assert report["extra"]["sample"] == ["ghost"]
++    assert report["stale"]["count"] == 1
++    assert report["stale"]["sample"] == ["one"]
++    # ``three`` lost its vector, and ``ghost`` was never given one: both are
++    # rows the replica holds without an embedding. ``two`` is absent from the
++    # replica entirely, so it is ``missing``, never ``null_embedding``.
++    assert report["null_embedding"]["count"] == 2
++    # ``sample`` is capped by ``page_size`` (1 here), so it shows the first id.
++    assert report["null_embedding"]["sample"] == ["ghost"]
++    assert report["null_embedding"]["sample_truncated"] is True
++    assert report["null_embedding"]["population"] == "replica"
++    assert report["page_size"] == 1
++    assert report["in_sync"] is False
++    assert report["peer"] == "pythia"
++
++
++@pytest.mark.asyncio
++async def test_parity_pages_never_load_the_whole_table(synced, monkeypatch):
++    """The comparison must be keyset-paged, not one full-table read."""
++    for i in range(7):
++        await insert(synced.source, f"p{i}", f"fact {i}", embedding=[0.1] * EMBED_DIM)
++    await sync(synced.replica, synced.peer["id"])
++
++    pages: list[int] = []
++    real_source_page = getattr(type(synced.replica.federation), "fetch_parity_page")
++
++    async def _spy(self, tx, **kwargs):
++        rows = await real_source_page(self, tx, **kwargs)
++        pages.append(len(list(rows)))
++        return rows
++
++    monkeypatch.setattr(type(synced.replica.federation), "fetch_parity_page", _spy)
++
++    ids = await source_export_ids(synced.source)
++    report = await replica_parity(synced.replica, synced.peer["id"], page_size=2, source_ids=ids)
++    assert report["in_sync"] is True
++    assert pages and max(pages) <= 2, pages
++
++
++@pytest.mark.asyncio
++async def test_parity_is_clean_for_a_freshly_synced_replica(synced):
++    for i in range(3):
++        await insert(synced.source, f"ok-{i}", f"fact {i}", embedding=[0.1] * EMBED_DIM)
++    await sync(synced.replica, synced.peer["id"])
++    ids = await source_export_ids(synced.source)
++    report = await replica_parity(synced.replica, synced.peer["id"], source_ids=ids)
++    assert report["in_sync"] is True
++    assert report["source"]["available"] is True
++    assert report["source"]["exportable_rows"] == 3
++    assert report["replica"]["rows"] == 3
++    assert report["hint"] is None
++
++
++# ── reconcile ────────────────────────────────────────────────────────────────
++
++
++@pytest.mark.asyncio
++async def test_reconcile_is_dry_run_first(synced):
++    await insert(synced.source, "lost", "never arrived")
++    await sync(synced.replica, synced.peer["id"])
++    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:lost")
++
++    before = len(synced.app.calls)
++    ids = await source_export_ids(synced.source)
++    dry = await reconcile_peer(synced.replica, synced.peer["id"], apply=False, source_ids=ids)
++
++    assert dry["applied"] is False
++    assert dry["requested"] == ["lost"]
++    assert dry["restored"] == 0
++    assert len(synced.app.calls) == before, "a dry run must not touch the feed"
++    still_missing = await replica_parity(synced.replica, synced.peer["id"], source_ids=ids)
++    assert still_missing["missing"]["count"] == 1
++
++
++@pytest.mark.asyncio
++async def test_reconcile_apply_restores_missing_ids_ignoring_the_fence(synced):
++    await insert(synced.source, "fenced", "sequence already seen", embedding=[0.5] * EMBED_DIM)
++    await sync(synced.replica, synced.peer["id"])
++    # Simulate the local mutation that the durable fence then refuses to re-apply.
++    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:fenced")
++
++    ids = await source_export_ids(synced.source)
++    result = await reconcile_peer(synced.replica, synced.peer["id"], apply=True, source_ids=ids)
++
++    assert result["applied"] is True
++    assert result["requested"] == ["fenced"]
++    assert result["restored"] == 1
++    assert result["failed"] == []
++    row = await fetch(
++        synced.replica,
++        "SELECT content FROM memories WHERE id = ?",
++        "fed:pythia:fenced",
++    )
++    assert row and row[0]["content"] == "sequence already seen"
++    report = await replica_parity(synced.replica, synced.peer["id"])
++    assert report["in_sync"] is True
++
++
++@pytest.mark.asyncio
++async def test_reconcile_reports_a_peer_that_cannot_serve_the_id(synced):
++    """A 404 from the peer is counted, not raised: one bad id cannot stop the run."""
++    await insert(synced.source, "retracted", "was here")
++    await sync(synced.replica, synced.peer["id"])
++    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:retracted")
++    # The replica was reconciled against an export set that names the row,
++    # but the source has since stopped serving it by id (soft delete). The
++    # 404 is therefore permanent for this run: re-dispatch publishes nothing
++    # and the id is counted as failed rather than retried forever.
++    await mutate(
++        synced.source,
++        "UPDATE memories SET deleted_at = ? WHERE id = ?",
++        (NOW + timedelta(days=1)).isoformat(),
++        "retracted",
++    )
++    ids = {"retracted": None}
++    result = await reconcile_peer(synced.replica, synced.peer["id"], apply=True, source_ids=ids)
++    assert result["requested"] == ["retracted"]
++    assert result["restored"] == 0
++    assert result["failed"] and result["failed"][0]["id"] == "retracted"
++    # Still reported missing -- the operator sees the gap rather than a silence.
++    # The report must be given the same export set, or it would re-derive one
++    # from the source, which no longer lists the row.
++    report = await replica_parity(synced.replica, synced.peer["id"], source_ids=ids)
++    assert report["missing"]["sample"] == ["retracted"]
++
++
++@pytest.mark.asyncio
++async def test_parity_endpoint_reports_and_reconcile_dry_run(synced):
++    """The admin surface: GET parity and POST reconcile (dry run by default)."""
++    import mnemos.api.persistence_helpers as _ph
++
++    await insert(synced.source, "gone", "lost locally", embedding=[0.1] * EMBED_DIM)
++    await sync(synced.replica, synced.peer["id"])
++    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:gone")
++
++    real = _ph.backend_or_503
++    # The peer row lives on the replica, so the admin surface runs there.
++    _ph.backend_or_503 = lambda *a, **k: synced.replica
++    try:
++        transport = httpx.ASGITransport(app=synced.app.app)
++        async with httpx.AsyncClient(transport=transport, base_url="http://source") as client:
++            report = (await client.get(f"/v1/federation/peers/{synced.peer['id']}/parity")).json()["report"]
++            # A replica cannot see the source's export set, so it reports the
++            # gap honestly as source-unavailable rather than inventing one.
++            assert report["source"]["available"] is False
++            assert report["missing"]["count"] == 0
++            # A dry run touches neither side.
++            dry = (
++                await client.post(
++                    f"/v1/federation/peers/{synced.peer['id']}/reconcile",
++                    params={"apply": False},
++                )
++            ).json()
++            assert dry["result"]["applied"] is False
++            assert dry["result"]["restored"] == 0
++            # No source export set on this host => nothing to request, which
++            # is the honest answer rather than a silent "all good".
++            assert dry["result"]["requested"] == []
++    finally:
++        _ph.backend_or_503 = real
++
++    assert await fetch(synced.replica, "SELECT id FROM memories WHERE id = ?", "fed:pythia:gone") == []
