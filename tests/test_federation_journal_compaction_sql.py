@@ -773,15 +773,18 @@ def test_peer_lock_registry_works_and_releases_dead_loops():
         federation_module._peer_sync_lock("pin-peer-leak")
         return True
 
+    import gc
+
     assert asyncio.run(_hold())
+    # Collect first: a loop caught in a reference cycle is only freed by the
+    # cycle collector, so asserting before gc.collect() would depend on when
+    # the collector last ran.
+    gc.collect()
     assert held[0]() is None, "the loop was not released"
     # The loop that registered "pin-peer-leak" is gone, so its entry must be
     # too: a plain dict keyed by loop would keep the lock forever. Keyed on
     # this test's own peer name rather than the global size, so other tests'
     # live loops cannot make it flaky.
-    import gc
-
-    gc.collect()
     surviving = [registry for registry in federation_module._SYNC_LOCKS.values() if "pin-peer-leak" in registry]
     assert not surviving, "a dead loop still holds its locks"
 
