@@ -562,8 +562,30 @@ def test_peer_lock_registry_works_and_releases_dead_loops():
         return federation_module._peer_sync_lock("pin-peer") is federation_module._peer_sync_lock("pin-peer")
 
     assert asyncio.run(_same()), "the lock is not stable within a loop"
-    # Both loops are gone, so the weak registry holds nothing.
-    assert len(federation_module._SYNC_LOCKS) == 0, "finished loops were not collected"
+
+    # A finished loop's entry must be dropped, or the registry leaks one
+    # dict per loop for the process lifetime. Measured against the loop that
+    # created it (not the global size), so other tests' loops cannot make
+    # this flaky.
+    held: list = []
+
+    async def _hold():
+        loop = asyncio.get_running_loop()
+        held.append(weakref.ref(loop))
+        federation_module._peer_sync_lock("pin-peer-leak")
+        return True
+
+    assert asyncio.run(_hold())
+    assert held[0]() is None, "the loop was not released"
+    # The loop that registered "pin-peer-leak" is gone, so its entry must be
+    # too: a plain dict keyed by loop would keep the lock forever. Keyed on
+    # this test's own peer name rather than the global size, so other tests'
+    # live loops cannot make it flaky.
+    import gc
+
+    gc.collect()
+    surviving = [registry for registry in federation_module._SYNC_LOCKS.values() if "pin-peer-leak" in registry]
+    assert not surviving, "a dead loop still holds its locks"
 
 
 def test_apply_hnsw_query_tuning_accepts_pgvector_version():
