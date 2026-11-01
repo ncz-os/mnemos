@@ -2368,9 +2368,15 @@ class OracleMemoryRepository(MemoryRepository):
         try:
             placeholders, params = _in_placeholders(duplicate_ids, "dup")
             params["canonical_id"] = canonical_id
-            # F-3: a replica's lifecycle belongs to its source.
+            # F-3: a replica is never a consolidation target, and never
+            # redirected into a local canonical row -- its lifecycle belongs to
+            # its source. The canonical EXISTS mirrors Postgres: it must be a
+            # live, local row, or a local duplicate would be dropped in favour
+            # of a replica (or of a row that is already gone).
             fence = _eligibility.local_sweep_predicate("")
-            duplicate_guard = f"AND {fence}" if fence else ""
+            fence_clause = f"AND {fence}" if fence else ""
+            canonical_fence = _eligibility.local_sweep_predicate("cm")
+            canonical_clause = f"AND {canonical_fence}" if canonical_fence else ""
             await _call(
                 cursor.execute,
                 f"""
@@ -2379,7 +2385,15 @@ class OracleMemoryRepository(MemoryRepository):
                  WHERE id IN ({placeholders})
                    AND id != :canonical_id
                    AND deleted_at IS NULL
-                   {duplicate_guard}
+                   {fence_clause}
+                   AND EXISTS (
+                       SELECT 1 FROM memories cm
+                        WHERE cm.id = :canonical_id
+                          AND cm.deleted_at IS NULL
+                          AND cm.archived_at IS NULL
+                          AND cm.consolidated_into IS NULL
+                          {canonical_clause}
+                   )
                 """,
                 params,
             )
