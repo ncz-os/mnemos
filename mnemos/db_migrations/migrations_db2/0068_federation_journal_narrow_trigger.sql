@@ -1,4 +1,4 @@
--- F-4: narrow the federation journal update trigger (see the Postgres 0067).
+-- F-4: narrow the federation journal update trigger (see the Postgres 0068).
 CREATE OR REPLACE TRIGGER fed_journal_update AFTER UPDATE OF federation_source,content,category,namespace,owner_id,permission_mode,deleted_at,archived_at,consolidated_into,embedding,metadata,verbatim_content ON memories REFERENCING OLD AS o NEW AS n FOR EACH ROW MODE DB2SQL
 WHEN ((o.federation_source IS NULL AND (o.namespace IS NULL OR o.namespace<>'vault')) OR (n.federation_source IS NULL AND (n.namespace IS NULL OR n.namespace<>'vault')))
 BEGIN ATOMIC

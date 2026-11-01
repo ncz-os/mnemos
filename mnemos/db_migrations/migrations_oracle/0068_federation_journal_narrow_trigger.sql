@@ -1,4 +1,4 @@
--- F-4: narrow the federation journal update trigger (see the Postgres 0067).
+-- F-4: narrow the federation journal update trigger (see the Postgres 0068).
 -- ``subcategory``, ``updated`` and the ``source_*`` bookkeeping columns no
 -- longer fire the journal; ``embedding``/``metadata`` still do (a
 -- copy_embeddings peer receives them).

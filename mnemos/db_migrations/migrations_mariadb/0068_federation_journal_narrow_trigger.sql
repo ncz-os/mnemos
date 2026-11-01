@@ -1,4 +1,4 @@
--- F-4: narrow the federation journal update trigger (see the Postgres 0067).
+-- F-4: narrow the federation journal update trigger (see the Postgres 0068).
 DROP TRIGGER IF EXISTS fed_journal_update;
 CREATE TRIGGER fed_journal_update AFTER UPDATE ON memories FOR EACH ROW
 BEGIN
