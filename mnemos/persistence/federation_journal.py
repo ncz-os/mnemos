@@ -425,7 +425,9 @@ def compaction_sql(dialect: str) -> str:
             "  SELECT 1 FROM federation_changes newer "
             "  WHERE newer.memory_id = stale.memory_id "
             "  AND newer.seq IS NOT NULL "
-            "  AND newer.seq > stale.seq"
+            "  AND newer.seq > stale.seq "
+            # A successor only retires a row if it is itself compactable.
+            "  AND newer.changed_at < ?"
             ")"
         )
     return (
@@ -436,7 +438,12 @@ def compaction_sql(dialect: str) -> str:
         "  SELECT 1 FROM federation_changes AS newer "
         "  WHERE newer.memory_id = federation_changes.memory_id "
         "  AND newer.seq IS NOT NULL "
-        "  AND newer.seq > federation_changes.seq"
+        "  AND newer.seq > federation_changes.seq "
+        # Only a *compactable* successor retires a row. Without this the
+        # newest published event can be dropped when a later, still-recent
+        # event exists (it is inside a consumer's in-flight page, so it is
+        # not itself a keeper), which would hide the memory from the feed.
+        "  AND newer.changed_at < ?"
         ")"
     )
 
@@ -478,4 +485,6 @@ async def compact(tx: Any, *, older_than_days: int = 30) -> int:
     ops = _ops(tx)
     cutoff = _cutoff(older_than_days)
     sql = compaction_sql(ops.dialect)
-    return int(await ops.execute(sql, cutoff, *((cutoff,) if ops.dialect == "mysql" else ())))
+    # Every dialect's statement now takes the cutoff twice: the outer
+    # candidate filter and the "is there a compactable successor" test.
+    return int(await ops.execute(sql, cutoff, cutoff))

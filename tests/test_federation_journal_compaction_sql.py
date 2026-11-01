@@ -87,3 +87,47 @@ def test_mysql_provisioning_replays_the_narrowed_trigger():
 def test_sqlite_migration_is_registered():
     source = (Path(__file__).resolve().parents[1] / "mnemos" / "persistence" / "sqlite.py").read_text()
     assert "migrations_v7_2_federation_journal_narrow_trigger_sqlite.sql" in source
+
+
+def test_mysql_provisioning_strips_embedding_from_the_narrowed_trigger():
+    """0067 rebuilds the trigger, so it must honour ``separate_embeddings``.
+
+    0062 is patched to drop the embedding comparison on a dedicated-embeddings
+    table; 0067 is replayed afterwards and re-creates ``fed_journal_update``
+    from the file, so an unpatched 0067 silently restores the comparison and
+    the journal starts firing on embedding-only writes again. Drives the real
+    provisioning function with a recording cursor.
+    """
+    import asyncio
+
+    from mnemos.persistence import mysql
+
+    class _Cursor:
+        def __init__(self, sink):
+            self._sink = sink
+
+        async def execute(self, statement):
+            self._sink.append(statement)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Conn:
+        def __init__(self):
+            self.statements = []
+
+        def cursor(self):
+            return _Cursor(self.statements)
+
+    def _trigger_bodies(separate_embeddings: bool) -> str:
+        conn = _Conn()
+        asyncio.run(mysql._ensure_mysql_federation_journal(conn, separate_embeddings=separate_embeddings))
+        return " ".join(s for s in conn.statements if "fed_journal_update" in s)
+
+    assert "OLD.embedding" in _trigger_bodies(separate_embeddings=False)
+    assert "OLD.embedding" not in _trigger_bodies(separate_embeddings=True), (
+        "the narrowed trigger restored the embedding comparison on a dedicated-embeddings table"
+    )

@@ -1460,7 +1460,13 @@ async def _ensure_mysql_federation_journal(conn: Any, *, separate_embeddings: bo
     # (no subcategory/updated/source_*). It is replayed here, after 0062,
     # rather than relying on an ordered migration runner -- this provisioning
     # path is the one every MySQL/MariaDB node actually takes.
-    sql += (directory / "0067_federation_journal_narrow_trigger.sql").read_text()
+    narrowed = (directory / "0067_federation_journal_narrow_trigger.sql").read_text()
+    # 0067 rebuilds the trigger from scratch, so it must honour the same
+    # separate_embeddings strip as 0062 -- otherwise replaying it silently
+    # restores the embedding comparison on a dedicated-embeddings table.
+    if separate_embeddings:
+        narrowed = narrowed.replace(" OR NOT (OLD.embedding <=> NEW.embedding)", "")
+    sql += narrowed
     if separate_embeddings:
         sql += (directory.parent / "mariadb_helpers" / "federation_journal_mariadb_embeddings.sql").read_text()
     async with conn.cursor() as cursor:

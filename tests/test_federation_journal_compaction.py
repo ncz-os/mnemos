@@ -365,12 +365,13 @@ def test_compaction_statement_is_dialect_valid():
     for dialect in ("oracle", "db2"):
         assert "federation_changes stale" in compaction_sql(dialect)
 
-    # SQLite/Postgres: the plain correlated EXISTS, one bind.
+    # SQLite/Postgres: the plain correlated EXISTS. Two binds: the outer
+    # candidate filter and the compactable-successor test.
     for dialect in ("sqlite", "postgres"):
         sql = compaction_sql(dialect)
         assert sql.startswith("DELETE FROM federation_changes WHERE")
         assert "AS newer" in sql
-        assert sql.count("?") == 1
+        assert sql.count("?") == 2
 
 
 @pytest.mark.asyncio
@@ -416,3 +417,37 @@ def test_switches_do_not_raise_when_the_environment_variable_is_unset(monkeypatc
         monkeypatch.setenv("MNEMOS_FEDERATION_REPLICA_FENCE", raw)
         assert federation_journal_compaction_enabled() is True
         assert federation_replica_fence_enabled() is True
+
+
+def test_postgres_compaction_keeps_the_newest_published_event_whatever_its_age():
+    """The ``EXISTS`` shape must retire a row only for a *compactable* successor.
+
+    SQLite and Postgres share the correlated ``EXISTS`` statement, so the
+    shape can be executed here against real rows. The invariant the module
+    docstring states -- "the newest event is kept *whatever its age*" -- only
+    holds if the newer-event test is restricted to rows compaction would
+    itself consider. Without that, a row revived by a recent (still
+    uncompacted) event retires an old one, deleting the memory's only
+    published event and making it vanish from the feed.
+    """
+    import sqlite3
+
+    from mnemos.persistence.federation_journal import compaction_sql
+
+    sql = compaction_sql("postgres")
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE federation_changes(seq INTEGER PRIMARY KEY, memory_id TEXT, changed_at INTEGER)")
+    # One memory, one published event, older than the cutoff. A newer event
+    # exists but is *recent*, so compaction must not treat it as a keeper.
+    db.executemany(
+        "INSERT INTO federation_changes VALUES(?,?,?)",
+        [(1, "m1", 10), (2, "m1", 200)],
+    )
+
+    db.execute(sql, (100, 100))
+    survivors = [row[0] for row in db.execute("SELECT seq FROM federation_changes ORDER BY seq")]
+
+    # The recent row is untouchable (inside a consumer's in-flight page), so
+    # the old row is the newest *compactable* event and must survive too:
+    # deleting it would leave a consumer without any published event.
+    assert survivors == [1, 2], f"old published event was dropped: {survivors}"
