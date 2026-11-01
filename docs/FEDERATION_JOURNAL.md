@@ -74,3 +74,42 @@ reserves its sequence immediately, so the event lands strictly after every
 sequence already handed out; an event that reused a cursor position would be
 invisible to the replica. Reconcile never deletes or overwrites a replica
 row.
+
+## Locally soft-deleted replicas (`skipped_deleted`, F-2)
+
+A replica an operator has soft-deleted on the receiving node is a lifecycle
+decision, not a stale copy. A sync must not quietly overwrite it, and must not
+quietly drop the event either: before migration 0069 the write was a no-op on
+every backend and the sync still reported a clean run, so the divergence had no
+number anywhere in the system.
+
+The receiver now accounts for it:
+
+- `fetch_federated_memory_marker` returns the row **including** `deleted_at`
+  on all six backends (previously the Postgres-family lookups filtered
+  `deleted_at IS NULL`, so a deleted replica read as *absent*: the
+  insert-or-ignore wrote nothing because the row still existed, and nothing was
+  counted — SQLite, which had no such filter, behaved differently).
+- `_store_memories` inspects that field, increments `skipped_deleted`, and
+  skips the write. It does **not** undelete: reviving a replica is a policy
+  decision. Same rule on the journaled path (after the versioned-update
+  prepare, which clears `deleted_at`) and the unjournaled one.
+- Migration `0069_federation_sync_skipped_deleted.sql` adds the
+  `skipped_deleted` column to `federation_sync_log` on all five dialect
+  directories; `finish_sync_log` takes it as a per-sync **delta** and
+  `fetch_sync_log` / `GET .../sync-log` return it.
+- One capped WARNING per sync carries the count, not one per row.
+
+`skipped_deleted` is a delta for that sync; `rows_without_embedding` next to it
+is the per-peer total. Both are reported in the same summary line.
+
+Test coverage: `tests/test_federation_soft_deleted_marker.py` (real SQLite,
+including that the skip count accumulates across pages of a single sync),
+`tests/test_federation_marker_postgres_live.py` (a live Postgres, gated on
+`MNEMOS_TEST_DB`), and `tests/test_federation_counter_backend_parity.py`
+(pins the SQL and the `finish_sync_log` bind count for all six dialects).
+
+**The report this work came from cites `mnemos/persistence/postgres.py:5976-5991`
+against commit `0073bb4`; on current master those lookups live at `:5980` and
+`:5986` and no longer carry the filter.** File:line leads from that report are
+against a 48-commit-older tree — re-read before trusting them.
