@@ -484,7 +484,8 @@ async def test_reconcile_apply_restores_missing_ids_ignoring_the_fence(synced):
         "fed:pythia:fenced",
     )
     assert row and row[0]["content"] == "sequence already seen"
-    report = await replica_parity(synced.replica, synced.peer["id"])
+    # ``in_sync`` is a claim about the source, so it needs the source's set.
+    report = await replica_parity(synced.replica, synced.peer["id"], source_ids=ids)
     assert report["in_sync"] is True
 
 
@@ -536,6 +537,8 @@ async def test_parity_endpoint_reports_and_reconcile_dry_run(synced):
             # gap honestly as source-unavailable rather than inventing one.
             assert report["source"]["available"] is False
             assert report["missing"]["count"] == 0
+            # ...and it must not call that in sync: it never saw the source.
+            assert report["in_sync"] is False
             # A dry run touches neither side.
             dry = (
                 await client.post(
@@ -950,6 +953,78 @@ async def test_reconcile_hint_names_the_peer(synced):
     assert hint is not None
     assert "{" not in hint, hint
     assert f"/v1/federation/peers/{synced.peer['id']}/reconcile" in hint
+
+
+# ── HIGH, confirmed (Muse review): in_sync without a source ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_parity_without_a_source_never_claims_in_sync(synced):
+    """No source export set => the report cannot say the replica is in sync.
+
+    ``in_sync`` was ``not (missing or extra or stale or null_embedding)``.
+    With ``source_available`` false the first three are empty by
+    construction, so a replica holding every vector printed ``in_sync: true``
+    having compared nothing -- exactly the "found nothing" vs "looked and
+    found everything" confusion the report exists to prevent.
+    """
+    for i in range(3):
+        await insert(synced.source, f"ok-{i}", f"fact {i}", embedding=[0.1] * EMBED_DIM)
+    await sync(synced.replica, synced.peer["id"])
+
+    blind = await replica_parity(synced.replica, synced.peer["id"])
+    assert blind["source"]["available"] is False
+    assert blind["null_embedding"]["count"] == 0  # nothing local is wrong...
+    assert blind["in_sync"] is False, "in_sync claimed with no source to compare against"
+
+    # The same replica, given the source's set, is genuinely in sync.
+    ids = await source_export_ids(synced.source)
+    seen = await replica_parity(synced.replica, synced.peer["id"], source_ids=ids)
+    assert seen["source"]["available"] is True
+    assert seen["in_sync"] is True
+
+
+# ── HIGH, confirmed (Muse review): reconcile dropped ``source_url`` ─────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_forwards_source_url_to_every_parity_call(synced, monkeypatch):
+    """``reconcile_peer(source_url=...)`` must reach ``replica_parity``.
+
+    Both parity calls (before and after the apply) were made without it, so
+    the report the reconcile is built on described the peer's configured
+    ``base_url`` while the redispatch went to the override.
+    """
+    from mnemos.domain.federation import parity as parity_mod
+
+    await insert(synced.source, "lost", "never arrived", embedding=[0.2] * EMBED_DIM)
+    await sync(synced.replica, synced.peer["id"])
+    await mutate(synced.replica, "DELETE FROM memories WHERE id = ?", "fed:pythia:lost")
+    ids = await source_export_ids(synced.source)
+
+    seen: list[str | None] = []
+    real = parity_mod.replica_parity
+
+    async def _spy(*args, **kwargs):
+        report = await real(*args, **kwargs)
+        seen.append(report["source_url"])
+        return report
+
+    monkeypatch.setattr(parity_mod, "replica_parity", _spy)
+    override = "http://pythia-from-source-host"
+
+    dry = await parity_mod.reconcile_peer(
+        synced.replica, synced.peer["id"], apply=False, source_ids=ids, source_url=override
+    )
+    assert dry["requested"] == ["lost"]
+    assert seen == [override], seen
+
+    seen.clear()
+    applied = await parity_mod.reconcile_peer(
+        synced.replica, synced.peer["id"], apply=True, source_ids=ids, source_url=override
+    )
+    assert applied["restored"] == 1, applied
+    assert seen == [override, override], seen
 
 
 # ── ABC-first: every backend implements the F-15 surface ────────────────────

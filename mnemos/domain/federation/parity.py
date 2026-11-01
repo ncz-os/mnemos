@@ -251,8 +251,9 @@ async def replica_parity(
     """Compare this node's replica of ``peer_id`` with the source's exports.
 
     Returns counts (plus a bounded id sample) per population. ``in_sync``
-    is true only when every population is empty -- "found nothing" and
-    "looked and found everything" must never print the same.
+    is true only when the source's export set was available AND every
+    population is empty -- "found nothing" and "looked and found
+    everything" must never print the same.
 
     Run this on the SOURCE host to get a full comparison, or pass the
     source's exportable id set as ``source_ids`` (what the source host's own
@@ -292,7 +293,11 @@ async def replica_parity(
         "unreachable": _bucket(unreachable, page_size),
     }
     counts["null_embedding"]["population"] = "replica"
-    in_sync = not (missing or extra or stale or null_embedding)
+    # Without the source's export set, missing/extra/stale are empty by
+    # construction, not by comparison: "in sync" would be a claim about a
+    # population this run never read. Stays a bool so callers keep their type;
+    # ``source.available`` says why.
+    in_sync = source_available and not (missing or extra or stale or null_embedding)
     hint = None
     if missing:
         hint = (
@@ -356,6 +361,7 @@ async def reconcile_peer(
         namespaces=namespaces,
         categories=categories,
         page_size=page_size,
+        source_url=source_url,
         source_ids=source_ids,
     )
     requested = list(report["missing"]["sample"])
@@ -421,6 +427,7 @@ async def reconcile_peer(
         namespaces=namespaces,
         categories=categories,
         page_size=page_size,
+        source_url=source_url,
         source_ids=source_ids,
     )
     replicated = await _replica_keyset(backend, report["peer"], page_size=page_size)
