@@ -30,9 +30,9 @@ CREATE TABLE IF NOT EXISTS federation_peers (
     lag_seconds DOUBLE PRECISION,
     rows_last_sync INTEGER,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
-    peer_embed_model VARCHAR2(200),
-    peer_embed_dim NUMBER,
-    embedding_status VARCHAR2(1000),
+    peer_embed_model TEXT,
+    peer_embed_dim INTEGER,
+    embedding_status TEXT,
     created             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated             TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 

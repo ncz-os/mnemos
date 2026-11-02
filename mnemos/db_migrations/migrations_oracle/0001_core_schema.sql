@@ -230,13 +230,13 @@ CREATE TABLE IF NOT EXISTS federation_peers (
     last_schema_check_at TIMESTAMP WITH TIME ZONE,
     -- M12 items 1/2: per-peer lag/health sample, peer embedder
     -- fingerprint, and why vectors were/weren't copied.
-    last_cursor_ts TIMESTAMP,
+    last_cursor_ts TIMESTAMP WITH TIME ZONE,
     lag_seconds BINARY_DOUBLE,
-    rows_last_sync INTEGER,
-    consecutive_failures INTEGER NOT NULL DEFAULT 0,
-    peer_embed_model VARCHAR(256),
-    peer_embed_dim INT,
-    embedding_status TEXT,
+    rows_last_sync NUMBER,
+    consecutive_failures NUMBER DEFAULT 0 NOT NULL,
+    peer_embed_model VARCHAR2(200),
+    peer_embed_dim NUMBER,
+    embedding_status VARCHAR2(1000),
     created TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
     updated TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
     CONSTRAINT federation_peer_interval_min CHECK (sync_interval_secs >= 30)
