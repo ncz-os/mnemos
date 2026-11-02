@@ -127,8 +127,8 @@ class AdminLifecycleRepository:
     ) -> int:
         from mnemos.domain.persephone.runner import (
             DEFAULT_ARCHIVED_BY,
-            _ELIGIBLE_SQL,
             archive_memory,
+            eligible_sql,
         )
 
         if archive_after_days < 1:
@@ -139,9 +139,16 @@ class AdminLifecycleRepository:
         ops = self._portable_ops(tx)
         if ops is not None:
             cutoff_dt = datetime.now(timezone.utc) - timedelta(days=archive_after_days)
+            # F-3: never archive a replica -- the archive marker replaces the
+            # body and the source never re-sends a fenced sequence.
+            from mnemos.core.eligibility import local_sweep_predicate
+
+            fence = local_sweep_predicate("")
             base = (
                 "SELECT id FROM memories WHERE deleted_at IS NULL AND archived_at IS NULL "
-                "AND consolidated_into IS NULL AND (last_recalled_at IS NULL OR last_recalled_at < ?) "
+                "AND consolidated_into IS NULL"
+                + (f" AND {fence}" if fence else "")
+                + " AND (last_recalled_at IS NULL OR last_recalled_at < ?) "
                 "AND created < ? AND namespace = ? ORDER BY created ASC"
             )
             if ops.dialect == "mysql":
@@ -157,7 +164,7 @@ class AdminLifecycleRepository:
 
         conn = _conn(tx)
         rows = await conn.fetch(
-            _ELIGIBLE_SQL,
+            eligible_sql(),
             namespace,
             int(archive_after_days),
             int(batch_size),

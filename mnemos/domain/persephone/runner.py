@@ -39,12 +39,13 @@ SELECT id, content, category, subcategory, metadata, quality_rating,
  FOR UPDATE
 """
 
-_ELIGIBLE_SQL = """
+_ELIGIBLE_SQL_TEMPLATE = """
 SELECT id
   FROM memories
  WHERE deleted_at IS NULL
    AND archived_at IS NULL
    AND consolidated_into IS NULL
+   {fence}
    AND (last_recalled_at IS NULL OR last_recalled_at < NOW() - ($2::int * INTERVAL '1 day'))
    AND created < NOW() - ($2::int * INTERVAL '1 day')
    AND namespace = $1
@@ -52,6 +53,22 @@ SELECT id
  LIMIT $3
  FOR UPDATE SKIP LOCKED
 """
+
+
+def eligible_sql() -> str:
+    """The cold-set SELECT with the local-sweep replica fence applied.
+
+    PERSEPHONE is a local heuristic, and an archive marker replaces the body:
+    archiving a replica destroys the only copy the receiver will ever get, since
+    the source's replay is fenced by its sequence. The backend-neutral sweep
+    already carries this fence (``worker_lifecycle._replica_fence``); this is the
+    asyncpg path, which the admin lifecycle sweep reuses. Empty when
+    ``MNEMOS_FEDERATION_REPLICA_FENCE`` is off, exactly like the others.
+    """
+    from mnemos.core.eligibility import local_sweep_predicate
+
+    fence = local_sweep_predicate("")
+    return _ELIGIBLE_SQL_TEMPLATE.format(fence=f"AND {fence}" if fence else "")
 
 
 async def is_archived(conn: Any, memory_id: str) -> bool:
@@ -231,7 +248,7 @@ async def sweep_for_archival(
     async with pool.acquire() as conn:
         async with conn.transaction():
             rows = await conn.fetch(
-                _ELIGIBLE_SQL,
+                eligible_sql(),
                 namespace,
                 int(archive_after_days),
                 int(batch_size),

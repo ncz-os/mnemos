@@ -49,10 +49,16 @@ async def prepare_versioned_update(tx, peer_name, remote_id):
     Clear the legacy marker only inside the fenced mutation transaction; the
     existing repository then writes the actual remote timestamp with the data.
     This handles source clocks moving backwards and changes sharing a timestamp.
+
+    ``archived_at`` is cleared for the same reason as ``deleted_at``: a local
+    sweep that archived a replica replaced the body with an ``ARCHIVED:<id>``
+    marker, so without this the fresh source content lands on a row that stays
+    hidden as a stub, and a later restore writes the stale payload back over it.
     """
     await _ops(tx).execute(
         "UPDATE memories SET federation_remote_updated = NULL, deleted_at = NULL, "
-        "consolidated_into = NULL, consolidated_at = NULL WHERE id = ? AND federation_source = ?",
+        "consolidated_into = NULL, consolidated_at = NULL, archived_at = NULL "
+        "WHERE id = ? AND federation_source = ?",
         f"fed:{peer_name}:{remote_id}",
         peer_name,
     )
