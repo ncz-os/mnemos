@@ -118,6 +118,25 @@ class _Ops:
             if close is not None:
                 await _await(close())
 
+    async def _materialize(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Resolve Oracle / Db2 LOB columns into plain str/bytes.
+
+        The enterprise drivers hand back LOB handles (``oracledb.AsyncLOB``)
+        whose ``read()`` is a coroutine and whose ``repr()`` is a memory
+        address. Callers here serialise the row into the archive and hash it
+        into the deletion log, so a handle that reaches them stores the address
+        instead of the text and the only copy is lost. The backend repositories
+        already route every value through ``oracle_helpers``; this is the
+        lifecycle path's equivalent.
+        """
+        if self.dialect not in {"oracle", "db2"}:
+            return row
+        from mnemos.persistence.oracle_helpers import _materialize_value
+
+        for key, value in row.items():
+            row[key] = await _materialize_value(value)
+        return row
+
     async def fetchone(self, sql: str, *params: Any) -> dict[str, Any] | None:
         if self.dialect == "postgres":
             row = await self.conn.fetchrow(self.sql(sql), *params)
@@ -127,10 +146,10 @@ class _Ops:
             row = await _await(cursor.fetchone())
             if row is None:
                 return None
-            if isinstance(row, dict):
-                return row
-            keys = [str(col[0]).lower() for col in (cursor.description or ())]
-            return dict(zip(keys, row))
+            if not isinstance(row, dict):
+                keys = [str(col[0]).lower() for col in (cursor.description or ())]
+                row = dict(zip(keys, row))
+            return await self._materialize(row)
         finally:
             close = getattr(cursor, "close", None)
             if close is not None:
@@ -150,7 +169,12 @@ class _Ops:
             if not rows:
                 return []
             keys = [str(col[0]).lower() for col in (cursor.description or ())]
-            return [row if isinstance(row, dict) else dict(zip(keys, row)) for row in rows]
+            materialized: list[dict[str, Any]] = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    row = dict(zip(keys, row))
+                materialized.append(await self._materialize(row))
+            return materialized
         finally:
             close = getattr(cursor, "close", None)
             if close is not None:
