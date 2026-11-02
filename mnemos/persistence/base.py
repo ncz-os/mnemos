@@ -2930,6 +2930,38 @@ class FederationRepository(ABC):
         ...
 
     @abstractmethod
+    async def fetch_source_pullable_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        """One keyset page of the rows the source can actually PUBLISH.
+
+        This is the PULLABLE population: the rows the live feed serves and
+        the by-id route answers for. It applies ``eligible_for_federation``
+        -- the same predicate ``fetch_source_export_keyset_page`` uses --
+        so the two pages agree by construction.
+
+        The pair (pullable, CHARON-exportable) is what makes the F-2
+        population observable. A row that is CHARON-exportable but NOT
+        pullable is exportable by definition and yet has no publishable
+        event (the journal triggers only fire for rows whose
+        ``federation_source`` IS NULL), so the source's own by-id route
+        answers 404 for it and no replica can ever receive it. Reading
+        both sets is what lets the parity report say "unreachable"
+        (a different bug, with a different fix) instead of "missing" (a
+        deficit the reconcile would chase forever).
+
+        Returns ``id`` + the stored ``content_hash`` (NULL when absent) in
+        ``id`` order, so a sweep never loads the whole population.
+        """
+        ...
+
+    @abstractmethod
     async def fetch_source_charon_export_keyset_page(
         self,
         tx: Transaction,

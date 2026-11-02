@@ -138,6 +138,62 @@ async def _feed_ids(
     return served
 
 
+async def _source_charon_keyset(backend, *, namespaces, categories, page_size: int) -> dict[str, str | None]:
+    """Every CHARON-exportable ``id -> content_hash`` on this node, by keyset page.
+
+    CHARON's export definition (``eligible_for_federation_export``) is
+    deliberately WIDER than the feed's: it has no ``federation_source``
+    term. Reading it is what makes the F-2 population observable.
+    """
+    seen: dict[str, str | None] = {}
+    after: str | None = None
+    repo = backend.federation
+    while True:
+        async with backend.transactional() as tx:
+            rows = await repo.fetch_source_charon_export_keyset_page(
+                tx,
+                namespaces=namespaces,
+                categories=categories,
+                after_id=after,
+                limit=page_size,
+            )
+        if not rows:
+            return seen
+        for row in rows:
+            seen[str(row["id"])] = row.get("content_hash")
+            after = str(row["id"])
+        if len(rows) < page_size:
+            return seen
+
+
+async def _source_pullable_keyset(backend, *, namespaces, categories, page_size: int) -> dict[str, str | None]:
+    """Every PULLABLE ``id -> content_hash`` on this node, by keyset page.
+
+    The pullable population is the one the live feed serves and the by-id
+    route answers for. Comparing it with the CHARON-exportable population
+    is what separates "exportable but unservable" from "missing".
+    """
+    seen: dict[str, str | None] = {}
+    after: str | None = None
+    repo = backend.federation
+    while True:
+        async with backend.transactional() as tx:
+            rows = await repo.fetch_source_pullable_keyset_page(
+                tx,
+                namespaces=namespaces,
+                categories=categories,
+                after_id=after,
+                limit=page_size,
+            )
+        if not rows:
+            return seen
+        for row in rows:
+            seen[str(row["id"])] = row.get("content_hash")
+            after = str(row["id"])
+        if len(rows) < page_size:
+            return seen
+
+
 async def _populations(
     backend,
     peer_id: str,
@@ -146,6 +202,7 @@ async def _populations(
     categories: list[str],
     page_size: int,
     source_ids: Mapping[str, str | None] | set[str] | None = None,
+    source_pullable_ids: Mapping[str, str | None] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Classify every id once; both public entry points read this.
 
@@ -155,6 +212,11 @@ async def _populations(
     nothing about the source: ``extra``/``stale``/``unreachable`` are left
     empty and ``source_available`` is False, so the report never claims
     "everything is extra" just because the replica's own corpus is small.
+
+    ``source_pullable_ids`` is the source's PULLABLE id set -- the rows it
+    can actually publish. It is what makes the F-2 population (exportable
+    but unservable) attributable instead of being reported as a permanent
+    ``missing`` deficit.
     """
     async with backend.transactional() as tx:
         peer = await backend.federation.get_sync_peer(tx, peer_id)
@@ -174,7 +236,35 @@ async def _populations(
         missing: list[str] = []
         extra: list[str] = []
         stale: list[str] = []
-        unreachable: list[str] = []
+        # The F-2 population: the rows THIS node exports but cannot
+        # publish. It is measurable here -- this node's own corpus is the
+        # source's corpus in the workflow the ADR describes ("run the
+        # report on the SOURCE host"), and the two populations are read
+        # from it:
+        #
+        #   * the CHARON-owned export set -- rows this node authored that
+        #     CHARON's export definition counts;
+        #   * the pullable set -- rows the feed serves and the by-id route
+        #     answers for.
+        #
+        # Their difference is exactly the rows the source exports and
+        # cannot publish: archived and consolidated rows (the journal
+        # records those as a withdrawal and a tombstone, never as live
+        # data) and rows that arrived from another peer. A replica can
+        # never receive them and the source's by-id route 404s them.
+        #
+        # The OWNED variant of the export predicate matters here: the
+        # plain one also counts the rows this node pulled FROM the peer
+        # being compared, so on a replica the "gap" would be the
+        # replica's own corpus -- a wall of ids that have nothing to do
+        # with the source.
+        charon = await _source_charon_keyset(
+            backend, namespaces=namespaces, categories=categories, page_size=page_size
+        )
+        pullable = await _source_pullable_keyset(
+            backend, namespaces=namespaces, categories=categories, page_size=page_size
+        )
+        unreachable = sorted(set(charon) - set(pullable))
         # A row the replica holds with no vector is still a real finding; it
         # is read entirely from the replica.
         null_embedding = [mid for mid, row in replicated.items() if not row["has_embedding"]]
@@ -198,18 +288,34 @@ async def _populations(
         else {str(mid): None for mid in source_ids}
     )
     exportable_count = len(exportable)
-    # "Exportable but unservable" is the F-15 eligibility gap: the journal
+    # "Exportable but unservable" is the F-2 eligibility gap: the journal
     # triggers (0062/0064) only journal rows whose ``federation_source`` is
     # NULL, so a row replicated from another peer is counted by CHARON's
-    # export definition but has no publishable event. It is only observable on
-    # the node that OWNS the journal, and this branch is the caller-supplied
-    # case (the population was read elsewhere), so no gap can be attributed
-    # from here: enumerating this node's own federated rows -- none of them
-    # publishable -- would mislabel every missing id as unservable. The gap is
-    # documented in ``eligible_for_federation_export`` and pinned by
-    # ``test_export_definition_is_a_superset_of_the_feed``; closing it needs a
-    # trigger change on all six backends and is out of scope here.
+    # export definition but has no publishable event. It is only observable
+    # on the node that OWNS the journal, and this branch is the
+    # caller-supplied case (the population was read elsewhere).
+    #
+    # So the gap is attributed ONLY when the caller supplies the source's
+    # PULLABLE set as well (``source_pullable_ids``): the difference
+    # between the two is exactly the rows the source exports but cannot
+    # publish, and those are ``unreachable`` -- a different bug with a
+    # different fix -- not ``missing``, a deficit the reconcile would
+    # chase forever because the source can never serve them.
+    #
+    # Without the pullable set the report says nothing about the gap
+    # rather than guessing: enumerating this node's own federated rows --
+    # none of them publishable -- would mislabel every missing id as
+    # unservable. The gap is documented in
+    # ``eligible_for_federation_export`` and pinned by
+    # ``test_export_definition_is_a_superset_of_the_feed``.
     unreachable: list[str] = []
+    if source_pullable_ids is not None:
+        pullable = (
+            {str(k) for k in source_pullable_ids}
+            if isinstance(source_pullable_ids, Mapping)
+            else {str(mid) for mid in source_pullable_ids}
+        )
+        unreachable = sorted(set(exportable) - pullable)
 
     missing = sorted(mid for mid in exportable if mid not in replicated and mid not in unreachable)
     extra = sorted(mid for mid in replicated if mid not in exportable)
@@ -247,6 +353,7 @@ async def replica_parity(
     source_url: str | None = None,
     auth_token: str | None = None,
     source_ids: Mapping[str, str | None] | set[str] | None = None,
+    source_pullable_ids: Mapping[str, str | None] | set[str] | None = None,
 ) -> dict[str, Any]:
     """Compare this node's replica of ``peer_id`` with the source's exports.
 
@@ -261,6 +368,11 @@ async def replica_parity(
     neither, the report is honest about what it cannot see:
     ``source_available`` is false and ``missing``/``extra``/``stale`` are
     zero rather than pretending the replica's own corpus is the source's.
+
+    ``source_pullable_ids`` is the source's PULLABLE id set -- the rows it
+    can actually publish. Supplying it lets the report separate the F-2
+    population (exportable but unservable -> ``unreachable``) from a real
+    deficit (``missing``).
     """
     page_size = max(1, min(int(page_size), 5000))
     namespaces = list(namespaces or [])
@@ -273,6 +385,7 @@ async def replica_parity(
         categories=categories,
         page_size=page_size,
         source_ids=source_ids,
+        source_pullable_ids=source_pullable_ids,
     )
     peer = populations["peer"]
     peer_name = populations["peer_name"]
@@ -343,6 +456,7 @@ async def reconcile_peer(
     page_size: int = DEFAULT_PAGE_SIZE,
     limit: int | None = None,
     source_ids: Mapping[str, str | None] | set[str] | None = None,
+    source_pullable_ids: Mapping[str, str | None] | set[str] | None = None,
     source_url: str | None = None,
 ) -> dict[str, Any]:
     """Re-pull the ids the parity report calls ``missing``.
@@ -353,6 +467,11 @@ async def reconcile_peer(
     ``source_ids`` is the peer's exportable id set, read on the source host
     (see ``replica_parity``). Without it the replica cannot know what it is
     missing and the reconcile reports an empty request rather than guessing.
+
+    ``source_pullable_ids`` is the source's PULLABLE id set. Supplying it
+    keeps the reconcile away from the F-2 population: an id the source
+    exports but cannot publish is never requested, because the request
+    would 404 and the deficit would never close.
     """
 
     report = await replica_parity(
@@ -363,6 +482,7 @@ async def reconcile_peer(
         page_size=page_size,
         source_url=source_url,
         source_ids=source_ids,
+        source_pullable_ids=source_pullable_ids,
     )
     requested = list(report["missing"]["sample"])
     if report["missing"]["count"] > len(requested):
@@ -384,7 +504,8 @@ async def reconcile_peer(
                 )
             }
         )
-        requested = sorted(mid for mid in all_ids if mid not in replicated)
+        unreachable = set(report["unreachable"]["sample"]) if report["unreachable"]["count"] else set()
+        requested = sorted(mid for mid in all_ids if mid not in replicated and mid not in unreachable)
     if limit is not None:
         requested = requested[: max(0, int(limit))]
 

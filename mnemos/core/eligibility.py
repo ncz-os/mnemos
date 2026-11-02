@@ -125,6 +125,12 @@ def eligible_for_federation_export(alias: str = "m", *, include_private: bool | 
     ``federation_source`` case needs a trigger change on all six backends and
     is out of scope for F-15. ``replica_parity`` reports those rows as
     ``unreachable`` rather than as a permanent ``missing`` deficit.
+
+    F-2: the parity report DOES read a population with this predicate
+    (``fetch_source_charon_export_keyset_page``) so the gap is measurable
+    rather than asserted. What it measures is the difference between what
+    the source EXPORTS and what the source can PUBLISH -- see
+    ``eligible_for_federation_export_owned``.
     """
     prefix = f"{alias}." if alias else ""
     vault_literal = VAULT_NAMESPACE.replace("'", "''")
@@ -132,6 +138,48 @@ def eligible_for_federation_export(alias: str = "m", *, include_private: bool | 
     return (
         f"{prefix}deleted_at IS NULL "
         f"{world_read}"
+        f"AND ({prefix}namespace IS NULL OR {prefix}namespace <> '{vault_literal}')"
+    )
+
+
+def eligible_for_federation_export_excluding_peer(
+    alias: str = "m",
+    *,
+    peer_name: str | None = None,
+    include_private: bool | None = None,
+) -> str:
+    """CHARON's export definition, minus the rows received FROM ``peer_name``.
+
+    F-2. ``eligible_for_federation_export`` counts every row the node
+    holds, including the rows it received BY FEDERATION. On a replica
+    that is every row it pulled from the peer it is comparing against --
+    so the export set and the feed set would differ by exactly the
+    replica's own corpus, and the difference would be reported as
+    "unreachable" ids that have nothing to do with the source.
+
+    Excluding the rows that came from THE PEER BEING COMPARED removes
+    that artefact while keeping the population the ADR names: a row that
+    arrived from ANOTHER peer, or that is archived, or that is
+    consolidated, is exportable by CHARON's definition and 404s on by-id
+    -- the F-2 population. Those rows are exactly the difference between
+    "what this node exports" and "what this node can publish".
+
+    The exclusion is by ``federation_source``, the column that records
+    which peer a received row came from. It is a no-op on a source node
+    (no row there carries the peer's name), and on a replica it removes
+    precisely the rows the replica pulled from that peer.
+    """
+    prefix = f"{alias}." if alias else ""
+    vault_literal = VAULT_NAMESPACE.replace("'", "''")
+    world_read = "" if _federation_include_private(include_private) else f"AND ({prefix}permission_mode % 10) >= 4 "
+    exclude_peer = ""
+    if peer_name:
+        peer_literal = str(peer_name).replace("'", "''")
+        exclude_peer = f"AND ({prefix}federation_source IS NULL OR {prefix}federation_source <> '{peer_literal}') "
+    return (
+        f"{prefix}deleted_at IS NULL "
+        f"{world_read}"
+        f"{exclude_peer}"
         f"AND ({prefix}namespace IS NULL OR {prefix}namespace <> '{vault_literal}')"
     )
 
