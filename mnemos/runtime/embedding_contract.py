@@ -84,7 +84,16 @@ KNOWN_MODEL_WIDTHS: dict[str, int] = {
 }
 
 #: Model names that carry a dimension in their spelling (``...-768``).
-_DIM_IN_NAME_RE = re.compile(r"^(?P<stem>.+?)-(?P<dim>\d{3,4})$")
+#:
+#: The width group must NOT start with a zero. A leading zero marks a
+#: VERSION, not a width: OpenAI's ``text-embedding-ada-002`` ends in
+#: ``-002``, and reading that as a dimension made the contract resolve a
+#: 1536-dimensional model to 2 dimensions — a column sized for two
+#: dimensions, which every write then fails against. No real embedding
+#: width has a leading zero (the fleet's are 384/512/768/1024/1536/3072),
+#: so requiring a non-zero first digit separates a width from a version
+#: without a table of exceptions.
+_DIM_IN_NAME_RE = re.compile(r"^(?P<stem>.+?)-(?P<dim>[1-9]\d{2,3})$")
 
 #: Quantization/precision suffixes the fleet writes after a model name.
 _QUANT_SUFFIXES = (
@@ -264,6 +273,45 @@ class EmbeddingContractReport:
 EMBEDDING_DIM_CHECK_ENV = "MNEMOS_EMBEDDING_DIM_CHECK"
 
 
+#: The failures the dimension probe is allowed to swallow.
+#:
+#: The probe answers one question — "how wide are the vectors the live
+#: embedder produces?" — and the honest answer when the embedder cannot
+#: be reached is "I could not measure it". That is a *transport* failure:
+#: the endpoint is down, the model file is missing, the HTTP call timed
+#: out, the backend could not be constructed.
+#:
+#: Everything else is a DEFECT in the probe itself (a missing import, a
+#: wrong call shape, a bad type) and must NOT be reported as "the
+#: embedder is unreachable": doing so turns a one-line bug into a silent
+#: permanent fallback to the model's known width, which is exactly the
+#: drift the contract exists to catch. A defect has to surface.
+#:
+#: ``OSError`` covers the file/model-load failures and the socket-level
+#: errors; ``httpx``'s own hierarchy covers the HTTP transport (it is NOT
+#: an ``OSError`` subclass); ``RuntimeError`` and ``ValueError`` cover the
+#: backend's own "cannot load / cannot serve" refusals.
+#: ``asyncio.TimeoutError`` is an ``OSError`` subclass in Python 3.11.
+def _probe_transport_errors() -> tuple[type[BaseException], ...]:
+    """The exception classes the dimension probe may swallow.
+
+    Built lazily because ``httpx`` is an optional dependency of some
+    minimal installs; a missing ``httpx`` simply means its transport
+    errors are not in the set (the probe then surfaces them, which is
+    the safe direction).
+    """
+    errors: list[type[BaseException]] = [OSError, RuntimeError, ValueError]
+    try:
+        import httpx
+    except Exception:  # pragma: no cover - httpx is a hard dependency in practice
+        return tuple(errors)
+    errors.append(httpx.HTTPError)
+    return tuple(errors)
+
+
+_PROBE_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = _probe_transport_errors()
+
+
 def _check_enabled() -> bool:
     from mnemos.core.config import embedding_dim_check_env
 
@@ -298,6 +346,47 @@ def _mismatch_message(
     )
 
 
+async def _read_column_dim_through_abc(
+    backend: Any,
+) -> tuple[int | None, str | None]:
+    """Read the live embedding column width through the persistence ABC.
+
+    Returns ``(width, error)``. ``width`` is ``None`` when the column
+    width could not be determined — the table is absent, the catalog is
+    unreadable, or the column carries no fixed width. ``None`` is "no
+    evidence", never a guess.
+
+    The width is read from the REPOSITORY (``backend.memories`` ->
+    ``MemoryRepository.embedding_column_dim``), which is the ABC the
+    governing rule in AGENTS.md names: "ABC method -> implementation on
+    all six backends -> facade exposure -> route calls the ABC". Asking
+    the backend facade instead would re-create the shortcut the rule
+    forbids, and would leave the repository method untested by the one
+    caller that needs it.
+
+    The repository method takes a transaction, so the read runs inside
+    one: the column width must be read from a consistent snapshot, the
+    same way every other repository read is.
+    """
+    memories = getattr(backend, "memories", None)
+    reader = getattr(memories, "embedding_column_dim", None)
+    if reader is None:
+        # A backend that does not expose the memory repository cannot
+        # answer; that is "no evidence", not a failure.
+        return None, None
+    try:
+        async with backend.transactional() as tx:
+            width = await reader(tx)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        logger.warning(
+            "[EMBED] live embedding column width could not be read (%s)",
+            error,
+        )
+        return None, error
+    return width, None
+
+
 async def check_embedding_contract(
     *,
     probe: Callable[[], Awaitable[int | None]],
@@ -314,8 +403,10 @@ async def check_embedding_contract(
     and says so in ``probe_error``.
 
     ``column_dim`` is the live column width the persistence layer read;
-    when it is ``None`` and a ``backend`` was given, the backend is asked
-    for it through the ``embedding_column_dim`` repository method.
+    when it is ``None`` and a ``backend`` was given, the width is read
+    through the persistence layer's ``embedding_column_dim`` repository
+    method — the ABC, not a backend-specific shortcut (the governing
+    rule in AGENTS.md: "route calls the ABC").
     """
     if not _check_enabled():
         return EmbeddingContractReport(
@@ -333,22 +424,14 @@ async def check_embedding_contract(
     except Exception as exc:
         probe_error = f"{type(exc).__name__}: {exc}"
         logger.warning(
-            "[EMBED] embedding dimension probe failed (%s); "
-            "skipping the embedder half of the contract check",
+            "[EMBED] embedding dimension probe failed (%s); skipping the embedder half of the contract check",
             probe_error,
         )
 
     if column_dim is None and backend is not None:
-        reader = getattr(backend, "embedding_column_dim", None)
-        if reader is not None:
-            try:
-                column_dim = await reader()
-            except Exception as exc:
-                probe_error = f"{type(exc).__name__}: {exc}"
-                logger.warning(
-                    "[EMBED] live embedding column width could not be read (%s)",
-                    probe_error,
-                )
+        column_dim, column_error = await _read_column_dim_through_abc(backend)
+        if column_error is not None:
+            probe_error = column_error
 
     report = EmbeddingContractReport(
         ok=True,
@@ -429,18 +512,47 @@ async def _default_probe() -> int | None:
     Returns ``None`` when the embedder cannot be reached or produces
     nothing measurable — a probe that cannot answer is not evidence of a
     mismatch.
+
+    The probe must actually MEASURE the embedder. Returning the model's
+    *known* width when the measurement failed would make the contract
+    compare the configuration against itself and never notice that the
+    live embedder produces a different width — which is the exact drift
+    this module exists to catch. So the fallback to the known width is
+    reported as a fallback, and the exceptions that are swallowed are
+    narrowed to the transport/embedding failures they are meant to cover:
+    a programming error (a ``NameError`` from a missing import, a
+    ``TypeError`` from a wrong call) is NOT a transport failure, and it
+    must not be allowed to masquerade as "the embedder is unreachable".
     """
     from mnemos.core.config import embed_http_model_env
 
     model = embed_http_model_env()
     known = known_model_width(model)
     try:
+        from mnemos.runtime.embedder import get_embedder
+
         embedder = get_embedder()
         vector = await embedder.embed("embedding dimension probe")
     except Exception as exc:
-        logger.info("[EMBED] could not probe the embedder's output width (%s)", exc)
+        # A defect in THIS module (missing import, wrong call shape) is not
+        # a transport failure. Let it surface instead of hiding it behind
+        # the known width.
+        if not isinstance(exc, _PROBE_TRANSPORT_ERRORS):
+            raise
+        logger.warning(
+            "[EMBED] could not measure the embedder's output width (%s: %s); "
+            "falling back to the model's known width %s",
+            type(exc).__name__,
+            exc,
+            known,
+        )
         return known
     if not vector:
+        logger.warning(
+            "[EMBED] the embedder returned no vector for the dimension probe; "
+            "falling back to the model's known width %s",
+            known,
+        )
         return known
     return len(vector)
 

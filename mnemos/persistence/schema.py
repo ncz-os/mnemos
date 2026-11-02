@@ -610,9 +610,7 @@ SELECT COLUMN_TYPE
 #: the width (``USING vec0(memory_id TEXT PRIMARY KEY, embedding
 #: float[1024] distance_metric=cosine)``). The table's own ``sqlite_master``
 #: row is the catalog entry that holds it.
-_SQLITE_EMBEDDING_DIM_SQL = (
-    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?"
-)
+_SQLITE_EMBEDDING_DIM_SQL = "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?"
 
 #: The vec0 ``float[N]`` declaration — a more specific shape than the
 #: generic width scan, because a vec0 DDL also carries numbers that are
