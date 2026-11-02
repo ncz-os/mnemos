@@ -4212,6 +4212,63 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         finally:
             await _call(cur.close)
 
+    async def list_federated_missing_embeddings(
+        self,
+        tx: Any,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        peer_name: str | None = None,
+    ) -> list[Row]:
+        """F-3: the local-embed queue -- pulled rows with no vector.
+
+        Db2 stores the vector in the inline ``memories.embedding`` column
+        (VECTOR), so a NULL there is the missing-vector signal.
+        """
+        clauses = [
+            "federation_source IS NOT NULL",
+            "deleted_at IS NULL",
+            "archived_at IS NULL",
+            "consolidated_into IS NULL",
+            "embedding IS NULL",
+        ]
+        params: list[Any] = []
+        if after_id is not None:
+            clauses.append("id > ?")
+            params.append(after_id)
+        if peer_name is not None:
+            clauses.append("federation_source = ?")
+            params.append(peer_name)
+        params.append(max(1, min(int(limit), 1000)))
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT id, content, metadata FROM memories "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY id FETCH FIRST ? ROWS ONLY",
+                tuple(params),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def count_federated_missing_embeddings(
+        self,
+        tx: Any,
+        *,
+        peer_name: str | None = None,
+    ) -> int:
+        """F-3: depth of the local-embed queue, optionally for one peer."""
+        from mnemos.persistence.federation_journal import count_federated_missing_embeddings
+
+        return await count_federated_missing_embeddings(
+            tx,
+            peer_name=peer_name,
+            join_table=False,
+        )
+
     async def count_federated_rows_without_embedding_per_peer(self, tx: Any) -> dict[str, int]:
         """Count federated rows with no embedding, grouped by peer name.
 

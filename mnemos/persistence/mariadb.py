@@ -1105,6 +1105,63 @@ class MariadbFederationRepository(MysqlFederationRepository):
     _journal_embedding_sql = "VEC_ToText(journal_embedding.embedding)"
     _journal_embedding_join = " LEFT JOIN memory_embeddings journal_embedding ON journal_embedding.memory_id = m.id"
 
+    async def list_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        peer_name: str | None = None,
+    ) -> list[Row]:
+        """F-3: the local-embed queue -- pulled rows with no vector.
+
+        MariaDB has no inline ``memories.embedding`` column -- the vector
+        lives in the ``memory_embeddings`` join table -- so the inherited
+        MySQL query (which filters on ``memories.embedding``) would fail
+        with "unknown column". Read the join table instead.
+        """
+        clauses = [
+            "m.federation_source IS NOT NULL",
+            "m.deleted_at IS NULL",
+            "m.archived_at IS NULL",
+            "m.consolidated_into IS NULL",
+            "me.embedding IS NULL",
+        ]
+        params: list[Any] = []
+        if after_id is not None:
+            clauses.append("m.id > %s")
+            params.append(after_id)
+        if peer_name is not None:
+            clauses.append("m.federation_source = %s")
+            params.append(peer_name)
+        params.append(max(1, min(int(limit), 1000)))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT m.id AS id, m.content AS content, m.metadata AS metadata "
+                "FROM memories m "
+                "LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY m.id LIMIT %s",
+                tuple(params),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        return list(rows)
+
+    async def count_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str | None = None,
+    ) -> int:
+        """F-3: depth of the local-embed queue, optionally for one peer."""
+        from mnemos.persistence.federation_journal import count_federated_missing_embeddings
+
+        return await count_federated_missing_embeddings(
+            tx,
+            peer_name=peer_name,
+            join_table=True,
+        )
+
     async def count_federated_rows_without_embedding_per_peer(self, tx: Transaction) -> dict[str, int]:
         """Count federated rows with no embedding, grouped by peer name.
 

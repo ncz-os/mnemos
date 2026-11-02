@@ -2622,6 +2622,51 @@ class FederationRepository(ABC):
         """
         ...
 
+    # ── F-3: the local-embed queue (the durable backfill for replicas) ────
+    #
+    # A pulled row lands with ``embedding IS NULL`` unless the peer copied a
+    # vector this node could verify. The queue is the PREDICATE itself, not a
+    # side table: nothing is held in memory between passes, so a restart
+    # simply resumes and the row can never be "lost" between the sync and the
+    # worker. The worker (mnemos.domain.federation.local_embed) drains it.
+
+    async def list_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        peer_name: str | None = None,
+    ) -> list[Row]:
+        """F-3: list pulled rows still waiting for an embedding.
+
+        Returns the rows the local embedder still owes a vector for, in
+        ``id`` order, keyset-paginated by ``after_id`` so a pass can walk the
+        whole queue without holding it in memory. Each row carries ``id``,
+        ``content`` and ``metadata`` (the secret-redaction source).
+
+        The default implementation is a no-op returning an empty list; a
+        backend that cannot express the predicate keeps the old behaviour
+        (the rows are still reported as ``rows_without_embedding``).
+        """
+        return []
+
+    async def count_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str | None = None,
+    ) -> int:
+        """F-3: how many pulled rows are still waiting for an embedding.
+
+        The queue depth. ``peer_name`` narrows it to one peer so an
+        operator can see WHICH peer lags; ``None`` is the whole queue.
+
+        The default implementation returns 0; see
+        :meth:`list_federated_missing_embeddings` for why.
+        """
+        return 0
+
     @abstractmethod
     async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]: ...
 

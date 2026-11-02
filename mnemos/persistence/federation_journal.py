@@ -297,6 +297,67 @@ async def feed_query(
     return FeedRows(rows, checkpoint=checkpoint, pending=pending is not None)
 
 
+# ── F-3: the local-embed queue ─────────────────────────────────────────────
+#
+# A pulled row lands with ``embedding IS NULL`` unless the peer copied a vector
+# this node could verify. Those rows are invisible to semantic search until
+# something embeds them, so they are the durable work queue of the local
+# embedder (mnemos.domain.federation.local_embed).
+#
+# The queue is the PREDICATE, not a side table: nothing is held in memory
+# between passes, so a restart resumes and no row can be lost between the sync
+# and the worker.
+#
+# The vector lives in a different place per dialect -- an inline
+# ``memories.embedding`` column on Postgres/Oracle/Db2/MySQL, a
+# ``memory_embeddings`` join table on SQLite/MariaDB -- so the "has no
+# vector" test is per-dialect and lives on each backend's repository.
+
+_MISSING_EMBEDDING_INLINE = (
+    "federation_source IS NOT NULL AND embedding IS NULL "
+    "AND deleted_at IS NULL AND archived_at IS NULL AND consolidated_into IS NULL"
+)
+
+
+def missing_embedding_predicate(*, join_table: bool) -> str:
+    """The "pulled row with no vector" predicate for one dialect shape.
+
+    ``join_table=True`` for the backends that keep the vector in the
+    ``memory_embeddings`` table (SQLite, MariaDB); ``False`` for the
+    backends with an inline ``memories.embedding`` column (Postgres, Oracle,
+    Db2, MySQL).
+    """
+    if join_table:
+        return (
+            "m.federation_source IS NOT NULL "
+            "AND m.deleted_at IS NULL "
+            "AND m.archived_at IS NULL "
+            "AND m.consolidated_into IS NULL "
+            "AND me.embedding IS NULL"
+        )
+    return _MISSING_EMBEDDING_INLINE
+
+
+async def count_federated_missing_embeddings(tx, *, peer_name=None, join_table: bool) -> int:
+    """Depth of the local-embed queue, optionally for one peer."""
+    ops = _ops(tx)
+    predicate = missing_embedding_predicate(join_table=join_table)
+    if join_table:
+        sql = (
+            "SELECT COUNT(*) AS n FROM memories m "
+            "LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
+            f"WHERE {predicate}"
+        )
+    else:
+        sql = f"SELECT COUNT(*) AS n FROM memories WHERE {predicate}"
+    params: list[Any] = []
+    if peer_name is not None:
+        sql += " AND federation_source = ?"
+        params.append(peer_name)
+    row = await ops.fetchone(sql, *params)
+    return int(next(iter(row.values()))) if row else 0
+
+
 async def get_feed_memory(repo, tx, memory_id, *, namespaces, categories):
     ops = _ops(tx)
     await _publish(ops, memory_id)
