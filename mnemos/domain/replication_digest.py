@@ -230,8 +230,12 @@ def diff_digests(source: Mapping[str, Any], replica: Mapping[str, Any]) -> dict[
         rep = replica_buckets.get(bucket) or {}
         src_ids = [str(mid) for mid in src.get("ids") or []]
         rep_ids = [str(mid) for mid in rep.get("ids") or []]
-        source_only.extend(mid for mid in src_ids if mid not in set(rep_ids))
-        replica_only.extend(mid for mid in rep_ids if mid not in set(src_ids))
+        # Hoist the membership sets: rebuilding them per element made the
+        # per-bucket scan quadratic in the bucket's width.
+        src_set = set(src_ids)
+        rep_set = set(rep_ids)
+        source_only.extend(mid for mid in src_ids if mid not in rep_set)
+        replica_only.extend(mid for mid in rep_ids if mid not in src_set)
         repair_ids.extend(src_ids)
 
     return {
