@@ -38,6 +38,7 @@ receive unframed, unquarantined content.
 
 from __future__ import annotations
 
+import json
 import re
 from typing import List, Tuple
 
@@ -172,6 +173,79 @@ def _coalesce(spans: List[Tuple[int, int]], n: int) -> List[Tuple[int, int]]:
     return [(s, e) for s, e in merged]
 
 
+def _json_string_value_spans(content: str) -> List[Tuple[int, int]]:
+    """FB113 (2026-11-02): inner spans of STRING VALUES in one JSON document.
+
+    Returns ``[]`` unless the whole content is a single JSON object or array
+    (``json.loads`` must accept it), so ordinary prose keeps behavior that is
+    exactly pre-FB113. Inside the document, a string is a KEY when the next
+    non-whitespace character after its closing quote is ``:``; every other
+    string is a VALUE. Spans are the INNER text (quotes excluded) so a
+    quarantine wrapper clipped into a value can never touch the quote
+    characters, the key names, or the structural tokens around them.
+    """
+    try:
+        json.loads(content)
+    except (TypeError, ValueError):
+        return []
+    n = len(content)
+    i = 0
+    while i < n and content[i].isspace():
+        i += 1
+    if i >= n or content[i] not in "{[":
+        return []
+    spans: List[Tuple[int, int]] = []
+    in_str = False
+    esc = False
+    start = -1
+    while i < n:
+        ch = content[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+                j = i + 1
+                while j < n and content[j].isspace():
+                    j += 1
+                if j >= n or content[j] != ":":
+                    spans.append((start, i))  # a VALUE: inner span, no quotes
+                # else: a KEY string — never quarantined
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            start = i + 1
+            i += 1
+            continue
+        i += 1
+    return spans
+
+
+def _clip_spans_to_values(
+    spans: List[Tuple[int, int]], values: List[Tuple[int, int]]
+) -> List[Tuple[int, int]]:
+    """Clip detector spans into JSON string VALUES (FB113).
+
+    A span fully inside one value passes through unchanged; a span that
+    crosses out of a value into tokens/keys (the audit's ``ignore … rules``
+    case) keeps only the portion(s) that lie inside value strings, so the
+    prose is still defanged while the key and structure are never rewritten.
+    """
+    pieces: List[Tuple[int, int]] = []
+    for s, e in spans:
+        for v_s, v_e in values:
+            a, b = max(s, v_s), min(e, v_e)
+            if b > a:
+                pieces.append((a, b))
+    if not pieces:
+        return []
+    # _coalesce only uses ``n`` to clamp; clamp at the largest piece end.
+    return _coalesce(pieces, max(e for _, e in pieces))
+
+
 def detect_injection(content: str | None) -> bool:
     """True iff ``content`` contains at least one AI-targeting injection span."""
     if not content:
@@ -200,6 +274,16 @@ def quarantine_injections(content: str | None) -> str:
     spans = _coalesce(_injection_spans(content), len(content))
     if not spans:
         return content
+    # FB113 (2026-11-02): a structured JSON body must survive the quarantine
+    # as valid JSON with every key intact. Detector spans are clipped to JSON
+    # string VALUES (keys and structure untouched), so inserting
+    # ``[QUARANTINED-INJECTION: ...]`` never escapes a string; non-JSON
+    # content is quarantined exactly as before.
+    values = _json_string_value_spans(content)
+    if values:
+        spans = _clip_spans_to_values(spans, values)
+        if not spans:
+            return content
     out = content
     for s, e in reversed(spans):  # right-to-left keeps earlier offsets valid
         original = out[s:e]
