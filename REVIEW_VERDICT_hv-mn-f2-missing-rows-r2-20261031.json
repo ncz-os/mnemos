@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "kind": "review",
+  "job_id": "01a19dab-6fa5-7891-a201-d13d6b4ee5e4",
+  "head_branch": "hv/mn-f2-missing-rows-r2-20261031",
+  "base_branch": "hv/mn-f2-missing-rows-20261031",
+  "base_sha": "6d28989a310194d73007af1cef72a468d09ac19f",
+  "head_sha": "9b4af4f945557dd77e9d75a9e7beac7f742a66d0",
+  "review_ref": "review/hv/mn-f2-missing-rows-r2-20261031-01a19dab-6fa5-7891-a201-d13d6b4ee5e4",
+  "final_verdict": "request-changes",
+  "verdict": "request-changes",
+  "reviewers": [
+    {
+      "model": "muse-spark-1.3",
+      "family": "meta",
+      "verdict": "request-changes"
+    }
+  ],
+  "author_model": "MiniMax-M3",
+  "author_family": "minimax",
+  "cross_family": true,
+  "reason": "The HEAD WIP commit 9b4af4f9 ('preserve uncommitted work from an unfinished run') is an incomplete, non-self-consistent change that breaks the whole tree. It declares fetch_source_pullable_keyset_page as an @abstractmethod on FederationRepository (base.py:2933) and calls it from parity.py (_source_pullable_keyset, line ~181), but provides NO implementation on any of the six backends (sqlite/postgres/oracle/mysql; db2 inherits oracle, mariadb inherits mysql). Consequence: every concrete FederationRepository is now an uninstantiable abstract class. Verified with Python: 'TypeError: Can't instantiate abstract class SqliteFederationRepository without an implementation for abstract method fetch_source_pullable_keyset_page' (and the same for postgres/oracle/mysql). This is a direct violation of the repo's governing ABC-first rule (AGENTS.md: a new storage capability is ABC method -> implementation on ALL SIX backends -> facade -> route calls the ABC), and it is exactly the defect the c8af6b24 commit message says the prior WIP had already fixed. The breakage is fleet-wide and confirmed at the test level: across the federation/parity/reconcile scope the suite reports 138 failed + 141 errors, and every one of those failures/errors cites the missing fetch_source_pullable_keyset_page abstract method (280 matching lines); tests/test_federation_f2_exportable_pullable.py errors on 4 of its 5 tests at backend construction. This is a regression relative to the immediately prior commit c8af6b24, whose tree imports and instantiates cleanly (it predates the pullable abstract method and its caller). Two secondary defects: (1) eligible_for_federation_export_excluding_peer was added to core/eligibility.py but is referenced nowhere, so the intended peer-exclusion logic is dead code; (2) _populations in parity.py uses the PLAIN eligible_for_federation_export (via _source_charon_keyset) even though its comment cites 'the OWNED variant', conflating exportable-vs-owned semantics. A cross-family reviewer (muse-spark-1.3, family meta; author MiniMax-M3, family minimax) independently reached the same verdict (request-changes) with the same critical findings. The correct fix is to implement fetch_source_pullable_keyset_page on all six backends (mirroring fetch_source_export_keyset_page, i.e. the feed predicate eligible_for_federation) so the tree instantiates and the F-2 tests pass, then re-run the abc-first guard. Verdict: request-changes.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "critical",
+      "title": "fetch_source_pullable_keyset_page is abstract but unimplemented on all six backends",
+      "detail": "Declared @abstractmethod in mnemos/persistence/base.py:2933 (commit 9b4af4f9). No concrete implementation exists in mnemos/persistence/{sqlite,postgres,oracle,mysql}.py (db2 inherits oracle, mariadb inherits mysql). Python: 'TypeError: Can't instantiate abstract class SqliteFederationRepository without an implementation for abstract method fetch_source_pullable_keyset_page' (same for postgres/oracle/mysql). Violates the ABC-first governing rule."
+    },
+    {
+      "id": "F2",
+      "severity": "critical",
+      "title": "Fleet-wide test breakage from the missing backend implementation",
+      "detail": "pytest across -k 'federation or parity or reconcile': 138 failed + 141 errors, all citing fetch_source_pullable_keyset_page (280 matching lines). tests/test_federation_f2_exportable_pullable.py errors on 4/5 tests at SqliteBackend construction. Regression vs c8af6b24 (imports/instantiates cleanly)."
+    },
+    {
+      "id": "F3",
+      "severity": "high",
+      "title": "Dead code: eligible_for_federation_export_excluding_peer is referenced nowhere",
+      "detail": "Added in mnemos/core/eligibility.py (9b4af4f9) but has no call sites in the diff or at HEAD, so the intended peer-exclusion logic is not wired in."
+    },
+    {
+      "id": "F4",
+      "severity": "high",
+      "title": "Coherence mismatch: parity comment cites 'OWNED variant' but code uses the plain predicate",
+      "detail": "_populations in mnemos/domain/federation/parity.py calls _source_charon_keyset -> fetch_source_charon_export_keyset_page (PLAIN eligible_for_federation_export), yet the adjacent comment states the OWNED variant is required. Semantics are conflated."
+    }
+  ],
+  "verify_delivery": {
+    "command": "/usr/bin/python3 /opt/graeae/hive_worker.py --verify-delivery /home/jasonperlow/hive-workspaces/01a19dab-6fa5-7891-a201-d13d6b4ee5e4 9b4af4f945557dd77e9d75a9e7beac7f742a66d0",
+    "exit_code": 1,
+    "delivery_ready": false,
+    "commit_count": 0,
+    "worktree_clean": true,
+    "tracked_worktree_clean": true,
+    "remote_verified": true,
+    "note": "Expected for a READ-ONLY review: baseline==HEAD, so no commits sit above the baseline on the author branch and the review job commits nothing there. The review job's only permitted write is this verdict artifact on the separate review ref."
+  },
+  "review_overreach": {
+    "author_branch_touched": false,
+    "author_branch_head_before": "9b4af4f945557dd77e9d75a9e7beac7f742a66d0",
+    "author_branch_head_after": "9b4af4f945557dd77e9d75a9e7beac7f742a66d0",
+    "verdict_artifact": "REVIEW_VERDICT_hv-mn-f2-missing-rows-r2-20261031.json",
+    "verdict_ref": "review/hv/mn-f2-missing-rows-r2-20261031-01a19dab-6fa5-7891-a201-d13d6b4ee5e4"
+  }
+}
