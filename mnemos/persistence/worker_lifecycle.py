@@ -74,6 +74,11 @@ class _Ops:
             template = template.replace("? IS NULL", "?::text IS NULL")
             marker = "${}"
         elif self.dialect in {"sqlite", "db2"}:
+            if self.dialect == "db2":
+                # Db2 refuses a parameter marker whose type it cannot infer
+                # when it appears only in ``IS NULL`` (SQL0418N). Cast to a
+                # string wide enough for any namespace column.
+                template = template.replace("? IS NULL", "CAST(? AS VARCHAR(256)) IS NULL")
             marker = "?"
         elif self.dialect == "mysql":
             marker = "%s"
@@ -174,10 +179,8 @@ _RELATED_TABLES = (
 # Identity / credential tables. These DO NOT carry the ``owner_id`` /
 # ``namespace`` / ``deleted_at`` triple that the rest of the deletion
 # scope uses, so they are deleted directly during the hard-delete phase
-# (no soft-delete fence). On Postgres the column is ``user_id``; on
-# Oracle / Db2 it is ``owner_id``. The backend-neutral path dispatches
-# via ``_identity_user_column`` so the same call shape works on every
-# dialect.
+# (no soft-delete fence). The backend-neutral path dispatches via
+# ``_identity_scope`` so the same call shape works on every dialect.
 _IDENTITY_TABLES: tuple[str, ...] = (
     "api_keys",
     "oauth_sessions",
@@ -186,15 +189,23 @@ _IDENTITY_TABLES: tuple[str, ...] = (
 )
 
 
-def _identity_user_column(dialect: str) -> str:
-    """Postgres uses ``user_id`` on api_keys / oauth_* / user_groups; the
-    Oracle / Db2 ports use ``owner_id`` (with a parallel ``namespace``
-    column). MySQL / MariaDB carry neither -- the OAUTH capability is not
-    advertised on those backends and the deletion worker should never
-    reach this code path there."""
+def _identity_scope(dialect: str, table: str) -> tuple[str, bool]:
+    """Return ``(subject column, has namespace column)`` for an identity table.
+
+    Only ``api_keys`` was ported with the owner/namespace pair, and only on
+    Oracle / Db2 (``migrations_oracle/0003_api_keys.sql``). ``oauth_sessions``,
+    ``oauth_identities`` and ``user_groups`` key on ``user_id`` on every
+    backend and have no ``namespace`` column (``0005:41``, ``0006:38``,
+    ``0008:4``), so filtering them by ``owner_id AND namespace`` raised
+    ORA-00904 / SQL0206N and rolled the whole erasure back. MySQL / MariaDB
+    carry neither column set -- the OAUTH capability is not advertised there
+    and the deletion worker should never reach this code path.
+    """
+    if table != "api_keys":
+        return "user_id", False
     if dialect in {"oracle", "db2"}:
-        return "owner_id"
-    return "user_id"
+        return "owner_id", True
+    return "user_id", False
 
 
 async def _hard_delete_identity_rows(ops: _Ops, user_id: str, namespace: str | None) -> dict[str, int]:
@@ -208,10 +219,18 @@ async def _hard_delete_identity_rows(ops: _Ops, user_id: str, namespace: str | N
     accepting the credential after the DELETE commits).
     """
     counts: dict[str, int] = {}
-    user_col = _identity_user_column(ops.dialect)
     # Revoke api_keys first so any concurrent auth check that has already
-    # read the row sees ``revoked = TRUE`` before the DELETE runs.
-    revoke_sql = f"UPDATE api_keys SET revoked = TRUE, last_used = NULL WHERE {user_col} = ?"
+    # read the row sees the revocation before the DELETE runs. The Oracle / Db2
+    # port spells the flag ``revoked_at`` (TIMESTAMP, the revocation instant)
+    # and the usage stamp ``last_used_at``; only the Postgres / SQLite / MySQL
+    # table has boolean ``revoked`` + ``last_used``.
+    if ops.dialect in {"oracle", "db2"}:
+        revoke_sql = (
+            "UPDATE api_keys SET revoked_at = COALESCE(revoked_at, CURRENT_TIMESTAMP), "
+            "last_used_at = NULL WHERE owner_id = ?"
+        )
+    else:
+        revoke_sql = "UPDATE api_keys SET revoked = TRUE, last_used = NULL WHERE user_id = ?"
     if ops.dialect in {"oracle", "db2"} and namespace is not None:
         revoke_sql += " AND namespace = ?"
     params: tuple[Any, ...] = (user_id,)
@@ -219,9 +238,10 @@ async def _hard_delete_identity_rows(ops: _Ops, user_id: str, namespace: str | N
         params = params + (namespace,)
     counts["api_keys_revoked"] = await ops.execute(revoke_sql, *params)
     for table in _IDENTITY_TABLES:
-        sql = f"DELETE FROM {table} WHERE {user_col} = ?"
+        column, namespaced = _identity_scope(ops.dialect, table)
+        sql = f"DELETE FROM {table} WHERE {column} = ?"
         params = (user_id,)
-        if ops.dialect in {"oracle", "db2"} and namespace is not None:
+        if namespaced and namespace is not None:
             sql += " AND namespace = ?"
             params = params + (namespace,)
         counts[table] = await ops.execute(sql, *params)
@@ -240,11 +260,13 @@ async def _scope_live_counts_identity(ops: _Ops, user_id: str, namespace: str | 
     entry before the request can advance to ``hard_deleted``.
     """
     counts: dict[str, int] = {}
-    user_col = _identity_user_column(ops.dialect)
     for table in _IDENTITY_TABLES:
-        sql = f"SELECT COUNT(*) FROM {table} WHERE {user_col} = ?"
+        # Must target exactly what ``_hard_delete_identity_rows`` deletes, or a
+        # wrong column makes the verifier raise instead of clearing the entry.
+        column, namespaced = _identity_scope(ops.dialect, table)
+        sql = f"SELECT COUNT(*) FROM {table} WHERE {column} = ?"
         params: tuple[Any, ...] = (user_id,)
-        if ops.dialect in {"oracle", "db2"} and namespace is not None:
+        if namespaced and namespace is not None:
             sql += " AND namespace = ?"
             params = params + (namespace,)
         counts[table] = int(await ops.scalar(sql, *params) or 0)
@@ -688,19 +710,37 @@ async def sweep_for_archival(
             "AND consolidated_into IS NULL AND (last_recalled_at IS NULL OR last_recalled_at < ?) "
             "AND created < ? AND namespace = ?" + _replica_fence() + " ORDER BY created ASC"
         )
+        limit = int(batch_size)
         if dialect in {"mysql", "postgres"}:
             claim_sql = base_sql + " LIMIT ? FOR UPDATE SKIP LOCKED"
-        elif dialect in {"oracle", "db2"}:
-            claim_sql = f"SELECT id FROM ({base_sql}) WHERE ROWNUM <= ? FOR UPDATE SKIP LOCKED"
+            claim_params: tuple[Any, ...] = (cutoff, cutoff, namespace, limit)
+        elif dialect == "oracle":
+            # Oracle rejects FOR UPDATE against an inline view carrying ROWNUM
+            # (ORA-02014), which is exactly what
+            # ``SELECT id FROM (<ordered>) WHERE ROWNUM <= ? FOR UPDATE`` sent:
+            # the lock targets the view. Keep the ordering and the row limit in
+            # a predicate subquery and lock ``memories`` itself, the way
+            # ``_claim`` does for deletion_requests. Rows come back unordered, so
+            # the caller re-reads each id below instead of relying on the batch
+            # order.
+            claim_sql = (
+                "SELECT id FROM memories WHERE id IN "
+                f"(SELECT id FROM ({base_sql}) WHERE ROWNUM <= ?) FOR UPDATE SKIP LOCKED"
+            )
+            claim_params = (cutoff, cutoff, namespace, limit)
+        elif dialect == "db2":
+            # Db2 needs SKIP LOCKED DATA, and FETCH FIRST takes an integer
+            # rather than a marker, so the validated batch size is inlined.
+            claim_sql = (
+                base_sql
+                + f" FETCH FIRST {limit} ROWS ONLY "
+                "FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS SKIP LOCKED DATA"
+            )
+            claim_params = (cutoff, cutoff, namespace)
         else:
             claim_sql = base_sql + " LIMIT ?"
-        rows = await ops.fetchall(
-            claim_sql,
-            cutoff,
-            cutoff,
-            namespace,
-            int(batch_size),
-        )
+            claim_params = (cutoff, cutoff, namespace, limit)
+        rows = await ops.fetchall(claim_sql, *claim_params)
 
         archived = 0
         for item in rows:
@@ -802,9 +842,14 @@ async def active_deletion_for_scope(
         "  AND (? IS NULL OR (target_namespace IS NULL OR target_namespace = ?)) "
         "  AND status IN ('sweep_verifying', 'soft_deleted', 'hard_deleting') "
         "ORDER BY COALESCE(soft_deleted_at, confirmed_at) DESC "
-        "LIMIT 1"
     )
     dialect = backend_dialect(backend)
+    # Oracle has no LIMIT at all (ORA-00933) and Db2 only accepts it under a
+    # compatibility vector, so this fence used to raise on both and the callers
+    # -- which treat any exception as "no active deletion" -- kept accepting
+    # writes inside a GDPR deletion. FETCH FIRST is core syntax on both, so the
+    # fence actually applies there instead of failing open.
+    sql += "FETCH FIRST 1 ROWS ONLY" if dialect in {"oracle", "db2"} else "LIMIT 1"
     async with backend.transactional() as tx:
         ops = _Ops(tx, dialect)
         return await ops.fetchone(
