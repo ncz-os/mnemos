@@ -55,13 +55,14 @@ import pytest
 # it keeps ONE definition of "a replica that has pulled from a source".
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_federation_parity_reconcile import (  # noqa: E402
+from test_federation_parity_reconcile import (  # noqa: E402, F401
     EMBED_DIM,
     NOW,
     fetch,
     insert,
     register_peer,
     source_export_ids,
+    # Imported for pytest's fixture discovery, not for direct use.
     source_app,
     source,
     replica,
@@ -220,14 +221,21 @@ async def test_a_row_that_arrived_from_another_peer_is_unreachable_not_missing(s
     assert "arrived-from-a-third-node" not in pulled
 
     # The parity report must classify it as unreachable, not missing.
+    #
+    # The report runs on the SOURCE host against the peer row that names this
+    # source's own replica. In that mode (``source_ids`` omitted) the report
+    # reads the source's OWNED export set and its PULLABLE set from this
+    # node, and the difference between them is exactly the F-2 population --
+    # no cross-host bookkeeping and no ``missing`` deficit to chase.
     from mnemos.domain.federation.parity import replica_parity
 
-    # The source host's own view of the replica: a peer row pointing back.
     back = await register_peer(synced.source, name="proteus")
-    report = await replica_parity(synced.source, back["id"], source_ids=await source_export_ids(synced.source))
+    report = await replica_parity(synced.source, back["id"])
 
-    # The FEED's export set does not contain the federated row, so it is
-    # not a missing deficit from the feed's point of view.
+    # The fed row is exportable but unservable, so it is ``unreachable`` ...
+    assert report["unreachable"]["count"] == 1, report["unreachable"]
+    assert report["unreachable"]["sample"] == ["arrived-from-a-third-node"], report["unreachable"]
+    # ... and NEVER a missing deficit the reconcile would chase forever.
     assert report["missing"]["count"] == 0, report["missing"]
 
 
