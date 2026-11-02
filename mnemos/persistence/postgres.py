@@ -6506,6 +6506,44 @@ class PostgresFederationRepository(FederationRepository):
             *args,
         )
 
+    async def fetch_source_pullable_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        # The PULLABLE population: the feed's own predicate
+        # (``eligible_for_federation``) -- the same one
+        # ``fetch_source_export_keyset_page`` applies -- so the two pages
+        # agree by construction. Its difference from the CHARON page is the
+        # F-2 "exportable but unservable" population.
+        query_parts = [_eligibility.eligible_for_federation("m")]
+        args: list[Any] = []
+        if after_id is not None:
+            args.append(after_id)
+            query_parts.append(f"m.id > ${len(args)}")
+        if namespaces:
+            args.append(list(namespaces))
+            query_parts.append(f"m.namespace = ANY(${len(args)})")
+        if categories:
+            args.append(list(categories))
+            query_parts.append(f"m.category = ANY(${len(args)})")
+        args.append(max(1, int(limit)))
+        where_clause = " AND ".join(query_parts)
+        return await _postgres_tx(tx).conn.fetch(
+            f"""
+            SELECT m.id AS id, m.content_hash AS content_hash
+            FROM memories m
+            WHERE {where_clause}
+            ORDER BY m.id ASC
+            LIMIT ${len(args)}
+            """,
+            *args,
+        )
+
     async def count_exportable_rows(
         self,
         tx: Transaction,

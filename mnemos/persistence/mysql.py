@@ -8126,6 +8126,43 @@ class MysqlFederationRepository(FederationRepository):
             )
             return await _fetch_all_dicts(cursor)
 
+    async def fetch_source_pullable_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        # The PULLABLE population: the feed's own predicate
+        # (``eligible_for_federation``) -- the same one
+        # ``fetch_source_export_keyset_page`` applies -- so the two pages
+        # agree by construction. Its difference from the CHARON page is the
+        # F-2 "exportable but unservable" population.
+        where = [_eligibility.eligible_for_federation("m")]
+        params: list[Any] = []
+        if after_id is not None:
+            where.append("m.id > %s")
+            params.append(after_id)
+        for column, values in (("namespace", namespaces), ("category", categories)):
+            if values:
+                where.append(f"m.{column} IN ({', '.join(['%s'] * len(values))})")
+                params.extend(values)
+        params.append(max(1, int(limit)))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT m.id AS id, m.content_hash AS content_hash
+                  FROM memories m
+                 WHERE {" AND ".join(where)}
+                 ORDER BY m.id ASC
+                 LIMIT %s
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
     async def count_exportable_rows(
         self,
         tx: Transaction,
