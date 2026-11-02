@@ -8138,6 +8138,47 @@ class OracleFederationRepository(FederationRepository):
         finally:
             await _call(cursor.close)
 
+    async def fetch_source_charon_export_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        query_parts = [_eligibility.eligible_for_federation_export("m")]
+        params: dict[str, Any] = {"limit": max(1, int(limit))}
+        if after_id is not None:
+            query_parts.append("m.id > :after_id")
+            params["after_id"] = after_id
+        for column, values in (("namespace", namespaces), ("category", categories)):
+            if values:
+                bind_names = []
+                for index, value in enumerate(values):
+                    name = f"{column}_{index}"
+                    bind_names.append(f":{name}")
+                    params[name] = value
+                query_parts.append(f"m.{column} IN ({', '.join(bind_names)})")
+        where_clause = " AND ".join(query_parts)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id AS id, m.content_hash AS content_hash
+                  FROM memories m
+                 WHERE {where_clause}
+                 ORDER BY m.id ASC
+                 FETCH FIRST :limit ROWS ONLY
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
     async def count_exportable_rows(
         self,
         tx: Transaction,

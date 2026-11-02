@@ -7299,6 +7299,31 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             params,
         )
 
+    async def fetch_source_charon_export_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        where = "WHERE " + _eligibility.eligible_for_federation_export("m")
+        params: list[Any] = []
+        if after_id is not None:
+            where += " AND m.id > ?"
+            params.append(after_id)
+        for column, values in (("namespace", namespaces), ("category", categories)):
+            if values:
+                where += f" AND m.{column} IN ({_placeholders(values)})"
+                params.extend(values)
+        params.append(max(1, int(limit)))
+        return await _fetch_all(
+            self._conn(tx),
+            f"SELECT m.id AS id, m.content_hash AS content_hash FROM memories m {where} ORDER BY m.id ASC LIMIT ?",
+            params,
+        )
+
     async def count_exportable_rows(
         self,
         tx: Transaction,

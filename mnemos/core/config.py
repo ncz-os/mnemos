@@ -93,7 +93,7 @@ _FALLBACK_EMBEDDING_DIM = 768
 
 
 def _default_embedding_dim() -> int:
-    """The default embedding width: the CONFIGURED MODEL's width.
+    """The default embedding width: the ENVIRONMENT's, else the MODEL's.
 
     F-6. The default used to be a hard-coded 768 while the default HTTP
     embedding model (``bge-m3``) produces 1024 dimensions — the exact pair
@@ -105,11 +105,40 @@ def _default_embedding_dim() -> int:
     that names none gets the fleet standard (bge-m3, 1024-D) rather than
     a number that contradicts it.
 
+    The ENVIRONMENT is consulted FIRST, and it is consulted HERE rather
+    than only through pydantic's env source. The reason is the shape of
+    the settings build: ``_build_settings`` constructs every section
+    EXPLICITLY (``_DatabaseSettings(**db_section)``) and hands the result
+    to ``Settings``. A nested model that is passed in by value is
+    validated as plain data — pydantic-settings does NOT run the nested
+    model's own env source for it — so the section's ``validation_alias``
+    never reaches ``MNEMOS_EMBEDDING_DIM``. With a literal default that
+    was invisible (the constant happened to be the value the operator
+    wanted); with a MODEL-derived default it became a real bug: the
+    operator's ``MNEMOS_EMBEDDING_DIM=768`` was silently ignored and the
+    column was sized for bge-m3's 1024 instead.
+
+    Reading the env here makes the resolution order explicit and
+    independent of how the section was constructed:
+    ``MNEMOS_EMBEDDING_DIM`` -> ``PG_EMBEDDING_DIM`` -> the configured
+    model's width -> the fleet standard.
+
     The model table lives in ``mnemos.runtime.embedding_contract``,
     which imports this module for the environment — so the lookup is
     deferred into the function to keep the dependency arrow one-way
     (``core`` must not import ``runtime`` at module scope).
     """
+    for alias in ("MNEMOS_EMBEDDING_DIM", "PG_EMBEDDING_DIM"):
+        raw = runtime_env_value_stripped(alias)
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                # An unparseable value is an operator error the F-6 startup
+                # contract reports with an actionable message; here it falls
+                # through to the model's width rather than raising at import.
+                break
+
     from mnemos.runtime.embedding_contract import known_model_width
 
     try:
@@ -178,6 +207,42 @@ class _DatabaseSettings(BaseSettings):
     @classmethod
     def _expand_sqlite_path(cls, raw: Any) -> Path:
         return Path(raw).expanduser()
+
+    @field_validator("embedding_dim", mode="after")
+    @classmethod
+    def _embedding_dim_follows_the_environment(cls, value: int) -> int:
+        """The ENVIRONMENT wins over the default, whatever built the section.
+
+        F-6. The width the fleet records is the width the operator asked
+        for, and the operator states it in the environment
+        (``MNEMOS_EMBEDDING_DIM``, or the legacy ``PG_EMBEDDING_DIM``).
+        A nested settings section is validated as plain data when the
+        parent hands it over by value (``_build_settings`` does exactly
+        that for every section), so pydantic-settings never runs this
+        section's own env source for it and the field's
+        ``validation_alias`` never reaches the environment. The default
+        therefore has to resolve the environment ITSELF, at validation
+        time, or an operator's explicit width is silently replaced by the
+        model's width -- the operator sizes a 768-wide column, the
+        process believes 1024, and every write fails the dimension guard.
+
+        The environment is consulted on every validation, so the value is
+        correct no matter WHEN the section was built (import time, a
+        cached singleton, or a fresh construction).
+        """
+        for alias in ("MNEMOS_EMBEDDING_DIM", "PG_EMBEDDING_DIM"):
+            raw = runtime_env_value_stripped(alias)
+            if not raw:
+                continue
+            try:
+                return int(raw)
+            except ValueError:
+                # An unparseable value is an operator error the F-6 startup
+                # contract reports with an actionable message. Here it is
+                # ignored rather than raised, so a typo cannot make the
+                # whole settings object unbuildable.
+                break
+        return value
 
     @property
     def oracle_dsn(self) -> str:
@@ -1272,10 +1337,49 @@ PG_CONFIG: dict[str, Any] = {}
 GRAEAE_CONFIG: dict[str, Any] = {}
 
 
+#: The fingerprint of the environment the memoised settings were built from.
+#:
+#: The embedding width is the ONE setting whose value must never be stale:
+#: it sizes a vector column, and a stale width means every write fails the
+#: dimension guard while every search silently falls back to FTS. It is
+#: also the one setting an operator changes at RUNTIME (a re-embed
+#: resizes the column), and the one a test changes between cases.
+#:
+#: The settings object is memoised, and it is built at IMPORT time
+#: (``_sync_compat_exports(get_settings())`` at the bottom of this module)
+#: — long before a test or an operator's shell had a chance to set the
+#: variable. With a literal default that was invisible; with the
+#: MODEL-derived F-6 default it was a real defect: the operator's
+#: ``MNEMOS_EMBEDDING_DIM=768`` was ignored and the width silently became
+#: the model's (1024 for bge-m3).
+#:
+#: So the memoised build records the width it was built from, and a
+#: change in the environment invalidates the memo. The rebuild is cheap
+#: and happens exactly once per real change.
+_settings_embedding_dim_env: str | None = None
+
+
+def _embedding_dim_env_fingerprint() -> str:
+    """The embedding-width environment the settings would be built from."""
+    for alias in ("MNEMOS_EMBEDDING_DIM", "PG_EMBEDDING_DIM"):
+        raw = runtime_env_value_stripped(alias)
+        if raw:
+            return f"{alias}={raw}"
+    return ""
+
+
 def get_settings() -> Settings:
-    global _settings
+    global _settings, _settings_embedding_dim_env
     if _settings is None:
         _settings = _build_settings()
+        _settings_embedding_dim_env = _embedding_dim_env_fingerprint()
+        _sync_compat_exports(_settings)
+    elif _embedding_dim_env_fingerprint() != _settings_embedding_dim_env:
+        # The width changed under us: the memoised object now describes a
+        # column width the operator no longer wants. Rebuild rather than
+        # serve a stale width.
+        _settings = _build_settings()
+        _settings_embedding_dim_env = _embedding_dim_env_fingerprint()
         _sync_compat_exports(_settings)
     return _settings
 
