@@ -6211,6 +6211,7 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         updated_after: str | None = None,
         id_after: str | None = None,
         limit: int = 100,
+        include_content_hash: bool = False,
     ) -> list[Row]:
         params: list[Any] = []
         where = ""
@@ -6218,6 +6219,10 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             where = "WHERE updated > ? OR (updated = ? AND id > ?)"
             params.extend([updated_after, updated_after, id_after])
         params.append(limit)
+        # M12 item 4: SQLite has no stored content_hash column on memories, so
+        # the digest falls back to hashing ``content`` (which this projection
+        # already selects). The flag is accepted for ABC parity and changes no
+        # column here — see FederationRepository.fetch_memory_page.
         return await _fetch_all(
             self._conn(tx),
             "SELECT id, content, category, subcategory, metadata, owner_id, namespace, updated "

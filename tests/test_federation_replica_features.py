@@ -217,14 +217,20 @@ class FakeReplicaBackend:
 
         for _name in (
             "apply_consolidation_tombstone",
+            "count_exportable_rows",
+            "count_federated_missing_embeddings",
             "create_peer",
             "delete_federated_memory",
             "delete_peer",
             "feed_query",
             "fetch_memory_page",
+            "fetch_parity_page",
+            "fetch_source_export_keyset_page",
             "fetch_sync_log",
             "get_feed_memory",
             "list_due_peers",
+            "list_federated_missing_embeddings",
+            "redispatch_federation_journal",
             "update_peer",
             "upsert_peer",
         ):
@@ -289,6 +295,9 @@ class FakeReplicaBackend:
                 memories_updated,
                 error,
                 cursor_after,
+                events_received=0,
+                rows_without_embedding=0,
+                skipped_deleted=0,
             ):
                 self.sync_log[-1].update(
                     {
@@ -297,6 +306,9 @@ class FakeReplicaBackend:
                         "memories_updated": memories_updated,
                         "error": error,
                         "cursor_after": cursor_after,
+                        "events_received": events_received,
+                        "rows_without_embedding": rows_without_embedding,
+                        "skipped_deleted": skipped_deleted,
                     }
                 )
 
@@ -358,6 +370,11 @@ class FakeReplicaBackend:
                 row["federation_remote_updated"] = remote_updated
                 row["updated"] = remote_updated
                 return True
+
+            async def count_federated_rows_without_embedding_per_peer(self, tx):
+                # F-5: the durable per-peer embedding gap, as the backends
+                # compute it (rows of this peer with no vector).
+                return {}
 
             async def get_peer(self, tx, peer_id):
                 return dict(self.peer) if peer_id == self.peer["id"] else None
