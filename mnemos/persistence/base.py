@@ -2930,6 +2930,40 @@ class FederationRepository(ABC):
         ...
 
     @abstractmethod
+    async def fetch_source_charon_export_keyset_page(
+        self,
+        tx: Transaction,
+        *,
+        namespaces: Sequence[str] = (),
+        categories: Sequence[str] = (),
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        """One keyset page of the rows CHARON's export counts.
+
+        CHARON's export predicate (``eligible_for_federation_export``) is
+        deliberately WIDER than the feed's (``eligible_for_federation``):
+        it has no ``federation_source`` term, so a row that arrived here
+        from another peer is exportable by CHARON's definition even though
+        the journal never fires for it and the feed can therefore never
+        serve it. That difference is the F-2 "exportable but never pulled"
+        population -- the rows a replica can never receive, and the rows the
+        source's own by-id route answers with a 404.
+
+        The parity report needs BOTH sets to tell those rows apart: an id
+        that is exportable but not feed-servable is ``unreachable`` (a
+        different bug with a different fix), while an id that IS
+        feed-servable but absent from the replica is ``missing`` (the
+        deficit reconcile repairs). Comparing the CHARON set against the
+        replica without also reading the feed set conflates the two and
+        makes reconcile request ids the source can never serve.
+
+        Returns ``id`` + the stored ``content_hash`` (NULL when absent) in
+        ``id`` order, so a sweep never loads the whole population.
+        """
+        ...
+
+    @abstractmethod
     async def redispatch_federation_journal(
         self,
         tx: Transaction,
