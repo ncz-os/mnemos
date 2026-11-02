@@ -1281,3 +1281,45 @@ def reset_embedder() -> None:
     """Drop the process-wide singleton. Test-helper; not for production use."""
     global _embedder
     _embedder = None
+
+
+# ---------------------------------------------------------------------------
+# F-6 — the embedding-dimension contract.
+#
+# The contract itself lives in ``mnemos.runtime.embedding_contract`` (it
+# needs the runtime's own model table, and the persistence layer must be
+# able to import it without a layer inversion). It is re-exported HERE
+# because ``mnemos.runtime.embedder`` is the module every embedder caller
+# already imports, so the resolved identity and the startup check are one
+# import away from the code that writes vectors.
+# ---------------------------------------------------------------------------
+
+from mnemos.runtime.embedding_contract import (  # noqa: E402
+    FLEET_EMBEDDING_DIM,
+    FLEET_EMBEDDING_MODEL,
+    KNOWN_MODEL_WIDTHS,
+    EmbeddingContractReport,
+    EmbeddingIdentity,
+    check_embedding_contract,
+    embedding_identity,
+    embedding_identity_from_settings,
+    known_model_width,
+    verify_startup_embedding_contract,
+)
+
+__all__ = [
+    "EmbeddingContractReport",
+    "EmbeddingIdentity",
+    "FLEET_EMBEDDING_DIM",
+    "FLEET_EMBEDDING_MODEL",
+    "KNOWN_MODEL_WIDTHS",
+    "InProcessEmbedder",
+    "check_embedding_contract",
+    "embed_text",
+    "embedding_identity",
+    "embedding_identity_from_settings",
+    "get_embedder",
+    "known_model_width",
+    "reset_embedder",
+    "verify_startup_embedding_contract",
+]

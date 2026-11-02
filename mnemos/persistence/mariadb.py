@@ -1410,6 +1410,10 @@ class MariadbBackend(MysqlBackend):
         self._settings = settings
         self._closed = False
         self._memories_repo = MariadbMemoryRepository()
+        # The repository reads the live embedding width from the SAME
+        # target the startup dimension check inspects (MariaDB's join
+        # table, not ``memories``).
+        self._memories_repo._embedding_column_target = self._embedding_column_target
         try:
             self._memories_repo._expected_embedding_dim = int(
                 getattr(settings.database, "embedding_dim", _DEFAULT_EMBEDDING_DIM)

@@ -1035,6 +1035,22 @@ class MemoryRepository(ABC):
         with no visibility filter — only operators reach this path."""
         ...
 
+    @abstractmethod
+    async def embedding_column_dim(self, tx: Transaction) -> int | None:
+        """Return the LIVE width of this backend's embedding column.
+
+        ``None`` means "could not be determined" — the table is absent, the
+        catalog is unreadable, or the column carries no fixed width. A
+        backend that cannot answer MUST NOT guess: the F-6 startup
+        contract treats an unknown width as "no evidence", and a wrong
+        width would size the check against a column that does not exist.
+
+        The width is what the column was actually CREATED at, not what the
+        configuration says — the disagreement between the two is exactly
+        the drift this method exists to detect.
+        """
+        ...
+
 
 class KGRepository(ABC):
     """Knowledge graph triple persistence."""

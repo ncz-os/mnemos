@@ -82,6 +82,45 @@ def _config_model_config(*, env_prefix: str = "", extra: str = "ignore") -> Sett
     )
 
 
+#: The width the fleet standard embedding model (bge-m3) produces.
+FLEET_EMBEDDING_DIM = 1024
+
+#: The fallback width for an embedding model whose width is not known.
+#: Only reached when the configured model is not one this build knows,
+#: in which case there is nothing better to go on — and the F-6 startup
+#: contract is what turns "we guessed" into "we checked".
+_FALLBACK_EMBEDDING_DIM = 768
+
+
+def _default_embedding_dim() -> int:
+    """The default embedding width: the CONFIGURED MODEL's width.
+
+    F-6. The default used to be a hard-coded 768 while the default HTTP
+    embedding model (``bge-m3``) produces 1024 dimensions — the exact pair
+    that produced the PROTEUS field incident, where every write failed the
+    dimension guard and every search silently fell back to FTS.
+
+    The default therefore follows the model: a deployment that names a
+    different model gets that model's width for free, and a deployment
+    that names none gets the fleet standard (bge-m3, 1024-D) rather than
+    a number that contradicts it.
+
+    The model table lives in ``mnemos.runtime.embedding_contract``,
+    which imports this module for the environment — so the lookup is
+    deferred into the function to keep the dependency arrow one-way
+    (``core`` must not import ``runtime`` at module scope).
+    """
+    from mnemos.runtime.embedding_contract import known_model_width
+
+    try:
+        width = known_model_width()
+    except Exception:  # pragma: no cover - defensive; the table is static
+        width = None
+    if width:
+        return int(width)
+    return FLEET_EMBEDDING_DIM
+
+
 class _DatabaseSettings(BaseSettings):
     model_config = _config_model_config(env_prefix="PG_")
 
@@ -117,16 +156,21 @@ class _DatabaseSettings(BaseSettings):
         validation_alias=AliasChoices("MNEMOS_DB2_DIALECT", "PG_DB2_DIALECT"),
     )
     embedding_dim: int = Field(
-        768,
+        default_factory=_default_embedding_dim,
         validation_alias=AliasChoices("MNEMOS_EMBEDDING_DIM", "PG_EMBEDDING_DIM"),
         description=(
             "Vector dimension for the embedding column / sqlite-vec virtual table. "
-            "Default 768 matches nomic-embed-text and the OpenAI text-embedding-3-small "
-            "default. Override to match your embedding model: e.g. 512 for bge-small-zh-v1.5 "
-            "(used on Cix Sky1 NPU substrate), 1536 for OpenAI text-embedding-3-small at "
-            "full dim, 3072 for text-embedding-3-large. SQLite valid range is [1, 8192] "
-            "per sqlite-vec SQLITE_VEC_VEC0_MAX_DIMENSIONS. Postgres backends are sized "
-            "at schema-init time; switching dim on a populated DB requires a re-embed."
+            "The default FOLLOWS the embedding model: the fleet standard "
+            "(bge-m3) is 1024-dimensional, and shipping a 768-wide default "
+            "against it is the pair that produced the PROTEUS field incident "
+            "(24,986 NULL embeddings in a vector(768) column). Override to "
+            "match a different embedding model: e.g. 768 for nomic-embed-text "
+            "or bge-base-en-v1.5, 512 for bge-small-zh-v1.5 (used on the Cix "
+            "Sky1 NPU substrate), 1536 for text-embedding-3-small at full dim, "
+            "3072 for text-embedding-3-large. SQLite valid range is [1, 8192] "
+            "per sqlite-vec SQLITE_VEC_VEC0_MAX_DIMENSIONS. Postgres backends "
+            "are sized at schema-init time; switching dim on a populated DB "
+            "requires a re-embed."
         ),
     )
 
@@ -1153,33 +1197,43 @@ class Settings(BaseSettings):
 
     _explicit_fields: dict[str, set[str]] = PrivateAttr(default_factory=dict)
 
-    layers: _LayerSettings
-    database: _DatabaseSettings
-    graeae: _GraeaeSettings
-    server: _ServerSettings
-    services: _ProfileServiceSettings
-    webhook: _WebhookSettings
-    providers: _ProviderSettings
-    mcp: _MCPSettings
-    rate_limit: _RateLimitSettings
-    resilience: _ResilienceSettings
-    observability: _ObservabilitySettings
-    compression: _CompressionSettings
-    artemis: _ArtemisSettings
-    morpheus: _MorpheusSettings
-    persephone: _PersephoneSettings
-    kronos: KronosSettings
-    pantheon: PantheonSettings
-    knemon: KnemonSettings
-    federation: _FederationSettings
-    oauth: _OAuthSettings
-    auth: _AuthSettings
-    runtime: _RuntimeSettings
-    tools: _ToolSettings
-    logging: _LoggingSettings
-    nats: _NatsSettings
-    audit: _AuditSettings
-    hive_mind: _HiveMindSettings
+    # Every section defaults to its own model, so ``Settings()`` is a
+    # complete, valid configuration with no arguments. The F-6 embedding
+    # contract reads ``Settings().database.embedding_dim`` and
+    # ``Settings().providers...`` to answer "what is this deployment
+    # configured to do?", and it must be able to ask that of a plain
+    # Settings object — not only of the one the process happens to have
+    # built from TOML+env. Each section model already carries its own
+    # defaults, so constructing them here adds no new behaviour; it only
+    # removes the requirement that every caller assemble 28 sections by
+    # hand before it can read a value.
+    layers: _LayerSettings = Field(default_factory=_LayerSettings)
+    database: _DatabaseSettings = Field(default_factory=_DatabaseSettings)
+    graeae: _GraeaeSettings = Field(default_factory=_GraeaeSettings)
+    server: _ServerSettings = Field(default_factory=_ServerSettings)
+    services: _ProfileServiceSettings = Field(default_factory=_ProfileServiceSettings)
+    webhook: _WebhookSettings = Field(default_factory=_WebhookSettings)
+    providers: _ProviderSettings = Field(default_factory=_ProviderSettings)
+    mcp: _MCPSettings = Field(default_factory=_MCPSettings)
+    rate_limit: _RateLimitSettings = Field(default_factory=_RateLimitSettings)
+    resilience: _ResilienceSettings = Field(default_factory=_ResilienceSettings)
+    observability: _ObservabilitySettings = Field(default_factory=_ObservabilitySettings)
+    compression: _CompressionSettings = Field(default_factory=_CompressionSettings)
+    artemis: _ArtemisSettings = Field(default_factory=_ArtemisSettings)
+    morpheus: _MorpheusSettings = Field(default_factory=_MorpheusSettings)
+    persephone: _PersephoneSettings = Field(default_factory=_PersephoneSettings)
+    kronos: KronosSettings = Field(default_factory=KronosSettings)
+    pantheon: PantheonSettings = Field(default_factory=PantheonSettings)
+    knemon: KnemonSettings = Field(default_factory=KnemonSettings)
+    federation: _FederationSettings = Field(default_factory=_FederationSettings)
+    oauth: _OAuthSettings = Field(default_factory=_OAuthSettings)
+    auth: _AuthSettings = Field(default_factory=_AuthSettings)
+    runtime: _RuntimeSettings = Field(default_factory=_RuntimeSettings)
+    tools: _ToolSettings = Field(default_factory=_ToolSettings)
+    logging: _LoggingSettings = Field(default_factory=_LoggingSettings)
+    nats: _NatsSettings = Field(default_factory=_NatsSettings)
+    audit: _AuditSettings = Field(default_factory=_AuditSettings)
+    hive_mind: _HiveMindSettings = Field(default_factory=_HiveMindSettings)
 
     @model_validator(mode="after")
     def enforce_layer_direction(self) -> "Settings":
@@ -1742,7 +1796,37 @@ def set_runtime_env_value(name: str, value: str) -> None:
 
 
 def embedding_dim_env() -> int:
-    return int(runtime_env_value("MNEMOS_EMBEDDING_DIM", "768"))
+    """The configured embedding width, or the CONFIGURED MODEL's width.
+
+    F-6: when ``MNEMOS_EMBEDDING_DIM`` is not set, the width follows the
+    embedding model instead of a hard-coded number. The old default (768)
+    contradicted the default HTTP model (``bge-m3``, 1024-D), so a fresh
+    deployment provisioned a column the embedder could not fill.
+
+    An unparseable value is a configuration error the operator has to see,
+    so it falls back to the model's width rather than raising here: the
+    F-6 startup contract is where a genuine mismatch is reported with an
+    actionable message.
+    """
+    raw = runtime_env_value_stripped("MNEMOS_EMBEDDING_DIM")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return _default_embedding_dim()
+
+
+def embedding_dim_check_env() -> str:
+    """The F-6 startup contract check's switch.
+
+    ``"off"`` (or ``0``/``false``/``no``) turns the cross-check off for
+    an operator who has deliberately accepted a mismatch — for example a
+    node that is mid-re-embed, where refusing to serve is worse than
+    serving with a stale column. The default is on: the check exists
+    because the failure it prevents is silent.
+    """
+    return runtime_env_value_stripped("MNEMOS_EMBEDDING_DIM_CHECK", "on")
 
 
 def oracle_dsn_env() -> str:

@@ -857,6 +857,18 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
     # the inherited ``OracleMemoryRepository`` constructor signature.
     _settings: Any = None
 
+    async def embedding_column_dim(self, tx: Any) -> int | None:
+        """The live width of Db2's ``memories.embedding`` column.
+
+        Db2 reports the column type through ``SYSCAT.COLUMNS.TYPENAME``
+        (``VECTOR(1024, FLOAT32)``), which is a different catalog from
+        Oracle's ``ALL_TAB_COLUMNS`` — so the inherited Oracle read would
+        query the wrong catalog and answer "unknown" for every Db2 node.
+        """
+        from mnemos.persistence.schema import read_db2_embedding_column_dim
+
+        return await read_db2_embedding_column_dim(_conn_from_tx(tx))
+
     async def replace_memory_tags(
         self,
         tx: Any,

@@ -586,6 +586,82 @@ async def check_db2_embedding_dim(conn: Any, embedding_dim: int) -> None:
     )
 
 
+#: The catalog reads that answer "how wide is the live embedding column?".
+#: Each returns the backend's own type string (``vector(1024)``,
+#: ``VECTOR(1024, FLOAT32)``, ``float[1024]``) so one parser serves them all.
+_POSTGRES_EMBEDDING_DIM_SQL = """
+SELECT format_type(atttypid, atttypmod)
+  FROM pg_attribute
+ WHERE attrelid = 'memories'::regclass
+   AND attname = 'embedding'
+   AND NOT attisdropped
+"""
+
+_MYSQL_EMBEDDING_DIM_SQL = """
+SELECT COLUMN_TYPE
+  FROM information_schema.COLUMNS
+ WHERE TABLE_SCHEMA = DATABASE()
+   AND TABLE_NAME = %s
+   AND COLUMN_NAME = %s
+"""
+
+
+async def read_postgres_embedding_column_dim(conn: Any) -> int | None:
+    """The live width of Postgres' ``memories.embedding`` column, or None.
+
+    ``None`` means "could not be determined": the table is absent, the
+    column was dropped, or the catalog read failed. Never a guess.
+    """
+    try:
+        column_type = await conn.fetchval(_POSTGRES_EMBEDDING_DIM_SQL)
+    except Exception as exc:  # pragma: no cover - catalog privileges vary
+        _LOG.warning("Postgres embedding column width probe failed: %s", _first_line(exc))
+        return None
+    return _column_embed_dim(column_type)
+
+
+async def read_mysql_embedding_column_dim(conn: Any, table: str, column: str) -> int | None:
+    """The live width of a MySQL/MariaDB VECTOR column, or None."""
+    try:
+        async with conn.cursor() as cursor:
+            await cursor.execute(_MYSQL_EMBEDDING_DIM_SQL, (table, column))
+            row = await cursor.fetchone()
+    except Exception as exc:  # pragma: no cover - catalog privileges vary
+        _LOG.warning("MySQL embedding column width probe failed: %s", _first_line(exc))
+        return None
+    if not row:
+        return None
+    column_type = row.get("COLUMN_TYPE") if isinstance(row, Mapping) else row[0]
+    return _column_embed_dim(column_type)
+
+
+async def read_oracle_embedding_column_dim(conn: Any) -> int | None:
+    """The live width of Oracle's ``memories.embedding`` column, or None."""
+    return await _read_catalog_embedding_dim(conn, _ORACLE_EMBEDDING_DIM_SQL)
+
+
+async def read_db2_embedding_column_dim(conn: Any) -> int | None:
+    """The live width of Db2's ``memories.embedding`` column, or None."""
+    return await _read_catalog_embedding_dim(conn, _DB2_EMBEDDING_DIM_SQL)
+
+
+async def _read_catalog_embedding_dim(conn: Any, sql: str) -> int | None:
+    cursor = await _maybe_await(conn.cursor)
+    try:
+        try:
+            await _maybe_await(cursor.execute, sql)
+            row = await _maybe_await(cursor.fetchone)
+        except Exception as exc:  # pragma: no cover - catalog privileges vary
+            _LOG.warning("embedding column width probe failed: %s", _first_line(exc))
+            return None
+    finally:
+        await _maybe_await(cursor.close)
+    if row is None:
+        return None
+    column_type = row.get("DATA_TYPE") if isinstance(row, Mapping) else row[0]
+    return _column_embed_dim(column_type)
+
+
 async def _check_catalog_embedding_dim(
     conn: Any,
     sql: str,
@@ -1062,6 +1138,10 @@ __all__ = [
     "check_db2_embedding_dim",
     "check_oracle_embedding_dim",
     "embedding_dimension_mismatch",
+    "read_db2_embedding_column_dim",
+    "read_mysql_embedding_column_dim",
+    "read_oracle_embedding_column_dim",
+    "read_postgres_embedding_column_dim",
     "resolve_embedding_dim",
     "warn_embedding_dimension_mismatch",
     "split_db2_statements",
