@@ -34,7 +34,6 @@ from urllib.parse import unquote, urlparse
 
 from mnemos.core import eligibility as _eligibility
 from mnemos.core.config import db2_text_search_override, db2_vector_index_override
-from mnemos.core import eligibility as _eligibility
 from mnemos.core import webhook_constants
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.oracle import (
