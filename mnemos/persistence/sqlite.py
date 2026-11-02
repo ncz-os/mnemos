@@ -91,6 +91,8 @@ from mnemos.persistence.types import (
     MEMORY_COLS as _MEMORY_COLS,
     Row,
     assemble_consultation_full,
+    metadata_json_path,
+    normalize_metadata_eq,
 )
 from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
@@ -181,6 +183,8 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v7_2_federation_journal_narrow_trigger_sqlite.sql",
     # F-2: count the inbound events a locally soft-deleted replica skipped.
     "0069_federation_sync_skipped_deleted.sql",
+    # FB103: expression index behind GET /v1/memories?meta=job_id:X.
+    "migrations_v7_3_memory_metadata_eq_index_sqlite.sql",
 ]
 
 
@@ -1788,6 +1792,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         offset: int = 0,
         include_archived: bool = False,
         exclude_superseded: bool = False,
+        metadata_eq: Mapping[str, str] | None = None,
     ) -> tuple[list[Row], int]:
         conn = self._conn(tx)
         where_parts: list[str] = []
@@ -1796,6 +1801,14 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         if exclude_superseded:
             where_parts.append("consolidated_into IS NULL")
         params: list[Any] = []
+        for meta_key, meta_value in normalize_metadata_eq(metadata_eq).items():
+            # FB103: exact match on one top-level metadata field. The path is
+            # a literal so the json_extract expression index the migration
+            # creates can serve it; metadata_json_path validates the key, and
+            # the value stays bound. NULL / absent / non-string metadata
+            # yields NULL from json_extract, which never compares equal.
+            where_parts.append(f"json_extract(metadata, '{metadata_json_path(meta_key)}') = ?")
+            params.append(meta_value)
         if category is not None:
             where_parts.append("category = ?")
             params.append(category)

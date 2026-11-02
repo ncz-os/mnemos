@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeAlias
 
@@ -23,6 +25,65 @@ MEMORY_COLS = (
 # Backward-compatible persistence-layer alias for modules that still use the
 # historical private constant spelling.
 _MEMORY_COLS = MEMORY_COLS
+
+
+# ── exact-match metadata filter (FB103) ─────────────────────────────────────
+#
+# ``GET /v1/memories?meta=job_id:X`` answers "every memory whose metadata has
+# job_id == X" — the doctor's status read-back. FTS / substring search cannot:
+# it also returns rows that merely *mention* the id.
+#
+# SQLite, MySQL and Oracle only accept a JSON path as literal SQL text (a
+# computed path is either rejected or unusable by the index), so the KEY is
+# validated here and interpolated as a quoted path segment while the VALUE is
+# always a bound parameter. This module is the single place that check lives:
+# the persistence layer and the HTTP edge both call it.
+METADATA_EQ_KEY_PATTERN = r"[A-Za-z_][A-Za-z0-9_.-]{0,63}"
+METADATA_EQ_VALUE_MAX_LENGTH = 512
+METADATA_EQ_MAX_KEYS = 8
+
+_METADATA_EQ_KEY_RE = re.compile(rf"\A{METADATA_EQ_KEY_PATTERN}\Z")
+
+
+def normalize_metadata_eq(metadata_eq: Mapping[str, str] | None) -> dict[str, str]:
+    """Validate an exact-match metadata filter into plain ``{key: value}``.
+
+    Every key must be a plain JSON field name and every value a non-empty
+    string, so a caller cannot smuggle JSON-path syntax (or a second
+    predicate) through either side of the filter.
+    """
+    if metadata_eq is None:
+        return {}
+    if not isinstance(metadata_eq, Mapping):
+        raise ValueError("metadata_eq must be a mapping of metadata key to exact string value")
+    if len(metadata_eq) > METADATA_EQ_MAX_KEYS:
+        raise ValueError(f"metadata_eq accepts at most {METADATA_EQ_MAX_KEYS} keys")
+    out: dict[str, str] = {}
+    for key, value in metadata_eq.items():
+        if not isinstance(key, str) or not _METADATA_EQ_KEY_RE.match(key):
+            raise ValueError(f"metadata_eq key {key!r} must match {METADATA_EQ_KEY_PATTERN}")
+        if not isinstance(value, str):
+            raise ValueError(f"metadata_eq[{key!r}] must be a string")
+        if not value:
+            raise ValueError(f"metadata_eq[{key!r}] must not be empty")
+        if len(value) > METADATA_EQ_VALUE_MAX_LENGTH:
+            raise ValueError(
+                f"metadata_eq[{key!r}] must be at most {METADATA_EQ_VALUE_MAX_LENGTH} characters"
+            )
+        out[key] = value
+    return out
+
+
+def metadata_json_path(key: str) -> str:
+    """Return the quoted JSON path to one top-level metadata field.
+
+    Raises ``ValueError`` for anything that is not a plain key — this is the
+    guard that makes interpolating the path into SQL safe. Backends bind the
+    VALUE; only this validated path is ever concatenated into a statement.
+    """
+    if not isinstance(key, str) or not _METADATA_EQ_KEY_RE.match(key):
+        raise ValueError(f"metadata key {key!r} must match {METADATA_EQ_KEY_PATTERN}")
+    return f'$."{key}"'
 
 
 def _coerce_text(value: Any) -> str | None:

@@ -114,7 +114,7 @@ from mnemos.persistence.schema import (
     split_postgres_statements,
     warn_embedding_dimension_mismatch,
 )
-from mnemos.persistence.types import Row
+from mnemos.persistence.types import Row, metadata_json_path, normalize_metadata_eq
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 _LOG = logging.getLogger(__name__)
@@ -1977,6 +1977,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         offset: int = 0,
         include_archived: bool = False,
         exclude_superseded: bool = False,
+        metadata_eq: Mapping[str, str] | None = None,
     ) -> tuple[list[Row], int]:
         conn = tx.conn
         vis_clause, vis_params = _render_visibility(visibility, table_alias="m")
@@ -2001,6 +2002,14 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
                 f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
             )
             params.extend(tags)
+        for meta_key, meta_value in normalize_metadata_eq(metadata_eq).items():
+            # FB103: MySQL and MariaDB both accept the JSON *path* as a bind
+            # parameter, so nothing is interpolated here at all — the path
+            # comes from metadata_json_path (validated) purely so the same
+            # predicate shape is used everywhere. JSON_UNQUOTE is what turns
+            # a JSON string into a comparable SQL string.
+            where.append("JSON_UNQUOTE(JSON_EXTRACT(m.metadata, %s)) = %s")
+            params.extend((metadata_json_path(meta_key), meta_value))
         where_sql = " AND ".join(where)
 
         async with conn.cursor() as cursor:

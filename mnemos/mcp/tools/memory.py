@@ -8,6 +8,11 @@ from mnemos.core.auth_context import UserContext
 from mnemos.core.config import connector_default_namespace
 from mnemos.core.injection_defense import defend as _defend_untrusted
 from mnemos.domain.models import MAX_TAG_LENGTH, MAX_TAGS_PER_REQUEST
+from mnemos.persistence.types import (
+    METADATA_EQ_MAX_KEYS,
+    METADATA_EQ_VALUE_MAX_LENGTH,
+    normalize_metadata_eq,
+)
 
 from ._runtime import (
     MCP_BULK_CREATE_MAX_ITEMS,
@@ -265,6 +270,7 @@ async def tool_list_memories(
     tags: list[str] | None = None,
     limit: int = 20,
     offset: int = 0,
+    metadata_eq: dict[str, str] | None = None,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     limit = _bounded_int(
@@ -276,6 +282,10 @@ async def tool_list_memories(
     category = _validate_optional_filter(category, label="category")
     subcategory = _validate_optional_filter(subcategory, label="subcategory")
     tags = _validate_tags(tags)
+    # FB103: exact-match metadata read-back ("all memories with job_id == X").
+    # normalize_metadata_eq is the same guard the SQL builders use, so a
+    # hostile key is rejected here instead of becoming a JSON path.
+    metadata_pairs = normalize_metadata_eq(metadata_eq)
     params: dict[str, Any] = {}
     for key, value in {
         "category": category,
@@ -286,6 +296,8 @@ async def tool_list_memories(
     }.items():
         if value is not None:
             params[key] = value
+    if metadata_pairs:
+        params["meta"] = [f"{pair_key}:{pair_value}" for pair_key, pair_value in metadata_pairs.items()]
     ns = _connector_namespace()
     if ns:
         params["namespace"] = ns
@@ -444,7 +456,8 @@ TOOLS: dict[str, dict[str, Any]] = {
         tool_delete_memory,
     ),
     "list_memories": _tool(
-        "List memories with optional category/subcategory filter and pagination.",
+        "List memories with optional category/subcategory filter, exact metadata "
+        "match (e.g. metadata_eq={\"job_id\": \"J-1\"}) and pagination.",
         {
             "category": {"type": "string"},
             "subcategory": {"type": "string"},
@@ -456,6 +469,18 @@ TOOLS: dict[str, dict[str, Any]] = {
             },
             "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": MCP_DEFAULT_LIMIT_MAX},
             "offset": {"type": "integer", "default": 0, "minimum": 0, "maximum": MCP_OFFSET_MAX},
+            "metadata_eq": {
+                "type": "object",
+                "maxProperties": METADATA_EQ_MAX_KEYS,
+                "additionalProperties": {
+                    "type": "string",
+                    "maxLength": METADATA_EQ_VALUE_MAX_LENGTH,
+                },
+                "description": (
+                    "Exact-match filter on top-level metadata string fields; "
+                    "every pair must match the stored value exactly"
+                ),
+            },
         },
         [],
         tool_list_memories,

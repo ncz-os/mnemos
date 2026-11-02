@@ -74,7 +74,7 @@ from mnemos.persistence.oracle import (
 from mnemos.persistence.base import IsolationLevel, Transaction
 from mnemos.persistence.model_registry_unsupported import Db2ModelRegistryRepository
 from mnemos.persistence.schema import ensure_db2_schema
-from mnemos.persistence.types import Row
+from mnemos.persistence.types import Row, metadata_json_path, normalize_metadata_eq
 from mnemos.persistence.visibility import VisibilityFilter
 from mnemos.persistence.base import WebhookDeliveryIntent
 
@@ -1367,6 +1367,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         offset: int = 0,
         include_archived: bool = False,
         exclude_superseded: bool = False,
+        metadata_eq: Mapping[str, str] | None = None,
     ) -> tuple[list[Row], int]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -1395,6 +1396,13 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                     f"EXISTS (SELECT 1 FROM memory_tags mt WHERE mt.memory_id = m.id AND mt.tag IN ({placeholders}))"
                 )
                 params_list.extend(tags)
+            for meta_key, meta_value in normalize_metadata_eq(metadata_eq).items():
+                # FB103: Db2 writes this method natively (positional binds), so
+                # it does not inherit Oracle's named-bind shape. JSON_VALUE
+                # over the metadata CLOB is Db2's SQL/JSON reader; the path is
+                # the validated literal and the value is bound.
+                where.append(f"JSON_VALUE(m.metadata, '{metadata_json_path(meta_key)}') = ?")
+                params_list.append(meta_value)
             where_sql = " AND ".join(where)
 
             await _call(

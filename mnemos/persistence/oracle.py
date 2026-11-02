@@ -92,7 +92,12 @@ from mnemos.persistence.base import (
     WebhookSubscriptionRecord,
 )
 from mnemos.persistence.model_registry_unsupported import OracleModelRegistryRepository
-from mnemos.persistence.types import Row, assemble_consultation_full
+from mnemos.persistence.types import (
+    Row,
+    assemble_consultation_full,
+    metadata_json_path,
+    normalize_metadata_eq,
+)
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.persistence.schema import ensure_oracle_schema
@@ -1617,6 +1622,7 @@ class OracleMemoryRepository(MemoryRepository):
         offset: int = 0,
         include_archived: bool = False,
         exclude_superseded: bool = False,
+        metadata_eq: Mapping[str, str] | None = None,
     ) -> tuple[list[Row], int]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -1645,6 +1651,16 @@ class OracleMemoryRepository(MemoryRepository):
                     "EXISTS (SELECT 1 FROM memory_tags mt "
                     f"WHERE mt.memory_id = m.id AND mt.tag IN ({', '.join(placeholders)}))"
                 )
+            for index, (meta_key, meta_value) in enumerate(normalize_metadata_eq(metadata_eq).items()):
+                # FB103: Oracle takes a JSON path as literal text (a bind for
+                # the path raises ORA-40454), and the metadata column carries
+                # CHECK (... IS JSON), so JSON_VALUE is safe here. The path
+                # comes from metadata_json_path (validated); the value is a
+                # bind. Db2 inherits this method and its cursor layer
+                # rewrites the named binds to positional ones.
+                param_name = f"meta_{index}"
+                where.append(f"JSON_VALUE(m.metadata, '{metadata_json_path(meta_key)}') = :{param_name}")
+                params[param_name] = meta_value
             where_sql = " AND ".join(where)
 
             await _call(

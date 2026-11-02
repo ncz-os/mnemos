@@ -167,6 +167,7 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v7_1_model_registry_repository_sqlite.sql",
     "migrations_v7_2_federation_journal_narrow_trigger_sqlite.sql",  # F-4: narrowed journal trigger
     "0069_federation_sync_skipped_deleted.sql",  # F-2: soft-deleted replica skip counter
+    "migrations_v7_3_memory_metadata_eq_index_sqlite.sql",  # FB103: job_id metadata index
 ]
 
 

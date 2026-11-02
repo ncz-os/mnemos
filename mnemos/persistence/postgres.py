@@ -93,6 +93,7 @@ from mnemos.persistence.types import (
     MEMORY_COLS as _MEMORY_COLS,
     Row,
     assemble_consultation_full,
+    normalize_metadata_eq,
 )
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import webhook_constants
@@ -1202,6 +1203,7 @@ class PostgresMemoryRepository(MemoryRepository):
         offset: int = 0,
         include_archived: bool = False,
         exclude_superseded: bool = False,
+        metadata_eq: Mapping[str, str] | None = None,
     ) -> tuple[list[Row], int]:
         conn = _postgres_tx(tx).conn
         where_parts: list[str] = ["deleted_at IS NULL"]
@@ -1210,6 +1212,13 @@ class PostgresMemoryRepository(MemoryRepository):
         if exclude_superseded:
             where_parts.append("consolidated_into IS NULL")
         params: list[Any] = []
+        for meta_key, meta_value in normalize_metadata_eq(metadata_eq).items():
+            # FB103: jsonb containment, so both the key and the value are
+            # bind parameters and the gin(jsonb_path_ops) index from the
+            # 0070 migration serves it. Containment only matches a *string*
+            # value, which is what an exact status field always is.
+            params.append(json.dumps({meta_key: meta_value}))
+            where_parts.append(f"metadata @> ${len(params)}::jsonb")
         if category is not None:
             params.append(category)
             where_parts.append(f"category=${len(params)}")

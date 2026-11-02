@@ -8,7 +8,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from collections.abc import Callable
-from typing import Generic, Optional, TypeVar
+from typing import Any, Generic, Optional, TypeVar
 from uuid import uuid4
 
 import asyncpg
@@ -66,6 +66,7 @@ from mnemos.persistence.visibility import VisibilityFilter
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.persistence.base import DuplicateMemoryError
+from mnemos.persistence.types import METADATA_EQ_MAX_KEYS, normalize_metadata_eq
 from mnemos.persistence.nats_events import safe_subject_segment
 from mnemos.domain.models import (
     DEFAULT_SEMANTIC_FLOOR,
@@ -408,6 +409,26 @@ async def _bump_recall_counters(memory_ids: list) -> None:
         logger.warning(f"[RECALL] bump failed for {len(memory_ids)} ids: {e}")
 
 
+def _parse_metadata_eq_query(raw: Any) -> dict[str, str]:
+    """Turn repeated ``?meta=key:value`` params into an exact-match filter.
+
+    Split on the FIRST colon only, so a value may contain colons (timestamps,
+    URLs). Nothing is stripped: the match is exact, so ``meta=job_id:J-1 ``
+    asks for the value with the trailing space. Keys and values are then
+    validated by ``normalize_metadata_eq`` (which is also what the SQL
+    builders call), and a 400 names the offending pair.
+    """
+    if not isinstance(raw, list):
+        return {}
+    pairs: dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, str) or ":" not in item:
+            raise HTTPException(status_code=400, detail="meta must be key:value")
+        key, _, value = item.partition(":")
+        pairs[key] = value
+    return pairs
+
+
 @router.get("/memories", response_model=MemoryListResponse)
 async def list_memories(
     category: Optional[str] = None,
@@ -420,8 +441,22 @@ async def list_memories(
     limit: int = Query(20, ge=1, le=500),
     offset: int = Query(0, ge=0),
     operational: bool = False,
+    meta: Optional[list[str]] = Query(
+        None,
+        max_length=METADATA_EQ_MAX_KEYS,
+        description=(
+            "Exact-match filter on top-level metadata string fields, "
+            "repeatable as ``key:value``; all pairs must match"
+        ),
+    ),
     user: UserContext = Depends(get_current_user),
 ):
+    """List memories.
+
+    ``?meta=job_id:J-1`` answers "every memory whose metadata has "
+    ``job_id`` exactly ``J-1``" — the structured status read-back. FTS /
+    substring search also returns rows that merely mention the id.
+    """
     backend = _backend_or_503()
     # Cross-namespace request rejected explicitly for non-root —
     # don't silently scope and hide rows. Root callers may pass any
@@ -464,6 +499,10 @@ async def list_memories(
         offset = 0
     if not isinstance(tags, list):
         tags = None
+    try:
+        metadata_eq = normalize_metadata_eq(_parse_metadata_eq_query(meta))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     list_request = MemoryListRequest(
         category=category,
         subcategory=subcategory,
@@ -491,6 +530,7 @@ async def list_memories(
             offset=offset,
             include_archived=include_archived,
             exclude_superseded=exclude_superseded_effective,
+            metadata_eq=metadata_eq or None,
         )
         rows = await _attach_memory_tags(backend, tx, rows)
     redact = _should_redact_secrets(user, namespace=effective_namespace)

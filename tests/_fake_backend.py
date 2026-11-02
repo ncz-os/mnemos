@@ -18,6 +18,7 @@ lifecycle for the duration of a test.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -25,6 +26,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+from mnemos.persistence.types import normalize_metadata_eq
 from mnemos.persistence.postgres import (
     PostgresConsultationAuditRepository,
     PostgresConsultationsRepository,
@@ -68,6 +70,7 @@ class _FakeMemoryRepo:
         offset=0,
         include_archived=False,
         exclude_superseded=False,
+        metadata_eq=None,
     ):
         self.calls.append(
             (
@@ -81,6 +84,7 @@ class _FakeMemoryRepo:
                     "offset": offset,
                     "include_archived": include_archived,
                     "exclude_superseded": exclude_superseded,
+                    "metadata_eq": metadata_eq,
                 },
             )
         )
@@ -652,6 +656,7 @@ class _PoolBackedMemoryRepo:
         offset=0,
         include_archived=False,
         exclude_superseded=False,
+        metadata_eq=None,
     ):
         rows = self._rows(
             visibility,
@@ -661,6 +666,20 @@ class _PoolBackedMemoryRepo:
             include_archived=include_archived,
             exclude_superseded=exclude_superseded,
         )
+        # FB103: exact metadata match, mirroring the SQL predicate (absent
+        # key / non-string value / unparseable blob simply does not match).
+        for meta_key, meta_value in normalize_metadata_eq(metadata_eq).items():
+            matching: list[dict[str, Any]] = []
+            for row in rows:
+                blob = row.get("metadata")
+                if isinstance(blob, str):
+                    try:
+                        blob = json.loads(blob)
+                    except ValueError:
+                        blob = None
+                if isinstance(blob, dict) and blob.get(meta_key) == meta_value:
+                    matching.append(row)
+            rows = matching
         return rows[offset : offset + limit], len(rows)
 
     async def get_memory(self, tx, memory_id, *, visibility, include_archived=False):

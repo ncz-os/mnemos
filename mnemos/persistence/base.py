@@ -784,6 +784,7 @@ class MemoryRepository(ABC):
         offset: int = 0,
         include_archived: bool = False,
         exclude_superseded: bool = False,
+        metadata_eq: Mapping[str, str] | None = None,
     ) -> tuple[list[Row], int]:
         """List memories under the given visibility filter, ordered
         ``created DESC``.
@@ -792,6 +793,17 @@ class MemoryRepository(ABC):
         ``COUNT(*)`` over the same predicate (pre-LIMIT/OFFSET) so the
         handler can populate paged response totals without a second
         round-trip.
+
+        ``metadata_eq`` is an exact-match filter on top-level metadata
+        string fields, ANDed together: ``{"job_id": "J-1"}`` returns only
+        rows whose stored metadata has ``job_id`` exactly ``"J-1"``. It is
+        how a structured status checkpoint is read back — FTS / substring
+        search also matches rows that merely mention the id. Keys and
+        values are validated by ``normalize_metadata_eq``; the value is
+        always a bind parameter, only the (validated) JSON path is
+        interpolated. A backend that cannot express the predicate in SQL
+        must still honour it rather than ignore it, and the filter must
+        narrow the ``COUNT(*)`` as well.
         """
         ...
 
