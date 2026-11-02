@@ -28,6 +28,7 @@ when the value itself looks secret-grade, otherwise REDACT.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -256,16 +257,24 @@ _CRED_RECORD_RE = re.compile(
 # it is 64+ chars (SHA-256-token grade) AND not preceded by SHA/commit
 # context. 40-char SHAs in prose are left CLEAN by design.
 _HEX_BLOB_RE = re.compile(r"\b[0-9a-fA-F]{64,}\b")
-_SHA_CONTEXT_RE = re.compile(r"(?i)\b(sha|commit|sha256|sha-256|digest|hash|md5)\b")
+# FB112 (2026-11-02): underscore-aware, so the sha keyword inside a JSON-ish
+# status field name ("head_sha", "last_good_head_sha") — where `_` and `s` are
+# both word chars and `\b` alone can never fire — still counts as sha/commit
+# context for the 30-char window before a long hex blob.
+_SHA_CONTEXT_RE = re.compile(r"(?i)(?:\b|_)(sha|commit|sha256|sha-256|digest|hash|md5)(?:\b|_)")
 
 _PLACEHOLDER_RE = re.compile(
     r"(?i)\A(x{3,}|\*{3,}|<[^>]+>|your[_-]?\w+|changeme|placeholder|redacted|"
-    r"example|todo|none|null|n/?a|\.\.\.|\$\{?\w+\}?)\Z"
+    r"example|todo|none|null|n/?a|\.\.\.|\$\{?\w+\}?|__\w+__)\Z"
 )
 
 # Words that legitimately follow a secret-noun in ordinary prose and must
 # NOT be treated as the secret value: "password rotation", "password is
 # required", "password auth enabled", "credential management", etc.
+# FB112 (2026-11-02): numeric pass/coverage tallies and percentages are not
+# password values ("tests pass 412/412", "97.3%", "4895|2").
+_TALLY_VALUE_RE = re.compile(r"^(?:\d+[/.,|])+\d+%?$|^\d+%$")
+
 _PROSE_STOPWORDS: frozenset[str] = frozenset(
     {
         "is",
@@ -723,6 +732,130 @@ def verify_prefilter_superset() -> list[str]:
     return bad
 
 
+# ── FB112 (2026-11-02): typed status ids inside a structured body ─────────
+# Audit finding F2: a JSON status checkpoint stores ids (job_id), head/last
+# SHAs, a branch name and a verdict — identifiers, not credentials. The
+# generic detectors answered REDACT (hex64 / cred_record_token / prose_pass)
+# or VAULT for `KEY=__NAME_API_KEY__`-style placeholder bodies, which strips
+# the body (or 404s the non-root doctor). The exemption is deliberately
+# narrow: ONLY a JSON object body, ONLY the typed status keys below, ONLY a
+# value matching that key's strict shape, and only when the value carries no
+# vault-shape content (provider tokens, connection strings, prose passwords,
+# all-caps assignments, denylisted literals). A real secret under any key —
+# including an allowlisted one — keeps matching, so the vault stays sealed.
+_STATUS_SHA_VALUE_RE = re.compile(r"(?i)^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_STATUS_UUID_VALUE_RE = re.compile(
+    r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+# Bounded identifier slug: job_review ids like "J-ab12cd34" or hash-like ids;
+# 3+ chars, no whitespace, no separators that would end a JSON string early.
+_STATUS_ID_VALUE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:/-]{2,64}$")
+_STATUS_BRANCH_VALUE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_./-]{0,127}$")
+_STATUS_WORD_VALUE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_. -]{0,63}$")
+
+# key regex | allowed value shapes. `v` names the RAW (still-escaped) value
+# span; it is decoded and then validated, so the blanked region always covers
+# the full raw value the way it is stored.
+_STATUS_TYPED_FIELDS: tuple[tuple[re.Pattern[str], tuple[re.Pattern[str], ...]], ...] = (
+    (
+        re.compile(r'"(?i:job_id)"\s*:\s*"(?P<v>(?:[^"\\]|\\.)*)"'),
+        (_STATUS_SHA_VALUE_RE, _STATUS_UUID_VALUE_RE, _STATUS_ID_VALUE_RE),
+    ),
+    (
+        # any sha-suffixed key ("head_sha", "last_good_head_sha", "tree_sha")
+        re.compile(r'"(?i:[\w.-]*sha)"\s*:\s*"(?P<v>(?:[^"\\]|\\.)*)"'),
+        (_STATUS_SHA_VALUE_RE,),
+    ),
+    (
+        re.compile(r'"(?i:branch)"\s*:\s*"(?P<v>(?:[^"\\]|\\.)*)"'),
+        (_STATUS_BRANCH_VALUE_RE,),
+    ),
+    (
+        re.compile(r'"(?i:verdict)"\s*:\s*"(?P<v>(?:[^"\\]|\\.)*)"'),
+        (_STATUS_WORD_VALUE_RE,),
+    ),
+    (
+        re.compile(r'"(?i:phase)"\s*:\s*"(?P<v>(?:[^"\\]|\\.)*)"'),
+        (_STATUS_WORD_VALUE_RE,),
+    ),
+    (
+        re.compile(r'"(?i:reviewer_model)"\s*:\s*"(?P<v>(?:[^"\\]|\\.)*)"'),
+        (_STATUS_WORD_VALUE_RE,),
+    ),
+)
+
+# Detector families that must NEVER be exempted: their span alone escalates
+# to VAULT (or anchors a denylist hit). The generic hex64 / cred-record-token
+# families are deliberately NOT in this list — the whole point of the
+# allowance is that ids and long hex digest VALUES are not credentials, and
+# branch/ref half-slugs are (as the module already documents for 40-hex
+# SHAs) not passwords.
+_VAULT_SHAPES: tuple[re.Pattern[str], ...] = ()
+
+
+def _collect_vault_shapes() -> None:
+    """Gather every VAULT-capable detector pattern once (import time)."""
+    global _VAULT_SHAPES
+    shapes = [pat for _, pat in _HIGH_CONFIDENCE]
+    shapes.extend((_CONN_URI_RE, _BASIC_AUTH_URI_RE, _SSHPASS_RE, _ENV_SECRET_RE, _PROSE_PASS_RE, _PW_KV_RE))
+    _VAULT_SHAPES = tuple(shapes)
+
+
+_collect_vault_shapes()
+
+
+def _value_carries_vault_shape(value: str) -> bool:
+    """True if an allowlist candidate value is (or anchors) a real credential.
+
+    Checked on the DECODED value, so an escaped (`\u0041`) carrier cannot
+    sneak past its type regex while keeping its vault shape. Denylist hits
+    are checked first: a denylisted literal vaults wherever it appears, so it
+    must never be exempted even though its shape may look like an id.
+    """
+    if _is_denylisted(value):
+        return True
+    return any(pat.search(value) for pat in _VAULT_SHAPES)
+
+
+def _status_exempt_spans(text: str) -> list[tuple[int, int]]:
+    """Fake-value spans to blank inside ONE structured JSON status body.
+
+    Returns [] unless the WHOLE body parses as a single JSON object
+    (``json.loads`` -> dict), so ordinary prose keeps the exact behavior it
+    had. Each returned span covers the RAW value of an allowlisted typed
+    status field (never the key, delimiter or the rest of the body). Values
+    are validated per key, and vault-shaped values are refused, so real
+    secrets still classify and vault exactly as before.
+    """
+    try:
+        doc = json.loads(text)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(doc, dict):
+        return []
+    spans: list[tuple[int, int]] = []
+
+    def _covered(start: int, end: int) -> bool:
+        return any(s <= start and end <= e for s, e in spans)
+
+    for key_re, value_res in _STATUS_TYPED_FIELDS:
+        for mo in key_re.finditer(text):
+            raw = mo.group("v")
+            try:
+                value = json.loads('"' + raw + '"')
+            except ValueError:
+                value = raw
+            if not isinstance(value, str) or not any(r.match(value) for r in value_res):
+                continue
+            if _value_carries_vault_shape(value):
+                continue
+            start, end = mo.start("v"), mo.end("v")
+            if _covered(start, end):
+                continue
+            spans.append((start, end))
+    return spans
+
+
 def classify(content: str | None) -> SecretFinding:
     """Classify memory content into CLEAN / REDACT / VAULT.
 
@@ -746,6 +879,14 @@ def classify(content: str | None) -> SecretFinding:
     # full pattern battery (perf — see _prefilter_hits).
     if not _prefilter_hits(text):
         return finding
+
+    # FB112 (2026-11-02): blank the typed status ids of a structured JSON
+    # body so the detectors below never fire on them. Blanks keep the SAME
+    # length, so every span collected on the blanked text keeps its original
+    # coordinates; a value that carries vault-shape content (or fails its
+    # type check) is never blanked, so real secrets keep vaulting everywhere.
+    for _s, _e in _status_exempt_spans(text):
+        text = text[:_s] + " " * (_e - _s) + text[_e:]
 
     cred_span_count = 0  # distinct credential spans -> "predominantly" signal
 
@@ -807,6 +948,10 @@ def classify(content: str | None) -> SecretFinding:
                 quoted = bool(mo.group(2))
                 vgroup = 3 if quoted else 4
                 value = mo.group(vgroup)
+                if _TALLY_VALUE_RE.match(value):
+                    # FB112: a numeric pass/fail tally ("tests pass 412/412",
+                    # "97.3%", "4895|2") is a count, not a password value.
+                    continue
                 if not (quoted or _prose_value_is_credential(value)):
                     continue
             else:  # pw_kv: group 1 = opt quote, group 2 = value (explicit,
