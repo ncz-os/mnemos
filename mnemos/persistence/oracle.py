@@ -7470,6 +7470,84 @@ class OracleFederationRepository(FederationRepository):
             await _call(cursor.close)
         return {str(row["peer_name"]): int(row["n"]) for row in rows}
 
+    async def list_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        peer_name: str | None = None,
+    ) -> list[Row]:
+        """F-3: the local-embed queue -- pulled rows with no vector.
+
+        Oracle stores the vector in the inline ``memories.embedding``
+        column (VECTOR), so a NULL there is the missing-vector signal.
+        Keyset-paginated by ``id`` so a pass can walk the whole queue
+        without holding it in memory.
+        """
+        clauses = [
+            "federation_source IS NOT NULL",
+            "deleted_at IS NULL",
+            "archived_at IS NULL",
+            "consolidated_into IS NULL",
+            "embedding IS NULL",
+        ]
+        params: dict[str, Any] = {}
+        if after_id is not None:
+            clauses.append("id > :after_id")
+            params["after_id"] = after_id
+        if peer_name is not None:
+            clauses.append("federation_source = :peer_name")
+            params["peer_name"] = peer_name
+        params["row_limit"] = max(1, min(int(limit), 1000))
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "SELECT id AS id, content AS content, metadata AS metadata "
+                "FROM memories "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY id FETCH FIRST :row_limit ROWS ONLY",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def count_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str | None = None,
+    ) -> int:
+        """F-3: depth of the local-embed queue, optionally for one peer."""
+        clauses = [
+            "federation_source IS NOT NULL",
+            "deleted_at IS NULL",
+            "archived_at IS NULL",
+            "consolidated_into IS NULL",
+            "embedding IS NULL",
+        ]
+        params: dict[str, Any] = {}
+        if peer_name is not None:
+            clauses.append("federation_source = :peer_name")
+            params["peer_name"] = peer_name
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"SELECT COUNT(*) AS n FROM memories WHERE {' AND '.join(clauses)}",
+                params,
+            )
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        if not rows:
+            return 0
+        return int(next(iter(rows[0].values())))
+
     async def record_schema_abort(
         self,
         tx: Transaction,
@@ -8325,6 +8403,10 @@ class OracleBackend(OracleAuditJournalMixin):
     # Db2 inherits this fail-closed value.
     supports_webhooks = False
     supports_nats_dispatch_log = True  # backed by OracleNatsDispatchLogRepository, see .nats_dispatch_log
+    # F-3: the local-embed queue (the durable backfill for pulled rows that
+    # arrived without a vector).  Oracle implements the queue predicate
+    # against the inline memories.embedding column.
+    supports_federation_local_embed = True
 
     supports_listen_notify = False
     supports_advisory_locks = False

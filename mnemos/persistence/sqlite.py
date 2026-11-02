@@ -6716,6 +6716,84 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         )
         return {str(row["peer_name"]): int(row["n"]) for row in rows}
 
+    async def list_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        peer_name: str | None = None,
+    ) -> list[Row]:
+        """F-3: the local-embed queue -- pulled rows with no vector.
+
+        SQLite keeps the vector in the ``memory_embeddings`` join table
+        (that is what ``semantic_search`` reads) and MIRRORS it into
+        ``memories.embedding``. A row therefore counts as embedded when
+        EITHER carries a value -- the same rule
+        :meth:`count_federated_rows_without_embedding_per_peer` applies --
+        so a row the embedder has already written to one of the two
+        columns never sits in the queue again.
+
+        Keyset-paginated by ``id`` so a pass can walk the whole queue
+        without holding it in memory.
+        """
+        clauses = [
+            "m.federation_source IS NOT NULL",
+            "m.deleted_at IS NULL",
+            "m.archived_at IS NULL",
+            "m.consolidated_into IS NULL",
+            "m.embedding IS NULL",
+        ]
+        params: list[Any] = []
+        if after_id is not None:
+            clauses.append("m.id > ?")
+            params.append(after_id)
+        if peer_name is not None:
+            clauses.append("m.federation_source = ?")
+            params.append(peer_name)
+        params.append(max(1, min(int(limit), 1000)))
+        return await _fetch_all(
+            self._conn(tx),
+            "SELECT m.id AS id, m.content AS content, m.metadata AS metadata "
+            "FROM memories m "
+            "LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
+            f"WHERE {' AND '.join(clauses)} "
+            "AND me.embedding IS NULL "
+            "ORDER BY m.id LIMIT ?",
+            tuple(params),
+        )
+
+    async def count_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str | None = None,
+    ) -> int:
+        """F-3: depth of the local-embed queue, optionally for one peer."""
+        clauses = [
+            "m.federation_source IS NOT NULL",
+            "m.deleted_at IS NULL",
+            "m.archived_at IS NULL",
+            "m.consolidated_into IS NULL",
+            "m.embedding IS NULL",
+        ]
+        params: list[Any] = []
+        if peer_name is not None:
+            clauses.append("m.federation_source = ?")
+            params.append(peer_name)
+        rows = await _fetch_all(
+            self._conn(tx),
+            "SELECT COUNT(*) AS n "
+            "FROM memories m "
+            "LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
+            f"WHERE {' AND '.join(clauses)} "
+            "AND me.embedding IS NULL",
+            tuple(params),
+        )
+        if not rows:
+            return 0
+        return int(next(iter(rows[0].values())))
+
     async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None:
         await _execute(
             self._conn(tx),
@@ -7465,6 +7543,10 @@ class SqliteBackend:
     # append outbox rows, but advertising delivery support strands those rows.
     supports_webhooks = False
     supports_nats_dispatch_log = True  # backed by SqliteNatsDispatchLogRepository, see .nats_dispatch_log
+    # F-3: the local-embed queue (the durable backfill for pulled rows that
+    # arrived without a vector).  SQLite implements the queue predicate
+    # against the memory_embeddings join table.
+    supports_federation_local_embed = True
     uses_sqlite_vec = True
     uses_fts5 = True
     # On SQLite, insert_memory writes memories.embedding but semantic_search

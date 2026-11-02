@@ -1398,6 +1398,10 @@ class MariadbBackend(MysqlBackend):
     supports_mariadb_vector = True
     supports_webhooks = False
     supports_nats_dispatch_log = True  # backed by MariadbNatsDispatchLogRepository, see .nats_dispatch_log
+    # F-3: the local-embed queue (the durable backfill for pulled rows that
+    # arrived without a vector).  MariaDB implements the queue predicate
+    # against the memory_embeddings join table.
+    supports_federation_local_embed = True
     inline_embedding_searchable = True
     _supports_core_persistence = True
 

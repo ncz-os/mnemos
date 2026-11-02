@@ -6003,6 +6003,10 @@ class Db2BackendNative(Db2Backend):
     supports_row_level_security = False
     supports_pgvector = False
     supports_db2_vector = True
+    # F-3: the local-embed queue (the durable backfill for pulled rows that
+    # arrived without a vector).  Db2 implements the queue predicate
+    # against the inline memories.embedding column.
+    supports_federation_local_embed = True
 
     # The native cursor rejects ``FROM DUAL`` (it does no Oracle->Db2 token
     # translation), so the inherited open()/ping() liveness probe must use

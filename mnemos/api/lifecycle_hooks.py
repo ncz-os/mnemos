@@ -137,6 +137,41 @@ def _federation_sync_worker(pool: Any):
     return federation_worker_loop(backend)
 
 
+def _federation_local_embed_worker(pool: Any):
+    """F-3: embed the pulled federation rows that arrived without a vector.
+
+    A replica stores a pulled row with ``embedding IS NULL`` whenever it
+    cannot use the peer's vector.  Vector search excludes NULL-embedding
+    rows, so those rows stay invisible to semantic recall until something
+    embeds them HERE.  This worker is that something: it drains the
+    ``federation_source IS NOT NULL AND no vector`` queue the persistence
+    ABC exposes.
+
+    The backend must advertise ``supports_federation_local_embed``; a
+    backend that cannot express the queue predicate must not run a worker
+    that would report "nothing to do" forever.
+    """
+    from mnemos.core.config import get_settings
+
+    if not service_enabled(get_settings(), "federation_local_embed_worker"):
+        logger.info("federation local-embed worker disabled by profile service manifest")
+        return None
+
+    from mnemos.domain.federation.local_embed import federation_local_embed_loop
+
+    backend = lifecycle._persistence_backend
+    if backend is None:
+        raise RuntimeError("federation local-embed worker requires an initialized persistence backend")
+    if not getattr(backend, "supports_federation_local_embed", False):
+        logger.warning(
+            "federation local-embed worker not started: backend %s does not "
+            "implement the federated-missing-embeddings queue",
+            type(backend).__name__,
+        )
+        return None
+    return federation_local_embed_loop(backend)
+
+
 def _deletion_request_worker(_pool: Any):
     from mnemos.core.config import get_settings
 
@@ -407,6 +442,7 @@ def register_lifespan_hooks() -> None:
     lifecycle.register_lifespan_worker("webhook retry repair worker", _webhook_repair_worker)
     lifecycle.register_lifespan_worker("webhook delivery recovery worker", _webhook_delivery_worker)
     lifecycle.register_lifespan_worker("federation sync worker", _federation_sync_worker)
+    lifecycle.register_lifespan_worker("federation local-embed worker", _federation_local_embed_worker)
     lifecycle.register_post_db_startup_hook("federation nats consumers", _federation_nats_post_db_hook)
     lifecycle.register_post_db_startup_hook("webhook nats trigger", _webhook_nats_post_db_hook)
     lifecycle.register_post_db_startup_hook(

@@ -5958,6 +5958,70 @@ class PostgresFederationRepository(FederationRepository):
         )
         return {str(row["peer_name"]): int(row["n"]) for row in rows}
 
+    async def list_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        peer_name: str | None = None,
+    ) -> list[Row]:
+        """F-3: the local-embed queue -- pulled rows with no vector.
+
+        Postgres keeps the vector in the inline ``memories.embedding``
+        column (pgvector), so a NULL there is the missing-vector signal.
+        Keyset-paginated by ``id`` so a pass can walk the whole queue
+        without holding it in memory.
+        """
+        clauses = [
+            "federation_source IS NOT NULL",
+            "deleted_at IS NULL",
+            "archived_at IS NULL",
+            "consolidated_into IS NULL",
+            "embedding IS NULL",
+        ]
+        params: list[Any] = []
+        if after_id is not None:
+            clauses.append(f"id > ${len(params) + 1}")
+            params.append(after_id)
+        if peer_name is not None:
+            clauses.append(f"federation_source = ${len(params) + 1}")
+            params.append(peer_name)
+        params.append(max(1, min(int(limit), 1000)))
+        return list(
+            await _postgres_tx(tx).conn.fetch(
+                "SELECT id AS id, content AS content, metadata AS metadata "
+                "FROM memories "
+                f"WHERE {' AND '.join(clauses)} "
+                f"ORDER BY id LIMIT ${len(params)}",
+                *params,
+            )
+        )
+
+    async def count_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str | None = None,
+    ) -> int:
+        """F-3: depth of the local-embed queue, optionally for one peer."""
+        clauses = [
+            "federation_source IS NOT NULL",
+            "deleted_at IS NULL",
+            "archived_at IS NULL",
+            "consolidated_into IS NULL",
+            "embedding IS NULL",
+        ]
+        params: list[Any] = []
+        if peer_name is not None:
+            clauses.append(f"federation_source = ${len(params) + 1}")
+            params.append(peer_name)
+        row = await _postgres_tx(tx).conn.fetchrow(
+            f"SELECT COUNT(*) AS n FROM memories WHERE {' AND '.join(clauses)}",
+            *params,
+        )
+        return int(row["n"]) if row else 0
+
     async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
         return list(
             await _postgres_tx(tx).conn.fetch(
@@ -7506,6 +7570,10 @@ class PostgresBackend:
     supports_pgvector = True
     supports_webhooks = True  # backed by PostgresWebhookRepository, see .webhooks
     supports_nats_dispatch_log = True  # backed by PostgresNatsDispatchLogRepository, see .nats_dispatch_log
+    # F-3: the local-embed queue (the durable backfill for pulled rows that
+    # arrived without a vector).  Postgres implements the queue predicate
+    # against the inline memories.embedding column.
+    supports_federation_local_embed = True
 
     def __init__(self, pool: asyncpg.Pool, settings: Any):
         self._pool = pool

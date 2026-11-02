@@ -2630,6 +2630,7 @@ class FederationRepository(ABC):
     # simply resumes and the row can never be "lost" between the sync and the
     # worker. The worker (mnemos.domain.federation.local_embed) drains it.
 
+    @abstractmethod
     async def list_federated_missing_embeddings(
         self,
         tx: Transaction,
@@ -2645,12 +2646,17 @@ class FederationRepository(ABC):
         whole queue without holding it in memory. Each row carries ``id``,
         ``content`` and ``metadata`` (the secret-redaction source).
 
-        The default implementation is a no-op returning an empty list; a
-        backend that cannot express the predicate keeps the old behaviour
-        (the rows are still reported as ``rows_without_embedding``).
+        Every backend implements this: the "has no vector" test is
+        per-dialect (an inline ``memories.embedding`` column on
+        Postgres/Oracle/Db2/MySQL, a ``memory_embeddings`` join table on
+        SQLite/MariaDB), so it lives on the backend's repository. A silent
+        no-op here would report "nothing to do" forever on the backends that
+        inherited it -- the exact failure mode the ABC-first rule exists to
+        prevent.
         """
-        return []
+        ...
 
+    @abstractmethod
     async def count_federated_missing_embeddings(
         self,
         tx: Transaction,
@@ -2662,10 +2668,10 @@ class FederationRepository(ABC):
         The queue depth. ``peer_name`` narrows it to one peer so an
         operator can see WHICH peer lags; ``None`` is the whole queue.
 
-        The default implementation returns 0; see
-        :meth:`list_federated_missing_embeddings` for why.
+        Implemented on every backend for the same reason as
+        :meth:`list_federated_missing_embeddings`.
         """
-        return 0
+        ...
 
     @abstractmethod
     async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]: ...

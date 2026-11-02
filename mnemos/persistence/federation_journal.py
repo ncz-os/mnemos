@@ -312,10 +312,33 @@ async def feed_query(
 # ``memories.embedding`` column on Postgres/Oracle/Db2/MySQL, a
 # ``memory_embeddings`` join table on SQLite/MariaDB -- so the "has no
 # vector" test is per-dialect and lives on each backend's repository.
+#
+# Two dialect facts have to travel WITH the query, not be guessed from it:
+#
+# * the SHAPE (inline column vs. join table) -- pushed in as ``join_table``;
+# * the PLACEHOLDER STYLE -- qmark (``?``) for SQLite/Db2, percent (``%s``)
+#   for MySQL/MariaDB, dollar (``$N``) for Postgres, named (``:name``) for
+#   Oracle.
+#
+# The placeholder style was the defect this helper used to have: it hardcoded
+# the qmark form while accepting only a boolean dialect hint, so every caller
+# that routes through it bound a qmark against a driver that wants ``%s`` or
+# ``:n``. The style is now resolved from the transaction's dialect by
+# ``_Ops.sql``, exactly like every other shared lifecycle query.
 
+#: The inline-``memories.embedding`` predicate (Postgres/Oracle/Db2/MySQL).
 _MISSING_EMBEDDING_INLINE = (
     "federation_source IS NOT NULL AND embedding IS NULL "
     "AND deleted_at IS NULL AND archived_at IS NULL AND consolidated_into IS NULL"
+)
+
+#: The ``memory_embeddings`` join-table predicate (SQLite/MariaDB).
+_MISSING_EMBEDDING_JOIN = (
+    "m.federation_source IS NOT NULL "
+    "AND m.deleted_at IS NULL "
+    "AND m.archived_at IS NULL "
+    "AND m.consolidated_into IS NULL "
+    "AND me.embedding IS NULL"
 )
 
 
@@ -327,19 +350,18 @@ def missing_embedding_predicate(*, join_table: bool) -> str:
     backends with an inline ``memories.embedding`` column (Postgres, Oracle,
     Db2, MySQL).
     """
-    if join_table:
-        return (
-            "m.federation_source IS NOT NULL "
-            "AND m.deleted_at IS NULL "
-            "AND m.archived_at IS NULL "
-            "AND m.consolidated_into IS NULL "
-            "AND me.embedding IS NULL"
-        )
-    return _MISSING_EMBEDDING_INLINE
+    return _MISSING_EMBEDDING_JOIN if join_table else _MISSING_EMBEDDING_INLINE
 
 
 async def count_federated_missing_embeddings(tx, *, peer_name=None, join_table: bool) -> int:
-    """Depth of the local-embed queue, optionally for one peer."""
+    """Depth of the local-embed queue, optionally for one peer.
+
+    The query is written with the qmark placeholder and handed to ``_Ops``,
+    which rewrites the marker to the transaction's dialect (``%s`` for
+    MySQL/MariaDB, ``$N`` for Postgres, ``:n`` for Oracle, ``?`` for
+    SQLite/Db2). The peer filter is bound as a PARAMETER, never
+    interpolated, so a peer name can never become SQL.
+    """
     ops = _ops(tx)
     predicate = missing_embedding_predicate(join_table=join_table)
     if join_table:
@@ -348,11 +370,13 @@ async def count_federated_missing_embeddings(tx, *, peer_name=None, join_table: 
             "LEFT JOIN memory_embeddings me ON me.memory_id = m.id "
             f"WHERE {predicate}"
         )
+        peer_column = "m.federation_source"
     else:
         sql = f"SELECT COUNT(*) AS n FROM memories WHERE {predicate}"
+        peer_column = "federation_source"
     params: list[Any] = []
     if peer_name is not None:
-        sql += " AND federation_source = ?"
+        sql += f" AND {peer_column} = ?"
         params.append(peer_name)
     row = await ops.fetchone(sql, *params)
     return int(next(iter(row.values()))) if row else 0

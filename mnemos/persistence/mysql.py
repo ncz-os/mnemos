@@ -7550,6 +7550,77 @@ class MysqlFederationRepository(FederationRepository):
             rows = await _fetch_all_dicts(cursor)
         return {str(row["peer_name"]): int(row["n"]) for row in rows}
 
+    async def list_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        after_id: str | None = None,
+        limit: int = 100,
+        peer_name: str | None = None,
+    ) -> list[Row]:
+        """F-3: the local-embed queue -- pulled rows with no vector.
+
+        MySQL keeps the vector in the inline ``memories.embedding``
+        VECTOR column, so a NULL there is the missing-vector signal.
+        MariaDB has no such column (it uses the ``memory_embeddings``
+        join table) and overrides this method.
+
+        Keyset-paginated by ``id`` so a pass can walk the whole queue
+        without holding it in memory.
+        """
+        clauses = [
+            "federation_source IS NOT NULL",
+            "deleted_at IS NULL",
+            "archived_at IS NULL",
+            "consolidated_into IS NULL",
+            "embedding IS NULL",
+        ]
+        params: list[Any] = []
+        if after_id is not None:
+            clauses.append("id > %s")
+            params.append(after_id)
+        if peer_name is not None:
+            clauses.append("federation_source = %s")
+            params.append(peer_name)
+        params.append(max(1, min(int(limit), 1000)))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT id AS id, content AS content, metadata AS metadata "
+                "FROM memories "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY id LIMIT %s",
+                tuple(params),
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def count_federated_missing_embeddings(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str | None = None,
+    ) -> int:
+        """F-3: depth of the local-embed queue, optionally for one peer."""
+        clauses = [
+            "federation_source IS NOT NULL",
+            "deleted_at IS NULL",
+            "archived_at IS NULL",
+            "consolidated_into IS NULL",
+            "embedding IS NULL",
+        ]
+        params: list[Any] = []
+        if peer_name is not None:
+            clauses.append("federation_source = %s")
+            params.append(peer_name)
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"SELECT COUNT(*) AS n FROM memories WHERE {' AND '.join(clauses)}",
+                tuple(params),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        if not rows:
+            return 0
+        return int(next(iter(rows[0].values())))
+
     async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
@@ -8241,6 +8312,10 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
     supports_mysql_vector = True  # MySQL 9.0 native VECTOR
     supports_webhooks = False
     supports_nats_dispatch_log = True  # backed by MysqlNatsDispatchLogRepository, see .nats_dispatch_log
+    # F-3: the local-embed queue (the durable backfill for pulled rows that
+    # arrived without a vector).  MySQL implements the queue predicate
+    # against the inline memories.embedding column.
+    supports_federation_local_embed = True
     _supports_core_persistence = True
     _supports_oauth_persistence = True
     # (table, column) the M8 startup dimension check inspects. MySQL keeps
