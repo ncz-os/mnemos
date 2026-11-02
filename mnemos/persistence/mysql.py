@@ -7856,6 +7856,9 @@ class MysqlFederationRepository(FederationRepository):
             return int(cursor.rowcount or 0) > 0
 
     async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int:
+        # A withdrawal owns the replica's whole lifecycle: deleting a row this
+        # node already soft-deleted is idempotent, and leaving it behind meant a
+        # ghost row that only SQLite did not have.
         local_id = f"fed:{peer_name}:{memory_id}"
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
@@ -7863,7 +7866,6 @@ class MysqlFederationRepository(FederationRepository):
                 DELETE FROM memories
                  WHERE id IN (%s, %s)
                    AND federation_source = %s
-                   AND deleted_at IS NULL
                 """,
                 (memory_id, local_id, peer_name),
             )

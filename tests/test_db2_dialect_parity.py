@@ -1804,8 +1804,12 @@ async def test_db2_memory_gather_stats_native_tokens() -> None:
     cat_sql = calls[1]["sql"].upper()
     assert "COUNT(*)" in agg_sql
     assert "AVG(QUALITY_RATING)" in agg_sql
-    assert "LOCATE('\"FEDERATION_ORIGIN\"'" in agg_sql
-    assert "COALESCE(METADATA, ''" in agg_sql
+    # FB101/P4: replicas are counted by the federation_source column, not by
+    # searching metadata for a "federation_origin" key nothing writes.
+    assert "FEDERATION_SOURCE IS NULL" in agg_sql
+    assert "FEDERATION_SOURCE IS NOT NULL" in agg_sql
+    assert "FEDERATION_ORIGIN" not in agg_sql
+    assert "COALESCE(METADATA, ''" not in agg_sql
     assert "DBMS_LOB" not in agg_sql
     assert "INSTR" not in agg_sql
     assert "SYSTIMESTAMP" not in agg_sql

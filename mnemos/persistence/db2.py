@@ -1727,15 +1727,16 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
+            # A replica is identified by its federation_source column. Nothing
+            # writes a "federation_origin" metadata key, so the previous LOCATE
+            # search counted every replica as native.
             await _call(
                 cursor.execute,
                 """
                 SELECT COUNT(*) AS total,
-                       SUM(CASE WHEN metadata IS NULL
-                                 OR LENGTH(COALESCE(metadata, '')) = 0
-                                 OR LOCATE('\"federation_origin\"', COALESCE(metadata, '')) = 0
+                       SUM(CASE WHEN federation_source IS NULL
                                 THEN 1 ELSE 0 END) AS native_count,
-                       SUM(CASE WHEN LOCATE('\"federation_origin\"', COALESCE(metadata, '')) > 0
+                       SUM(CASE WHEN federation_source IS NOT NULL
                                 THEN 1 ELSE 0 END) AS federated_count,
                        AVG(quality_rating) AS avg_quality
                   FROM memories
@@ -3913,6 +3914,11 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
         canonical_remote_id: str,
         peer_name: str,
     ) -> bool:
+        # The side table keeps the remote pointers, and the canonical pointer
+        # lives on the row itself as it does on Postgres: memories.consolidated_into
+        # has existed since migrations_db2/0045_consolidated_into.sql. Soft-deleting
+        # the loser instead re-exported every consolidation as a withdrawal, so a
+        # downstream peer deleted the row rather than consolidating it.
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
@@ -3961,21 +3967,36 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 cursor.execute,
                 """
                 UPDATE memories
-                   SET deleted_at = CURRENT TIMESTAMP
+                   SET consolidated_into = ?,
+                       consolidated_at = COALESCE(
+                           CAST(? AS TIMESTAMP),
+                           CURRENT TIMESTAMP
+                       ),
+                       permission_mode = 400
                  WHERE id = ?
                    AND deleted_at IS NULL
+                   AND (consolidated_into IS NULL OR consolidated_into <> ?)
                    AND EXISTS (
                        SELECT 1 FROM memories c
                         WHERE c.id = ? AND c.deleted_at IS NULL
                    )
                 """,
-                (local_id, local_canonical_id),
+                (
+                    local_canonical_id,
+                    consolidated_at,
+                    local_id,
+                    local_canonical_id,
+                    local_canonical_id,
+                ),
             )
             return int(getattr(cursor, "rowcount", 0) or 0) > 0
         finally:
             await _call(cursor.close)
 
     async def delete_federated_memory(self, tx: Any, peer_name: str, memory_id: str) -> int:
+        # A withdrawal owns the replica's whole lifecycle: deleting a row this
+        # node already soft-deleted is idempotent, and leaving it behind meant a
+        # ghost row that only SQLite did not have.
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
@@ -3985,7 +4006,6 @@ class Db2FederationRepository(_Db2OraCompatMixin, OracleFederationRepository):
                 DELETE FROM memories
                  WHERE id IN (?, ?)
                    AND federation_source = ?
-                   AND deleted_at IS NULL
                 """,
                 (memory_id, f"fed:{peer_name}:{memory_id}", peer_name),
             )

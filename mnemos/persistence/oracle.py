@@ -1533,16 +1533,16 @@ class OracleMemoryRepository(MemoryRepository):
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
+            # A replica is identified by its federation_source column. Nothing
+            # writes a "federation_origin" metadata key, so the previous
+            # DBMS_LOB search counted every replica as native.
             await _call(
                 cursor.execute,
                 """
                 SELECT
                     COUNT(*) AS total,
-                    SUM(CASE WHEN metadata IS NULL OR DBMS_LOB.GETLENGTH(metadata) = 0
-                              OR INSTR(metadata, '\"federation_origin\"') = 0
-                             THEN 1 ELSE 0 END) AS native_count,
-                    SUM(CASE WHEN INSTR(metadata, '\"federation_origin\"') > 0
-                             THEN 1 ELSE 0 END) AS federated_count,
+                    SUM(CASE WHEN federation_source IS NULL THEN 1 ELSE 0 END) AS native_count,
+                    SUM(CASE WHEN federation_source IS NOT NULL THEN 1 ELSE 0 END) AS federated_count,
                     AVG(quality_rating) AS avg_quality
                   FROM memories
                  WHERE deleted_at IS NULL
@@ -7795,10 +7795,12 @@ class OracleFederationRepository(FederationRepository):
         canonical_remote_id: str,
         peer_name: str,
     ) -> bool:
-        # Oracle schema lacks the memories.consolidated_into column the
-        # Postgres path mutates. Instead we record the tombstone in the
-        # dedicated federation_consolidation_tombstones table and
-        # soft-delete the source row so re-pulls do not resurrect it.
+        # The side table keeps the remote pointers for the audit trail, and the
+        # canonical pointer lives on the row itself, exactly as on Postgres:
+        # memories.consolidated_into has existed since
+        # migrations_oracle/0045_consolidated_into.sql. Soft-deleting the loser
+        # instead re-exported every Oracle consolidation as a withdrawal, so
+        # downstream peers deleted the row rather than consolidating it.
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
@@ -7838,21 +7840,34 @@ class OracleFederationRepository(FederationRepository):
                 cursor.execute,
                 """
                 UPDATE memories
-                   SET deleted_at = SYSTIMESTAMP
+                   SET consolidated_into = :canonical_id,
+                       consolidated_at = NVL(
+                           CAST(:consolidated_at AS TIMESTAMP WITH TIME ZONE),
+                           SYSTIMESTAMP
+                       ),
+                       permission_mode = 400
                  WHERE id = :id
                    AND deleted_at IS NULL
+                   AND (consolidated_into IS NULL OR consolidated_into <> :canonical_id)
                    AND EXISTS (
                        SELECT 1 FROM memories c
                         WHERE c.id = :canonical_id AND c.deleted_at IS NULL
                    )
                 """,
-                {"id": local_id, "canonical_id": local_canonical_id},
+                {
+                    "id": local_id,
+                    "canonical_id": local_canonical_id,
+                    "consolidated_at": consolidated_at,
+                },
             )
             return int(getattr(cursor, "rowcount", 0) or 0) > 0
         finally:
             await _call(cursor.close)
 
     async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int:
+        # A withdrawal owns the replica's whole lifecycle: deleting a row this
+        # node already soft-deleted is idempotent, and leaving it behind meant a
+        # ghost row that only SQLite did not have.
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
         try:
@@ -7862,7 +7877,6 @@ class OracleFederationRepository(FederationRepository):
                 DELETE FROM memories
                  WHERE id IN (:id, :local_id)
                    AND federation_source = :peer
-                   AND deleted_at IS NULL
                 """,
                 {"id": memory_id, "local_id": f"fed:{peer_name}:{memory_id}", "peer": peer_name},
             )

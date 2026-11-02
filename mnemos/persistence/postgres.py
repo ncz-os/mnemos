@@ -6244,13 +6244,15 @@ class PostgresFederationRepository(FederationRepository):
         return _pg_result_count(result) > 0
 
     async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int:
+        # A withdrawal owns the replica's whole lifecycle: deleting a row this
+        # node already soft-deleted is idempotent, and leaving it behind meant a
+        # ghost row that only SQLite did not have.
         local_id = f"fed:{peer_name}:{memory_id}"
         result = await _postgres_tx(tx).conn.execute(
             """
             DELETE FROM memories
             WHERE id = $1
               AND federation_source = $2
-              AND deleted_at IS NULL
             """,
             local_id,
             peer_name,

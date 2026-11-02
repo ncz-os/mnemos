@@ -2154,35 +2154,39 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         return await _fetch_one(conn, sql, params)
 
     async def gather_stats(self, tx: Transaction) -> MemoryStatsRow:
+        # Every count is limited to live rows: a soft-deleted memory is not part
+        # of the corpus, and every other backend already filters it here.
         conn = self._conn(tx)
-        total = await _fetch_val(conn, "SELECT COUNT(*) FROM memories")
+        total = await _fetch_val(conn, "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL")
         native = await _fetch_val(
             conn,
-            "SELECT COUNT(*) FROM memories WHERE federation_source IS NULL",
+            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL AND federation_source IS NULL",
         )
         federated = await _fetch_val(
             conn,
-            "SELECT COUNT(*) FROM memories WHERE federation_source IS NOT NULL",
+            "SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL AND federation_source IS NOT NULL",
         )
         peer_rows = await _fetch_all(
             conn,
             "SELECT federation_source, COUNT(*) AS cnt FROM memories "
-            "WHERE federation_source IS NOT NULL "
+            "WHERE deleted_at IS NULL AND federation_source IS NOT NULL "
             "GROUP BY federation_source ORDER BY cnt DESC",
         )
         cat_rows = await _fetch_all(
             conn,
-            "SELECT category, COUNT(*) AS cnt FROM memories GROUP BY category",
+            "SELECT category, COUNT(*) AS cnt FROM memories "
+            "WHERE deleted_at IS NULL GROUP BY category",
         )
         sub_rows = await _fetch_all(
             conn,
             "SELECT category, subcategory, COUNT(*) AS cnt FROM memories "
-            "WHERE subcategory IS NOT NULL "
+            "WHERE deleted_at IS NULL AND subcategory IS NOT NULL "
             "GROUP BY category, subcategory ORDER BY cnt DESC",
         )
         avg_quality = await _fetch_val(
             conn,
-            "SELECT AVG(quality_rating) FROM memories WHERE quality_rating IS NOT NULL",
+            "SELECT AVG(quality_rating) FROM memories "
+            "WHERE deleted_at IS NULL AND quality_rating IS NOT NULL",
         )
         memories_by_subcategory: dict[str, dict[str, int]] = {}
         for r in sub_rows:
@@ -7048,10 +7052,11 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
                     )
                 )
             WHERE id = ?
+              AND deleted_at IS NULL
               AND (consolidated_into IS NULL OR consolidated_into <> ?)
               AND EXISTS (
                   SELECT 1 FROM memories
-                  WHERE id = ?
+                  WHERE id = ? AND deleted_at IS NULL
               )
             """,
                 (
