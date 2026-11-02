@@ -5485,6 +5485,23 @@ class Db2Backend(OracleBackend):
         await ensure_db2_schema(self._pool, self._settings)
         self._schema_ensured = True
 
+    async def embedding_column_dim(self, tx: Any | None = None) -> int | None:
+        """Facade exposure of the Db2 repository's ABC method.
+
+        Db2 reports the column type through ``SYSCAT.COLUMNS.TYPENAME``,
+        a different catalog from Oracle's ``ALL_TAB_COLUMNS`` — so the
+        inherited Oracle facade read would query the wrong catalog and
+        answer "unknown" for every Db2 node.
+        """
+        if tx is not None:
+            return await self._memories_repo.embedding_column_dim(tx)
+        if self._pool is None:
+            return None
+        async with self._pool.acquire() as conn:
+            from mnemos.persistence.schema import read_db2_embedding_column_dim
+
+            return await read_db2_embedding_column_dim(conn)
+
     @asynccontextmanager
     async def transactional(
         self,

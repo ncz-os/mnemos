@@ -548,6 +548,18 @@ class PostgresMemoryRepository(MemoryRepository):
     # cross-code audit (#202).
     _expected_embedding_dim: int | None = None
 
+    async def embedding_column_dim(self, tx: Transaction) -> int | None:
+        """The live width of Postgres' ``memories.embedding`` column.
+
+        Read from the catalog (``format_type`` -> ``vector(1024)``), so the
+        F-6 startup contract compares what the column was actually created
+        at against the embedder's width — not what the configuration claims.
+        """
+        from mnemos.persistence.schema import read_postgres_embedding_column_dim
+
+        conn = _postgres_tx(tx).conn
+        return await read_postgres_embedding_column_dim(conn)
+
     # F-8 (2026-10-31): the installed pgvector version, probed once and
     # cached on the repository instance. ``hnsw.iterative_scan`` only
     # exists in pgvector >= 0.8, so the GUC is gated on the *installed*
@@ -7757,6 +7769,22 @@ class PostgresBackend:
     @property
     def capability_details(self) -> set[str]:
         return set(POSTGRES_CAPABILITY_DETAILS)
+
+    async def embedding_column_dim(self, tx: Transaction | None = None) -> int | None:
+        """Facade exposure of the repository ABC method.
+
+        The F-6 startup contract (``verify_startup_embedding_contract``)
+        asks the *backend* for the live column width; when called without a
+        transaction it acquires its own connection.
+        """
+        if tx is not None:
+            return await self._memories.embedding_column_dim(tx)
+        if self._pool is None:
+            return None
+        async with self._pool.acquire() as conn:
+            from mnemos.persistence.schema import read_postgres_embedding_column_dim
+
+            return await read_postgres_embedding_column_dim(conn)
 
     @asynccontextmanager
     async def transactional(

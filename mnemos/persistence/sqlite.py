@@ -804,6 +804,19 @@ def _vec_cosine_safe(values: Sequence[float]) -> bool:
 
 
 class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
+    async def embedding_column_dim(self, tx: Transaction) -> int | None:
+        """The live width of SQLite's embedding storage.
+
+        SQLite keeps vectors in a ``vec0`` virtual table declared as
+        ``embedding float[<N>]`` — that DDL is the live column width. When
+        sqlite-vec is unavailable there is no fixed-width column at all, so
+        this answers ``None`` (the F-6 startup contract treats that as "no
+        evidence", never a guess).
+        """
+        from mnemos.persistence.schema import read_sqlite_embedding_column_dim
+
+        return await read_sqlite_embedding_column_dim(self._conn(tx))
+
     # semantic_search emits ``similarity`` = mnemos_cosine_similarity (already
     # cosine similarity in [0,1], higher = better).
     SEMANTIC_SCORE_COLUMN = "similarity"
@@ -8868,6 +8881,21 @@ class SqliteBackend:
             )
             return 768
         return dim
+
+    async def embedding_column_dim(self, tx: Transaction | None = None) -> int | None:
+        """Facade exposure of the repository ABC method.
+
+        The F-6 startup contract (``verify_startup_embedding_contract``)
+        asks the *backend* for the live column width; when called without a
+        transaction it reads through the backend's own live connection.
+        """
+        if tx is not None:
+            return await self._memories.embedding_column_dim(tx)
+        if self._conn is None:
+            return None
+        from mnemos.persistence.schema import read_sqlite_embedding_column_dim
+
+        return await read_sqlite_embedding_column_dim(self._conn)
 
     @asynccontextmanager
     async def transactional(

@@ -606,6 +606,53 @@ SELECT COLUMN_TYPE
 """
 
 
+#: SQLite keeps its vectors in a ``vec0`` virtual table whose DDL carries
+#: the width (``USING vec0(memory_id TEXT PRIMARY KEY, embedding
+#: float[1024] distance_metric=cosine)``). The table's own ``sqlite_master``
+#: row is the catalog entry that holds it.
+_SQLITE_EMBEDDING_DIM_SQL = (
+    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?"
+)
+
+#: The vec0 ``float[N]`` declaration — a more specific shape than the
+#: generic width scan, because a vec0 DDL also carries numbers that are
+#: NOT the width (rowids, metric ids) that a generic scan could pick up
+#: instead.
+_VEC0_FLOAT_DIM_RE = re.compile(r"float\[(\d+)\]", re.IGNORECASE)
+
+
+async def read_sqlite_embedding_column_dim(conn: Any) -> int | None:
+    """The live width of SQLite's ``memory_embedding_vec`` vector table.
+
+    ``None`` means "could not be determined": the vec0 table is absent
+    (sqlite-vec unavailable — there is then no fixed-width column to
+    report), the DDL carries no ``float[N]`` declaration, or the read
+    failed. Never a guess.
+    """
+    try:
+        cursor = await _maybe_await(conn.execute, _SQLITE_EMBEDDING_DIM_SQL, ("memory_embedding_vec",))
+        try:
+            row = await _maybe_await(cursor.fetchone)
+        finally:
+            await _maybe_await(cursor.close)
+    except Exception as exc:  # pragma: no cover - driver variants vary
+        _LOG.warning("SQLite embedding column width probe failed: %s", _first_line(exc))
+        return None
+    if not row:
+        return None
+    ddl = row.get("sql") if isinstance(row, Mapping) else row[0]
+    if not ddl:
+        return None
+    match = _VEC0_FLOAT_DIM_RE.search(str(ddl))
+    if match is None:
+        return None
+    try:
+        width = int(match.group(1))
+    except ValueError:  # pragma: no cover - the regex only admits digits
+        return None
+    return width if width > 0 else None
+
+
 async def read_postgres_embedding_column_dim(conn: Any) -> int | None:
     """The live width of Postgres' ``memories.embedding`` column, or None.
 
@@ -1142,6 +1189,7 @@ __all__ = [
     "read_mysql_embedding_column_dim",
     "read_oracle_embedding_column_dim",
     "read_postgres_embedding_column_dim",
+    "read_sqlite_embedding_column_dim",
     "resolve_embedding_dim",
     "warn_embedding_dimension_mismatch",
     "split_db2_statements",

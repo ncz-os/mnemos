@@ -1277,6 +1277,16 @@ class OracleMemoryRepository(MemoryRepository):
     Postgres ``read_visibility_predicate`` helper (P1 follow-up).
     """
 
+    async def embedding_column_dim(self, tx: Transaction) -> int | None:
+        """The live width of Oracle's ``memories.embedding`` column.
+
+        ``ALL_TAB_COLUMNS.DATA_TYPE`` reports ``VECTOR(1024, FLOAT32)``;
+        the shared schema reader parses the width out of the type string.
+        """
+        from mnemos.persistence.schema import read_oracle_embedding_column_dim
+
+        return await read_oracle_embedding_column_dim(_conn_from_tx(tx))
+
     async def insert_memory(
         self,
         tx: Transaction,
@@ -8629,6 +8639,24 @@ class OracleBackend(OracleAuditJournalMixin):
     @property
     def capability_details(self) -> set[str]:
         return set(FULL_STORAGE_CAPABILITY_DETAILS)
+
+    async def embedding_column_dim(self, tx: Transaction | None = None) -> int | None:
+        """Facade exposure of the repository ABC method.
+
+        The F-6 startup contract (``verify_startup_embedding_contract``)
+        asks the *backend* for the live column width; when called without a
+        transaction it acquires its own connection. Inherited by Db2, which
+        overrides nothing here because its repository read already handles
+        the Db2 catalog (``SYSCAT.COLUMNS``).
+        """
+        if tx is not None:
+            return await self._memories_repo.embedding_column_dim(tx)
+        if self._pool is None:
+            return None
+        async with self._pool.acquire() as conn:
+            from mnemos.persistence.schema import read_oracle_embedding_column_dim
+
+            return await read_oracle_embedding_column_dim(conn)
 
     @asynccontextmanager
     async def transactional(

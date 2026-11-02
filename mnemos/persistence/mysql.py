@@ -1766,6 +1766,24 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
 
     _expected_embedding_dim: int | None = _DEFAULT_EMBEDDING_DIM
 
+    #: (table, column) the live-width read inspects. MySQL keeps embeddings
+    #: inline on ``memories.embedding``; MariaDB overrides this to its join
+    #: table (mirroring ``MariadbBackend._embedding_column_target``).
+    _embedding_column_target: tuple[str, str] = ("memories", "embedding")
+
+    async def embedding_column_dim(self, tx: Transaction) -> int | None:
+        """The live width of this backend's embedding column.
+
+        ``information_schema.COLUMNS.COLUMN_TYPE`` reports ``VECTOR(n)``
+        (MySQL) or the MariaDB join-table column; the shared schema reader
+        parses the width. The table/column target is a class attribute so
+        MariaDB can point the same read at ``memory_embeddings``.
+        """
+        from mnemos.persistence.schema import read_mysql_embedding_column_dim
+
+        table, column = self._embedding_column_target
+        return await read_mysql_embedding_column_dim(tx.conn, table, column)
+
     def _require_dim(self, embedding: Sequence[float], op: str) -> None:
         expected = self._expected_embedding_dim
         if expected is None:
@@ -8754,6 +8772,24 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                 (entry_id, owner_id, namespace),
             )
             return int(getattr(cursor, "rowcount", 0) or 0) > 0
+
+    async def embedding_column_dim(self, tx: Transaction | None = None) -> int | None:
+        """Facade exposure of the repository ABC method.
+
+        The F-6 startup contract (``verify_startup_embedding_contract``)
+        asks the *backend* for the live column width; when called without a
+        transaction it acquires its own connection. Inherited by MariaDB,
+        whose repository read targets the ``memory_embeddings`` join table.
+        """
+        if tx is not None:
+            return await self._memories_repo.embedding_column_dim(tx)
+        if self._pool is None:
+            return None
+        async with self._pool.acquire() as conn:
+            from mnemos.persistence.schema import read_mysql_embedding_column_dim
+
+            table, column = self._embedding_column_target
+            return await read_mysql_embedding_column_dim(conn, table, column)
 
     @asynccontextmanager
     async def transactional(

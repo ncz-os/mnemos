@@ -477,6 +477,10 @@ async def create_mariadb_pool(
 class MariadbMemoryRepository(MysqlMemoryRepository):
     """MariaDB 11.7+ memory repository with MariaDB vector SQL."""
 
+    #: MariaDB stores vectors in the ``memory_embeddings`` join table, not
+    #: inline on ``memories`` — the live-width read must point there.
+    _embedding_column_target: tuple[str, str] = ("memory_embeddings", "embedding")
+
     async def fetch_memory_export(
         self,
         tx: Transaction,
