@@ -6983,14 +6983,21 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             """,
             tuple(params),
         )
-        return [
-            {
-                "id": row["id"],
-                "content_hash": hashlib.sha256(str(row.get("content") or "").encode("utf-8")).hexdigest(),
-                "updated": row.get("updated"),
-            }
-            for row in rows
-        ]
+        out: list[Row] = []
+        for row in rows:
+            content = row.get("content") or ""
+            if hasattr(content, "read"):
+                content = content.read()
+            if isinstance(content, (bytes, bytearray)):
+                content = content.decode("utf-8", "replace")
+            out.append(
+                {
+                    "id": row["id"],
+                    "content_hash": hashlib.sha256(str(content).encode("utf-8")).hexdigest(),
+                    "updated": row.get("updated"),
+                }
+            )
+        return out
 
     async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
         return await _fetch_one(

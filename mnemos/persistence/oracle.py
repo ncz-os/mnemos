@@ -7739,6 +7739,8 @@ class OracleFederationRepository(FederationRepository):
             content = row.get("content") or ""
             if hasattr(content, "read"):
                 content = content.read()
+            if isinstance(content, (bytes, bytearray)):
+                content = content.decode("utf-8", "replace")
             out.append(
                 {
                     "id": row["id"],
