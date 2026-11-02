@@ -873,6 +873,37 @@ class TestAntiEntropyDigest:
         assert diff["differing_buckets"] == []
 
     @pytest.mark.asyncio
+    async def test_namespaced_digest_is_not_emptied_by_the_route(self, monkeypatch):
+        """A namespaced digest must describe that namespace, not an empty set.
+
+        Regression: the route used to re-filter ABC rows by a ``namespace``
+        key. ``list_namespace_digest_rows`` already scopes by namespace and
+        returns ``{id, content_hash, updated}`` with no such key, so the
+        re-filter dropped every row and handed a repairing replica an empty
+        digest — anti-entropy could never see a namespaced difference.
+        """
+        from mnemos.api.routes import federation as handler
+        from mnemos.domain.replication_digest import DEFAULT_BUCKET_SIZE, diff_digests
+
+        t0 = datetime(2026, 10, 31, 10, 0, 0, tzinfo=timezone.utc)
+        source_rows = [_remote_row(f"mem-{i}", t0 + timedelta(seconds=i)) for i in range(1, 4)]
+        feed = FakePeerFeed(source_rows, schema=_schema(embed_model="bge-m3", embed_dim=1024))
+        backend = FakeReplicaBackend()
+        _install_transport(monkeypatch, feed)
+        _install_local_fingerprint(monkeypatch, embed_model="bge-m3", embed_dim=1024)
+        monkeypatch.setattr("mnemos.domain.federation._utcnow", lambda: t0 + timedelta(minutes=5))
+        _install_status_backend(monkeypatch, backend)
+
+        await federation_sync(backend)
+
+        feed.bucket_size = DEFAULT_BUCKET_SIZE
+        source_digest = feed.digest(params={"namespace": "default"})
+        replica_digest = await handler.federation_digest(None, namespace="default", bucket_size=None, ids=None)
+
+        assert replica_digest["row_count"] == len(source_rows)
+        assert diff_digests(source_digest, replica_digest)["in_sync"] is True
+
+    @pytest.mark.asyncio
     async def test_digest_route_requires_federation_role(self, monkeypatch):
         from fastapi import HTTPException
 

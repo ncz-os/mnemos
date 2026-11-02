@@ -761,11 +761,10 @@ async def federation_digest(
     # bucket_size and the bucket labels must describe the same partitioning
     # (omitted => the shared default, not "every row in bucket 0").
     width = _fed_digest.normalize_bucket_size(bucket_size)
-    rows = [
-        r
-        for r in rows
-        if namespace is None or (r.get("namespace") if isinstance(r, dict) else r["namespace"]) == namespace
-    ]
+    # The ABC ``list_namespace_digest_rows`` already scopes by ``namespace`` —
+    # its row shape is ``{id, content_hash, updated}`` and carries no
+    # ``namespace`` key, so re-filtering in memory would drop every row for a
+    # namespaced request and hand the replica an empty digest. Trust the ABC.
     document = _fed_digest.build_namespace_digest(rows, bucket_size=width, namespace=namespace)
     if ids:
         wanted = [item.strip() for item in ids.split(",") if item.strip()]
