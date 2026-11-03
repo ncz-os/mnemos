@@ -1,0 +1,10 @@
+[Unit]
+Description=Run mnemos-model-sync daily at 03:17
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

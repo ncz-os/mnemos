@@ -1,0 +1,34 @@
+# MNEMOS model_registry daily sync on PYTHIA.
+#
+# Install: see docs/DEPLOY_PYTHIA.md, "Model registry sync".
+#
+# mnemos-api is a ROOTFUL podman quadlet container (unit mnemos-api.service).
+# The previous unit ran `docker exec mnemos-api` as jasonperlow: Docker on
+# PYTHIA is a separate engine (it runs pythia-oracle, nats, grafana, ...)
+# and has never seen the podman container, so every run failed with
+# "No such container: mnemos-api". A rootless `podman exec` as jasonperlow
+# would not see it either, so this unit runs as root (no User=).
+#
+# The script runs inside the container: same code as the serving API, same
+# Oracle DSN and API keys (the container's env files and mounts), and no
+# host-side copy of /etc/mnemos/config.toml or the DSN.
+[Unit]
+Description=MNEMOS model_registry daily sync (provider /v1/models + Arena rankings, inside mnemos-api)
+After=mnemos-api.service network-online.target
+Requisite=mnemos-api.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/podman exec mnemos-api python3 /app/scripts/sync_provider_models.py
+# Providers load at import; ask the running API to reload them. Best effort
+# ("-"): a reload failure must not mark the sync failed. The admin token
+# comes from a root-only env file and is fed to curl on stdin, so it never
+# appears in the process table or in this unit.
+EnvironmentFile=-/etc/mnemos/model-sync.env
+ExecStartPost=-/bin/sh -c 'test -n "$$MNEMOS_RELOAD_TOKEN" || exit 0; printf "Authorization: Bearer %%s\\n" "$$MNEMOS_RELOAD_TOKEN" | /usr/bin/curl -fsS -m 30 -X POST -H @- http://127.0.0.1:5002/admin/graeae/reload-providers'
+# Exit 2 = partial provider failure (timeouts, credit limits).
+SuccessExitStatus=0 2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mnemos-model-sync

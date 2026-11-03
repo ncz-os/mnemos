@@ -2,7 +2,9 @@
 """
 Update GRAEAE config.toml when provider models change in the MNEMOS model registry.
 
-Triggered daily by graeae-model-sync.service, after sync_provider_models.py finishes.
+Formerly triggered by graeae-model-sync.service (retired 2026-11: duplicate of
+mnemos-model-sync, and this script needs a Postgres model_registry; Oracle
+deployments must not schedule it). Run it by hand only on a Postgres install.
 
 Modes
 -----
