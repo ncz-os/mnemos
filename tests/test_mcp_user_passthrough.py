@@ -60,6 +60,7 @@ def test_stdio_dispatch_passes_authenticated_context_user(monkeypatch):
 def test_http_sse_dispatch_passes_authenticated_context_user(monkeypatch):
     _install_mcp_stubs(monkeypatch)
     monkeypatch.setenv("MNEMOS_MCP_TOKENS", "alice:alice-token:alice-api-key")
+    monkeypatch.setenv("MNEMOS_MCP_AUTH_ENABLED", "true")  # enforced-auth path; edge default is off
     mcp_server = _fresh_import("mnemos.mcp.stdio")
     mcp_http = _fresh_import("mnemos.mcp.http")
 

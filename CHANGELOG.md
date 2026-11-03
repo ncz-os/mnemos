@@ -62,6 +62,15 @@ Landed on `master` after the v7.0.0 tag, so **not present in the published
 
 ### Added
 
+- **`MNEMOS_MCP_AUTH_ENABLED`: MCP HTTP/SSE bearer auth is an environment
+  toggle.** Unset, it follows REST auth (`MNEMOS_AUTH_ENABLED`, else the
+  profile: `server` on, `edge`/`personal`/`dev` off). Off, the server starts
+  with no token, ignores any `Authorization` header and serves every caller as
+  the legacy single-token identity, logging one WARNING. On, behaviour is
+  unchanged. **Upgrade note:** edge/personal/dev deployments that used
+  `MNEMOS_MCP_TOKEN(S)` with REST auth off now run MCP without auth; set
+  `MNEMOS_MCP_AUTH_ENABLED=true` to keep tokens. See docs/INSTALL.md.
+
 - **`fetch_memory_context`: one filter-driven statement per backend.**
   Every backend now builds its read predicate from a
   `VisibilityFilter` and renders it with that dialect's existing

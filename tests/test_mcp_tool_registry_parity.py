@@ -85,6 +85,8 @@ async def _stdio_server():
 
 
 def _install_mcp_stubs(monkeypatch):
+    # These tests exercise enforced bearer auth; edge-profile default is off.
+    monkeypatch.setenv("MNEMOS_MCP_AUTH_ENABLED", "true")
     # mnemos.mcp.tools imports FastAPI handlers. Load FastAPI against real Starlette
     # before replacing only the MCP HTTP server's Starlette-facing modules below.
     importlib.import_module("fastapi")

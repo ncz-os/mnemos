@@ -117,6 +117,12 @@ mode every accepted MCP HTTP client shares the process-level `MNEMOS_API_KEY`
 backend identity; the server logs a WARNING at startup so this collapse is
 operationally visible. Do not use shared-token mode for multi-tenant HTTP MCP.
 
+Whether the HTTP/SSE edge asks for a token at all is set by
+`MNEMOS_MCP_AUTH_ENABLED`; unset, it follows `MNEMOS_AUTH_ENABLED` and the
+profile (on for `server`, off for `edge`/`personal`/`dev`). The examples above
+assume it is on. See `docs/INSTALL.md`, "Running without tokens on a trusted
+LAN", for the off mode.
+
 ---
 
 ## Federation Feed Cursors

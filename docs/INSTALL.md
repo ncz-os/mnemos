@@ -256,6 +256,55 @@ See [docs/MEMORY_EXPORT_FORMAT.md](MEMORY_EXPORT_FORMAT.md).
 
 ---
 
+## Running without tokens on a trusted LAN
+
+The MCP HTTP/SSE edge (`mnemos serve mcp-http`, port 5004) uses the same
+on/off rule as the REST API, so a home or lab deployment needs no tokens and
+has none to leak.
+
+| Variable | Values | Default |
+|---|---|---|
+| `MNEMOS_AUTH_ENABLED` | `true` / `false` | profile: `server` on; `edge`, `personal`, `dev` off. Images built from `Dockerfile.core` (and so the everything/enterprise images on top of it), `Dockerfile.split` and `Dockerfile.oracle` set it to `true` |
+| `MNEMOS_MCP_AUTH_ENABLED` | `true` / `false` (also `1`/`0`, `yes`/`no`, `on`/`off`) | unset: same as the resolved `MNEMOS_AUTH_ENABLED` |
+| `MNEMOS_MCP_TOKENS` / `MNEMOS_MCP_TOKEN` | bearer tokens | required only while MCP auth is on |
+
+The rule, in order:
+
+1. `MNEMOS_MCP_AUTH_ENABLED` set (or `[mcp] auth_enabled` in config.toml):
+   that value wins.
+2. Otherwise MCP auth equals REST auth: `MNEMOS_AUTH_ENABLED` if set, else
+   the profile default.
+
+Any other value of `MNEMOS_MCP_AUTH_ENABLED` is a configuration error and
+the process does not start.
+
+With MCP auth **off**:
+
+- the server starts with no token configured; `MNEMOS_MCP_TOKEN(S)` are not
+  read, so leave them unset;
+- `/mcp`, `/sse`, `/messages/` and `/mcp/events/stream` accept every request.
+  An `Authorization` header is ignored, so a client still configured with an
+  old token keeps working;
+- every caller gets the legacy single-token identity: no MCP user, the
+  process `MNEMOS_API_KEY` (if set) as the backend identity, namespace and
+  role from that key (or `default` / `user` without one);
+- `/health`, `/healthz`, `/.well-known/*` and `/oauth/*` behave as before.
+  OAuth needs bearer auth on to mean anything, so leave it unconfigured;
+- startup logs one WARNING, for example
+  `MCP HTTP/SSE auth DISABLED by MNEMOS_MCP_AUTH_ENABLED=false (trusted network only)`.
+
+With MCP auth **on**, nothing changes: a token (or a complete OAuth setup)
+is required, the server refuses to start without one, and requests without a
+valid bearer get 401.
+
+Turn it on explicitly (`MNEMOS_MCP_AUTH_ENABLED=true`) before you publish
+port 5004 through a tunnel, reverse proxy or port forward. Off means anyone
+who can reach the port can read and write memories.
+
+Upgrading: an `edge`/`personal`/`dev` deployment that relied on
+`MNEMOS_MCP_TOKEN(S)` while REST auth was off now runs the MCP edge without
+auth. Set `MNEMOS_MCP_AUTH_ENABLED=true` to keep the old behaviour.
+
 ## For agents
 
 Machine-readable install instructions (which dist/image to choose for a

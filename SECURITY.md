@@ -45,6 +45,12 @@ These hold in 6.3:
   success guards, and SSRF checks at subscription and delivery time.
 - MCP stdio and HTTP/SSE use the same registry under `mnemos/mcp/tools/`, with
   per-user HTTP token mapping available through `MNEMOS_MCP_TOKENS`.
+  HTTP/SSE bearer auth follows the REST auth setting (on in the `server`
+  profile, off in `edge`/`personal`/`dev`) unless `MNEMOS_MCP_AUTH_ENABLED`
+  sets it explicitly. With it off, no token is required and every caller
+  shares one backend identity: use that only on a trusted network, and set
+  `MNEMOS_MCP_AUTH_ENABLED=true` before exposing port 5004 through a tunnel
+  or proxy. See docs/INSTALL.md, "Running without tokens on a trusted LAN".
 - Circuit-breaker, rate-limit, and concurrency state is process-local by
   default (`memory://`), which is correct for the single-worker edge and dev
   profiles. Multi-worker or multi-node deployments should install the

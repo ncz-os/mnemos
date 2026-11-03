@@ -101,6 +101,8 @@ services:
     ports:
       - "5004:5004"
     environment:
+      # Internet-facing: always enforce bearer auth explicitly.
+      MNEMOS_MCP_AUTH_ENABLED: "true"
       MNEMOS_MCP_TOKENS: "alice:${MNEMOS_MCP_TOKEN}:${MNEMOS_API_KEY}"
       MNEMOS_BASE: "http://mnemos:5002"
       MNEMOS_API_KEY: "<your existing MNEMOS bearer>"

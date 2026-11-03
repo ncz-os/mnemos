@@ -8,12 +8,17 @@ difference is the transport: stdio framing vs SSE-over-HTTP framing.
 Tool surface is identical, so a memory written from Claude Desktop
 (stdio) is queryable from ChatGPT Pro (SSE) and vice versa.
 
-Auth: bearer token. The connector caller MUST send
+Auth: bearer token, when enabled. MNEMOS_MCP_AUTH_ENABLED switches it
+explicitly; unset, it follows the REST auth setting (MNEMOS_AUTH_ENABLED,
+else the profile default: ``server`` on, ``edge``/``personal``/``dev``
+off). When enabled, the connector caller MUST send
   Authorization: Bearer <token>
 on the SSE handshake. Prefer per-user token issuance with
 MNEMOS_MCP_TOKENS=user:api_key[,user:api_key]. Legacy
 MNEMOS_MCP_TOKEN remains supported for single-user deployments but
 logs a warning because every client shares the same backend identity.
+When disabled, no token is required or read and every caller is served
+as the legacy single-token principal (trusted networks only).
 
 Transport security: TLS terminated upstream (Cloudflare Tunnel,
 Tailscale Funnel, Caddy/nginx). This process listens on a local
@@ -108,6 +113,39 @@ class MCPUserContext:
     namespace: str
 
 
+MCP_AUTH_DISABLED_EXPLICIT_WARNING = (
+    "MCP HTTP/SSE auth DISABLED by MNEMOS_MCP_AUTH_ENABLED=false (trusted network only)"
+)
+
+
+def _mcp_auth_enabled() -> bool:
+    return bool(get_settings().mcp.auth_enabled)
+
+
+def _mcp_auth_disabled_warning() -> str:
+    settings = get_settings()
+    if "auth_enabled" in settings.explicit_fields("mcp"):
+        return MCP_AUTH_DISABLED_EXPLICIT_WARNING
+    return (
+        "MCP HTTP/SSE auth DISABLED by default "
+        f"(profile={settings.profile}, REST auth off; "
+        "set MNEMOS_MCP_AUTH_ENABLED=true to require tokens) (trusted network only)"
+    )
+
+
+def _trusted_network_principal() -> MCPClientPrincipal:
+    """The principal every caller gets when MCP bearer auth is disabled.
+
+    Identical to the legacy single MNEMOS_MCP_TOKEN principal: no MCP user,
+    the backend MNEMOS_API_KEY (if any) as the identity, so namespace and
+    role resolve exactly as they do in legacy single-token mode.
+    """
+    return MCPClientPrincipal(
+        user_id=None,
+        api_key=get_settings().server.api_key.strip() or None,
+    )
+
+
 def _fatal_auth_config(message: str) -> None:
     sys.stderr.write(message)
     sys.exit(2)
@@ -123,6 +161,13 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
       MNEMOS_MCP_TOKENS=user1:mcp_token1:api_key1
     """
     settings = get_settings()
+    if not _mcp_auth_enabled():
+        # Auth off: tokens are neither required nor parsed (a malformed map
+        # cannot FATAL), and none of their values are ever logged.
+        logger.warning(_mcp_auth_disabled_warning())
+        if settings.mcp.tokens.strip() or settings.mcp.token.strip():
+            logger.info("MNEMOS_MCP_TOKEN/MNEMOS_MCP_TOKENS are set but ignored while MCP auth is disabled")
+        return {}
     raw_map = settings.mcp.tokens.strip()
     if raw_map:
         principals: dict[str, MCPClientPrincipal] = {}
@@ -168,14 +213,10 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
         "identity. Set MNEMOS_MCP_TOKENS=user:api_key,... for per-user "
         "token issuance and backend tenancy."
     )
-    return {
-        tok: MCPClientPrincipal(
-            user_id=None,
-            api_key=settings.server.api_key.strip() or None,
-        )
-    }
+    return {tok: _trusted_network_principal()}
 
 
+MCP_AUTH_ENABLED = _mcp_auth_enabled()
 TOKEN_PRINCIPALS = _load_token_principals()
 
 
@@ -232,11 +273,21 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Validate `Authorization: Bearer <token>` on every request before
     the SSE handshake or the POST-message endpoint sees it. Reject
     everything else with 401 + a `WWW-Authenticate` header so the
-    client knows what scheme to use."""
+    client knows what scheme to use.
+
+    With MCP auth disabled (MNEMOS_MCP_AUTH_ENABLED=false, or the profile
+    default) every request is attached to the legacy single-token
+    principal and any Authorization header is ignored, so clients still
+    configured with an old token keep working."""
 
     async def dispatch(self, request, call_next):
         path = request.url.path
         if path in {"/health", "/healthz"} or path.startswith("/.well-known/") or path.startswith("/oauth/"):
+            return await call_next(request)
+        if not MCP_AUTH_ENABLED:
+            principal = _trusted_network_principal()
+            request.state.mnemos_mcp_principal = principal
+            request.state.mnemos_mcp_principal_id = _principal_id(principal)
             return await call_next(request)
         auth = request.headers.get("authorization", "")
         if not auth.lower().startswith("bearer "):
@@ -627,7 +678,7 @@ def _register_epoch_listener() -> None:
     """Subscribe to visibility-epoch bumps, if core is importable.
 
     Registration is pull-based so core never has to import this module (which
-    exits at import when MNEMOS_MCP_TOKEN is unset).
+    exits at import when MCP auth is enabled and no token is configured).
     """
     try:
         from mnemos.core.lifecycle import register_visibility_epoch_listener
@@ -1215,7 +1266,10 @@ def main() -> None:
     args = p.parse_args()
 
     logger.info("MNEMOS MCP HTTP/SSE listening on %s:%d", args.host, args.port)
-    logger.info("Bearer principals configured (count=%d)", len(TOKEN_PRINCIPALS))
+    if MCP_AUTH_ENABLED:
+        logger.info("Bearer principals configured (count=%d)", len(TOKEN_PRINCIPALS))
+    else:
+        logger.info("Bearer auth disabled; all callers share the legacy single-token identity")
     logger.info("MNEMOS backend: %s", get_settings().server.base)
     uvicorn.run(starlette_app, host=args.host, port=args.port, log_level="info", access_log=False)
 

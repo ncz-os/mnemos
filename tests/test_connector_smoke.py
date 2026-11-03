@@ -390,6 +390,7 @@ def test_streamable_http_mcp_smoke(tmp_path: Path) -> None:
         env = _safe_process_env()
         env.update(_base_env(backend_url, config_path))
         env["MNEMOS_MCP_TOKENS"] = f"smoke:{MCP_EDGE_TOKEN}:{BACKEND_TOKEN}"
+        env["MNEMOS_MCP_AUTH_ENABLED"] = "true"  # enforced-auth smoke; edge default is off
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -454,6 +455,7 @@ def test_documented_http_sse_connector_smoke(surface: str, doc_path: Path, tmp_p
         env = _safe_process_env()
         env.update(_base_env(backend_url, config_path))
         env["MNEMOS_MCP_TOKENS"] = f"smoke:{MCP_EDGE_TOKEN}:{BACKEND_TOKEN}"
+        env["MNEMOS_MCP_AUTH_ENABLED"] = "true"  # enforced-auth smoke; edge default is off
         proc = subprocess.Popen(
             [
                 sys.executable,

@@ -271,6 +271,7 @@ Manual HTTP/SSE verification for ChatGPT Pro Developer Mode:
 ```bash
 export MNEMOS_BASE=http://localhost:5002
 export MNEMOS_API_KEY=<backend bearer token>
+export MNEMOS_MCP_AUTH_ENABLED=true   # bearer auth is off by default outside the server profile
 export MNEMOS_MCP_TOKENS="alice:<connector bearer token>:<backend bearer token>"
 mnemos serve mcp-http --host 127.0.0.1 --port 5004
 ```

@@ -284,6 +284,11 @@ services:
       # on :5004. This compose runs the default REST/MCP-stdio surface on
       # :5002 only; expose 5004 explicitly when running `mnemos serve mcp-http`.
       # - '5004:5004'
+      # MCP HTTP/SSE bearer auth follows REST auth: off in this personal
+      # profile, so no MNEMOS_MCP_TOKEN(S) are needed on a trusted LAN. Set
+      # MNEMOS_MCP_AUTH_ENABLED: "true" plus MNEMOS_MCP_TOKENS before exposing
+      # 5004 beyond the LAN (docs/INSTALL.md, "Running without tokens on a
+      # trusted LAN").
     restart: unless-stopped
 
   # ───────────────────────────────────────────────────────────────────────────

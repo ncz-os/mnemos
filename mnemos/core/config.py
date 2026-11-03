@@ -546,6 +546,13 @@ class _MCPSettings(BaseSettings):
 
     token: str = Field("", validation_alias="MNEMOS_MCP_TOKEN")
     tokens: str = Field("", validation_alias="MNEMOS_MCP_TOKENS")
+    # Bearer auth on the MCP HTTP/SSE edge (``mnemos serve mcp-http``).
+    # Explicit MNEMOS_MCP_AUTH_ENABLED wins. Unset, it follows the resolved
+    # REST auth setting (``auth.enabled``: MNEMOS_AUTH_ENABLED, else the
+    # profile default -- ``server`` on, ``edge``/``personal``/``dev`` off),
+    # so one rule governs both surfaces. See ``_apply_mcp_auth_default``.
+    # False means no token is required or read: trusted networks only.
+    auth_enabled: bool = Field(False, validation_alias="MNEMOS_MCP_AUTH_ENABLED")
     bind: str = Field("127.0.0.1", validation_alias="MNEMOS_MCP_BIND")
     # /admin/tunnels/* spawns `cloudflared`/`ngrok` and publishes a local
     # MNEMOS port to the public internet. Root auth alone is not a
@@ -1540,6 +1547,7 @@ def _build_settings() -> Settings:
         if isinstance(group, BaseSettings)
     }
     _apply_profile_defaults(settings)
+    _apply_mcp_auth_default(settings)
     _apply_backend_layer_defaults(settings)
     settings.services.resolution = resolve_profile_services(
         profile=settings.profile,
@@ -1624,6 +1632,18 @@ def _apply_profile_defaults(settings: Settings) -> None:
         if field_name in settings.explicit_fields(group_name):
             continue
         setattr(getattr(settings, group_name), field_name, value)
+
+
+def _apply_mcp_auth_default(settings: Settings) -> None:
+    """Default MCP HTTP/SSE bearer auth to the resolved REST auth setting.
+
+    Runs after the profile defaults, so ``settings.auth.enabled`` already
+    reflects MNEMOS_AUTH_ENABLED or the profile. An explicit
+    MNEMOS_MCP_AUTH_ENABLED (or ``[mcp] auth_enabled``) is left alone.
+    """
+    if "auth_enabled" in settings.explicit_fields("mcp"):
+        return
+    settings.mcp.auth_enabled = bool(settings.auth.enabled)
 
 
 #: Top-level config.toml tables that ``_build_settings`` actually consumes.

@@ -241,6 +241,7 @@ async def mcp_http_app(
 
     monkeypatch.delenv("MNEMOS_OAUTH_DATABASE_URL", raising=False)
     monkeypatch.setenv("MNEMOS_MCP_TOKEN", legacy_token)
+    monkeypatch.setenv("MNEMOS_MCP_AUTH_ENABLED", "true")  # enforced-auth tests; edge default is off
     monkeypatch.setenv("MNEMOS_OAUTH_SIGNING_KEY", signing_key)
     monkeypatch.setenv("MNEMOS_OAUTH_ADMIN_PASSPHRASE", admin_passphrase)
     monkeypatch.setenv("MNEMOS_OAUTH_ISSUER", "http://testserver")
