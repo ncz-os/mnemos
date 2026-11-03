@@ -1848,13 +1848,15 @@ class PostgresMemoryRepository(MemoryRepository):
             "plainto_tsquery('english', $1)) AS rank "
             "FROM memories "
             f"WHERE {' AND '.join(conditions)} "
-            "ORDER BY rank DESC LIMIT $2"
+            "ORDER BY rank DESC, id ASC LIMIT $2"
         )
 
         async def _ilike_search() -> list[Row]:
-            like_q = f"%{query}%"
+            # % and _ in the user text are literals, not wildcards (audit F7).
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like_q = f"%{escaped}%"
             ilike_params: list[Any] = [like_q, limit]
-            ilike_conditions: list[str] = ["content ILIKE $1", "deleted_at IS NULL"]
+            ilike_conditions: list[str] = ["content ILIKE $1 ESCAPE '\\'", "deleted_at IS NULL"]
             if not include_archived:
                 ilike_conditions.append("archived_at IS NULL")
             if exclude_superseded:
@@ -1885,21 +1887,28 @@ class PostgresMemoryRepository(MemoryRepository):
             ilike_sql = (
                 f"SELECT {_MEMORY_COLS} FROM memories "
                 f"WHERE {' AND '.join(ilike_conditions)} "
-                "ORDER BY created DESC LIMIT $2"
+                "ORDER BY created DESC, id ASC LIMIT $2"
             )
             return list(await conn.fetch(ilike_sql, *ilike_params))
 
         try:
-            rows = list(await conn.fetch(sql, *params))
-            if rows:
-                return rows
-            return await _ilike_search()
+            # The FTS attempt runs under a savepoint: a failed statement
+            # aborts the enclosing transaction, so without the rollback to
+            # the savepoint the fallback below (and every later statement
+            # in the caller's transaction) would fail with
+            # InFailedSQLTransactionError (audit F6).
+            async with conn.transaction():
+                rows = list(await conn.fetch(sql, *params))
         except Exception:
             # ILIKE fallback: same predicate shape, $1 becomes the LIKE
-            # pattern, $2 still the limit. We also use it for zero FTS
-            # results so exact-substring searches survive stale FTS
-            # config or stop-word/tokenization misses.
+            # pattern, $2 still the limit, used when FTS errors (stale or
+            # missing text-search config).
             return await _ilike_search()
+        if rows:
+            return rows
+        # Zero FTS results: exact-substring searches survive stop-word /
+        # tokenization misses.
+        return await _ilike_search()
 
     async def gather_stats(self, tx: Transaction) -> MemoryStatsRow:
         conn = _postgres_tx(tx).conn
@@ -2939,9 +2948,9 @@ class PostgresWebhookRepository(WebhookRepository):
 
     async def fetch_deliveries(self, tx: Transaction, subscription_id: str | None = None) -> list[Row]:
         if subscription_id is None:
-            return await _postgres_tx(tx).conn.fetch("SELECT * FROM webhook_deliveries ORDER BY created ASC")
+            return await _postgres_tx(tx).conn.fetch("SELECT * FROM webhook_deliveries ORDER BY created ASC, id ASC")
         return await _postgres_tx(tx).conn.fetch(
-            "SELECT * FROM webhook_deliveries WHERE subscription_id = $1::uuid ORDER BY created ASC",
+            "SELECT * FROM webhook_deliveries WHERE subscription_id = $1::uuid ORDER BY created ASC, id ASC",
             subscription_id,
         )
 
@@ -3019,7 +3028,7 @@ class PostgresWebhookRepository(WebhookRepository):
                    created, revoked, revoked_at
             FROM webhook_subscriptions
             {where}
-            ORDER BY created DESC
+            ORDER BY created DESC, id ASC
             {limit_clause}
             """,
             *args,
@@ -3127,7 +3136,7 @@ class PostgresWebhookRepository(WebhookRepository):
             FROM webhook_deliveries d
             JOIN webhook_subscriptions s ON s.id = d.subscription_id
             WHERE d.subscription_id = $1::uuid{scope_clause}
-            ORDER BY d.created DESC
+            ORDER BY d.created DESC, d.id ASC
             LIMIT ${len(args)}
             """,
             *args,
@@ -5131,7 +5140,7 @@ class PostgresSessionsRepository(SessionsRepository):
         conn = _postgres_tx(tx).conn
         rows = await conn.fetch(
             "SELECT role, content, timestamp, model FROM session_messages "
-            "WHERE session_id=$1 AND deleted_at IS NULL ORDER BY timestamp ASC LIMIT $2 OFFSET $3",
+            "WHERE session_id=$1 AND deleted_at IS NULL ORDER BY timestamp ASC, id ASC LIMIT $2 OFFSET $3",
             session_id,
             limit,
             offset,

@@ -29,6 +29,7 @@ DEFAULT_REDACT_THREAD_THRESHOLD_BYTES = 256 * 1024
 # single search cannot expand into an unbounded backend IN/ANY predicate.
 MAX_TAGS_PER_REQUEST = 32
 MAX_TAG_LENGTH = 255
+MAX_SEARCH_QUERY_LENGTH = 10_000
 
 
 def _normalize_memory_tags(value: Optional[List[str]]) -> Optional[List[str]]:
@@ -769,8 +770,12 @@ class MemoryListRequest(BaseModel):
 
 
 class MemorySearchRequest(BaseModel):
-    query: str
-    limit: int = 10
+    # Bounded so an oversized query is a 422 at the edge instead of a
+    # backend error (SQLite rejects LIKE patterns over 50,000 bytes).
+    query: str = Field(..., max_length=MAX_SEARCH_QUERY_LENGTH)
+    # ge=1: zero/negative limits were unbounded on SQLite (LIMIT -1).
+    # The upper bound stays with the route's profile/500 clamp.
+    limit: int = Field(10, ge=1)
     category: Optional[str] = None
     subcategory: Optional[str] = None
     tags: Optional[List[str]] = Field(None, max_length=MAX_TAGS_PER_REQUEST)

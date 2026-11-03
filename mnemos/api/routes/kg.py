@@ -145,7 +145,7 @@ async def list_triples(
 
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
-            f"SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples {where} ORDER BY created DESC "
+            f"SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples {where} ORDER BY created DESC, id ASC "
             f"LIMIT ${idx} OFFSET ${idx + 1}",
             *filter_params, limit, offset,
         )
@@ -164,12 +164,12 @@ async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), use
     async with _lc.get_pool_manager().acquire() as conn:
         if is_root(user):
             rows = await conn.fetch(
-                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND deleted_at IS NULL ORDER BY valid_from ASC LIMIT $2",
+                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND deleted_at IS NULL ORDER BY valid_from ASC, created ASC, id ASC LIMIT $2",
                 subject, limit,
             )
         else:
             rows = await conn.fetch(
-                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND deleted_at IS NULL AND owner_id=$2 AND namespace=$3 ORDER BY valid_from ASC LIMIT $4",
+                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND deleted_at IS NULL AND owner_id=$2 AND namespace=$3 ORDER BY valid_from ASC, created ASC, id ASC LIMIT $4",
                 subject, user.user_id, user.namespace, limit,
             )
     return KGTripleListResponse(count=len(rows), triples=[_row_to_triple(r) for r in rows])

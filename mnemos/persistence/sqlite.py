@@ -395,6 +395,16 @@ def _fts5_plain_query(query: str) -> str | None:
     return " ".join(terms)
 
 
+def _like_contains_pattern(text: str) -> str:
+    """``%text%`` with LIKE metacharacters escaped (use with ESCAPE '\\').
+
+    A user query of ``%`` or ``_`` must match those characters literally,
+    not every row (audit F7).
+    """
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def _read_visibility_clause(
     user: UserContext,
     params: list[Any],
@@ -1790,8 +1800,11 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         select_cols = _sqlite_memory_cols("m")
 
         async def _like_search() -> list[Row]:
-            like_params: list[Any] = [f"%{query}%"]
-            like_conditions: list[str] = ["m.deleted_at IS NULL", "lower(m.content) LIKE lower(?)"]
+            like_params: list[Any] = [_like_contains_pattern(query)]
+            like_conditions: list[str] = [
+                "m.deleted_at IS NULL",
+                "lower(m.content) LIKE lower(?) ESCAPE '\\'",
+            ]
             if not include_archived:
                 like_conditions.append("m.archived_at IS NULL")
             if exclude_superseded:
@@ -1823,7 +1836,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 conn,
                 f"SELECT {select_cols} FROM memories m "
                 f"WHERE {' AND '.join(like_conditions)} "
-                "ORDER BY m.updated DESC LIMIT ?",
+                "ORDER BY m.updated DESC, m.id ASC LIMIT ?",
                 like_params,
             )
 
@@ -1839,7 +1852,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 "FROM memories_fts "
                 "JOIN memories m ON m.id = memories_fts.id "
                 f"WHERE memories_fts MATCH ?{where_extra} "
-                "ORDER BY rank ASC, m.updated DESC LIMIT ?",
+                "ORDER BY rank ASC, m.updated DESC, m.id ASC LIMIT ?",
                 [plain_query, *params],
             )
             if rows:
@@ -2417,7 +2430,7 @@ class SqliteKGRepository(_SqliteRepository, KGRepository):
         params.append(limit)
         return await _fetch_all(
             self._conn(tx),
-            f"SELECT * FROM kg_triples WHERE {' AND '.join(conditions)} ORDER BY valid_from ASC, created ASC LIMIT ?",
+            f"SELECT * FROM kg_triples WHERE {' AND '.join(conditions)} ORDER BY valid_from ASC, created ASC, id ASC LIMIT ?",
             params,
         )
 
@@ -4106,7 +4119,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
             "SELECT id, url, events, description, owner_id, namespace, "
             "created_at AS created, revoked, revoked_at "
             "FROM webhook_subscriptions"
-            f"{where} ORDER BY julianday(created_at) DESC, created_at DESC LIMIT ?",
+            f"{where} ORDER BY julianday(created_at) DESC, created_at DESC, id ASC LIMIT ?",
             params,
         )
         return [_sqlite_webhook_subscription(row) for row in rows]
@@ -4183,7 +4196,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
             "d.writer_revision FROM webhook_deliveries d "
             "JOIN webhook_subscriptions s ON s.id = d.subscription_id "
             "WHERE d.subscription_id = ?"
-            f"{scope} ORDER BY julianday(d.created_at) DESC, d.created_at DESC LIMIT ?",
+            f"{scope} ORDER BY julianday(d.created_at) DESC, d.created_at DESC, d.id ASC LIMIT ?",
             params,
         )
         return [_sqlite_webhook_delivery(row) for row in rows]
@@ -4755,10 +4768,10 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
 
     async def fetch_deliveries(self, tx: Transaction, subscription_id: str | None = None) -> list[Row]:
         if subscription_id is None:
-            return await _fetch_all(self._conn(tx), "SELECT * FROM webhook_deliveries ORDER BY created_at ASC")
+            return await _fetch_all(self._conn(tx), "SELECT * FROM webhook_deliveries ORDER BY created_at ASC, id ASC")
         return await _fetch_all(
             self._conn(tx),
-            "SELECT * FROM webhook_deliveries WHERE subscription_id = ? ORDER BY created_at ASC",
+            "SELECT * FROM webhook_deliveries WHERE subscription_id = ? ORDER BY created_at ASC, id ASC",
             (subscription_id,),
         )
 
@@ -5915,28 +5928,32 @@ class SqliteSessionsRepository(_SqliteRepository, SessionsRepository):
         return message_id
 
     async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]:
+        # timestamp is CURRENT_TIMESTAMP (one-second resolution) and id is
+        # random hex, so turns stored in the same second have no meaningful
+        # order on (timestamp, id). rowid is the insertion sequence of this
+        # rowid table: it is the tiebreak (audit F3).
         return await _fetch_all(
             self._conn(tx),
             """
             WITH first_system AS (
-                SELECT id, role, content, timestamp FROM session_messages
+                SELECT id, rowid AS seq, role, content, timestamp FROM session_messages
                 WHERE session_id=? AND role='system' AND deleted_at IS NULL
-                ORDER BY timestamp ASC, id ASC LIMIT 1
+                ORDER BY timestamp ASC, rowid ASC LIMIT 1
             ), later_system AS (
-                SELECT s.id, s.role, s.content, s.timestamp FROM session_messages s
+                SELECT s.id, s.rowid AS seq, s.role, s.content, s.timestamp FROM session_messages s
                 WHERE s.session_id=? AND s.role='system' AND s.deleted_at IS NULL
                 AND s.id <> (SELECT id FROM first_system)
-                ORDER BY s.timestamp DESC, s.id DESC LIMIT 4
+                ORDER BY s.timestamp DESC, s.rowid DESC LIMIT 4
             ), pinned AS (
-                SELECT id, role, content, timestamp, 0 AS k FROM first_system
-                UNION ALL SELECT id, role, content, timestamp, 0 AS k FROM later_system
+                SELECT id, seq, role, content, timestamp, 0 AS k FROM first_system
+                UNION ALL SELECT id, seq, role, content, timestamp, 0 AS k FROM later_system
             ), recent AS (
-                SELECT id, role, content, timestamp, 1 AS k FROM session_messages
+                SELECT id, rowid AS seq, role, content, timestamp, 1 AS k FROM session_messages
                 WHERE session_id=? AND role <> 'system' AND deleted_at IS NULL
-                ORDER BY timestamp DESC, id DESC LIMIT 10
+                ORDER BY timestamp DESC, rowid DESC LIMIT 10
             )
             SELECT role, content FROM (SELECT * FROM pinned UNION ALL SELECT * FROM recent)
-            ORDER BY k, timestamp ASC, id ASC
+            ORDER BY k, timestamp ASC, seq ASC
             """,
             (session_id, session_id, session_id),
         )
@@ -5968,7 +5985,7 @@ class SqliteSessionsRepository(_SqliteRepository, SessionsRepository):
         rows = await _fetch_all(
             conn,
             "SELECT role, content, timestamp, model FROM session_messages "
-            "WHERE session_id=? AND deleted_at IS NULL ORDER BY timestamp ASC LIMIT ? OFFSET ?",
+            "WHERE session_id=? AND deleted_at IS NULL ORDER BY timestamp ASC, rowid ASC LIMIT ? OFFSET ?",
             (session_id, limit, offset),
         )
         total = await _fetch_val(
@@ -8279,7 +8296,7 @@ class SqliteBackend:
         sql = "SELECT id, user_id, prompt, task_type, mode, status, created_at, completed_at FROM consultations"
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        sql += " ORDER BY created_at DESC, id ASC LIMIT ? OFFSET ?"
         rows = await _fetch_all(_sqlite_tx(tx).conn, sql, [*params, limit, offset])
         out: list[Row] = []
         for row in rows:

@@ -2509,7 +2509,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
                        MATCH (m.content) AGAINST (%s IN BOOLEAN MODE) AS rank_score
                   FROM memories m
                  WHERE {" AND ".join(where)}
-                 ORDER BY rank_score DESC
+                 ORDER BY rank_score DESC, m.id ASC
                  LIMIT %s
                 """,
                 [query] + params + [limit],
@@ -3105,7 +3105,7 @@ class MysqlKGRepository(KGRepository):
         async with conn.cursor() as cursor:
             await cursor.execute(
                 f"SELECT * FROM kg_triples WHERE {' AND '.join(conditions)} "
-                "ORDER BY valid_from ASC, created ASC LIMIT 1",
+                "ORDER BY valid_from ASC, created ASC, id ASC LIMIT 1",
                 params,
             )
             return await _fetchone_dict(cursor)
@@ -3132,7 +3132,7 @@ class MysqlKGRepository(KGRepository):
         async with conn.cursor() as cursor:
             await cursor.execute(
                 f"SELECT * FROM kg_triples WHERE {' AND '.join(conditions)} "
-                "ORDER BY valid_from ASC, created ASC LIMIT %s",
+                "ORDER BY valid_from ASC, created ASC, id ASC LIMIT %s",
                 params,
             )
             return await _fetch_all_dicts(cursor)
@@ -3234,7 +3234,7 @@ class MysqlKGRepository(KGRepository):
                 SELECT *
                   FROM kg_triples
                  WHERE {" AND ".join(conditions)}
-                 ORDER BY valid_from ASC, created ASC
+                 ORDER BY valid_from ASC, created ASC, id ASC
                  LIMIT %s OFFSET %s
                 """,
                 params,
@@ -3295,7 +3295,7 @@ class MysqlKGRepository(KGRepository):
         async with conn.cursor() as cursor:
             await cursor.execute(
                 f"SELECT * FROM kg_triples WHERE {' AND '.join(conditions)} "
-                "ORDER BY valid_from ASC, created ASC LIMIT %s",
+                "ORDER BY valid_from ASC, created ASC, id ASC LIMIT %s",
                 params,
             )
             return await _fetch_all_dicts(cursor)
@@ -3325,7 +3325,7 @@ class MysqlKGRepository(KGRepository):
         async with conn.cursor() as cursor:
             await cursor.execute(
                 f"SELECT * FROM kg_triples WHERE {' AND '.join(conditions)} "
-                "ORDER BY valid_from ASC, created ASC LIMIT %s",
+                "ORDER BY valid_from ASC, created ASC, id ASC LIMIT %s",
                 params,
             )
             return await _fetch_all_dicts(cursor)
@@ -5232,7 +5232,7 @@ class MysqlWebhookRepository(WebhookRepository):
             "SELECT id, url, events, description, owner_id, namespace, "
             "created, revoked, revoked_at "
             "FROM webhook_subscriptions "
-            f"{where} ORDER BY created DESC LIMIT %s"
+            f"{where} ORDER BY created DESC, id ASC LIMIT %s"
         )
         async with conn.cursor() as cursor:
             await cursor.execute(sql, tuple(params))
@@ -5312,7 +5312,7 @@ class MysqlWebhookRepository(WebhookRepository):
             "FROM webhook_deliveries d "
             "JOIN webhook_subscriptions s ON s.id = d.subscription_id "
             f"WHERE d.subscription_id = %s{scope} "
-            "ORDER BY d.created DESC LIMIT %s"
+            "ORDER BY d.created DESC, d.id ASC LIMIT %s"
         )
         async with conn.cursor() as cursor:
             await cursor.execute(sql, tuple(params))
@@ -6298,11 +6298,11 @@ class MysqlWebhookRepository(WebhookRepository):
         conn = _mysql_tx(tx).conn
         if subscription_id is None:
             async with conn.cursor() as cursor:
-                await cursor.execute("SELECT * FROM webhook_deliveries ORDER BY created ASC")
+                await cursor.execute("SELECT * FROM webhook_deliveries ORDER BY created ASC, id ASC")
                 return await _fetch_all_dicts(cursor)
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "SELECT * FROM webhook_deliveries WHERE subscription_id = %s ORDER BY created ASC",
+                "SELECT * FROM webhook_deliveries WHERE subscription_id = %s ORDER BY created ASC, id ASC",
                 (subscription_id,),
             )
             return await _fetch_all_dicts(cursor)
@@ -6728,7 +6728,7 @@ class MysqlConsultationAuditRepository(ConsultationAuditRepository):
         if namespace is not None:
             sql += " AND namespace = %s"
             params.append(namespace)
-        sql += " ORDER BY created DESC LIMIT %s OFFSET %s"
+        sql += " ORDER BY created DESC, id ASC LIMIT %s OFFSET %s"
         params.extend([limit, offset])
         async with tx.conn.cursor() as cursor:
             await cursor.execute(sql, params)
