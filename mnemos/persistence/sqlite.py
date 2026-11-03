@@ -1711,7 +1711,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         # full _MEMORY_COLS row so the handler can pass results
         # straight to row_to_memory.
         params: list[Any] = [query]
-        conditions: list[str] = []
+        # M6 parity with postgres: soft-deleted rows are invisible to search.
+        conditions: list[str] = ["m.deleted_at IS NULL"]
         if not include_archived:
             conditions.append("m.archived_at IS NULL")
         if exclude_superseded:
@@ -1738,7 +1739,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
 
         async def _like_search() -> list[Row]:
             like_params: list[Any] = [f"%{query}%"]
-            like_conditions: list[str] = ["lower(m.content) LIKE lower(?)"]
+            like_conditions: list[str] = ["m.deleted_at IS NULL", "lower(m.content) LIKE lower(?)"]
             if not include_archived:
                 like_conditions.append("m.archived_at IS NULL")
             if exclude_superseded:
@@ -1811,7 +1812,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         metadata_eq: Mapping[str, str] | None = None,
     ) -> tuple[list[Row], int]:
         conn = self._conn(tx)
-        where_parts: list[str] = []
+        # M6 parity with postgres: soft-deleted rows are invisible to list.
+        where_parts: list[str] = ["deleted_at IS NULL"]
         if not include_archived:
             where_parts.append("archived_at IS NULL")
         if exclude_superseded:
@@ -1858,15 +1860,16 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
     ) -> Row | None:
         conn = self._conn(tx)
         archived_clause = "" if include_archived else " AND archived_at IS NULL"
+        # M6 parity with postgres: a soft-deleted row is invisible to get.
         if visibility.scope == VisibilityScope.ROOT_BYPASS and visibility.namespace is None:
             return await _fetch_one(
                 conn,
-                f"SELECT {_sqlite_memory_cols()} FROM memories WHERE id = ?{archived_clause}",
+                f"SELECT {_sqlite_memory_cols()} FROM memories WHERE id = ? AND deleted_at IS NULL{archived_clause}",
                 (memory_id,),
             )
         params: list[Any] = [memory_id]
         vis_clause = _render_sqlite_visibility(visibility, params)
-        sql = f"SELECT {_sqlite_memory_cols()} FROM memories WHERE id = ?{archived_clause} AND {vis_clause}"
+        sql = f"SELECT {_sqlite_memory_cols()} FROM memories WHERE id = ? AND deleted_at IS NULL{archived_clause} AND {vis_clause}"
         return await _fetch_one(conn, sql, params)
 
     async def update_memory(
