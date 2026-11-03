@@ -59,7 +59,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 from urllib.parse import unquote, urlparse
 
 from mnemos.core.auth_context import UserContext
@@ -338,6 +338,30 @@ def _is_vec_distance_unsupported(exc: BaseException) -> bool:
     """True when exc indicates MySQL lacks built-in vector distance functions."""
     msg = str(exc)
     return "1305" in msg and ("VEC_DISTANCE" in msg or "VEC_COSINE" in msg or "VEC_L2" in msg)
+
+
+def _mysql_errno(exc: BaseException) -> Optional[int]:
+    """The MySQL error number carried by ``exc``, or None.
+
+    aiomysql raises ``OperationalError(1060, "...")`` (or ``ProgrammingError``),
+    so the code is ``exc.args[0]``. Indexing that directly assumed at least one
+    arg: an argument-less exception raised ``IndexError`` *inside* the
+    handler, masking the original failure and turning a "skip this one
+    ALTER" path into a startup crash. Every errno comparison must go through
+    here.
+    """
+    args = getattr(exc, "args", ())
+    if not args:
+        # Argument-less: nothing to read a code from. Never index blindly —
+        # that raised IndexError *inside* the handler and masked the failure.
+        return None
+    first = args[0]
+    if isinstance(first, bool):
+        return None
+    if isinstance(first, int):
+        return first
+    errno = getattr(first, "errno", None)
+    return errno if isinstance(errno, int) else None
 
 
 def _is_unique_violation(exc: BaseException) -> bool:
@@ -713,6 +737,40 @@ def _has_executable_mysql_sql(statement: str) -> bool:
     return False
 
 
+def _comments_prepended_to_sql(statement: str) -> str:
+    """Return the leading ``--`` comment block, or "" when none prefixes SQL.
+
+    Some migration files open with a header comment and then a blank line
+    before the first statement. The splitter keeps that pair together (only a
+    ``;`` ends a statement), so the resulting item is ``-- header\\n\\nALTER
+    ...;`` — a single string aiomysql refuses, because it rejects
+    multi-statement text. That made the FIRST statement of every such file a
+    silent no-op.
+
+    Only a pure comment block followed by SQL counts; anything else (a
+    statement that merely *contains* comments) returns "" and is left alone,
+    which keeps trigger bodies and their internal comments byte-identical.
+    """
+    lines = statement.splitlines()
+    first_sql = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("--"):
+            first_sql = index
+            break
+    if not first_sql:
+        return ""
+    return "\n".join(lines[:first_sql])
+
+
+def _strip_leading_comments(statement: str) -> str:
+    """``_comments_prepended_to_sql``'s complement: the statement minus them."""
+    comments = _comments_prepended_to_sql(statement)
+    if not comments:
+        return statement
+    return statement[len(comments) :].lstrip("\n")
+
+
 # ── DDL ───────────────────────────────────────────────────────────────────────
 
 _DDL_MEMORIES = """\
@@ -840,6 +898,13 @@ CREATE TABLE IF NOT EXISTS federation_peers (
     peer_mnemos_version  VARCHAR(128),
     last_schema_check_at TIMESTAMP(6) NULL,
     copy_embeddings      BOOLEAN      NOT NULL DEFAULT FALSE,
+    last_cursor_ts       TIMESTAMP(6) NULL,
+    lag_seconds          DOUBLE       NULL,
+    rows_last_sync       INT          NULL,
+    consecutive_failures INT          NOT NULL DEFAULT 0,
+    peer_embed_model     VARCHAR(256) NULL,
+    peer_embed_dim       INT          NULL,
+    embedding_status     TEXT         NULL,
     created              TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated              TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     PRIMARY KEY (id),
@@ -1474,10 +1539,38 @@ async def _ensure_mysql_federation_journal(conn: Any, *, separate_embeddings: bo
         sql += (directory.parent / "mariadb_helpers" / "federation_journal_mariadb_embeddings.sql").read_text()
     async with conn.cursor() as cursor:
         for statement in _split_mysql_statements(sql):
+            statement = _strip_leading_comments(statement)
             try:
                 await cursor.execute(statement)
             except Exception as exc:
-                if getattr(exc, "args", (None,))[0] == 1061 and "CREATE INDEX" in statement.upper():
+                if _mysql_errno(exc) == 1061 and "CREATE INDEX" in statement.upper():
+                    continue
+                raise
+
+
+async def _ensure_mysql_federation_replica_health(conn: Any) -> None:
+    """Apply ``migrations_mysql/0071_federation_replica_health.sql`` (M12 1/2).
+
+    0071 is an ALTER-only upgrade file and MySQL has no ``ADD COLUMN IF NOT
+    EXISTS`` (that is MariaDB syntax), so replaying it on an already-migrated
+    database raises error 1060 (duplicate column). That one code is swallowed
+    and every other error propagates — the same contract 0065 uses above.
+
+    This is the path an *upgraded* database takes; a fresh one already gets
+    the columns from ``_DDL_FEDERATION_PEERS`` and the inline ensure in
+    ``open()``, so the ALTERs are a no-op there.
+    """
+    directory = Path(__file__).resolve().parents[1] / "db_migrations" / "migrations_mysql"
+    sql = (directory / "0071_federation_replica_health.sql").read_text(encoding="utf-8")
+    async with conn.cursor() as cursor:
+        for statement in _split_mysql_statements(sql):
+            # Drop a leading header comment: aiomysql rejects multi-statement
+            # text, and "-- header\n\nALTER ...;" is exactly that.
+            statement = _strip_leading_comments(statement)
+            try:
+                await cursor.execute(statement)
+            except Exception as exc:
+                if _mysql_errno(exc) == 1060:
                     continue
                 raise
 
@@ -1496,10 +1589,15 @@ async def _ensure_mysql_oauth_schema(conn: Any) -> None:
     async with conn.cursor() as cursor:
         for name in ("0052_oauth_repository.sql", "0053_mcp_oauth.sql", "0065_api_keys_key_prefix.sql"):
             for statement in split_postgres_statements((directory / name).read_text(encoding="utf-8")):
+                # Each of these files opens with a "-- migration: ..." header
+                # block. aiomysql rejects multi-statement text, so without this
+                # the first statement (`CREATE TABLE users ...` for 0052) never
+                # ran and an upgraded database was left without it.
+                statement = _strip_leading_comments(statement)
                 try:
                     await cursor.execute(statement)
                 except Exception as exc:
-                    if getattr(exc, "args", (None,))[0] == 1060:
+                    if _mysql_errno(exc) == 1060:
                         continue
                     raise
 
@@ -1612,7 +1710,7 @@ async def _ensure_mysql_webhook_schema(conn: Any) -> None:
             _DDL_WEBHOOK_TRIGGERS,
         ):
             for statement in _split_mysql_statements(ddl):
-                await cursor.execute(statement)
+                await cursor.execute(_strip_leading_comments(statement))
 
 
 # ── Pool factory ──────────────────────────────────────────────────────────────
@@ -9032,6 +9130,7 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                 await _ensure_mysql_oauth_schema(conn)
                 await _ensure_mysql_webhook_schema(conn)
                 await _ensure_mysql_federation_journal(conn)
+                await _ensure_mysql_federation_replica_health(conn)
                 await _ensure_mysql_columns(
                     conn,
                     "memories",
@@ -9114,6 +9213,18 @@ class MysqlBackend:  # P14: PersistenceBackend is now a Union type alias; align 
                         "copy_embeddings": "copy_embeddings BOOLEAN NOT NULL DEFAULT FALSE",
                         "created": "created TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
                         "updated": "updated TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)",
+                        # M12 items 1/2 — replica health + peer embedder
+                        # fingerprint. MySQL 8.0 has no ADD COLUMN IF NOT
+                        # EXISTS, so the inline ensure below (not the
+                        # migrations_mysql file) is the path that actually
+                        # guarantees these on every open.
+                        "last_cursor_ts": "last_cursor_ts TIMESTAMP(6) NULL",
+                        "lag_seconds": "lag_seconds DOUBLE NULL",
+                        "rows_last_sync": "rows_last_sync INT NULL",
+                        "consecutive_failures": "consecutive_failures INT NOT NULL DEFAULT 0",
+                        "peer_embed_model": "peer_embed_model VARCHAR(256) NULL",
+                        "peer_embed_dim": "peer_embed_dim INT NULL",
+                        "embedding_status": "embedding_status TEXT NULL",
                     },
                 )
                 await _ensure_mysql_columns(

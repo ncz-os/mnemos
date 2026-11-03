@@ -158,26 +158,69 @@ def filter_digest_by_namespace(
     ids: Iterable[str],
     *,
     bucket_size: int = DEFAULT_BUCKET_SIZE,
+    rows: Iterable[Mapping[str, Any]] | None = None,
+    id_prefix: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Re-fold a digest down to ``ids`` (the repair set).
+    """Re-fold a digest down to ``ids`` (the repair set) and re-verify its root.
 
     Used to build the expectation for the repair round: the same hashing rules
     must apply, so the caller compares like with like rather than hand-rolling
     a second projection.
+
+    The ``merkle_root`` is recomputed over the kept subset rather than copied
+    from the source bucket. Handing back the full bucket's root beside a
+    shrunken id list gives a root that does not describe its own membership,
+    so a bounded by-id repair can never converge — the two sides differ
+    forever on a bucket that is already whole.
+
+    ``rows`` are the source rows the subset was drawn from; when they are not
+    supplied the folded bucket carries ``merkle_root=None``, which
+    ``diff_digests`` reads as "unverifiable" (never as "matches") rather than
+    publishing a root that would be a lie.
     """
     wanted = {str(memory_id) for memory_id in ids}
     per_bucket: dict[str, list[str]] = {}
     for memory_id in sorted(wanted):
         per_bucket.setdefault(bucket_index(memory_id, bucket_size), []).append(memory_id)
+
+    folded: dict[str, dict[str, Any]] = {}
+    if rows is not None:
+        # Fold only the requested rows: folding the whole corpus and then
+        # picking a bucket would hand back that bucket's *full* root under a
+        # subset, which is the very bug this guards against.
+        selected = []
+        for row in rows:
+            memory_id = row.get("id")
+            if not memory_id:
+                continue
+            remote_id = str(memory_id)
+            if id_prefix and remote_id.startswith(id_prefix):
+                remote_id = remote_id[len(id_prefix) :]
+            if remote_id in wanted:
+                selected.append(row)
+        folded = {
+            entry["bucket"]: entry
+            for entry in build_namespace_digest(
+                selected,
+                bucket_size=bucket_size,
+                id_prefix=id_prefix,
+            )["buckets"]
+        }
+
+    # Membership is what this side actually holds, never the request: an id
+    # asked for but absent here is not in the bucket, or the root (computed
+    # over the rows present) would not describe the ids/count beside it.
+    by_bucket = {str(b.get("bucket")): b for b in buckets}
     out: list[dict[str, Any]] = []
-    by_bucket = {b["bucket"]: b for b in buckets}
-    for bucket, members in sorted(per_bucket.items()):
-        source = by_bucket.get(bucket)
-        if source is None:
-            out.append({"bucket": bucket, "count": 0, "merkle_root": None, "ids": []})
-            continue
-        kept = [mid for mid in source.get("ids", []) if mid in wanted]
-        out.append({"bucket": bucket, "count": len(kept), "merkle_root": source.get("merkle_root"), "ids": kept})
+    for bucket in sorted(per_bucket):
+        if rows is not None:
+            entry = folded.get(bucket) or {}
+            kept = list(entry.get("ids") or [])
+            subset_root = entry.get("merkle_root") if kept else None
+        else:
+            kept = [mid for mid in (by_bucket.get(bucket) or {}).get("ids", []) if mid in wanted]
+            subset_root = None
+        out.append({"bucket": bucket, "count": len(kept), "merkle_root": subset_root, "ids": kept})
     return out
 
 

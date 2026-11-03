@@ -1063,6 +1063,18 @@ class _FederationSettings(BaseSettings):
     # cross-replica coordination — flip to a non-empty group name only
     # after every replica is known to be on a build that understands it.
     nats_queue_group: str = Field("", validation_alias="MNEMOS_FEDERATION_NATS_QUEUE_GROUP")
+    # Anti-entropy (decision M12 item 4): how often, in seconds, the sync
+    # worker runs a digest diff + bounded repair pass for a peer that has
+    # just synced successfully. 0 disables the periodic pass — the manual
+    # ``POST /v1/federation/peers/{id}/anti-entropy`` trigger still works.
+    # The cursor-only sync path is blind to rows it should have but never
+    # saw, so this is the only thing that closes that hole in the steady
+    # state; it defaults to on at a low cadence rather than off.
+    anti_entropy_interval_secs: int = Field(
+        3600,
+        ge=0,
+        validation_alias="MNEMOS_FEDERATION_ANTI_ENTROPY_INTERVAL_SECS",
+    )
 
 
 class _OAuthSettings(BaseSettings):

@@ -1522,6 +1522,21 @@ class FederationSyncTriggerResponse(BaseModel):
     updated: int
 
 
+class FederationAntiEntropyResponse(BaseModel):
+    """Result of one anti-entropy pass (decision M12 item 4)."""
+
+    peer: str
+    namespace: Optional[str] = None
+    in_sync: bool
+    differing_buckets: list[str] = []
+    checked_ids: int
+    pulled: int
+    restored: int
+    failed: list[str] = []
+    truncated: bool
+    repaired_at: str
+
+
 class FederationSyncLogEntry(BaseModel):
     id: str
     started_at: str

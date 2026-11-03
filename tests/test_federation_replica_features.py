@@ -127,14 +127,22 @@ class FakePeerFeed:
         # /v1/federation/digest hashes the *stored* content_hash column, not
         # the payload; the feed rows carry content, so derive it the same way
         # the server-side column is derived or the two sides never agree.
+        digest_rows = [
+            {**row, "content_hash": hashlib.sha256(row["content"].encode()).hexdigest()} for row in self.rows
+        ]
         document = build_namespace_digest(
-            [{**row, "content_hash": hashlib.sha256(row["content"].encode()).hexdigest()} for row in self.rows],
+            digest_rows,
             bucket_size=self.bucket_size,
             namespace=namespace,
             id_prefix=None,
         )
         if ids is not None:
-            buckets = filter_digest_by_namespace(document["buckets"], ids, bucket_size=self.bucket_size)
+            # The real route hands the rows it just fetched to the fold so
+            # each bucket's root describes its own subset; the fake must do
+            # the same or every by-id answer is an unverifiable None root.
+            buckets = filter_digest_by_namespace(
+                document["buckets"], ids, bucket_size=self.bucket_size, rows=digest_rows
+            )
             document = {**document, "row_count": sum(b["count"] for b in buckets), "buckets": buckets}
         return document
 
@@ -456,6 +464,12 @@ def _install_transport(monkeypatch, feed) -> None:
         return httpx.AsyncClient(transport=transport), object()
 
     monkeypatch.setattr(domain.federation, "make_safe_client", _safe_client)
+    # anti_entropy imported make_safe_client into its own namespace, so the
+    # patch above does not reach the digest fetch or the by-id repair pull.
+    # Patch it there too or every anti-entropy test dials the real network.
+    from mnemos.domain import anti_entropy
+
+    monkeypatch.setattr(anti_entropy, "make_safe_client", _safe_client)
     # The local embedder fingerprint is what makes a two-node dimension
     # mismatch observable; pin it per test through _install_local_fingerprint.
     from mnemos.persistence import federation_journal
@@ -624,6 +638,126 @@ def _gauge_value(name: str, labelname: str) -> float:
 
 
 class TestEmbedderFingerprint:
+    def test_default_install_resolves_a_real_embed_model(self, monkeypatch):
+        """The fingerprint reads the knob the runtime loads, not a dead field.
+
+        ``providers.inference_embed_model`` is documented "retained for
+        installer compatibility only, no longer read by the runtime" and is
+        empty on a default install. Reading it made every default-configured
+        node advertise ``embed_model=None``, which fail-closes every peer
+        into a durable 412 — and could equally have matched a peer whose
+        vectors this node cannot compare.
+        """
+        from mnemos.domain import federation
+
+        monkeypatch.delenv("MNEMOS_EMBED_HTTP_MODEL", raising=False)
+        monkeypatch.delenv("MNEMOS_EMBED_BACKEND", raising=False)
+        monkeypatch.delenv("MNEMOS_EMBED_MODEL_PATH", raising=False)
+        monkeypatch.setenv("INFERENCE_EMBED_MODEL", "")
+
+        fingerprint = federation._local_embedding_fingerprint()
+
+        assert fingerprint["embed_model"], "a default install must not advertise an unresolved model"
+        assert fingerprint["embed_model"] != "unknown"
+        # Invariant (not a literal): a default install advertises exactly the
+        # width it is configured with. Pre-F-6 the default was a hard-coded 768
+        # while the default model (bge-m3) is 1024-D; F-6 makes the default
+        # follow the model. Asserting the invariant keeps this test correct
+        # either way — a literal here is what made the branch disagree with the
+        # merged tree. The two sides are resolved independently (this helper
+        # vs. Settings), so this catches a divergence rather than restating one.
+        from mnemos.core.config import embedding_dim_env
+
+        assert fingerprint["embed_dim"] == embedding_dim_env()
+
+    def test_http_backend_reports_the_http_model_name(self, monkeypatch):
+        from mnemos.domain import federation
+
+        monkeypatch.setenv("MNEMOS_EMBED_BACKEND", "http")
+        monkeypatch.setenv("MNEMOS_EMBED_HTTP_MODEL", "bge-m3")
+
+        assert federation._local_embedding_fingerprint()["embed_model"] == "bge-m3"
+
+    def test_http_model_describes_a_node_with_no_local_path_configured(self, monkeypatch):
+        """The GGUF default is not this node's identity.
+
+        ``embed_model_path_env()`` always returns a path, so treating it as
+        proof of a local model made every node report the default GGUF name
+        even when it embeds over HTTP — two nodes then disagreed on a model
+        neither had loaded and durably 412'd each other.
+        """
+        from mnemos.domain import federation
+
+        monkeypatch.setenv("MNEMOS_EMBED_HTTP_MODEL", "bge-m3")
+        monkeypatch.delenv("MNEMOS_EMBED_MODEL_PATH", raising=False)
+        monkeypatch.delenv("MNEMOS_EMBED_BACKEND", raising=False)
+
+        fingerprint = federation._local_embedding_fingerprint()
+
+        assert fingerprint["embed_model"] == "bge-m3"
+
+    def test_a_missing_import_surfaces_instead_of_silently_unresolving(self):
+        """A missing module-level import must not masquerade as "unresolved".
+
+        The function's ``except Exception`` used to swallow ``NameError``, so a
+        missing ``os`` import returned ``embed_model=None`` — and every peer
+        then durably 412'd with no traceback anywhere. A code defect has to be
+        loud; only a genuinely unrecognisable config shape is "unresolved".
+        """
+        from mnemos.domain import federation
+
+        real_os = federation.os
+        del federation.os
+        try:
+            with pytest.raises(NameError):
+                federation._local_embedding_fingerprint()
+        finally:
+            federation.os = real_os
+
+    def test_explicit_local_model_path_wins_over_the_http_default(self, monkeypatch):
+        """A node that was told which GGUF to load reports that GGUF.
+
+        ``embed_model_path_env()`` falls back to a default path, so the
+        fingerprint cannot treat a non-empty value as proof of configuration.
+        Only an explicitly-set ``MNEMOS_EMBED_MODEL_PATH`` names this node's
+        weights; otherwise the HTTP model — itself defaulted — would describe
+        a backend ``auto`` never selects.
+        """
+        from mnemos.domain import federation
+
+        monkeypatch.delenv("MNEMOS_EMBED_BACKEND", raising=False)
+        monkeypatch.setenv("MNEMOS_EMBED_HTTP_MODEL", "bge-m3")
+        monkeypatch.setenv("MNEMOS_EMBED_MODEL_PATH", "/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf")
+
+        assert federation._local_embedding_fingerprint()["embed_model"] == "nomic-embed-text-v1.5.Q8_0.gguf"
+
+    def test_default_install_fingerprint_is_stable_across_calls(self, monkeypatch):
+        """Two identically-configured nodes must agree, or every sync 412s."""
+        from mnemos.domain import federation
+
+        monkeypatch.delenv("MNEMOS_EMBED_HTTP_MODEL", raising=False)
+        monkeypatch.delenv("MNEMOS_EMBED_BACKEND", raising=False)
+
+        first = federation._local_embedding_fingerprint()
+        second = federation._local_embedding_fingerprint()
+        assert first == second
+        assert federation.fingerprint_mismatch_reason(first, second) is None
+
+    @pytest.mark.asyncio
+    async def test_schema_route_serves_the_resolved_default_fingerprint(self, monkeypatch):
+        """The real handler, with no fingerprint monkeypatch: not None."""
+        from mnemos.api.routes.federation import federation_schema
+
+        monkeypatch.delenv("MNEMOS_EMBED_HTTP_MODEL", raising=False)
+        monkeypatch.delenv("MNEMOS_EMBED_BACKEND", raising=False)
+
+        payload = await federation_schema(None)
+
+        assert payload["embed_model"], "default nodes must advertise a resolvable embedder"
+        from mnemos.core.config import embedding_dim_env
+
+        assert payload["embed_dim"] == embedding_dim_env()
+
     @pytest.mark.asyncio
     async def test_schema_advertises_embed_model_and_dim(self, monkeypatch):
         from mnemos.api.routes.federation import federation_schema
@@ -853,6 +987,140 @@ class TestAntiEntropyDigest:
         assert diff_digests(source_digest, replica_digest)["differing_buckets"] == []
 
     @pytest.mark.asyncio
+    async def test_digest_route_honours_a_namespace_filter(self, monkeypatch):
+        """``?namespace=`` must not come back empty.
+
+        The route used to re-filter rows on a ``namespace`` key that no
+        backend's ``list_namespace_digest_rows`` returns (the row shape is
+        ``{id, content_hash, updated}`` on all six), so every namespaced
+        request answered ``buckets: []`` — and an anti-entropy pass scoped to
+        one namespace saw a source with no rows at all.
+        """
+        from mnemos.api.routes import federation as handler
+
+        t0 = datetime(2026, 10, 31, 10, 0, 0, tzinfo=timezone.utc)
+        source_rows = [_remote_row(f"mem-{i}", t0 + timedelta(seconds=i)) for i in range(1, 4)]
+        for row in source_rows:
+            row["namespace"] = "team-a"
+        feed = FakePeerFeed(source_rows, schema=_schema(embed_model="bge-m3", embed_dim=1024))
+        backend = FakeReplicaBackend()
+        _install_transport(monkeypatch, feed)
+        _install_local_fingerprint(monkeypatch, embed_model="bge-m3", embed_dim=1024)
+        monkeypatch.setattr("mnemos.domain.federation._utcnow", lambda: t0 + timedelta(minutes=5))
+        _install_status_backend(monkeypatch, backend)
+
+        await federation_sync(backend)
+
+        document = await handler.federation_digest(None, namespace="team-a", bucket_size=None, ids=None)
+
+        assert document["namespace"] == "team-a"
+        assert document["row_count"] == 3
+        assert sum(b["count"] for b in document["buckets"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_digest_route_ids_subset_has_a_root_for_its_own_ids(self, monkeypatch):
+        """A folded (by-id) bucket's root must describe its own membership.
+
+        Copying the source bucket's root beside a shrunken id list gave a
+        root that did not match its ids, so a bounded repair round compared
+        two roots that could never converge.
+        """
+        from mnemos.domain.replication_digest import bucket_index, build_namespace_digest
+
+        # Pick two ids in ONE bucket and one in another, at bucket_size=2, so
+        # the folded document has a bucket that is a strict subset.
+        pair = None
+        for i in range(128):
+            for j in range(i + 1, 128):
+                if bucket_index(f"mem-{i}", 2) == bucket_index(f"mem-{j}", 2):
+                    pair = (f"mem-{i}", f"mem-{j}")
+                    break
+            if pair:
+                break
+        assert pair is not None
+
+        rows = [
+            {"id": pair[0], "content_hash": "h0", "updated": "2026-10-31T10:00:00Z"},
+            {"id": pair[1], "content_hash": "h1", "updated": "2026-10-31T10:01:00Z"},
+        ]
+        full = build_namespace_digest(rows, bucket_size=2)
+        populated = [b for b in full["buckets"] if b["count"] == 2]
+        assert populated, "the two ids must share a bucket for this test"
+
+        subset = build_namespace_digest([rows[0]], bucket_size=2)
+
+        # The route's own folding must equal folding the rows directly.
+        from mnemos.domain.replication_digest import filter_digest_by_namespace
+
+        folded = filter_digest_by_namespace(full["buckets"], [rows[0]["id"]], bucket_size=2, rows=rows)
+        (entry,) = [b for b in folded if b["bucket"] == populated[0]["bucket"]]
+        assert entry["ids"] == [rows[0]["id"]]
+        assert entry["count"] == 1
+        assert entry["merkle_root"] == subset["buckets"][0]["merkle_root"]
+        assert entry["merkle_root"] != populated[0]["merkle_root"]
+
+    def test_digest_ids_subset_counts_only_rows_present_on_this_side(self):
+        """A requested id this side does not hold is not a member of its bucket.
+
+        In the repair round one side is normally missing rows. Folding
+        ``[a, b]`` over rows that hold only ``a`` must describe ``a`` alone:
+        listing ``b`` (and counting it) beside a root computed over ``a``
+        gives a bucket whose root does not describe its membership and a
+        row_count that overcounts, so the two sides never converge.
+        """
+        from mnemos.domain.replication_digest import bucket_index, build_namespace_digest, filter_digest_by_namespace
+
+        pair = None
+        for i in range(128):
+            for j in range(i + 1, 128):
+                if bucket_index(f"mem-{i}", 2) == bucket_index(f"mem-{j}", 2):
+                    pair = (f"mem-{i}", f"mem-{j}")
+                    break
+            if pair:
+                break
+        assert pair is not None
+        present, absent = pair
+        rows = [{"id": present, "content_hash": "h0", "updated": "2026-10-31T10:00:00Z"}]
+        full = build_namespace_digest(rows, bucket_size=2)
+        only = build_namespace_digest(rows, bucket_size=2)["buckets"][0]
+
+        (entry,) = filter_digest_by_namespace(full["buckets"], [present, absent], bucket_size=2, rows=rows)
+        assert entry["ids"] == [present]
+        assert entry["count"] == 1
+        assert entry["merkle_root"] == only["merkle_root"]
+
+        # A requested bucket with none of the ids present is empty, not a
+        # bucket that claims rows it cannot hash.
+        lonely = next(f"mem-x{k}" for k in range(512) if bucket_index(f"mem-x{k}", 2) != only["bucket"])
+        folded = filter_digest_by_namespace(full["buckets"], [present, lonely], bucket_size=2, rows=rows)
+        empty = [b for b in folded if b["bucket"] == bucket_index(lonely, 2)]
+        assert empty == [{"bucket": bucket_index(lonely, 2), "count": 0, "merkle_root": None, "ids": []}]
+        assert sum(b["count"] for b in folded) == 1
+
+    def test_digest_ids_subset_without_rows_lists_only_source_bucket_ids(self):
+        """Without rows the ids/count come from the source bucket, never from the request."""
+        from mnemos.domain.replication_digest import build_namespace_digest, filter_digest_by_namespace
+
+        rows = [{"id": "mem-a", "content_hash": "h", "updated": "2026-10-31T10:00:00Z"}]
+        full = build_namespace_digest(rows, bucket_size=1)
+        (entry,) = filter_digest_by_namespace(full["buckets"], ["mem-a", "mem-zz"], bucket_size=1)
+        assert entry["ids"] == ["mem-a"]
+        assert entry["count"] == 1
+        assert entry["merkle_root"] is None
+
+    @pytest.mark.asyncio
+    async def test_digest_route_ids_subset_without_rows_is_unverifiable(self, monkeypatch):
+        """Without the rows, the folded root is None — never the full bucket's root."""
+        from mnemos.domain.replication_digest import build_namespace_digest, filter_digest_by_namespace, bucket_index
+
+        rows = [{"id": "mem-a", "content_hash": "h", "updated": "2026-10-31T10:00:00Z"}]
+        full = build_namespace_digest(rows, bucket_size=1)
+        entry = filter_digest_by_namespace(full["buckets"], ["mem-a"], bucket_size=1)[0]
+        assert entry["bucket"] == bucket_index("mem-a", 1)
+        assert entry["ids"] == ["mem-a"]
+        assert entry["merkle_root"] is None
+
+    @pytest.mark.asyncio
     async def test_digest_diff_is_empty_when_nodes_agree(self, monkeypatch):
         from mnemos.api.routes import federation as handler
         from mnemos.domain.replication_digest import DEFAULT_BUCKET_SIZE, diff_digests
@@ -873,6 +1141,96 @@ class TestAntiEntropyDigest:
             await handler.federation_digest(None, namespace=None, bucket_size=None, ids=None),
         )
         assert diff["differing_buckets"] == []
+
+    @pytest.mark.asyncio
+    async def test_bounded_by_id_digest_roundtrip_converges(self, monkeypatch):
+        """A by-id digest roundtrip over a whole bucket converges.
+
+        The repair set names every id in a bucket that the replica already
+        holds. The source must fold over its own rows for exactly that set,
+        and the replica folds over its own rows for the same set; the two
+        answers must be identical in count, ids, and root. Before the fix,
+        the source's folded bucket listed the full repair-set ids and
+        reported count=len(request) even when some ids were absent, so the
+        root (computed only over the present rows) no longer described its
+        own membership and the two sides could never agree on a bucket that
+        was already whole.
+        """
+        from mnemos.api.routes import federation as handler
+        from mnemos.domain.replication_digest import bucket_index, build_namespace_digest
+
+        t0 = datetime(2026, 10, 31, 10, 0, 0, tzinfo=timezone.utc)
+
+        # Find two ids that share a bucket at width 2, and a third in a
+        # different bucket, so the folded document exercises both the
+        # populated-bucket path and the empty-bucket path.
+        pair = None
+        for i in range(256):
+            for j in range(i + 1, 256):
+                if bucket_index(f"mem-{i}", 2) == bucket_index(f"mem-{j}", 2):
+                    pair = (f"mem-{i}", f"mem-{j}")
+                    break
+            if pair:
+                break
+        assert pair is not None
+        a, b = pair
+        other = next(
+            f"mem-o{k}" for k in range(256)
+            if bucket_index(f"mem-o{k}", 2) != bucket_index(a, 2)
+        )
+
+        source_rows = [
+            _remote_row(a, t0),
+            _remote_row(b, t0 + timedelta(seconds=1)),
+            _remote_row(other, t0 + timedelta(seconds=2)),
+        ]
+        feed = FakePeerFeed(source_rows, schema=_schema(embed_model="bge-m3", embed_dim=1024), bucket_size=2)
+        backend = FakeReplicaBackend()
+        _install_transport(monkeypatch, feed)
+        _install_local_fingerprint(monkeypatch, embed_model="bge-m3", embed_dim=1024)
+        monkeypatch.setattr("mnemos.domain.federation._utcnow", lambda: t0 + timedelta(minutes=5))
+        _install_status_backend(monkeypatch, backend)
+
+        await federation_sync(backend)
+
+        # The source folds to the repair set {a, b} over its own rows.
+        repair_ids = [a, b]
+        source_doc = feed.digest(params={"namespace": ""}, ids=repair_ids)
+
+        # The replica folds the same set over its own rows via the route.
+        replica_doc = await handler.federation_digest(
+            None, namespace=None, bucket_size=2, ids=",".join(repair_ids)
+        )
+
+        # Both sides must agree: same buckets, same counts, same roots.
+        source_b = {e["bucket"]: e for e in source_doc["buckets"]}
+        replica_b = {e["bucket"]: e for e in replica_doc["buckets"]}
+        assert set(source_b) == set(replica_b)
+        for bucket, src_entry in source_b.items():
+            rep_entry = replica_b[bucket]
+            assert src_entry["count"] == rep_entry["count"], (
+                f"bucket {bucket}: source count {src_entry['count']} != replica {rep_entry['count']}"
+            )
+            assert src_entry["ids"] == rep_entry["ids"], (
+                f"bucket {bucket}: source ids {src_entry['ids']} != replica {rep_entry['ids']}"
+            )
+            if src_entry["count"] > 0:
+                assert src_entry["merkle_root"] == rep_entry["merkle_root"], (
+                    f"bucket {bucket}: roots differ (source {src_entry['merkle_root']!r} vs "
+                    f"replica {rep_entry['merkle_root']!r})"
+                )
+
+        # The populated bucket must carry the correct count and ids.
+        populated = [e for e in source_doc["buckets"] if e["count"] > 0]
+        assert len(populated) == 1, f"expected exactly one populated bucket, got {source_doc['buckets']}"
+        (entry,) = populated
+        assert set(entry["ids"]) == {a, b}
+        assert entry["count"] == 2
+        assert entry["merkle_root"] is not None
+
+        # The document's row_count must equal the sum of bucket counts,
+        # not the number of requested ids.
+        assert source_doc["row_count"] == sum(e["count"] for e in source_doc["buckets"])
 
     @pytest.mark.asyncio
     async def test_namespaced_digest_is_not_emptied_by_the_route(self, monkeypatch):
@@ -904,6 +1262,61 @@ class TestAntiEntropyDigest:
 
         assert replica_digest["row_count"] == len(source_rows)
         assert diff_digests(source_digest, replica_digest)["in_sync"] is True
+
+    @pytest.mark.asyncio
+    async def test_anti_entropy_route_runs_a_repair_pass(self, monkeypatch):
+        """The repair is reachable from the API, not just from its own module.
+
+        M12 item 4 shipped with zero non-test call sites, so nothing in a
+        running deployment could ever compare digests. This operator trigger
+        is one of the two entry points; the other is the sync worker.
+        """
+        from mnemos.api.dependencies import UserContext
+        from mnemos.api.routes import federation as handler
+        from mnemos.domain.replication_digest import DEFAULT_BUCKET_SIZE
+
+        t0 = datetime(2026, 10, 31, 10, 0, 0, tzinfo=timezone.utc)
+        source_rows = [_remote_row(f"mem-{i}", t0 + timedelta(seconds=i)) for i in range(1, 4)]
+        feed = FakePeerFeed(source_rows, schema=_schema(embed_model="bge-m3", embed_dim=1024))
+        backend = FakeReplicaBackend()
+        _install_transport(monkeypatch, feed)
+        _install_local_fingerprint(monkeypatch, embed_model="bge-m3", embed_dim=1024)
+        monkeypatch.setattr("mnemos.domain.federation._utcnow", lambda: t0 + timedelta(minutes=5))
+        _install_status_backend(monkeypatch, backend)
+
+        await federation_sync(backend)
+        feed.bucket_size = DEFAULT_BUCKET_SIZE
+        backend.rows.pop("fed:peer:mem-2")
+
+        report = await handler.trigger_anti_entropy(
+            backend.federation.peer["id"],
+            UserContext(user_id="root", group_ids=[], role="root", namespace="default", authenticated=True),
+            None,
+            None,
+        )
+
+        assert report.in_sync is False
+        assert report.restored == 1
+        assert "fed:peer:mem-2" in backend.rows
+        assert report.peer == "peer"
+
+    @pytest.mark.asyncio
+    async def test_anti_entropy_route_maps_a_missing_peer_to_404(self, monkeypatch):
+        from fastapi import HTTPException
+
+        from mnemos.api.dependencies import UserContext
+        from mnemos.api.routes import federation as handler
+
+        backend = FakeReplicaBackend()
+        _install_status_backend(monkeypatch, backend)
+        with pytest.raises(HTTPException) as exc:
+            await handler.trigger_anti_entropy(
+                "00000000-0000-0000-0000-000000000000",
+                UserContext(user_id="root", group_ids=[], role="root", namespace="default", authenticated=True),
+                None,
+                None,
+            )
+        assert exc.value.status_code == 404
 
     @pytest.mark.asyncio
     async def test_digest_route_requires_federation_role(self, monkeypatch):

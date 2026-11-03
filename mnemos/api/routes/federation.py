@@ -26,6 +26,7 @@ from mnemos.domain.models import (
     FederationConsolidationEvent,
     FederationFeedResponse,
     FederationPeer,
+    FederationAntiEntropyResponse,
     FederationPeerCreateRequest,
     FederationPeerListResponse,
     FederationPeerUpdateRequest,
@@ -621,6 +622,56 @@ async def trigger_sync(
     )
 
 
+@router.post("/peers/{peer_id}/anti-entropy", response_model=FederationAntiEntropyResponse)
+async def trigger_anti_entropy(
+    peer_id: str,
+    _: UserContext = Depends(require_root),
+    namespace: Optional[str] = Query(None, description="Namespace to compare; omit for all"),
+    bucket_size: Optional[int] = Query(
+        None,
+        ge=_fed_digest.MIN_BUCKET_SIZE,
+        le=_fed_digest.MAX_BUCKET_SIZE,
+        alias="bucket",
+    ),
+):
+    """Run one digest diff + bounded repair pass against a peer (M12 item 4).
+
+    The scheduled worker runs this on its own cadence
+    (``MNEMOS_FEDERATION_ANTI_ENTROPY_INTERVAL_SECS``); this endpoint is the
+    operator's "repair now" trigger and returns the same report the worker
+    logs. It never advances the sync cursor — repaired rows are outside the
+    feed's sequence order and advancing to them would skip real events.
+    """
+    from mnemos.domain.anti_entropy import AntiEntropyError, run_anti_entropy
+
+    peer_id = parse_uuid_or_404(peer_id, "peer")
+    backend = require_federation_backend()
+    try:
+        report = await run_anti_entropy(backend, peer_id, namespace=namespace, bucket_size=bucket_size)
+    except AntiEntropyError as e:
+        # "not found" is a client error on the addressed peer; anything else
+        # is the peer not speaking /digest (pre-M12 build) or answering a
+        # malformed document, which the cursor sync path is unaffected by.
+        if "not found" in str(e):
+            raise HTTPException(status_code=404, detail=str(e))
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    diff = report.get("diff") or {}
+    return FederationAntiEntropyResponse(
+        peer=report["peer"],
+        namespace=report.get("namespace"),
+        in_sync=bool(diff.get("in_sync", False)),
+        differing_buckets=list(diff.get("differing_buckets") or []),
+        checked_ids=report["checked_ids"],
+        pulled=report["pulled"],
+        restored=report["restored"],
+        failed=list(report.get("failed") or []),
+        truncated=report["truncated"],
+        repaired_at=report["repaired_at"],
+    )
+
+
 @router.get("/peers/{peer_id}/log", response_model=FederationSyncLogResponse)
 async def peer_sync_log(
     peer_id: str,
@@ -768,7 +819,9 @@ async def federation_digest(
     document = _fed_digest.build_namespace_digest(rows, bucket_size=width, namespace=namespace)
     if ids:
         wanted = [item.strip() for item in ids.split(",") if item.strip()]
-        buckets = _fed_digest.filter_digest_by_namespace(document["buckets"], wanted, bucket_size=width)
+        # ``rows`` is what makes the folded bucket's merkle_root describe the
+        # subset it is attached to; without it the root is None (unverifiable).
+        buckets = _fed_digest.filter_digest_by_namespace(document["buckets"], wanted, bucket_size=width, rows=rows)
         document = {**document, "row_count": sum(b["count"] for b in buckets), "buckets": buckets}
     return document
 

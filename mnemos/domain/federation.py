@@ -255,25 +255,63 @@ def _local_embedding_fingerprint() -> Dict[str, Optional[Any]]:
     Two nodes only agree on a vector if both the model *and* the dimension
     match — the same model name at a different width, or two models at the
     same width, both produce vectors that are meaningless to the other side.
-    Either value may be None when the instance routes embedding over HTTP
-    without setting MNEMOS_EMBED_HTTP_MODEL, or has no inference config;
-    None means "unresolved", which callers must treat as unverifiable rather
-    than as a match.
+    Either value may be None when the instances cannot agree on a knob; None
+    means "unresolved", which callers must treat as unverifiable rather than
+    as a match.
+
+    The model is the one ``mnemos.runtime.embedder`` actually loads, not the
+    legacy ``providers.inference_embed_model`` field: that field is documented
+    "retained for installer compatibility only, no longer read by the runtime",
+    is empty on a default install, and reading it made every default-configured
+    node report ``unresolved`` and durably 412 every peer — or, worse, report a
+    stale name and match a peer whose vectors it cannot compare.
+
+    Resolution order mirrors the runtime: an explicit ``MNEMOS_EMBED_HTTP_MODEL``
+    only describes the model when the HTTP backend is the one in use; otherwise
+    the identity is the GGUF the local backend loads (``embed_model_path``).
     """
     embed_model: Optional[str] = None
     embed_dim: Optional[int] = None
     try:
-        from mnemos.core.config import embed_http_model_override, get_settings
-
-        settings = get_settings()
-        embed_model = (
-            embed_http_model_override()
-            or (getattr(settings.providers, "inference_embed_model", "") or "").strip()
-            or None
+        from mnemos.core.config import (
+            embed_backend_env,
+            embed_http_model_env,
+            embed_http_model_override,
+            embed_model_path_env,
+            get_settings,
         )
+
+        backend = (embed_backend_env() or "").strip().lower()
+        http_model = (embed_http_model_override() or "").strip()
+        # ``embed_model_path_env()`` substitutes a default GGUF path, so a
+        # non-empty result does not mean the operator chose a local model.
+        # Only an explicitly-set path names this node's weights; ``os.environ``
+        # is the only way to tell "configured" from "defaulted".
+        explicit_path = (os.environ.get("MNEMOS_EMBED_MODEL_PATH") or "").strip()
+        if backend == "http" or (backend == "auto" and not explicit_path):
+            # ``auto`` never selects HTTP (see embedder._select_backend), but it
+            # is also what is reported when nothing is configured at all. In
+            # that case the HTTP model is the fleet's stated identity and the
+            # GGUF default is not a fact about this node.
+            embed_model = http_model or (embed_http_model_env() or "").strip() or None
+        else:
+            # Every in-process backend (llamacpp / openvino / cix-npu)
+            # describes the same weights by path.
+            chosen_path = explicit_path or (embed_model_path_env() or "").strip()
+            embed_model = os.path.basename(chosen_path) if chosen_path else (http_model or None)
+        settings = get_settings()
         dim = getattr(settings.database, "embedding_dim", None)
         embed_dim = int(dim) if dim else None
+    except NameError:
+        # A missing module-level import (``os``, a config helper) is a code
+        # defect, not an unresolved embedder. Letting it surface beats the
+        # previous bare ``except Exception``, which turned it into
+        # ``embed_model=None`` — every peer then durably 412s with no
+        # traceback anywhere in the logs.
+        raise
     except Exception:
+        # Any *config-shape* problem is "unresolved", which callers treat as
+        # unverifiable rather than as a match.
         embed_model = None
         embed_dim = None
     return {"embed_model": embed_model, "embed_dim": embed_dim}
@@ -291,7 +329,9 @@ def fingerprint_mismatch_reason(local: Mapping[str, Any], peer: Mapping[str, Any
     peer_model = peer.get("embed_model")
     peer_dim = peer.get("embed_dim")
     if not local_model or not local_dim:
-        return f"local embedder unresolved (embed_model={local_model} embed_dim={local_dim}); cannot verify peer vectors"
+        return (
+            f"local embedder unresolved (embed_model={local_model} embed_dim={local_dim}); cannot verify peer vectors"
+        )
     if not peer_model or not peer_dim:
         return f"peer embedder unresolved (embed_model={peer_model} embed_dim={peer_dim}); cannot verify peer vectors"
     if peer_model != local_model or peer_dim != local_dim:
@@ -1838,10 +1878,23 @@ async def federation_worker_loop(backend: FederationPersistence) -> None:
     """Background loop: iterate enabled peers, sync those whose interval has elapsed.
 
     Started from the FastAPI lifespan. Cancels cleanly on shutdown.
+
+    A peer that just synced cleanly is also offered an anti-entropy pass
+    (decision M12 item 4) when its digest interval has elapsed. That pass is
+    the only thing that can repair rows the cursor is structurally blind to —
+    see ``mnemos.domain.anti_entropy`` — and it is skipped for a peer whose
+    sync failed, because there is no point diffing against a peer we cannot
+    reach. ``last_anti_entropy_at`` is tracked in memory per peer name so a
+    restart simply schedules the first pass again.
     """
     import asyncio
+    import time
+
+    from mnemos.core.config import get_settings
+    from mnemos.domain.anti_entropy import AntiEntropyError, run_anti_entropy
 
     logger.info("federation worker started")
+    last_pass: dict[str, float] = {}
     while True:
         try:
             await asyncio.sleep(60)  # check every minute
@@ -1856,11 +1909,36 @@ async def federation_worker_loop(backend: FederationPersistence) -> None:
                 # let 10 long-interval transient-failing peers starve
                 # short-interval healthy peers every 60s tick.
                 due = await backend.federation.list_due_peers(tx)
+            interval = int(getattr(get_settings().federation, "anti_entropy_interval_secs", 0) or 0)
+            now = time.monotonic()
             for p in due:
                 try:
                     await sync_peer(backend, p["id"])
                 except Exception:
                     logger.exception("federation: sync failed for peer %s", p["name"])
+                    continue
+                if interval <= 0:
+                    continue
+                if now - last_pass.get(p["name"], 0.0) < interval:
+                    continue
+                last_pass[p["name"]] = now
+                try:
+                    report = await run_anti_entropy(backend, p["id"])
+                except AntiEntropyError as e:
+                    # A peer that does not speak /digest (pre-M12 build) or
+                    # whose digest is malformed is not a sync failure — the
+                    # cursor path above still works and we retry next interval.
+                    logger.info("federation: anti-entropy skipped for peer %s: %s", p["name"], e)
+                except Exception:
+                    logger.exception("federation: anti-entropy failed for peer %s", p["name"])
+                else:
+                    logger.info(
+                        "federation: anti-entropy peer=%s differing=%s restored=%s truncated=%s",
+                        p["name"],
+                        report.get("diff", {}).get("differing_buckets"),
+                        report.get("restored"),
+                        report.get("truncated"),
+                    )
         except asyncio.CancelledError:
             logger.info("federation worker cancelled")
             raise

@@ -77,6 +77,7 @@ from mnemos.persistence.mysql import (
     _ensure_embedding_column_dim,
     _ensure_mysql_columns,
     _ensure_mysql_federation_journal,
+    _ensure_mysql_federation_replica_health,
     _ensure_mysql_oauth_schema,
     _ensure_mysql_webhook_schema,
     _fetch_all_dicts,
@@ -1557,6 +1558,7 @@ class MariadbBackend(MysqlBackend):
                 await _ensure_mysql_oauth_schema(conn)
                 await _ensure_mysql_webhook_schema(conn)
                 await _ensure_mysql_federation_journal(conn)
+                await _ensure_mysql_federation_replica_health(conn)
                 await _ensure_mysql_columns(
                     conn,
                     "memories",
@@ -1624,6 +1626,20 @@ class MariadbBackend(MysqlBackend):
                     conn,
                     "session_memory_injections",
                     {"deleted_at": "deleted_at TIMESTAMP(6) NULL"},
+                )
+                # M12 items 1/2 — replica health + peer embedder fingerprint.
+                await _ensure_mysql_columns(
+                    conn,
+                    "federation_peers",
+                    {
+                        "last_cursor_ts": "last_cursor_ts TIMESTAMP(6) NULL",
+                        "lag_seconds": "lag_seconds DOUBLE NULL",
+                        "rows_last_sync": "rows_last_sync INT NULL",
+                        "consecutive_failures": "consecutive_failures INT NOT NULL DEFAULT 0",
+                        "peer_embed_model": "peer_embed_model VARCHAR(256) NULL",
+                        "peer_embed_dim": "peer_embed_dim INT NULL",
+                        "embedding_status": "embedding_status TEXT NULL",
+                    },
                 )
                 await conn.commit()
         except Exception:
