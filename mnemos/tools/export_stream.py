@@ -102,6 +102,33 @@ def iter_pages(endpoint, api_key, params):
     yield {"export_complete": True, "record_count": count}
 
 
+def completion_count_matches(declared, *, unique, wire):
+    """Return True when a completion marker's ``record_count`` accounts for the stream.
+
+    Two server generations exist, and their markers count different things:
+
+    * every server up to and including the 7.0.5 image deployed on PYTHIA
+      (``stream_export`` summed ``len(page["records"])``) declares the WIRE
+      count, so a keyset seam that re-emitted a boundary row is counted twice;
+    * servers carrying the seam guard in ``domain/portability/stream.py`` never
+      emit an identity twice, so wire == unique and either reading agrees.
+
+    The caller has already proven that every repeated identity carried a
+    byte-identical payload (a divergent repeat raises before this check), so a
+    marker equal to the wire count means every frame the server sent arrived,
+    and the unique set is the complete snapshot. Anything else (a marker equal
+    to neither count) is a truncated or inconsistent stream and is rejected.
+
+    Both the STYX validator and ``write_export`` call this one function so
+    they cannot drift apart again: the 2026-11 STYX failures were exactly that
+    drift (the validator counted wire frames, the materializer counted unique
+    identities, and every backup with a seam duplicate failed ``N-k != N``).
+    """
+    if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0:
+        return False
+    return declared in (unique, wire)
+
+
 def _identity(surface, entry):
     if surface == "records":
         if not isinstance(entry.get("id"), str) or not entry["id"]:
@@ -128,14 +155,16 @@ def write_export(pages, output, *, jsonl=False, include_sidecars=True):
             pending_entries = 0
             for page in pages:
                 if page.get("export_complete") is True:
-                    # The completion marker declares the SNAPSHOT's unique
-                    # record count. A server that (before the 2026-10-03
-                    # cursor fix) re-emitted a boundary row byte-identically
-                    # on the wire still declared the unique count, so the
-                    # accepted comparison is against unique identities —
-                    # wire frames are transport, not records.
-                    if page.get("record_count") != unique_records:
-                        raise ExportValidationError("export completion count does not match unique record identities")
+                    # Repeated identities were verified byte-identical
+                    # below; the marker may count wire frames (deployed
+                    # servers) or unique identities (seam-guarded servers).
+                    # See completion_count_matches for why both are sound.
+                    if not completion_count_matches(page.get("record_count"), unique=unique_records, wire=wire_count):
+                        raise ExportValidationError(
+                            "export completion count does not match unique record identities "
+                            f"or received records ({page.get('record_count')!r} vs "
+                            f"{unique_records} unique / {wire_count} received)"
+                        )
                     complete = True
                     break
                 records = page.get("records")

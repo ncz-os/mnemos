@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 from mnemos.tools.styx.config import SOURCE_BACKEND, SOURCE_HTTP, StyxConfig
 from mnemos.tools.styx.errors import StyxConfigError, StyxError
+from mnemos.tools.export_stream import completion_count_matches
 
 _STREAM_CHUNK = 1024 * 256
 _HTTP_EXPORT_PAGE_LIMIT = 1000
@@ -210,19 +211,24 @@ def _validate_http_export(payload: Path) -> int:
     terminal marker is the snapshot's commit record and its declared count
     must equal the records that actually arrived.
 
-    Duplicate-identity policy (defense in depth against the 2026-10-03
-    keyset-boundary defect, where the server re-emitted the last row of a
-    page as the first row of the next): the protocol's completion marker
-    declares the SNAPSHOT's record count, not the wire frame count — a
-    byte-identical duplicate on the wire still declares the unique count,
-    and ``write_export`` deduplicates by identity anyway. So:
+    Duplicate-identity policy (the keyset-seam defect, where the server
+    re-emits the last row(s) of a page as the first row(s) of the next):
 
     * a duplicate identity whose payload is byte-identical to the first
       occurrence is TOLERATED: logged as a WARNING naming the duplicated
-      ids, and the returned count is the UNIQUE identity count (what the
-      completion marker and the materialized envelope agree on);
+      ids, and the returned count is the UNIQUE identity count, which is
+      exactly what ``write_export`` materializes (it deduplicates by
+      identity), so the two counts compare the same set;
     * a duplicate identity with a DIFFERENT payload still fails hard —
-      that is corruption, not a pagination seam.
+      that is corruption, not a pagination seam;
+    * the completion marker must equal either the unique count (seam-guarded
+      servers) or the received wire count (deployed servers count every
+      frame they send, duplicates included). See
+      :func:`mnemos.tools.export_stream.completion_count_matches`.
+
+    The 2026-11-01..03 PYTHIA failures (``28415 != 28418``) were this
+    function returning the WIRE count while ``write_export`` returned the
+    unique count: two counters over different sets, not a snapshot race.
     """
     record_count = 0
     completed = False
@@ -248,10 +254,11 @@ def _validate_http_export(payload: Path) -> int:
                         raise StyxError("streaming export completion marker has an invalid record_count")
                     if frame.get("records") not in (None, []):
                         raise StyxError("streaming export completion marker also contains records")
-                    if declared != unique_count:
+                    if not completion_count_matches(declared, unique=unique_count, wire=record_count):
                         raise StyxError(
                             "streaming export completion count does not match unique "
-                            f"record identities ({declared} != {unique_count})"
+                            f"record identities or received records ({declared} vs "
+                            f"{unique_count} unique / {record_count} received)"
                         )
                     if duplicates:
                         logger.warning(

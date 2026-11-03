@@ -316,11 +316,9 @@ async def test_http_source_rejects_duplicate_identity_with_divergent_payload(mon
 
 
 @pytest.mark.asyncio
-async def test_http_source_rejects_completion_count_mismatching_unique_identities(monkeypatch, tmp_path):
-    """The completion marker must match the UNIQUE identity count: a stream
-    that duplicated on the wire but declares the WIRE count (N) is
-    inconsistent and must fail — only the unique-count declaration is the
-    trusted snapshot count."""
+async def test_http_source_rejects_completion_count_matching_neither_unique_nor_wire(monkeypatch, tmp_path):
+    """A marker that equals neither the unique identity count nor the
+    received wire count is a truncated or inconsistent stream: fail."""
     page1 = [_dup_record(0), _dup_record(1)]
     page2 = [_dup_record(1), _dup_record(2)]
     body = (
@@ -328,7 +326,7 @@ async def test_http_source_rejects_completion_count_mismatching_unique_identitie
         + "\n"
         + json.dumps({"records": page2}, separators=(",", ":"))
         + "\n"
-        + json.dumps({"export_complete": True, "record_count": 4})  # wire count, not unique
+        + json.dumps({"export_complete": True, "record_count": 5})  # neither 3 nor 4
         + "\n"
     )
 
@@ -338,3 +336,32 @@ async def test_http_source_rejects_completion_count_mismatching_unique_identitie
     monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: Response(body.encode()))
     with pytest.raises(StyxError, match="completion count does not match unique"):
         await produce_bundle(_http_config(tmp_path, "http://127.0.0.1:5002/v1/export"), tmp_path / "bundle")
+    assert not (tmp_path / "bundle" / "export.mpf.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_http_source_accepts_deployed_server_wire_count_with_seam_duplicates(monkeypatch, tmp_path):
+    """Regression for the 2026-11-01..03 PYTHIA STYX failures
+    (``materialized MPF record count does not match validated stream
+    (28415 != 28418)``). The deployed server counts every frame it sends,
+    seam re-emissions included (stream_export summed len(records)); a live
+    read-only export on 2026-11-03 showed marker 28455 = wire 28455, unique
+    28452. The validator and the materializer must count the SAME set (unique
+    identities) and accept a wire-count marker when every repeat is
+    byte-identical, so the backup succeeds with all unique records."""
+    page1 = [_dup_record(0), _dup_record(1)]
+    page2 = [_dup_record(1), _dup_record(2), _dup_record(3)]
+    page3 = [_dup_record(2), _dup_record(3), _dup_record(4)]  # two-row seam overlap
+    body = "".join(json.dumps({"records": page}, separators=(",", ":")) + "\n" for page in (page1, page2, page3)) + (
+        json.dumps({"export_complete": True, "record_count": 8}) + "\n"
+    )  # wire count
+
+    class Response(io.BytesIO):
+        headers: ClassVar[dict[str, str]] = {"Content-Type": "application/x-ndjson"}
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: Response(body.encode()))
+    result = await produce_bundle(_http_config(tmp_path, "http://127.0.0.1:5002/v1/export"), tmp_path / "bundle")
+    assert result.record_count == 5
+    exported = json.loads((result.path / "export.mpf.json").read_text())
+    assert exported["record_count"] == 5
+    assert [r["id"] for r in exported["records"]] == [f"mem_{i}" for i in range(5)]
