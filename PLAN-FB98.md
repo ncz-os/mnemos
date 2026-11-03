@@ -39,4 +39,4 @@ Base: master (0873b0e1). Branch: `freebuff/FB98-20261102`.
 
 ## Loop
 `python3 -m pytest tests/test_worker_lifecycle_oracle_db2_sql.py tests/test_worker_lifecycle_backends.py tests/test_worker_lifecycle_postgres.py -q`
-plus `ruff check` on the changed files; then branch review (`zoder review`) and push to ARGONAS.
+plus `ruff check` on the changed files; then branch review (`zoder review`) and push to the backup remote.
