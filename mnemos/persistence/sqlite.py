@@ -1842,7 +1842,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         if vis_clause:
             where_parts.append(vis_clause)
         where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
-        select_sql = f"SELECT {_sqlite_memory_cols()} FROM memories{where_sql} ORDER BY created DESC LIMIT ? OFFSET ?"
+        select_sql = f"SELECT {_sqlite_memory_cols()} FROM memories{where_sql} ORDER BY created DESC, id ASC LIMIT ? OFFSET ?"
         # COUNT(*) first (without limit/offset params), then paged
         # SELECT with the same predicate params plus limit/offset.
         count_sql = f"SELECT COUNT(*) FROM memories{where_sql}"

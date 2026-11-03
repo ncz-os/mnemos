@@ -2049,7 +2049,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
                        m.recall_count, m.last_recalled_at, m.consolidated_into
                   FROM memories m
                  WHERE {where_sql}
-                 ORDER BY m.created DESC
+                 ORDER BY m.created DESC, m.id ASC
                  LIMIT %s OFFSET %s
                 """,
                 params + [limit, offset],

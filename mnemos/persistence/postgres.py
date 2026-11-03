@@ -1253,7 +1253,7 @@ class PostgresMemoryRepository(MemoryRepository):
         where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
         select_sql = (
             f"SELECT {_MEMORY_COLS} FROM memories{where_sql} "
-            f"ORDER BY created DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
+            f"ORDER BY created DESC, id ASC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
         )
         count_sql = f"SELECT COUNT(*) FROM memories{where_sql}"
         rows = await conn.fetch(select_sql, *params, limit, offset)
