@@ -477,3 +477,10 @@ async def test_mysql_listings_carry_id_tiebreak():
     assert "ORDER BY d.created DESC, d.id ASC LIMIT %s" in joined
     assert "ORDER BY created DESC, id ASC LIMIT %s" in joined
     assert "ORDER BY created DESC, id ASC LIMIT %s OFFSET %s" in joined
+
+
+@pytest.mark.asyncio
+async def test_sqlite_fts_non_string_query_takes_like_rescue(sqlite_backend):
+    # The pre-escape LIKE path formatted f"%{query}%"; a non-str query must
+    # still reach the LIKE rescue instead of raising AttributeError.
+    assert await _fts_ids(sqlite_backend, None) == []

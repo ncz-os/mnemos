@@ -401,7 +401,7 @@ def _like_contains_pattern(text: str) -> str:
     A user query of ``%`` or ``_`` must match those characters literally,
     not every row (audit F7).
     """
-    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    escaped = str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
 
 

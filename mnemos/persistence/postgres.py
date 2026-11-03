@@ -1853,7 +1853,7 @@ class PostgresMemoryRepository(MemoryRepository):
 
         async def _ilike_search() -> list[Row]:
             # % and _ in the user text are literals, not wildcards (audit F7).
-            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            escaped = str(query).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             like_q = f"%{escaped}%"
             ilike_params: list[Any] = [like_q, limit]
             ilike_conditions: list[str] = ["content ILIKE $1 ESCAPE '\\'", "deleted_at IS NULL"]
