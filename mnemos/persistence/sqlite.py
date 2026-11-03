@@ -346,6 +346,55 @@ def _in_clause(column: str, values: Sequence[Any], params: list[Any]) -> str:
     return f"{column} IN ({_placeholders(values)})"
 
 
+_FTS5_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _fts5_plain_query(query: str) -> str | None:
+    """Build a safe FTS5 MATCH expression from raw user input.
+
+    Mirrors the Postgres arm, which binds ``plainto_tsquery`` instead of
+    the raw text (audit M7): every whitespace-separated token is
+    phrase-quoted, so FTS5 operators (AND/OR/NEAR, column filters such
+    as ``content:x``, NOT via ``-``) and malformed inputs (unbalanced
+    quotes) become literal text instead of live operators or MATCH
+    syntax errors. Interior double quotes are doubled per the FTS5
+    string-literal escape rule. Control characters are stripped (a raw
+    NUL would otherwise truncate the argument in sqlite's C layer).
+    A single trailing ``*`` on a token is preserved as the FTS5 prefix
+    operator — the one structured feature the raw pass-through served
+    that has an FTS5 representation under plain semantics.
+
+    Returns the MATCH expression, or None when nothing indexable
+    remains (empty / whitespace / punctuation-only input); callers fall
+    back to the LIKE path, which is where those inputs already ended
+    through the sqlite3-error and no-hit rescues.
+    """
+    if not isinstance(query, str):
+        return None
+    terms: list[str] = []
+    for raw_token in query.split():
+        if raw_token.endswith("*"):
+            token_body, is_prefix = raw_token[:-1], True
+        else:
+            token_body, is_prefix = raw_token, False
+        # Only the trailing prefix marker is an operator; every other star
+        # is punctuation inside the token and must not survive into the
+        # phrase (a token of stars alone would otherwise keep matching
+        # nothing instead of reducing away entirely).
+        token_body = token_body.rstrip("*")
+        token_body = _FTS5_CONTROL_RE.sub("", token_body)
+        if not token_body:
+            continue
+        escaped = token_body.replace('"', '""')
+        term = '"' + escaped + '"'
+        if is_prefix:
+            term += "*"
+        terms.append(term)
+    if not terms:
+        return None
+    return " ".join(terms)
+
+
 def _read_visibility_clause(
     user: UserContext,
     params: list[Any],
@@ -1710,7 +1759,10 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         # middle, $LAST=limit. Mirrors the legacy shape but with the
         # full _MEMORY_COLS row so the handler can pass results
         # straight to row_to_memory.
-        params: list[Any] = [query]
+        # $1 is a sanitised MATCH expression (audit M7, parity with the
+        # Postgres arm's plainto posture), never the raw user input.
+        params: list[Any] = []
+        plain_query = _fts5_plain_query(query)
         # M6 parity with postgres: soft-deleted rows are invisible to search.
         conditions: list[str] = ["m.deleted_at IS NULL"]
         if not include_archived:
@@ -1776,6 +1828,11 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             )
 
         try:
+            if plain_query is None:
+                # Nothing indexable (empty/whitespace/punctuation-only
+                # input). The FTS attempt would end in the same rescue
+                # either way — take _like_search directly.
+                return await _like_search()
             rows = await _fetch_all(
                 conn,
                 f"SELECT {select_cols}, bm25(memories_fts) AS rank "
@@ -1783,7 +1840,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 "JOIN memories m ON m.id = memories_fts.id "
                 f"WHERE memories_fts MATCH ?{where_extra} "
                 "ORDER BY rank ASC, m.updated DESC LIMIT ?",
-                params,
+                [plain_query, *params],
             )
             if rows:
                 return rows
