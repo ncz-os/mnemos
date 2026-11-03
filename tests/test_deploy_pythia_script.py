@@ -30,7 +30,11 @@ exit 0
 
 _FAKE_SYSTEMCTL = r"""#!/usr/bin/env bash
 echo "systemctl $*" >> "$FAKE_LOG"
-[ "$1" = restart ] && touch "$FAKE_LOG.restarted"
+if [ "$1" = restart ]; then
+  n=$(( $(cat "$FAKE_LOG.restarts" 2>/dev/null || echo 0) + 1 )); echo $n > "$FAKE_LOG.restarts"
+  touch "$FAKE_LOG.restarted"
+  case " ${FAKE_RESTART_FAILS:-} " in *" $n "*) exit 1;; esac
+fi
 exit 0
 """
 
@@ -130,6 +134,19 @@ def test_failed_rollback_is_reported_distinctly(env):
     assert "ROLLBACK FAILED" in result.stdout
     assert _image(env) == OLD, "the quadlet still points at the previous image"
     assert _mutations(calls).count("systemctl restart mnemos-api.service") == 2
+
+
+@pytest.mark.parametrize(("fails", "code"), [("1", 3), ("1 2", 4)])
+def test_failed_restart_command_still_rolls_back(env, fails, code):
+    """systemctl restart itself failing (not just an unhealthy start) must
+    take the rollback path; a failing rollback restart reports exit 4."""
+    result, calls = _run(env, "--apply", "--announced", FAKE_RESTART_FAILS=fails)
+    assert result.returncode == code, result.stdout + result.stderr
+    assert _image(env) == OLD
+    assert _mutations(calls).count("systemctl restart mnemos-api.service") == 2
+    assert "rolling out" in result.stdout
+    if code == 4:
+        assert "ROLLBACK FAILED" in result.stdout
 
 
 def test_unhealthy_current_service_blocks_the_roll(env):

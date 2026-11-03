@@ -112,13 +112,13 @@ set_image() {
 		return 0
 	fi
 	tmp=$(mktemp "${QUADLET}.XXXXXX")
-	sed "s|^\([[:space:]]*\)Image=.*|\1Image=$ref|" "$QUADLET" >"$tmp"
-	grep -q "^[[:space:]]*Image=$ref\$" "$tmp" || {
+	if ! sed "s|^\([[:space:]]*\)Image=.*|\1Image=$ref|" "$QUADLET" >"$tmp" ||
+		! grep -q "^[[:space:]]*Image=$ref\$" "$tmp"; then
 		rm -f "$tmp"
-		die 4 "failed to rewrite Image= in $QUADLET"
-	}
-	chmod 0644 "$tmp"
-	mv -f "$tmp" "$QUADLET"
+		log "failed to rewrite Image= in $QUADLET"
+		return 1
+	fi
+	chmod 0644 "$tmp" && mv -f "$tmp" "$QUADLET" || return 1
 	log "quadlet Image=$ref"
 }
 
@@ -133,10 +133,13 @@ healthy_within() {
 	done
 }
 
+# restart_on REF: point the quadlet at REF and restart. Returns non-zero
+# (never exits) so callers can roll back; set -e does not apply inside a
+# function called from an `if` condition, hence the explicit checks.
 restart_on() {
-	set_image "$1"
-	run "$SYSTEMCTL" daemon-reload
-	run "$SYSTEMCTL" restart "$SERVICE"
+	set_image "$1" || return 1
+	run "$SYSTEMCTL" daemon-reload || return 1
+	run "$SYSTEMCTL" restart "$SERVICE" || return 1
 }
 
 # ── preflight (read-only) ────────────────────────────────────────────────
@@ -178,7 +181,8 @@ fi
 if [ "$APPLY" = 1 ]; then
 	printf '%s prev=%s new=%s backup=%s\n' "$STAMP" "$PREV_IMAGE" "$NEW_IMAGE" "$BACKUP_DIR" >>"$STATE/history.log"
 fi
-restart_on "$NEW_IMAGE"
+rolled=1
+restart_on "$NEW_IMAGE" || rolled=0
 
 if [ "$APPLY" != 1 ]; then
 	log "[dry-run] would poll $HEALTH_URL for up to ${HEALTH_TIMEOUT}s, rolling back to $PREV_IMAGE on timeout"
@@ -186,15 +190,21 @@ if [ "$APPLY" != 1 ]; then
 	exit 0
 fi
 
-if healthy_within "$HEALTH_TIMEOUT"; then
+if [ "$rolled" = 1 ] && healthy_within "$HEALTH_TIMEOUT"; then
 	log "HEALTHY on $NEW_IMAGE (rollback image kept: $PREV_IMAGE; volume backup: $BACKUP_DIR)"
 	exit 0
 fi
 
 # ── rollback ─────────────────────────────────────────────────────────────
-log "new image not healthy after ${HEALTH_TIMEOUT}s; rolling back to $PREV_IMAGE"
+if [ "$rolled" = 1 ]; then
+	log "new image not healthy after ${HEALTH_TIMEOUT}s; rolling back to $PREV_IMAGE"
+else
+	log "rolling out $NEW_IMAGE failed (quadlet rewrite, daemon-reload or restart); rolling back to $PREV_IMAGE"
+fi
 "$PODMAN" logs --tail 80 "$CONTAINER" >"$BACKUP_DIR/failed-start.log" 2>&1 || true
-restart_on "$PREV_IMAGE"
+if ! restart_on "$PREV_IMAGE"; then
+	die 4 "ROLLBACK FAILED: could not restore Image=$PREV_IMAGE / reload / restart (quadlet now: $(current_image)); data volume backup at $BACKUP_DIR/$VOLUME.tar"
+fi
 if healthy_within "$HEALTH_TIMEOUT"; then
 	printf '%s ROLLED-BACK to %s\n' "$STAMP" "$PREV_IMAGE" >>"$STATE/history.log"
 	die 3 "rolled back to $PREV_IMAGE (new image logs: $BACKUP_DIR/failed-start.log)"
