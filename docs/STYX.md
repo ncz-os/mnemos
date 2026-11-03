@@ -288,4 +288,4 @@ seam guard in `mnemos/domain/portability/stream.py` never repeat an identity.
 The STYX validator and `write_export` share one rule
 (`mnemos.tools.export_stream.completion_count_matches`) and both return the
 unique count, so the materialized envelope is checked against the same set.
-PYTHIA operations and manual recovery: `docs/DEPLOY_PYTHIA.md`.
+Production-host operations and manual recovery: `docs/DEPLOY_PYTHIA.md`.
