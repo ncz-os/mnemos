@@ -183,7 +183,11 @@ async def _current_states(ops, ids, prefer_compressed=False, *, repo=None, inclu
         + " FROM federation_changes e "
         "JOIN (SELECT memory_id, MAX(seq) AS latest_seq FROM federation_changes "
         f"WHERE memory_id IN ({placeholders}) GROUP BY memory_id) latest "
-        "ON e.seq = latest.latest_seq LEFT JOIN memories m ON m.id = e.memory_id" + compressed_join + embedding_join,
+        # M2: matched on the memory too. ``seq`` is assigned from one clock, so a
+        # duplicated value means the journal diverged -- joining on it alone then
+        # cross-multiplies the latest row of *every* memory into each event.
+        "ON e.seq = latest.latest_seq AND e.memory_id = latest.memory_id "
+        "LEFT JOIN memories m ON m.id = e.memory_id" + compressed_join + embedding_join,
         *ids,
     )
     return {row["journal_memory_id"]: row for row in rows}

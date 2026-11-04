@@ -2035,20 +2035,29 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             if namespace is not None:
                 where.append("namespace = ?")
                 params_list.append(namespace)
+            # S2: the partition and the group key are digests of the normalized
+            # body, not the CLOB -- grouping on a LOB is SQL0134N, so this sweep
+            # could not run at all. HASH_SHA256 is the expression the content_hash
+            # backfill already uses on this port, so the folded-newline meaning is
+            # the same as on the text backends.
+            # S6: NULLS LAST, or an unrated duplicate outranks a rated one and is
+            # kept as the canonical row (Postgres and Oracle keep the rated one).
             sql = (
                 "WITH ordered AS ("
                 "SELECT id, owner_id, namespace, content_hash, created, quality_rating, "
                 "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) AS normalized_content, "
                 "ROW_NUMBER() OVER ("
                 "PARTITION BY owner_id, namespace, content_hash, "
-                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) "
-                "ORDER BY created DESC, quality_rating DESC, id DESC"
+                "LOWER(HEX(HASH_SHA256("
+                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10))))) "
+                "ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC"
                 ") AS rn "
                 "FROM memories WHERE " + " AND ".join(where) + " "
                 "), grouped AS ("
                 "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count, "
                 "LISTAGG(id, CHR(31)) WITHIN GROUP (ORDER BY rn ASC) AS memory_ids "
-                "FROM ordered GROUP BY owner_id, namespace, content_hash, normalized_content HAVING COUNT(*) > 1"
+                "FROM ordered GROUP BY owner_id, namespace, content_hash, "
+                "LOWER(HEX(HASH_SHA256(normalized_content))) HAVING COUNT(*) > 1"
                 ") "
                 "SELECT owner_id, namespace, content_hash, duplicate_count, memory_ids, "
                 "SUBSTR(memory_ids, 1, LOCATE(CHR(31), memory_ids || CHR(31)) - 1) AS keep_id, "
