@@ -1,0 +1,29 @@
+-- migration: 0070_memory_metadata_eq_index
+-- PostgreSQL-only GIN index; intentional parity no-op.
+--
+-- FB103 added an exact-match metadata read-back filter
+-- (GET /v1/memories?meta=key:value). The Postgres migration of this name
+-- creates
+--
+--   CREATE INDEX IF NOT EXISTS idx_memories_metadata_path_ops
+--       ON memories USING gin (metadata jsonb_path_ops);
+--
+-- because the Postgres filter emits ``metadata @> $n::jsonb`` and
+-- jsonb_path_ops is the GIN operator class that indexes that containment
+-- operator generically, for every metadata key at once.
+--
+-- Db2 has no equivalent: there is no jsonb containment operator and no
+-- key-generic operator class. The Db2 filter (mnemos/persistence/db2.py,
+-- list path) is
+--
+--   JSON_VALUE(m.metadata, '$.<key>') = ?
+--
+-- over the metadata CLOB, which is a per-key path expression. Indexing it
+-- would mean one expression-based index per filtered key, which is a
+-- per-deployment sizing decision rather than a mechanical translation of
+-- the Postgres change, so this migration does not add one.
+--
+-- This file is intentionally empty of executable statements: it exists so
+-- the migration-parity gate (which requires the same basename in the
+-- pg / oracle / db2 directories) stays satisfied, and so the reasoning
+-- above is recorded next to the Postgres change rather than in a chat log.
