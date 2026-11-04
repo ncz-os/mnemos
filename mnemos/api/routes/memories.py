@@ -1343,6 +1343,8 @@ async def create_memory(
         namespace=namespace,
         classified_at="ingest",
         memory_id=mem_id,
+        principal=user.user_id,
+        api_key_id=user.api_key_id,
     )
     _meta = _classified.metadata
     namespace = _classified.namespace
@@ -1596,6 +1598,8 @@ async def bulk_create_memories(
             namespace=namespace,
             classified_at="bulk_ingest",
             memory_id=mid,
+            principal=user.user_id,
+            api_key_id=user.api_key_id,
         )
         item_metadata = _classified.metadata
         namespace = _classified.namespace
@@ -1787,6 +1791,8 @@ async def update_memory(
             namespace=user.namespace,
             classified_at="patch",
             memory_id=memory_id,
+            principal=user.user_id,
+            api_key_id=user.api_key_id,
         )
         if _classified.metadata:
             updates["metadata"] = json.dumps(_classified.metadata)
@@ -1838,6 +1844,8 @@ async def update_memory(
                         namespace=existing.get("namespace") or user.namespace,
                         classified_at="patch",
                         memory_id=memory_id,
+                        principal=user.user_id,
+                        api_key_id=user.api_key_id,
                     )
                     updates["metadata"] = json.dumps(_patch_classified.metadata)
             if updates:

@@ -60,6 +60,7 @@ class _User:
     role = "user"
     group_ids: list[str] = []
     authenticated = True
+    api_key_id = None  # FB114: UserContext always carries this field
 
 
 class _Root:
@@ -68,6 +69,7 @@ class _Root:
     role = "root"
     group_ids: list[str] = []
     authenticated = True
+    api_key_id = None  # FB114: UserContext always carries this field
 
 
 class _NoopPgTransaction:

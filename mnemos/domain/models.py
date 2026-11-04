@@ -25,6 +25,14 @@ SUPPORTED_CONSULTATION_MODES: tuple[str, ...] = (
 # of the event loop (about 0.25 s of CPU for 200 rows of 2 KB).
 DEFAULT_REDACT_THREAD_THRESHOLD_BYTES = 256 * 1024
 
+# FB118 (2026-11-02, rework of FB114 after review): bound the stored-metadata
+# JSON parse. The metadata channel is caller-controlled at write time and a
+# store column at read time; parsing it unbounded let a garbage/oversized
+# string drive the redaction batch worker. 1 MiB is far above every
+# legitimate record's metadata (tags/labels/provenance) and below anything
+# that could matter to the event loop.
+_MAX_META_JSON_PARSE_BYTES = 1024 * 1024
+
 # Memory tags are lightweight filter labels. Bound the per-request list so a
 # single search cannot expand into an unbounded backend IN/ANY predicate.
 MAX_TAGS_PER_REQUEST = 32
@@ -532,6 +540,94 @@ def redact_row_fields(
     )
 
 
+def _bounded_meta_json_loads(raw_meta: Any) -> dict | None:
+    """FB118: json.loads for stored/caller metadata strings, size-bounded.
+
+    Returns the parsed dict, ``None`` when the input is not a parseable JSON
+    object, and ``None`` for strings over :data:`_MAX_META_JSON_PARSE_BYTES`
+    ( refusing the parse is the bound, not an error signal).
+    """
+    if not isinstance(raw_meta, str):
+        return None
+    if len(raw_meta) > _MAX_META_JSON_PARSE_BYTES:
+        return None
+    try:
+        parsed = json.loads(raw_meta)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def redact_metadata_with_stored(raw_meta: Any, stored_meta: Any = None) -> Any:
+    """FB114 (audit M4): mask metadata leaves flagged at ingest classification.
+
+    The write path classifies every string leaf of the metadata channel and
+    stores REDACT-class leaf paths under ``secret_redact_metadata``. On the
+    default (non-root) read path — ``redact_secrets=True`` — those leaves are
+    masked ``[REDACTED]`` so a credential caught at ingest cannot reach the
+    reader via the metadata channel either. Root / include_secrets reads
+    pass ``redact_secrets=False`` and keep metadata verbatim.
+
+    ``raw_meta`` may be a parsed dict (the normal case inside ``row_to_memory``)
+    or still a JSON string (the batch worker pieces); a JSON string is parsed
+    first (FB118: bounded at ``_MAX_META_JSON_PARSE_BYTES``), a failed or
+    over-bound parse is returned untouched. Paths are JSON-safe lists of
+    keys/indices; a missing path is tolerated silently (metadata may have been
+    changed by a later PATCH before this marker was recorded).
+
+    FB118 rework: string inputs to *both* arguments — the historical
+    ``(str, str)`` batch shape — now mask as documented: the parsed dict backs
+    ``raw_meta`` AND the stored-marker lookup (pre-FB118 the marker was looked
+    up on the still-string ``stored_meta``, never found there, and the
+    string-input path parsed and then masked nothing).
+
+    FB118 residual, stated plainly (structured review, verified): an
+    over-bound ``raw_meta`` string is returned UNTOUCHED — the parse is
+    refused as the resource-DoS bound, so no marker is consulted. This cannot
+    leak a secret through this function's callers: ``row_to_memory`` holds
+    ``None`` for an over-bound column, so the item carries no metadata at all
+    and content redaction recomputes. The batch arm keeps the raw string only
+    for the duration of the worker call and hands the result to
+    ``row_to_memory``, which drops it the same way.
+    """
+    if isinstance(raw_meta, str):
+        parsed = _bounded_meta_json_loads(raw_meta)
+        if parsed is None:
+            return raw_meta
+        raw_meta = parsed
+    if not isinstance(raw_meta, dict) or not raw_meta:
+        return raw_meta
+    stored = raw_meta if stored_meta is None else stored_meta
+    if isinstance(stored, str):
+        # FB118: the stored marker parses itself too (bounded); when it does
+        # not resolve, fall back to raw's own marker — masking still applies.
+        # Falling back narrows the marker source to the record's own copy, so
+        # it can mask MORE than the old code (never less): pre-FB118 a string
+        # ``stored_meta`` never yielded a marker at all.
+        parsed_stored = _bounded_meta_json_loads(stored)
+        stored = parsed_stored if parsed_stored is not None else raw_meta
+    paths = stored.get("secret_redact_metadata") if isinstance(stored, dict) else None
+    if not paths:
+        return raw_meta
+    import copy as _copy
+
+    out = _copy.deepcopy(raw_meta)
+    for path in paths:
+        if not isinstance(path, (list, tuple)) or len(path) < 1:
+            continue
+        node: Any = out
+        try:
+            for key in path[:-1]:
+                node = node[key]
+            final = path[-1]
+            value = node[final]
+            if isinstance(value, str):
+                node[final] = "[REDACTED]"
+        except (KeyError, IndexError, TypeError):
+            continue
+    return out
+
+
 async def rows_to_memories(
     rows,
     *,
@@ -598,7 +694,7 @@ async def rows_to_memories(
     # independently and the pure-Python classifier holds no locks.
     redacted_rows = await asyncio.to_thread(_redact_row_fields_batch, pieces)
     results = []
-    for row, (content, compressed, verbatim) in zip(row_list, redacted_rows):
+    for row, (content, compressed, verbatim, redacted_meta) in zip(row_list, redacted_rows):
         # Rebuild the row with the redacted fields and let the synchronous
         # builder do the (cheap) shaping; redaction is already applied, so it
         # is not run a second time.
@@ -608,6 +704,11 @@ async def rows_to_memories(
             compressed,
             verbatim,
         )
+        if redact_secrets:
+            # FB114 (audit M4): the metadata channel is redacted on the
+            # default path in the BATCH arm too, or faster rows would leak
+            # flagged metadata leaves the single-row arm masks.
+            shaped["metadata"] = redacted_meta
         results.append(
             row_to_memory(
                 shaped,
@@ -620,8 +721,22 @@ async def rows_to_memories(
 
 
 def _redact_row_fields_batch(pieces):
-    """Apply :func:`redact_row_fields` to a whole batch (runs off-loop)."""
-    return [redact_row_fields(content, compressed, verbatim, meta) for content, compressed, verbatim, meta in pieces]
+    """Apply :func:`redact_row_fields` to a whole batch (runs off-loop).
+
+    FB114: the 4th element carries the row's metadata and comes back with
+    flagged leaf paths masked (see :func:`redact_metadata_with_stored`).
+    """
+    from mnemos.core.secret_detection import redact_field_with_stored
+
+    return [
+        (
+            redact_field_with_stored(content, meta, "content"),
+            redact_field_with_stored(compressed, meta, "compressed_content") if compressed else compressed,
+            redact_field_with_stored(verbatim, meta, "verbatim_content") if verbatim else verbatim,
+            redact_metadata_with_stored(meta),
+        )
+        for content, compressed, verbatim, meta in pieces
+    ]
 
 
 def row_to_memory(
@@ -660,10 +775,14 @@ def row_to_memory(
     """
     raw_meta = row.get("metadata")
     if isinstance(raw_meta, str):
-        try:
-            raw_meta = json.loads(raw_meta)
-        except Exception:
-            raw_meta = None
+        # FB118: bounded parse — an over-bound/unparsable store value is
+        # treated exactly like the historic unparsable case (raw_meta=None),
+        # so content redaction recomputes instead of trusting absent markers,
+        # and the item's metadata is dropped rather than exposing a blob whose
+        # redaction marker could not be read (a dropped metadata blob leaks
+        # nothing; masking it would require parsing the blob the bound exists
+        # to refuse).
+        raw_meta = _bounded_meta_json_loads(raw_meta)
     elif not isinstance(raw_meta, dict):
         raw_meta = None
 
@@ -686,6 +805,10 @@ def row_to_memory(
         # ingest classification (authoritative) over recomputing, so a later
         # classifier relaxation cannot re-expose a secret caught at ingest.
         content, compressed, verbatim = redact_row_fields(content, compressed, verbatim, raw_meta)
+        # FB114 (audit M4): the metadata channel is redacted on the default
+        # read path too — a leaf flagged at ingest is masked, not passed
+        # through verbatim to a non-root reader.
+        raw_meta = redact_metadata_with_stored(raw_meta, raw_meta)
     if frame_data:
         from mnemos.core.injection_defense import defend
 
