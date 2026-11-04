@@ -559,7 +559,7 @@ async def test_sqlite_readonly_savepoint_nesting_still_works(sqlite_backend):
     async with sqlite_backend.transactional(
         isolation="repeatable_read", readonly=True
     ) as tx:
-        async with tx.savepoint() as inner:
+        async with tx.savepoint():
             rows = await _fetch("SELECT id FROM memories ORDER BY id")
             assert isinstance(rows, list)
             with pytest.raises(sqlite3.OperationalError, match="readonly database"):

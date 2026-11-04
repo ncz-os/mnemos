@@ -1157,7 +1157,7 @@ class TestAntiEntropyDigest:
         was already whole.
         """
         from mnemos.api.routes import federation as handler
-        from mnemos.domain.replication_digest import bucket_index, build_namespace_digest
+        from mnemos.domain.replication_digest import bucket_index
 
         t0 = datetime(2026, 10, 31, 10, 0, 0, tzinfo=timezone.utc)
 
