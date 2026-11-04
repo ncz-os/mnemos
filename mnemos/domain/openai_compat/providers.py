@@ -3,7 +3,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from mnemos.core.extras import missing_extra_detail
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
-from mnemos.domain.route_policy import check_route
+from mnemos.core.route_policy import check_route
 
 from .content import _flatten_messages_for_prompt, _has_content_blocks, _has_message_names, _plain_value
 from .schemas import ChatCompletionRequest

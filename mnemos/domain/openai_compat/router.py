@@ -9,7 +9,7 @@ from mnemos.core.config import get_registered_task_classifier, get_settings
 from mnemos.core.injection_defense import _strip_one_frame, defend
 from mnemos.core.secret_detection import redact_content
 from mnemos.db import openai_compat_repo
-from mnemos.domain.route_policy import check_route
+from mnemos.core.route_policy import check_route
 
 from .content import _content_text, _message_to_dict
 from .providers import (
