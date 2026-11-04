@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,11 @@ class _Req:
         self.headers = headers
         self.json = json_body
         self.params = params or {}
+
+
+# The per-peer gauges are soft-optional: without prometheus_client the route
+# publishes no gauges, so only the gauge assertion needs the package.
+_HAS_PROMETHEUS_CLIENT = importlib.util.find_spec("prometheus_client") is not None
 
 
 class FakePeerFeed:
@@ -563,6 +569,7 @@ class TestPerPeerLagMetrics:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(not _HAS_PROMETHEUS_CLIENT, reason="prometheus_client not installed")
     async def test_injected_error_raises_failure_counter_and_gauge(self, monkeypatch):
         """A failed pull bumps consecutive_failures and the labelled gauge."""
         from mnemos.api.routes.federation import federation_status_values, sync_federation_metrics
