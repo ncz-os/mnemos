@@ -800,6 +800,36 @@ _DB2_TEXT_SEARCH_DEFAULT = "like"
 _DB2_TEXT_SEARCH_VALID = ("like", "contains")
 
 
+def _ordered_unique_ids(ids: "Sequence[str]") -> list[str]:
+    """The aggregate's ids, first occurrence wins, duplicates dropped.
+
+    LISTAGG cannot repeat an id inside one group, but dropping duplicates here
+    keeps the keeper out of the duplicate list it would consolidate if a group
+    ever disagrees with its own aggregate.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for memory_id in ids:
+        text = str(memory_id)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _is_listagg_overflow(exc: BaseException) -> bool:
+    """True when Db2 refused a LISTAGG because the aggregated list is too long.
+
+    Measured on Db2 12.1.5 LUW community: a group whose ids exceed the 4,000-byte
+    VARCHAR result raises SQL0137N / SQLSTATE 54006 / SQLCODE -137. (The FB119
+    review reports named SQL0349N; that code does not occur on this build and is
+    matched only as a last resort.)
+    """
+    text = f"{exc}".upper()
+    return "SQL0137" in text or "54006" in text or "-137" in text or "SQL0349" in text or "57011" in text
+
+
 def _resolve_db2_text_search_mode(settings: Any) -> str:
     """Return the effective Db2 FTS mode (``"like"`` or ``"contains"``).
 
@@ -2065,13 +2095,103 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 "FROM grouped "
                 "ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC"
             )
-            await _call(cursor.execute, sql, tuple(params_list))
-            rows = await _fetch_all_dicts(cursor)
+            try:
+                await _call(cursor.execute, sql, tuple(params_list))
+                rows = await _fetch_all_dicts(cursor)
+            except Exception as exc:  # noqa: BLE001 - classified by _is_listagg_overflow
+                if not _is_listagg_overflow(exc):
+                    raise
+                _LOG.warning(
+                    "Db2 LISTAGG overflow in the duplicate sweep (%s); re-reading one group's ids at a time.",
+                    exc,
+                )
+                rows = await self._duplicate_groups_without_listagg(tx, where, params_list)
             for row in rows:
-                raw = row.get("memory_ids") or ""
-                row["memory_ids"] = [part for part in str(raw).split("\x1f") if part]
+                raw_ids = row.get("memory_ids")
+                if isinstance(raw_ids, (bytes, bytearray, memoryview)):
+                    raw_ids = bytes(raw_ids).decode("utf-8", errors="replace")
+                if isinstance(raw_ids, (list, tuple)):
+                    ids = [str(part) for part in raw_ids if part]
+                else:
+                    ids = [part for part in str(raw_ids or "").split("\x1f") if part]
+                if not ids:
+                    ids = await self._read_duplicate_ids_by_row(tx, row)
+                ids = _ordered_unique_ids(ids)
+                row["memory_ids"] = ids
+                row["keep_id"] = ids[0] if ids else None
+                row["canonical_id"] = row["keep_id"]
                 row["duplicate_count"] = int(row.get("duplicate_count") or 0)
             return rows
+        finally:
+            await _call(cursor.close)
+
+    async def _duplicate_groups_without_listagg(
+        self,
+        tx: Any,
+        where: list[str],
+        params_list: list[Any],
+    ) -> list[Row]:
+        """The same duplicate groups, counted without LISTAGG.
+
+        LISTAGG aborts the whole statement once one group's id list outgrows its
+        VARCHAR result, so there are no rows to repair in Python: the sweep is
+        re-run counting only, and each group's ids are then re-read in order.
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            sql = (
+                "WITH ordered AS ("
+                "SELECT id, owner_id, namespace, content_hash, "
+                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) AS normalized_content, "
+                "ROW_NUMBER() OVER ("
+                "PARTITION BY owner_id, namespace, content_hash, "
+                "LOWER(HEX(HASH_SHA256("
+                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10))))) "
+                "ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC"
+                ") AS rn "
+                "FROM memories WHERE " + " AND ".join(where) + " "
+                "), grouped AS ("
+                "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count "
+                "FROM ordered GROUP BY owner_id, namespace, content_hash, "
+                "LOWER(HEX(HASH_SHA256(normalized_content))) HAVING COUNT(*) > 1"
+                ") "
+                "SELECT owner_id, namespace, content_hash, duplicate_count FROM grouped "
+                "ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def _read_duplicate_ids_by_row(self, tx: Any, row: Row) -> list[str]:
+        """Re-read one duplicate group's ids in the sweep's own order.
+
+        The namespace match is NULL-safe: ``namespace = ?`` never matches a NULL
+        namespace, so a group of memories with no namespace would come back empty
+        and lose its keeper (FB119 review, confirmed on Db2).
+        """
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            where = [
+                "deleted_at IS NULL",
+                "archived_at IS NULL",
+                "consolidated_into IS NULL",
+                "content_hash IS NOT NULL",
+            ]
+            fence = _eligibility.local_sweep_predicate("")
+            if fence:
+                where.append(fence)
+            await _call(
+                cursor.execute,
+                "SELECT id FROM memories WHERE owner_id = ? "
+                "AND (namespace = ? OR (namespace IS NULL AND ? IS NULL)) "
+                "AND content_hash = ? AND " + " AND ".join(where) + " "
+                "ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC",
+                (row.get("owner_id"), row.get("namespace"), row.get("namespace"), row.get("content_hash")),
+            )
+            return [str(r["id"]) for r in await _fetch_all_dicts(cursor) if r.get("id")]
         finally:
             await _call(cursor.close)
 
