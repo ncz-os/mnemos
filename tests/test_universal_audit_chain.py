@@ -7,8 +7,10 @@ from types import SimpleNamespace
 import pytest
 import pytest_asyncio
 
+from mnemos.core.secret_detection import SECRET_CLEAN_MARKER_KEY, clean_marker_fields
 from mnemos.domain.models import BulkCreateRequest, MemoryCreateRequest, MemoryUpdateRequest
 from mnemos.persistence.sqlite import _execute as _sqlite_execute
+from mnemos.persistence.visibility import VisibilityFilter
 
 
 @pytest.fixture(autouse=True)
@@ -408,16 +410,29 @@ async def test_document_import_writes_create_audit_entry(sqlite_backend):
             tx,
             memory_id_to_audit_bytes(imported.memory_id),
         )
+        memory = await sqlite_backend.memories.get_memory(
+            tx,
+            imported.memory_id,
+            visibility=VisibilityFilter.for_read(_Root(), namespace="default"),
+        )
 
     assert row is not None
+    assert memory is not None
     assert row["op"] == "create"
     assert row["writer_id"] == "alice"
+    # The digest covers the metadata as persisted: the caller's keys plus the
+    # server-stamped clean marker for the text fields the classifier saw.
+    persisted_metadata = _metadata_dict(memory["metadata"])
+    assert persisted_metadata == {
+        "project_tag": "mnemos",
+        SECRET_CLEAN_MARKER_KEY: clean_marker_fields(["content", "verbatim_content"]),
+    }
     assert row["payload_hash"] == canonical_payload_hash(
         memory_id=imported.memory_id,
         content="document import audit chunk",
         category="documents",
         subcategory="audit",
-        metadata={"project_tag": "mnemos"},
+        metadata=persisted_metadata,
         embedding=None,
     )
     assert verify_entry(_audit_entry_from_row(row), row["signature"])
@@ -467,18 +482,29 @@ async def test_mpf_import_writes_create_audit_entry(sqlite_backend, monkeypatch)
             tx,
             memory_id_to_audit_bytes("mem_mpf_audit"),
         )
+        memory = await sqlite_backend.memories.get_memory(
+            tx,
+            "mem_mpf_audit",
+            visibility=VisibilityFilter.for_read(_Root(), namespace="default"),
+        )
 
     assert stats.imported == 1
     assert stats.failed == 0
     assert row is not None
+    assert memory is not None
     assert row["op"] == "create"
     assert row["writer_id"] == "root"
+    persisted_metadata = _metadata_dict(memory["metadata"])
+    assert persisted_metadata == {
+        "imported": True,
+        SECRET_CLEAN_MARKER_KEY: clean_marker_fields(["content", "verbatim_content"]),
+    }
     assert row["payload_hash"] == canonical_payload_hash(
         memory_id="mem_mpf_audit",
         content="mpf imported audited memory",
         category="portable",
         subcategory=None,
-        metadata={"imported": True},
+        metadata=persisted_metadata,
         embedding=None,
     )
     assert verify_entry(_audit_entry_from_row(row), row["signature"])
