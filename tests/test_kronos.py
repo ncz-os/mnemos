@@ -8,6 +8,109 @@ from fastapi.testclient import TestClient
 
 from mnemos.api.dependencies import UserContext, get_current_user
 
+# FB86 (2026-11-01): the kronos anomaly/forecast fixtures are dated from the
+# real clock while the production functions read the clock AGAIN internally
+# (anomaly.py:97/164, forecast.py:109/138). Two independent reads across the
+# test seam race at the 00:00 UTC day boundary (and the hour floor): the
+# "current" fixture bucket lands in the previous day and the spike/drop
+# classification inverts. Freeze BOTH reads to one pinned instant — test-only;
+# production code stays on the wall clock.
+#
+# The pin is midnight-ALIGNED, and deliberately the instant the race is worst.
+# It matters for a second reason: ``forecast._hourly_counts_from_rows`` floors
+# ``now`` to ``now_hour`` and indexes each row by ``(bucket_hour -
+# start_hour)`` hours, so a fixture hour LATER than the floored internal hour
+# (e.g. a 01:00 UTC pin, as an earlier revision of this fix used) lands at
+# index 168 and is dropped by the ``0 <= idx < window`` test -- the history
+# falls out of the window and the CI-bounds assertion inverts. Pinning to
+# 00:00 UTC keeps the newest fixture row at index 167, and the same instant is
+# the worst case for the day boundary.
+_PINNED_NOW = datetime(2026, 11, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def _as_frozen(value: datetime) -> datetime:
+    """Re-build a datetime as a ``_FrozenDatetime``, preserving tz-awareness.
+
+    Subclass arithmetic keeps the subclass, but anything that produced a plain
+    datetime (``_PINNED_NOW.replace``/``.astimezone`` build a ``_PINNED_NOW``
+    which is a plain ``datetime``) must be re-wrapped so a fixture value still
+    satisfies the ``isinstance(value, datetime)`` guards in anomaly.py
+    (``_coerce_date``/``_as_utc``) and forecast.py (``_as_utc``) -- those
+    guards test against the class that was imported at module scope, not
+    against the (possibly patched) module-level binding.
+    """
+    return _FrozenDatetime(
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+        tzinfo=value.tzinfo,
+    )
+
+
+def _pinned_now() -> datetime:
+    """The pinned instant, re-wrapped as a ``_FrozenDatetime``.
+
+    Every fixture value in this module is built from this one instant, so the
+    fixture side and the (patched) internal ``datetime.now`` side of the test
+    seam are the same value by construction -- that is the whole point of the
+    FB86 freeze.
+    """
+    return _as_frozen(_PINNED_NOW)
+
+
+class _FrozenDatetime(datetime):
+    """Drop-in ``datetime`` whose ``now()`` returns ``_PINNED_NOW``.
+
+    Subclasses the real ``datetime`` so the ``isinstance(value, datetime)``
+    guards inside anomaly.py/_coerce_date/_as_utc and forecast.py/_as_utc
+    keep recognizing our fixture rows (CPython keeps aware arithmetic on the
+    subclass, so ``_as_frozen(_PINNED_NOW) - timedelta(...)`` is still a
+    ``_FrozenDatetime``).
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        # Both modules under test always pass ``timezone.utc``; the naive
+        # branch exists only so a future tz-naive read still gets the pin
+        # rather than the host clock, and mirrors ``datetime.now(None)``
+        # (local naive time) by keeping the pin's own wall-clock fields.
+        if tz is None:
+            return _as_frozen(_PINNED_NOW.replace(tzinfo=None))
+        return _as_frozen(_PINNED_NOW.astimezone(tz))
+
+
+@pytest.fixture(autouse=True)
+def _kronos_frozen_clock(monkeypatch: pytest.MonkeyPatch):
+    """Pin the internal clock of the kronos anomaly/forecast modules.
+
+    Mirrors the repo-wide ``monkeypatch.setattr("mnemos.persistence.*.datetime",
+    _FixedDatetime)`` convention (see tests/test_db2_dialect_parity.py:159).
+    """
+    monkeypatch.setattr("mnemos.domain.kronos.anomaly.datetime", _FrozenDatetime)
+    monkeypatch.setattr("mnemos.domain.kronos.forecast.datetime", _FrozenDatetime)
+
+
+@pytest.fixture(autouse=True)
+def _kronos_cpu_backend(monkeypatch: pytest.MonkeyPatch):
+    """Keep this module's forecast tests on the deterministic NumPy backend.
+
+    The selector's default (``auto``) probes ``import cupy`` and, when the
+    wheel is installed but unusable, the GPU path raises
+    ``RuntimeError: CuPy failed to load libnvrtc.so.12`` out of ``ewma`` -- an
+    environment defect unrelated to the code under test
+    (``tests/test_kronos_backends.py`` covers the GPU path on purpose, with
+    its own fallback assertions). Pin the CPU backend here instead of letting
+    host CUDA state decide whether the forecast assertions can run at all.
+    """
+    from mnemos.domain.kronos.backends import selector
+
+    monkeypatch.setenv("MNEMOS_KRONOS_BACKEND", "cpu")
+    assert selector.get_backend().BACKEND_NAME == "cpu"
+
 
 class _Acquire:
     def __init__(self, conn):
@@ -85,7 +188,16 @@ def _alice() -> UserContext:
 
 
 def _day_start() -> datetime:
-    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    """Midnight UTC of the PINNED instant, so fixture rows are race-free.
+
+    Returns the frozen subclass on purpose: the row is fed to
+    ``anomaly._coerce_date``, whose first branch is
+    ``isinstance(value, datetime)`` -> ``_as_utc(value).date()``. A plain
+    ``date`` there would take the second branch instead, which is a different
+    code path from the one a real driver row exercises.
+    """
+    pinned = _pinned_now()
+    return _as_frozen(pinned.replace(hour=0, minute=0, second=0, microsecond=0))
 
 
 def _isolate_bind_guard_env(monkeypatch) -> None:
@@ -182,10 +294,33 @@ async def test_detect_recall_anomalies_drop_case():
 
 
 @pytest.mark.asyncio
+async def test_spike_classification_is_midnight_race_free():
+    """FB86 regression guard: the fixture clock and the internal
+    ``datetime.now`` read must be the same pinned instant. Previously the two
+    wall-clock reads raced across the 00:00 UTC day boundary: the "current"
+    fixture bucket landed in the previous day and the spike case inverted to
+    a drop.
+    """
+    from mnemos.domain.kronos import anomaly as anomaly_mod
+    from mnemos.domain.kronos import detect_recall_anomalies
+
+    # The module under test must see the frozen clock, same as the fixture
+    # builder does (this is what keeps both sides of the seam consistent).
+    assert anomaly_mod.datetime.now(timezone.utc) == _PINNED_NOW
+
+    pool = _Pool(daily_rows=_stable_daily_rows("mem_guard", 100, 500))
+    anomalies = await detect_recall_anomalies(pool, "default", sensitivity=2.5)
+
+    assert [a.memory_id for a in anomalies] == ["mem_guard"]
+    assert anomalies[0].anomaly_type == "spike"
+    assert anomalies[0].suggested_action == "trending"
+
+
+@pytest.mark.asyncio
 async def test_forecast_recall_load_returns_sane_ci_bounds():
     from mnemos.domain.kronos import forecast_recall_load
 
-    now_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    now_hour = _pinned_now().replace(minute=0, second=0, microsecond=0)
     rows = [
         {
             "bucket_hour": now_hour - timedelta(hours=idx),
@@ -202,10 +337,41 @@ async def test_forecast_recall_load_returns_sane_ci_bounds():
 
 
 @pytest.mark.asyncio
+async def test_forecast_recall_load_window_is_aligned_to_the_pinned_hour():
+    """FB86 regression guard: the fixture hour must line up with the hour the
+    ``forecast`` module floors its own clock to.
+
+    ``_hourly_counts_from_rows`` indexes rows by ``(row_hour - start_hour)``
+    with ``start_hour = now_hour - (window - 1) hours``, so a row at
+    ``now_hour + 1h`` indexes at 168 -- past the end of the window -- and is
+    dropped by the ``0 <= idx < window`` test. When the fixture is built from
+    a *later* instant than the frozen internal clock, the whole history falls
+    out of the window, the forecast collapses to its zero result, and the
+    CI-bounds assertions above invert. Pin both sides to one instant and
+    prove a one-hour shift is what breaks it.
+    """
+    from mnemos.domain.kronos import forecast as forecast_mod
+    from mnemos.domain.kronos import forecast_recall_load
+
+    internal_hour = forecast_mod.datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    assert internal_hour == _pinned_now().replace(minute=0, second=0, microsecond=0)
+
+    def rows_at(anchor: datetime) -> list[dict]:
+        return [{"bucket_hour": anchor - timedelta(hours=idx), "recall_count": 10 + (idx % 4)} for idx in range(24 * 7)]
+
+    aligned = await forecast_recall_load(_Pool(hourly_rows=rows_at(internal_hour)), "default")
+    shifted = await forecast_recall_load(_Pool(hourly_rows=rows_at(internal_hour + timedelta(hours=1))), "default")
+    # The extra row the shift contributes is the one real NEWEST hour, whose
+    # count is the fixture's highest (10 + 0 % 4 against a tail of 10 + 3): a
+    # one-hour misalignment changes the answer, it does not merely move it.
+    assert shifted.predicted_total_recalls > aligned.predicted_total_recalls > 0
+
+
+@pytest.mark.asyncio
 async def test_forecast_persephone_eligibility_counts_future_window():
     from mnemos.domain.kronos import forecast_persephone_eligibility
 
-    now = datetime.now(timezone.utc)
+    now = _pinned_now()
     pool = _Pool(
         eligibility_rows=[
             {"id": "soon", "last_recalled_at": now - timedelta(days=170)},
