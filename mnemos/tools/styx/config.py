@@ -113,8 +113,8 @@ def _int_env(env: dict[str, str], name: str, default: int) -> int:
 def _bool_env(env: dict[str, str], name: str, default: bool = False) -> bool:
     """Apply the process-wide truthy vocabulary to an injected env mapping.
 
-    STYX builds its config from an injected ``env`` dict rather than
-    ``os.environ``, so it cannot call ``runtime_env_bool`` directly — it uses
+    STYX builds its config from an injected ``env`` dict rather than the
+    process environment, so it cannot call ``runtime_env_bool`` directly — it uses
     the same parser, so ``STYX_*`` flags cannot mean something different from
     every other flag.
     """

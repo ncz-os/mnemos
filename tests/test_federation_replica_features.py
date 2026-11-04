@@ -696,7 +696,7 @@ class TestEmbedderFingerprint:
 
         assert fingerprint["embed_model"] == "bge-m3"
 
-    def test_a_missing_import_surfaces_instead_of_silently_unresolving(self):
+    def test_a_missing_import_surfaces_instead_of_silently_unresolving(self, monkeypatch):
         """A missing module-level import must not masquerade as "unresolved".
 
         The function's ``except Exception`` used to swallow ``NameError``, so a
@@ -706,6 +706,9 @@ class TestEmbedderFingerprint:
         """
         from mnemos.domain import federation
 
+        # An explicit model path selects the local-backend branch, the one
+        # that still names ``os`` directly (``os.path.basename``).
+        monkeypatch.setenv("MNEMOS_EMBED_MODEL_PATH", "/opt/mnemos/models/probe.gguf")
         real_os = federation.os
         del federation.os
         try:
