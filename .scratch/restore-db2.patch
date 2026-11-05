@@ -1,0 +1,384 @@
+diff --git a/mnemos/domain/models.py b/mnemos/domain/models.py
+index f406a504..e01301c0 100644
+--- a/mnemos/domain/models.py
++++ b/mnemos/domain/models.py
+@@ -1548,7 +1548,9 @@ class FederationPeerCreateRequest(BaseModel):
+     namespace_filter: Optional[List[str]] = None
+     category_filter: Optional[List[str]] = None
+     enabled: bool = True
+-    sync_interval_secs: int = 300
++    # The federation_peers table enforces CHECK (sync_interval_secs >= 30); validate here so a
++    # smaller value is a 422, not a database constraint error surfacing as a 500.
++    sync_interval_secs: int = Field(300, ge=30)
+     # #168: Literal["strict", "permissive"] gives type-level
+     # enforcement + auto-422 + OpenAPI enum, replacing the runtime
+     # `if request.compat_mode not in (...)` check at the route.
+@@ -1569,7 +1571,7 @@ class FederationPeerUpdateRequest(BaseModel):
+     namespace_filter: Optional[List[str]] = None
+     category_filter: Optional[List[str]] = None
+     enabled: Optional[bool] = None
+-    sync_interval_secs: Optional[int] = None
++    sync_interval_secs: Optional[int] = Field(None, ge=30)
+     # #168: same Literal[...] tightening on the update path.
+     compat_mode: Optional[Literal["strict", "permissive"]] = None
+ 
+diff --git a/mnemos/persistence/db2.py b/mnemos/persistence/db2.py
+index bc3b7c73..4df490d5 100644
+--- a/mnemos/persistence/db2.py
++++ b/mnemos/persistence/db2.py
+@@ -2020,26 +2020,29 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
+                 await _call(cursor.execute, "SELECT COUNT(*) AS cnt FROM memories WHERE content_hash IS NULL")
+                 row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+                 return int((row or {}).get("cnt") or 0)
++            # Db2 LUW cannot digest a CLOB in SQL: HASH() rejects LOBs (SQL-171)
++            # and CAST(... AS VARCHAR(32672)) silently truncates, so a SQL
++            # backfill would store a hash that is not the body's SHA-256. Read
++            # the batch and hash it in Python with _content_hash -- the exact
++            # function the insert and update paths already use -- so a
++            # backfilled row and a freshly written row carry the same digest.
+             await _call(
+                 cursor.execute,
+-                """
+-                UPDATE memories
+-                   SET content_hash = LOWER(HEX(HASH_SHA256(
+-                           REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10))
+-                       ))),
+-                       updated = CURRENT TIMESTAMP
+-                 WHERE id IN (
+-                    SELECT id
+-                      FROM memories
+-                     WHERE content_hash IS NULL
+-                     ORDER BY created ASC, id ASC
+-                     FETCH FIRST ? ROWS ONLY
+-                 )
+-                   AND content_hash IS NULL
+-                """,
++                "SELECT id, content FROM memories WHERE content_hash IS NULL "
++                "ORDER BY created ASC, id ASC FETCH FIRST ? ROWS ONLY",
+                 (int(batch_size),),
+             )
+-            return int(getattr(cursor, "rowcount", 0) or 0)
++            batch = await _fetch_all_dicts(cursor)
++            updated = 0
++            for row in batch:
++                await _call(
++                    cursor.execute,
++                    "UPDATE memories SET content_hash = ?, updated = CURRENT TIMESTAMP "
++                    "WHERE id = ? AND content_hash IS NULL",
++                    (_content_hash(row.get("content")), row.get("id")),
++                )
++                updated += int(getattr(cursor, "rowcount", 0) or 0)
++            return updated
+         finally:
+             await _call(cursor.close)
+ 
+@@ -2065,29 +2068,28 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
+             if namespace is not None:
+                 where.append("namespace = ?")
+                 params_list.append(namespace)
+-            # S2: the partition and the group key are digests of the normalized
+-            # body, not the CLOB -- grouping on a LOB is SQL0134N, so this sweep
+-            # could not run at all. HASH_SHA256 is the expression the content_hash
+-            # backfill already uses on this port, so the folded-newline meaning is
+-            # the same as on the text backends.
++            # S2: the partition cannot include the normalized CLOB -- grouping on
++            # a LOB is SQL0134N, so this sweep could not run at all. The identity
++            # is content_hash itself: the exact SHA-256 of the newline-normalized
++            # body that every insert, update and (now) backfill path writes in
++            # Python with _content_hash. This backend cannot digest a CLOB in SQL
++            # -- HASH() rejects LOBs (SQL-171) and CAST(... AS VARCHAR(32672))
++            # truncates -- and a truncated digest here would group two distinct
++            # long documents and consolidate one of them away.
+             # S6: NULLS LAST, or an unrated duplicate outranks a rated one and is
+             # kept as the canonical row (Postgres and Oracle keep the rated one).
+             sql = (
+                 "WITH ordered AS ("
+                 "SELECT id, owner_id, namespace, content_hash, created, quality_rating, "
+-                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) AS normalized_content, "
+                 "ROW_NUMBER() OVER ("
+-                "PARTITION BY owner_id, namespace, content_hash, "
+-                "LOWER(HEX(HASH_SHA256("
+-                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10))))) "
++                "PARTITION BY owner_id, namespace, content_hash "
+                 "ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC"
+                 ") AS rn "
+                 "FROM memories WHERE " + " AND ".join(where) + " "
+                 "), grouped AS ("
+                 "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count, "
+                 "LISTAGG(id, CHR(31)) WITHIN GROUP (ORDER BY rn ASC) AS memory_ids "
+-                "FROM ordered GROUP BY owner_id, namespace, content_hash, "
+-                "LOWER(HEX(HASH_SHA256(normalized_content))) HAVING COUNT(*) > 1"
++                "FROM ordered GROUP BY owner_id, namespace, content_hash HAVING COUNT(*) > 1"
+                 ") "
+                 "SELECT owner_id, namespace, content_hash, duplicate_count, memory_ids, "
+                 "SUBSTR(memory_ids, 1, LOCATE(CHR(31), memory_ids || CHR(31)) - 1) AS keep_id, "
+@@ -2143,18 +2145,14 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
+             sql = (
+                 "WITH ordered AS ("
+                 "SELECT id, owner_id, namespace, content_hash, "
+-                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) AS normalized_content, "
+                 "ROW_NUMBER() OVER ("
+-                "PARTITION BY owner_id, namespace, content_hash, "
+-                "LOWER(HEX(HASH_SHA256("
+-                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10))))) "
++                "PARTITION BY owner_id, namespace, content_hash "
+                 "ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC"
+                 ") AS rn "
+                 "FROM memories WHERE " + " AND ".join(where) + " "
+                 "), grouped AS ("
+                 "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count "
+-                "FROM ordered GROUP BY owner_id, namespace, content_hash, "
+-                "LOWER(HEX(HASH_SHA256(normalized_content))) HAVING COUNT(*) > 1"
++                "FROM ordered GROUP BY owner_id, namespace, content_hash HAVING COUNT(*) > 1"
+                 ") "
+                 "SELECT owner_id, namespace, content_hash, duplicate_count FROM grouped "
+                 "ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC"
+diff --git a/tests/test_db2_content_hash_exactness_20261105.py b/tests/test_db2_content_hash_exactness_20261105.py
+new file mode 100644
+index 00000000..0bb15374
+--- /dev/null
++++ b/tests/test_db2_content_hash_exactness_20261105.py
+@@ -0,0 +1,130 @@
++"""The Db2 dedup sweep and backfill must never digest a truncated CLOB.
++
++Measured on Db2 LUW 12.1.5 community: ``HASH_SHA256`` does not exist
++(SQL0440N), ``HASH(expr, 2)`` is SHA-256 but rejects a CLOB (SQL-171), and
++``CAST(clob AS VARCHAR(32672))`` truncates past 32,672 bytes. A sweep grouping
++on a truncated digest merges two distinct long documents and consolidates one
++of them away, so the identity has to be ``content_hash`` -- the exact SHA-256
++of the newline-normalized body that every write path computes in Python.
++"""
++
++from __future__ import annotations
++
++import hashlib
++from pathlib import Path
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++
++DB2_SOURCE = Path(__file__).resolve().parents[1] / "mnemos" / "persistence" / "db2.py"
++
++
++def _normalized(content: str) -> str:
++    return content.replace("\r\n", "\n").replace("\r", "\n")
++
++
++class _BackfillCursor:
++    """Serves one SELECT batch, then records the UPDATE parameters."""
++
++    def __init__(self, batch: list[tuple[str, str]]) -> None:
++        self._batch = batch
++        self.statements: list[tuple[str, Any]] = []
++        self.description: Any = None
++        self.rowcount = 0
++
++    async def execute(self, sql: Any, params: Any = ()) -> "_BackfillCursor":
++        text = " ".join(str(sql).split())
++        self.statements.append((text, params))
++        upper = text.upper()
++        if upper.startswith("SELECT"):
++            self.description = [("id",), ("content",)]
++            self.rowcount = 0
++        else:
++            self.description = None
++            self.rowcount = 1
++        return self
++
++    async def fetchall(self) -> list[tuple[str, str]]:
++        return list(self._batch)
++
++    async def fetchone(self) -> Any:
++        return None
++
++    async def close(self) -> None:
++        return None
++
++
++class _SweepCursor:
++    def __init__(self, calls: list[Any]) -> None:
++        self._calls = calls
++        self.description: Any = [
++            ("owner_id",),
++            ("namespace",),
++            ("content_hash",),
++            ("duplicate_count",),
++            ("memory_ids",),
++            ("keep_id",),
++            ("canonical_id",),
++        ]
++        self.rowcount = 0
++
++    async def execute(self, sql: Any, params: Any = ()) -> "_SweepCursor":
++        self._calls.append((" ".join(str(sql).split()), params))
++        return self
++
++    async def fetchall(self) -> list[Any]:
++        return []
++
++    async def fetchone(self) -> Any:
++        return None
++
++    async def close(self) -> None:
++        return None
++
++
++def test_db2_source_has_no_unavailable_or_truncating_digest() -> None:
++    source = DB2_SOURCE.read_text()
++    assert "HASH_SHA256" not in source
++    # Any SQL digest here can only be HASH(CAST(... AS VARCHAR(32672)), 2): the
++    # function rejects a CLOB (SQL-171) and the cast truncates past 32,672
++    # bytes, so no SQL digest belongs in this backend at all.
++    assert "HEX(HASH(" not in source
++
++
++@pytest.mark.asyncio
++async def test_db2_backfill_hashes_the_whole_body_in_python() -> None:
++    from mnemos.persistence.db2 import Db2MemoryRepository
++
++    long_body = "a" * 33000 + "tail-one"
++    cursor = _BackfillCursor([("mem-1", long_body)])
++    repo = Db2MemoryRepository()
++    applied = await repo.backfill_missing_content_hashes(
++        SimpleNamespace(conn=SimpleNamespace(cursor=lambda: cursor)),
++        apply=True,
++        batch_size=10,
++    )
++    assert applied == 1
++    updates = [(sql, params) for sql, params in cursor.statements if sql.upper().startswith("UPDATE")]
++    assert len(updates) == 1
++    digest = updates[0][1][0]
++    assert digest == hashlib.sha256(_normalized(long_body).encode("utf-8")).hexdigest()
++    truncated = hashlib.sha256(_normalized(long_body)[:32672].encode("utf-8")).hexdigest()
++    assert digest != truncated
++
++
++@pytest.mark.asyncio
++async def test_db2_sweep_groups_by_content_hash_never_by_a_bounded_digest() -> None:
++    from mnemos.persistence.db2 import Db2MemoryRepository
++
++    calls: list[Any] = []
++    repo = Db2MemoryRepository()
++    await repo.find_duplicate_content_groups(
++        SimpleNamespace(conn=SimpleNamespace(cursor=lambda: _SweepCursor(calls)))
++    )
++    assert calls, "the sweep issued no statement"
++    sql = " ".join(calls[0][0].upper().split())
++    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH" in sql
++    assert "HASH_SHA256" not in sql
++    assert "VARCHAR(32672)" not in sql
++    assert "NORMALIZED_CONTENT" not in sql
+diff --git a/tests/test_db2_dialect_parity.py b/tests/test_db2_dialect_parity.py
+index b482cd65..d8a214f8 100644
+--- a/tests/test_db2_dialect_parity.py
++++ b/tests/test_db2_dialect_parity.py
+@@ -2200,8 +2200,11 @@ async def test_db2_memory_find_duplicate_content_groups_native() -> None:
+     params = calls[0]["params"] if calls else ()
+     # FB102/S2: the group key is a SHA-256 of the normalized body, not the CLOB
+     # itself (grouping on a LOB is SQL0134N).
+-    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH, " in sql
+-    assert "HASH_SHA256(NORMALIZED_CONTENT)" in sql
++    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH" in sql
++    # HASH_SHA256 does not exist on Db2 LUW (SQL0440N); the identity is the
++    # exact content_hash column, never a digest of a truncated CLOB.
++    assert "HASH_SHA256" not in sql
++    assert "VARCHAR(32672)" not in sql
+     assert "HAVING COUNT(*) > 1" in sql
+     assert "WITH ORDERED AS" in sql  # CTE
+     assert "LISTAGG" in sql
+@@ -2241,8 +2244,11 @@ async def test_db2_memory_find_duplicate_content_groups_no_namespace_native() ->
+     await repo.find_duplicate_content_groups(tx)
+     sql = calls[0]["sql"].upper() if calls else ""
+     params = calls[0]["params"] if calls else ()
+-    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH, " in sql
+-    assert "HASH_SHA256(NORMALIZED_CONTENT)" in sql
++    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH" in sql
++    # HASH_SHA256 does not exist on Db2 LUW (SQL0440N); the identity is the
++    # exact content_hash column, never a digest of a truncated CLOB.
++    assert "HASH_SHA256" not in sql
++    assert "VARCHAR(32672)" not in sql
+     assert "HAVING COUNT(*) > 1" in sql
+     assert "WITH ORDERED AS" in sql
+     assert "LISTAGG" in sql
+diff --git a/tests/test_dedup_sql_portability_journal.py b/tests/test_dedup_sql_portability_journal.py
+index cbcd6348..a126cfe1 100644
+--- a/tests/test_dedup_sql_portability_journal.py
++++ b/tests/test_dedup_sql_portability_journal.py
+@@ -120,8 +120,13 @@ async def test_db2_dedup_groups_by_a_digest_not_a_clob():
+ 
+     (sql,) = _sql_of(conn.calls)
+     group_by = _group_by_clause(sql)
+-    assert "HASH_SHA256" in group_by
+-    # SQL0134N: a CLOB cannot be a grouping term -- only its digest may be.
++    # SQL0134N: a CLOB cannot be a grouping term. HASH_SHA256 does not exist on
++    # Db2 LUW (SQL0440N), and a digest of CAST(... AS VARCHAR(32672)) would
++    # truncate past 32 KB and merge distinct long documents. The identity is
++    # content_hash -- the exact SHA-256 of the normalized body -- so the group
++    # key never has to touch the CLOB at all.
++    assert "CONTENT_HASH" in group_by
++    assert "HASH_SHA256" not in group_by
+     assert "REPLACE(" not in group_by
+     assert "COALESCE(" not in group_by
+ 
+@@ -235,10 +240,12 @@ async def test_db2_dedup_statement_is_syntactically_closed():
+ 
+     (sql,) = _sql_of(conn.calls)
+     _balanced_expression(sql)
+-    # The digest must wrap the normalized body whole: HASH_SHA256( REPLACE(...) )
+-    # closes COALESCE's argument list, both REPLACEs, HASH_SHA256, HEX and LOWER.
+-    assert "LOWER(HEX(HASH_SHA256(REPLACE(REPLACE(COALESCE(content, '')," in sql
+-    assert "CHR(10))))) ORDER BY created DESC" in sql
++    # The identity is content_hash and the sweep never digests a truncated CLOB,
++    # so no HASH(...) of any kind appears and the window closes cleanly.
++    assert "HASH(" not in sql
++    assert "PARTITION BY owner_id, namespace, content_hash ORDER BY created DESC" in sql
++    assert "GROUP BY owner_id, namespace, content_hash HAVING COUNT(*) > 1" in sql
++
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/test_federation_peer_interval_validation_20261105.py b/tests/test_federation_peer_interval_validation_20261105.py
+new file mode 100644
+index 00000000..5bc2b06f
+--- /dev/null
++++ b/tests/test_federation_peer_interval_validation_20261105.py
+@@ -0,0 +1,38 @@
++"""A peer sync interval below the database floor is a validation error, not a 500."""
++
++import pytest
++from pydantic import ValidationError
++
++from mnemos.domain.models import FederationPeerCreateRequest, FederationPeerUpdateRequest
++
++
++def _create(**kw):
++    return FederationPeerCreateRequest(
++        name="peer-one", base_url="http://peer.example:5002", auth_token="t", **kw
++    )
++
++
++@pytest.mark.parametrize("secs", [0, 1, 10, 29])
++def test_create_rejects_an_interval_below_the_database_floor(secs):
++    with pytest.raises(ValidationError):
++        _create(sync_interval_secs=secs)
++
++
++@pytest.mark.parametrize("secs", [30, 60, 300])
++def test_create_accepts_the_floor_and_above(secs):
++    assert _create(sync_interval_secs=secs).sync_interval_secs == secs
++
++
++def test_create_default_interval_is_unchanged():
++    assert _create().sync_interval_secs == 300
++
++
++@pytest.mark.parametrize("secs", [0, 10, 29])
++def test_update_rejects_an_interval_below_the_database_floor(secs):
++    with pytest.raises(ValidationError):
++        FederationPeerUpdateRequest(sync_interval_secs=secs)
++
++
++def test_update_accepts_the_floor_and_none():
++    assert FederationPeerUpdateRequest(sync_interval_secs=30).sync_interval_secs == 30
++    assert FederationPeerUpdateRequest().sync_interval_secs is None
