@@ -564,7 +564,7 @@ def test_detect_os_permission_error_on_os_release_also_falls_back(os_release, fa
     reason=(
         "DEFECT (reported, not fixed — tests-only job). mnemos/installer/detect.py "
         "_detect_os(): the /etc/os-release parse runs inside `try:` (line 62), whose "
-        "`except Exception: pass` is line 92, and the `return \"linux\", distro, "
+        '`except Exception: pass` is line 92, and the `return "linux", distro, '
         "version_id` at line 91 is INSIDE that try block. So when ID is unmapped and "
         "ID_LIKE does not resolve the distro, the function returns "
         "('linux', 'unknown', version_id) without ever reaching the lsb_release "
@@ -650,9 +650,7 @@ def test_detect_postgres_takes_the_last_digit_leading_token(fake_run):
             _argv("which", "psql"): _FakeCompleted(0, "", ""),
             _argv("psql", "--version"): _FakeCompleted(0, "psql (PostgreSQL) 9.6 16.2", ""),
             _argv("which", "pg_isready"): _FakeCompleted(1, "", ""),
-            _argv("psql", "-U", "postgres", "-c", "SELECT 1", "-q", "--no-password"): _FakeCompleted(
-                0, "", ""
-            ),
+            _argv("psql", "-U", "postgres", "-c", "SELECT 1", "-q", "--no-password"): _FakeCompleted(0, "", ""),
         }
     )
 
@@ -694,7 +692,6 @@ def test_detect_postgres_accepts_a_major_only_banner_verbatim(fake_run):
     assert _detect_postgres() == (True, "16", True)
 
 
-
 def test_detect_postgres_version_lookup_failure_leaves_version_empty(fake_run):
     """A non-zero ``psql --version`` yields an empty version but 'installed'."""
     fake_run(
@@ -716,9 +713,7 @@ def test_detect_postgres_falls_back_to_psql_when_pg_isready_is_absent(fake_run):
             _argv("which", "psql"): _FakeCompleted(0, "", ""),
             _argv("psql", "--version"): _FakeCompleted(0, "psql (PostgreSQL) 15.4", ""),
             _argv("which", "pg_isready"): _FakeCompleted(1, "", ""),
-            _argv("psql", "-U", "postgres", "-c", "SELECT 1", "-q", "--no-password"): _FakeCompleted(
-                0, "1", ""
-            ),
+            _argv("psql", "-U", "postgres", "-c", "SELECT 1", "-q", "--no-password"): _FakeCompleted(0, "1", ""),
         }
     )
 
@@ -852,9 +847,7 @@ def test_detect_pgvector_never_raises_when_psql_is_missing(fake_run):
 
 def test_disk_free_gb_converts_fragment_blocks_to_gib(monkeypatch):
     """``f_bavail * f_frsize / 1024**3`` — note: bavail, not bfree."""
-    stat = os.statvfs_result(
-        (4096, 4096, 1000, 500, 400, 950, 950, 0, 0, 255)
-    )
+    stat = os.statvfs_result((4096, 4096, 1000, 500, 400, 950, 950, 0, 0, 255))
     monkeypatch.setattr(detect_mod.os, "statvfs", lambda path: stat)
 
     assert _disk_free_gb("/") == pytest.approx(400 * 4096 / 1024**3)
@@ -944,9 +937,7 @@ def wired_detect(monkeypatch, fake_run, os_release):
 
     def responder(cmd, *args, **kwargs):
         key = " ".join(str(c) for c in cmd)
-        if key.startswith("psql -U postgres -c SELECT 1 FROM") or key.startswith(
-            "sudo -u postgres psql"
-        ):
+        if key.startswith("psql -U postgres -c SELECT 1 FROM") or key.startswith("sudo -u postgres psql"):
             value = state["pgvector"]
         else:
             value = state.get(key, _FakeCompleted(1, "", ""))
@@ -1381,9 +1372,18 @@ def test_print_summary_line_order_is_stable():
     """The sections are printed in a fixed order: OS → Python → PG → init → disk → tools."""
     lines = _summary(_healthy())
     body = lines[3:-1]
-    markers = ["OS:", "Python ", "PostgreSQL installed", "PostgreSQL is running",
-               "pgvector", "systemd", "Disk free:", "pip available",
-               "venv module available", "git available"]
+    markers = [
+        "OS:",
+        "Python ",
+        "PostgreSQL installed",
+        "PostgreSQL is running",
+        "pgvector",
+        "systemd",
+        "Disk free:",
+        "pip available",
+        "venv module available",
+        "git available",
+    ]
     positions = []
     for marker in markers:
         idx = next(i for i, line in enumerate(body) if marker in line)
@@ -1632,7 +1632,7 @@ def test_module_main_guard_calls_detect_then_print_summary(monkeypatch, capsys):
         "detect": lambda: calls.append("detect") or _healthy(),
         "print_summary": lambda info: calls.append("print"),
     }
-    guard = source[source.index('if __name__ == "__main__":'):]
+    guard = source[source.index('if __name__ == "__main__":') :]
 
     exec(compile(guard, detect_mod.__file__, "exec"), namespace)
 
