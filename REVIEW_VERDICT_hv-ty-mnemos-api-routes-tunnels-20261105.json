@@ -1,5 +1,6 @@
-verdict: approve   ($0.0000)   [complete (1 reviewer)]
-
-── cerberus-reviewer :: approve ──
-No defects detected in the provided diff.
-
+{
+  "verdict": "approve",
+  "reason": "Reviewed branch hv/ty-mnemos-api-routes-tunnels-20261105 at 5c1ead88 against base master. The tunnel/API-route changes (3689adb0: characterise the tunnel admin routes; e22d626c: review verdict) are the branch's core delta and are sound. The two later functional fixes are also correct: (1) mnemos/persistence/db2.py — the Db2 backfill and dedup-sweep no longer digest a CLOB in SQL (HASH_SHA256 does not exist on Db2 LUW, SQL-171 rejects LOBs in HASH(), and CAST to VARCHAR(32672) truncates), so the group/backfill identity is the exact content_hash column written by _content_hash in Python; (2) mnemos/domain/models.py — FederationPeerCreate/UpdateRequest now enforce sync_interval_secs >= 30 at the Pydantic layer (matching the DB CHECK constraint), turning a 500 into a 422. New and updated tests pass locally (15 + 88 passed, federation/dead-field suites pass); the ABC-first ratchet guard passes. The sole HEAD commit (5c1ead88) is a WIP scratch-file preservation of a prior unfinished run (test-harness scripts, fail baselines, review logs under .scratch/) — inert to runtime behaviour. No defects found.",
+  "head_sha": "5c1ead88abbdf868cd77d47fb75bfc7c6c6de7c0",
+  "job_id": "01a1ac8b-5398-7cf1-bf7c-9359e510a2ae"
+}
