@@ -19,9 +19,11 @@ through ``TestClient``: the installed FastAPI version (see
 Calling the coroutines directly keeps this file independent of that
 environment skew while still covering every branch of this module.
 """
+
 from __future__ import annotations
 
 import asyncio
+import importlib
 from types import SimpleNamespace
 
 import pytest
@@ -87,15 +89,29 @@ class FakeNgrokBridge(FakeBridge):
 
 
 def _settings(*, tunnels_enabled=True, mcp_token="static-mcp-token"):
-    return SimpleNamespace(
-        mcp=SimpleNamespace(token=mcp_token, tokens="", tunnels_enabled=tunnels_enabled)
-    )
+    return SimpleNamespace(mcp=SimpleNamespace(token=mcp_token, tokens="", tunnels_enabled=tunnels_enabled))
+
+
+def _patch_settings(monkeypatch, **kwargs):
+    """Make ``get_settings()`` answer with ``_settings(**kwargs)``.
+
+    The route resolves ``get_settings`` from its own module globals, so the
+    patch is applied to ``tr`` directly: an import of the function would
+    rebind only this file's name, and patching ``mnemos.core.config`` would
+    miss a route module that was re-imported after this file was loaded.
+    monkeypatch restores the original afterwards.
+    """
+    monkeypatch.setattr(tr, "get_settings", lambda: _settings(**kwargs))
+    return tr
 
 
 def _root_user() -> UserContext:
     return UserContext(
-        user_id="root-user", group_ids=[], role="root",
-        namespace="default", authenticated=True,
+        user_id="root-user",
+        group_ids=[],
+        role="root",
+        namespace="default",
+        authenticated=True,
     )
 
 
@@ -114,7 +130,7 @@ def _isolate_module_state(request, monkeypatch):
     FakeNgrokBridge.start_calls = []
     # Default: enabled, with a static token, and OAuth unavailable. Tests
     # override the specific seam they care about.
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings())
+    _patch_settings(monkeypatch)
     if "real_oauth_seam" not in request.fixturenames:
         monkeypatch.setattr(tr, "_oauth_service", _oauth_unavailable)
     yield
@@ -123,6 +139,22 @@ def _isolate_module_state(request, monkeypatch):
     FakeBridge.start_calls = []
     FakeNgrokBridge.raise_on_start = None
     FakeNgrokBridge.start_calls = []
+
+
+@pytest.fixture(autouse=True)
+def _route_module_is_the_live_one():
+    """Run against the route module the rest of the repo currently uses.
+
+    Other suites in this repo pop and re-import ``mnemos.api.routes.*`` and
+    ``mnemos.core.config``. This file binds the route module at import time,
+    so after such a reload ``tr`` would be a superseded copy: its patches
+    would land on an object no request reaches. Re-binding ``tr`` to the
+    module the process actually serves keeps every patch here effective.
+    """
+    global tr
+    tr = importlib.import_module("mnemos.api.routes.tunnels")
+    yield
+    tr._reset_active_for_tests()
 
 
 @pytest.fixture
@@ -268,8 +300,13 @@ def test_stop_response_defaults_backend_to_none():
 def test_start_response_expires_in_defaults_to_none():
     """None signals a static token, which does not expire."""
     resp = tr.TunnelStartResponse(
-        url="https://x", token="t", token_source="static", backend="cloudflare",
-        target_port=5004, pid=1, started_at="2026-01-01T00:00:00+00:00",
+        url="https://x",
+        token="t",
+        token_source="static",
+        backend="cloudflare",
+        target_port=5004,
+        pid=1,
+        started_at="2026-01-01T00:00:00+00:00",
     )
     assert resp.expires_in is None
 
@@ -277,8 +314,13 @@ def test_start_response_expires_in_defaults_to_none():
 @pytest.mark.parametrize("source", ["oauth", "static"])
 def test_start_response_accepts_both_token_sources(source):
     resp = tr.TunnelStartResponse(
-        url="https://x", token="t", token_source=source, backend="cloudflare",
-        target_port=5004, pid=1, started_at="2026-01-01T00:00:00+00:00",
+        url="https://x",
+        token="t",
+        token_source=source,
+        backend="cloudflare",
+        target_port=5004,
+        pid=1,
+        started_at="2026-01-01T00:00:00+00:00",
     )
     assert resp.token_source == source
 
@@ -286,8 +328,13 @@ def test_start_response_accepts_both_token_sources(source):
 def test_start_response_rejects_an_unknown_token_source():
     with pytest.raises(ValidationError):
         tr.TunnelStartResponse(
-            url="https://x", token="t", token_source="cookie", backend="cloudflare",
-            target_port=5004, pid=1, started_at="2026-01-01T00:00:00+00:00",
+            url="https://x",
+            token="t",
+            token_source="cookie",
+            backend="cloudflare",
+            target_port=5004,
+            pid=1,
+            started_at="2026-01-01T00:00:00+00:00",
         )
 
 
@@ -299,7 +346,7 @@ def test_require_enabled_passes_when_the_host_opted_in():
 
 
 def test_require_enabled_raises_403_when_the_flag_is_false(monkeypatch):
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     with pytest.raises(HTTPException) as ei:
         tr._require_enabled()
     assert ei.value.status_code == 403
@@ -307,7 +354,7 @@ def test_require_enabled_raises_403_when_the_flag_is_false(monkeypatch):
 
 def test_require_enabled_403_names_the_env_var_and_config_key(monkeypatch):
     """The operator must be able to act on the message alone."""
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     with pytest.raises(HTTPException) as ei:
         tr._require_enabled()
     detail = ei.value.detail
@@ -317,7 +364,7 @@ def test_require_enabled_403_names_the_env_var_and_config_key(monkeypatch):
 
 
 def test_require_enabled_403_mentions_restart(monkeypatch):
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     with pytest.raises(HTTPException) as ei:
         tr._require_enabled()
     assert "restart MNEMOS" in ei.value.detail
@@ -325,7 +372,7 @@ def test_require_enabled_403_mentions_restart(monkeypatch):
 
 def test_require_enabled_treats_a_truthy_non_bool_as_enabled(monkeypatch):
     """The gate is a plain truthiness test, not `is True`."""
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=1))
+    _patch_settings(monkeypatch, tunnels_enabled=1)
     assert tr._require_enabled() is None
 
 
@@ -402,6 +449,7 @@ def test_oauth_service_delegates_to_the_mcp_edge_factory(monkeypatch, real_oauth
 
 def test_oauth_service_propagates_a_factory_failure(monkeypatch, real_oauth_seam):
     """An unconfigured OAuth server raises; callers decide whether to fall back."""
+
     def _boom():
         raise RuntimeError("MNEMOS_OAUTH_ISSUER is not configured")
 
@@ -446,18 +494,19 @@ def test_issue_requests_the_tunnel_lifetime_and_client_identity(monkeypatch):
 def test_issue_falls_back_to_the_static_token_when_oauth_is_unavailable(monkeypatch):
     """RuntimeError (the real 'not configured' shape) is swallowed."""
     monkeypatch.setattr(tr, "_oauth_service", _oauth_unavailable)
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(mcp_token="static-abc"))
+    _patch_settings(monkeypatch, mcp_token="static-abc")
     assert tr._issue_tunnel_token() == ("static-abc", "static", None)
 
 
 @pytest.mark.parametrize("exc", [RuntimeError("no issuer"), ImportError("no module"), ValueError("bad")])
 def test_issue_falls_back_for_any_oauth_exception(monkeypatch, exc):
     """The except clause is broad on purpose: any failure falls back."""
+
     def _boom():
         raise exc
 
     monkeypatch.setattr(tr, "_oauth_service", _boom)
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(mcp_token="static-abc"))
+    _patch_settings(monkeypatch, mcp_token="static-abc")
     assert tr._issue_tunnel_token() == ("static-abc", "static", None)
 
 
@@ -466,31 +515,30 @@ def test_issue_logs_the_oauth_failure_before_falling_back(monkeypatch, caplog):
     line — it is what an operator greps for when a tunnel gets a static
     token instead of the expected OAuth one."""
     monkeypatch.setattr(tr, "_oauth_service", _oauth_unavailable)
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(mcp_token="static-abc"))
+    _patch_settings(monkeypatch, mcp_token="static-abc")
     with caplog.at_level("INFO", logger=tr.logger.name):
         tr._issue_tunnel_token()
     messages = [rec.getMessage() for rec in caplog.records]
     assert any(
-        "[TUNNEL] OAuth token issuance unavailable" in m
-        and "MNEMOS_OAUTH_ISSUER is not configured" in m
+        "[TUNNEL] OAuth token issuance unavailable" in m and "MNEMOS_OAUTH_ISSUER is not configured" in m
         for m in messages
     ), messages
 
 
 def test_issue_strips_surrounding_whitespace_from_the_static_token(monkeypatch):
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(mcp_token="  spaced-token \n"))
+    _patch_settings(monkeypatch, mcp_token="  spaced-token \n")
     assert tr._issue_tunnel_token() == ("spaced-token", "static", None)
 
 
 def test_issue_raises_503_when_oauth_is_absent_and_no_static_token(monkeypatch):
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(mcp_token=""))
+    _patch_settings(monkeypatch, mcp_token="")
     with pytest.raises(HTTPException) as ei:
         tr._issue_tunnel_token()
     assert ei.value.status_code == 503
 
 
 def test_issue_503_message_names_both_accepted_credentials(monkeypatch):
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(mcp_token=""))
+    _patch_settings(monkeypatch, mcp_token="")
     with pytest.raises(HTTPException) as ei:
         tr._issue_tunnel_token()
     detail = ei.value.detail
@@ -501,7 +549,7 @@ def test_issue_503_message_names_both_accepted_credentials(monkeypatch):
 
 @pytest.mark.parametrize("empty", ["", "   ", "\n\t "])
 def test_issue_treats_whitespace_only_static_token_as_absent(monkeypatch, empty):
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(mcp_token=empty))
+    _patch_settings(monkeypatch, mcp_token=empty)
     with pytest.raises(HTTPException) as ei:
         tr._issue_tunnel_token()
     assert ei.value.status_code == 503
@@ -509,9 +557,7 @@ def test_issue_treats_whitespace_only_static_token_as_absent(monkeypatch, empty)
 
 def test_issue_never_uses_the_per_user_token_map(monkeypatch):
     """Handing one entry of MNEMOS_MCP_TOKENS out would grant that identity."""
-    settings = SimpleNamespace(
-        mcp=SimpleNamespace(token="", tokens="alice:key1,bob:key2", tunnels_enabled=True)
-    )
+    settings = SimpleNamespace(mcp=SimpleNamespace(token="", tokens="alice:key1,bob:key2", tunnels_enabled=True))
     monkeypatch.setattr(tr, "get_settings", lambda: settings)
     with pytest.raises(HTTPException) as ei:
         tr._issue_tunnel_token()
@@ -526,7 +572,7 @@ def test_issue_prefers_oauth_even_when_a_static_token_exists(monkeypatch):
             return "oauth-wins"
 
     monkeypatch.setattr(tr, "_oauth_service", lambda: _Service())
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(mcp_token="static-loses"))
+    _patch_settings(monkeypatch, mcp_token="static-loses")
     assert tr._issue_tunnel_token()[0] == "oauth-wins"
 
 
@@ -605,7 +651,7 @@ def test_start_accepts_both_boundary_ports(fake_bridge, port):
 
 
 def test_start_403s_when_the_host_has_not_opted_in(monkeypatch, fake_bridge):
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     with pytest.raises(HTTPException) as ei:
         _run(tr.start_tunnel(_request(), _root_user()))
     assert ei.value.status_code == 403
@@ -613,7 +659,7 @@ def test_start_403s_when_the_host_has_not_opted_in(monkeypatch, fake_bridge):
 
 def test_start_gate_runs_before_any_bridge_is_resolved(monkeypatch):
     """A disabled host must not even look up a backend."""
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     resolved = []
     monkeypatch.setattr(tr, "get_bridge_class", lambda b: resolved.append(b) or FakeBridge)
     with pytest.raises(HTTPException):
@@ -623,7 +669,7 @@ def test_start_gate_runs_before_any_bridge_is_resolved(monkeypatch):
 
 def test_start_gate_runs_before_any_token_is_issued(monkeypatch):
     """No live credential may be minted for a request that will be refused."""
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     issued = []
     monkeypatch.setattr(tr, "_oauth_service", lambda: issued.append(1) or object())
     with pytest.raises(HTTPException):
@@ -634,6 +680,7 @@ def test_start_gate_runs_before_any_token_is_issued(monkeypatch):
 
 def test_start_unknown_backend_is_422(monkeypatch):
     """get_bridge_class raising KeyError is turned into a 422, not a 500."""
+
     def _get(backend):
         raise KeyError(backend)
 
@@ -668,6 +715,7 @@ def test_start_unknown_backend_message_quotes_the_requested_value(monkeypatch):
 
 def test_start_validates_backend_before_issuing_a_token(monkeypatch):
     """A 422 must not leave a minted credential behind."""
+
     def _get(backend):
         raise KeyError(backend)
 
@@ -698,6 +746,7 @@ def test_start_resolves_the_bridge_class_before_issuing_a_token(monkeypatch, fak
 
 def test_start_resolves_the_token_before_spawning_the_bridge(monkeypatch, fake_bridge):
     """A tunnel opened with no credential would expose the port for nothing."""
+
     def _no_token():
         raise HTTPException(status_code=503, detail="no credential")
 
@@ -709,7 +758,7 @@ def test_start_resolves_the_token_before_spawning_the_bridge(monkeypatch, fake_b
 
 
 def test_start_503_on_no_credential_leaves_no_active_tunnel(monkeypatch, fake_bridge):
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(mcp_token=""))
+    _patch_settings(monkeypatch, mcp_token="")
     with pytest.raises(HTTPException) as ei:
         _run(tr.start_tunnel(_request(), _root_user()))
     assert ei.value.status_code == 503
@@ -855,14 +904,14 @@ def test_status_does_not_clear_a_dead_bridge_handle(monkeypatch):
 
 
 def test_status_403s_when_the_host_has_not_opted_in(monkeypatch):
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     with pytest.raises(HTTPException) as ei:
         _run(tr.tunnel_status(_root_user()))
     assert ei.value.status_code == 403
 
 
 def test_status_gate_does_not_touch_the_bridge(monkeypatch):
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     bridge = FakeBridge()
     touched = []
     bridge.status = lambda: touched.append(1)
@@ -906,6 +955,7 @@ def test_stop_calls_the_bridge_stop_once(fake_bridge):
 
 def test_stop_reports_backend_none_when_the_bridge_reports_false():
     """A bridge that says 'was not running' yields backend=None."""
+
     class _AlreadyDeadBridge(FakeBridge):
         async def stop(self):
             self.stop_calls += 1
@@ -941,7 +991,7 @@ def test_stop_after_stop_leaves_status_not_running(fake_bridge):
 
 def test_stop_403s_when_the_host_has_not_opted_in(monkeypatch, fake_bridge):
     _run(tr.start_tunnel(_request(), _root_user()))
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     with pytest.raises(HTTPException) as ei:
         _run(tr.stop_tunnel(_root_user()))
     assert ei.value.status_code == 403
@@ -951,7 +1001,7 @@ def test_stop_gate_runs_before_the_tunnel_is_torn_down(monkeypatch, fake_bridge)
     """A disabled host cannot tear down through the API either."""
     _run(tr.start_tunnel(_request(), _root_user()))
     bridge = tr._active_bridge
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     with pytest.raises(HTTPException):
         _run(tr.stop_tunnel(_root_user()))
     assert bridge.stop_calls == 0
@@ -985,6 +1035,7 @@ def test_shutdown_is_idempotent(fake_bridge):
 
 def test_shutdown_ignores_a_raising_bridge_stop(caplog):
     """Best-effort teardown: a bridge fault must not break app shutdown."""
+
     class _RaisingBridge(FakeBridge):
         async def stop(self):
             raise RuntimeError("teardown exploded")
@@ -994,13 +1045,13 @@ def test_shutdown_ignores_a_raising_bridge_stop(caplog):
     with caplog.at_level("WARNING"):
         _run(tr.shutdown_active_tunnel())  # must not raise
     assert tr._active_bridge is None
-    assert any("failed to close" in rec.message or "failed to close" in rec.getMessage()
-               for rec in caplog.records)
+    assert any("failed to close" in rec.message or "failed to close" in rec.getMessage() for rec in caplog.records)
 
 
 def test_shutdown_with_a_bridge_that_reports_not_stopped(caplog):
     """stop() returning False means 'there was nothing to stop'. The handle
     is still cleared; no 'closed on shutdown' line is emitted."""
+
     class _IdleBridge(FakeBridge):
         async def stop(self):
             self.stop_calls += 1
@@ -1024,10 +1075,7 @@ def test_shutdown_logs_when_the_bridge_was_closed(caplog):
     tr._active_bridge = _LiveBridge()
     with caplog.at_level("INFO", logger=tr.logger.name):
         _run(tr.shutdown_active_tunnel())
-    assert any(
-        "cloudflare tunnel closed on shutdown" in rec.getMessage()
-        for rec in caplog.records
-    )
+    assert any("cloudflare tunnel closed on shutdown" in rec.getMessage() for rec in caplog.records)
 
 
 def test_shutdown_clears_the_handle_before_awaiting_stop(monkeypatch):
@@ -1049,7 +1097,7 @@ def test_shutdown_does_not_require_the_opt_in_gate(monkeypatch, fake_bridge):
     """Lifespan teardown must work even if the host is now configured off."""
     _run(tr.start_tunnel(_request(), _root_user()))
     bridge = tr._active_bridge
-    monkeypatch.setattr(tr, "get_settings", lambda: _settings(tunnels_enabled=False))
+    _patch_settings(monkeypatch, tunnels_enabled=False)
     _run(tr.shutdown_active_tunnel())
     assert tr._active_bridge is None
     assert bridge.stop_calls == 1
