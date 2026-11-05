@@ -218,15 +218,12 @@ async def test_build_allowlist_defaults_scope_args_to_none_when_omitted():
 async def test_build_allowlist_uses_backend_rows_verbatim_including_missing_ids():
     # The result dict is built from what the backend returned, NOT from
     # the referenced set: an id that was referenced but absent from the
-    # rows is simply not in the dict, and extra rows would be included.
-    #
-    # SUSPECTED DEFECT (pinned, not fixed): ``import_.py`` pops rejected
-    # persisted ids from the allowlist, but nothing filters the backend
-    # rows back to the requested ``referenced_ids``. A backend row for an
-    # id the envelope never referenced would land in the allowlist and
-    # pass the cross-tenant gate — a cross-tenant smuggling path. The
-    # fake here reproduces that by returning a row for "m3" that was
-    # never referenced.
+    # rows is simply not in the dict, and a row for an id the envelope
+    # never referenced would also be included verbatim. Today this is
+    # harmless by construction — the three call sites in ``phases.py``
+    # only gate ids that appear in the same sidecars the builder scans —
+    # but it is an unfiltered trust in the backend row set (see the
+    # companion xfail pinning the safe filtering behaviour).
     repo = _FakeMemoryRepo()
     repo.rows = [
         {"id": "m2", "owner_id": "alice", "namespace": "ns1"},
@@ -300,11 +297,11 @@ def _allowed_ref(memory_id, **kwargs):
 
 
 def test_is_allowed_reference_none_memory_id_is_unconditionally_allowed():
-    # A None memory_id short-circuits to (True, "") BEFORE any allowlist
-    # lookup: sidecar entries that carry no parent reference are never
-    # cross-tenant-checked. (Pin: this is the by-design skip in the
-    # sidecar import phases, not a hole — see phases.py callers, which
-    # only gate entries that DO carry a memory_id.)
+    # A None id short-circuits to (True, "") BEFORE any allowlist lookup
+    # — the short-circuit lives in the helper itself. All three call
+    # sites in ``phases.py`` (kg_triples: memory_id, memory_versions and
+    # compression_manifest: record_id) pass ``entry.get(...)`` and
+    # therefore rely on this for entries with no parent reference.
     ok, reason = _allowed_ref(None, allowlist={})
     assert (ok, reason) == (True, "")
 
@@ -408,28 +405,31 @@ def test_is_allowed_reference_none_namespace_in_allowlist_is_refused_with_repr_n
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Suspected defect: _build_referenced_memory_allowlist returns the "
-        "backend rows verbatim as {row.id: (owner, ns)} without filtering "
-        "to the referenced_ids it just asked for. A row for an id the "
-        "envelope never references lands in the allowlist, and "
-        "_is_allowed_reference then grants it — a cross-tenant smuggling "
-        "path (a backend row for a non-referenced id passes the gate). "
-        "Fix: filter rows to the requested referenced_ids (or make the "
-        "backend contract guarantee it and document that here). The test "
-        "asserts the SAFE behaviour (row not in result), so it xfails "
-        "while the defect exists."
+        "Defensive-filtering gap (no live exploit identified): "
+        "_build_referenced_memory_allowlist maps the backend rows "
+        "verbatim — {row.id: (owner, ns) for row in rows} — without "
+        "filtering them to the referenced_ids it just requested. If a "
+        "backend implementation ever returns a row outside the "
+        "requested id set (driver bug, scope leak), that id silently "
+        "enters the allowlist and _is_allowed_reference will grant it. "
+        "Fix: intersect rows with referenced_ids, or document on the "
+        "MemoryRepository ABC that implementations guarantee the row "
+        "set is a subset of referenced_ids. The test asserts the safe "
+        "filtering behaviour (unreferenced row NOT in result), so it "
+        "xfails while the filter is absent."
     ),
 )
 @pytest.mark.asyncio
 async def test_build_allowlist_should_not_include_backend_rows_for_unreferenced_ids():
-    """A backend row whose id was never referenced must not enter the allowlist.
+    """A backend row whose id was never referenced should not enter the allowlist.
 
-    The current implementation trusts the backend row set blindly:
-    ``{r['id']: (r['owner_id'], r['namespace']) for r in rows}`` with no
-    intersection against ``referenced``. If the backend ever returns a
-    row outside the requested id set (a driver bug, a scope leak, or a
-    deleted-then-recreated id), the cross-tenant gate in
-    ``_is_allowed_reference`` will happily allow it.
+    The current implementation maps every backend row verbatim with no
+    intersection against ``referenced``. Today this is latent, not
+    exploitable: the three ``phases.py`` call sites only gate ids that
+    appear in the same sidecars the builder scans, so an extra row has
+    no corresponding attachment to ride on. The pin protects the
+    builder's implied contract (row set ⊆ referenced set) against
+    future callers that gate ids from a different surface.
     """
     repo = _FakeMemoryRepo()
     # The fake returns a row for 'm9' that the envelope never references.
