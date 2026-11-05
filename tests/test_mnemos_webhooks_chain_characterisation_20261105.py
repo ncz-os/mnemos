@@ -129,6 +129,19 @@ class _MappingRecord:
         return self._data[key]
 
 
+class _ClassAttributeHolder:
+    url = "https://example.test/class-level"
+
+
+class _SubscriptableMeta(type):
+    def __getitem__(cls, key):
+        return f"meta-indexed:{key}"
+
+
+class _MetaclassHolder(metaclass=_SubscriptableMeta):
+    url = "https://example.test/meta-class"
+
+
 class _RaisingRecord:
     """``__getitem__`` that always raises ``KeyError``."""
 
@@ -342,18 +355,22 @@ def test_record_value_on_a_plain_string_uses_getitem():
     assert chain._record_value("ab", "url") is None
 
 
-def test_record_value_on_a_class_object_returns_none():
-    """A class object takes the attribute path, not the subscript path.
+def test_record_value_reads_a_class_level_attribute_without_subscripting():
+    """A plain class has no ``__getitem__``, so the attribute path is taken."""
+    assert hasattr(_ClassAttributeHolder, "__getitem__") is False
+    assert chain._record_value(_ClassAttributeHolder, "url") == "https://example.test/class-level"
 
-    ``hasattr(cls, "__getitem__")`` is False for a plain class, and the
-    ``isinstance(record, type)`` guard forces the attribute lookup, so a
-    class-level attribute is read normally.
+
+def test_record_value_isinstance_type_guard_wins_over_a_subscriptable_metaclass():
+    """This is what the ``isinstance(record, type)`` guard is for.
+
+    A class whose *metaclass* defines ``__getitem__`` is itself subscriptable,
+    so without the guard it would take the mapping path and return the
+    metaclass result. The guard forces the attribute lookup instead.
     """
-
-    class _Holder:
-        url = "https://example.test/class-level"
-
-    assert chain._record_value(_Holder, "url") == "https://example.test/class-level"
+    assert hasattr(_MetaclassHolder, "__getitem__") is True
+    assert _MetaclassHolder["url"] == "meta-indexed:url"
+    assert chain._record_value(_MetaclassHolder, "url") == "https://example.test/meta-class"
 
 
 def test_record_value_swallows_attribute_error_from_a_property():
