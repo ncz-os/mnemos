@@ -2200,8 +2200,11 @@ async def test_db2_memory_find_duplicate_content_groups_native() -> None:
     params = calls[0]["params"] if calls else ()
     # FB102/S2: the group key is a SHA-256 of the normalized body, not the CLOB
     # itself (grouping on a LOB is SQL0134N).
-    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH, " in sql
-    assert "HASH_SHA256(NORMALIZED_CONTENT)" in sql
+    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH" in sql
+    # HASH_SHA256 does not exist on Db2 LUW (SQL0440N); the identity is the
+    # exact content_hash column, never a digest of a truncated CLOB.
+    assert "HASH_SHA256" not in sql
+    assert "VARCHAR(32672)" not in sql
     assert "HAVING COUNT(*) > 1" in sql
     assert "WITH ORDERED AS" in sql  # CTE
     assert "LISTAGG" in sql
@@ -2241,8 +2244,11 @@ async def test_db2_memory_find_duplicate_content_groups_no_namespace_native() ->
     await repo.find_duplicate_content_groups(tx)
     sql = calls[0]["sql"].upper() if calls else ""
     params = calls[0]["params"] if calls else ()
-    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH, " in sql
-    assert "HASH_SHA256(NORMALIZED_CONTENT)" in sql
+    assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH" in sql
+    # HASH_SHA256 does not exist on Db2 LUW (SQL0440N); the identity is the
+    # exact content_hash column, never a digest of a truncated CLOB.
+    assert "HASH_SHA256" not in sql
+    assert "VARCHAR(32672)" not in sql
     assert "HAVING COUNT(*) > 1" in sql
     assert "WITH ORDERED AS" in sql
     assert "LISTAGG" in sql

@@ -120,8 +120,13 @@ async def test_db2_dedup_groups_by_a_digest_not_a_clob():
 
     (sql,) = _sql_of(conn.calls)
     group_by = _group_by_clause(sql)
-    assert "HASH_SHA256" in group_by
-    # SQL0134N: a CLOB cannot be a grouping term -- only its digest may be.
+    # SQL0134N: a CLOB cannot be a grouping term. HASH_SHA256 does not exist on
+    # Db2 LUW (SQL0440N), and a digest of CAST(... AS VARCHAR(32672)) would
+    # truncate past 32 KB and merge distinct long documents. The identity is
+    # content_hash -- the exact SHA-256 of the normalized body -- so the group
+    # key never has to touch the CLOB at all.
+    assert "CONTENT_HASH" in group_by
+    assert "HASH_SHA256" not in group_by
     assert "REPLACE(" not in group_by
     assert "COALESCE(" not in group_by
 
@@ -235,10 +240,12 @@ async def test_db2_dedup_statement_is_syntactically_closed():
 
     (sql,) = _sql_of(conn.calls)
     _balanced_expression(sql)
-    # The digest must wrap the normalized body whole: HASH_SHA256( REPLACE(...) )
-    # closes COALESCE's argument list, both REPLACEs, HASH_SHA256, HEX and LOWER.
-    assert "LOWER(HEX(HASH_SHA256(REPLACE(REPLACE(COALESCE(content, '')," in sql
-    assert "CHR(10))))) ORDER BY created DESC" in sql
+    # The identity is content_hash and the sweep never digests a truncated CLOB,
+    # so no HASH(...) of any kind appears and the window closes cleanly.
+    assert "HASH(" not in sql
+    assert "PARTITION BY owner_id, namespace, content_hash ORDER BY created DESC" in sql
+    assert "GROUP BY owner_id, namespace, content_hash HAVING COUNT(*) > 1" in sql
+
 
 
 @pytest.mark.asyncio
