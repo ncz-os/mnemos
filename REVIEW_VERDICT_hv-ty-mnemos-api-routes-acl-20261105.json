@@ -1,0 +1,60 @@
+{
+  "task": "characterisation tests for mnemos/api/routes/acl.py",
+  "branch": "hv/ty-mnemos-api-routes-acl-20261105",
+  "deliverable": "tests/test_mnemos_api_routes_acl_characterisation_20261105.py",
+  "reviewer_model": "deepseek-v4-pro (non-author)",
+  "reviewer_verdict": "REQUEST_CHANGES",
+  "author_assessment": "REJECTED — every finding was refuted against source; no finding warranted a change",
+  "verification": [
+    {
+      "finding": "[high] logger.info receives principal without str() conversion",
+      "test_cited": "test_grant_memory_acl_success",
+      "result": "REFUTED",
+      "reason": "No such test exists in the file. The real test (test_grant_logs_the_grant_at_info_with_principal_perm_and_memory, line 1049) asserts the emitted message string via caplog and does not mock logger.info. It also pins the behaviour the reviewer describes as a risk: the route logs the raw request field, not a str()-converted value, exactly as acl.py:207-213 does."
+    },
+    {
+      "finding": "[high] cache-invalidation exception paths untested",
+      "test_cited": "test_invalidate_search_caches_after_acl_change",
+      "result": "REFUTED",
+      "reason": "No such test exists. Six dedicated tests cover these exact branches: no-op passthrough when _lc._cache is None (line 1175), scan failure (1196), epoch failure (1207), delete failure (test_grant_returns_the_entry_even_when_cache_delete_raises), plus the ordering/pattern assertions (1216)."
+    },
+    {
+      "finding": "[medium] backend with no capabilities attr not verified",
+      "test_cited": "test_require_acl_backend_missing_capabilities_attr",
+      "result": "REFUTED",
+      "reason": "No such test exists. test_backend_without_capabilities_or_an_acl_attribute_is_rejected (line 783) builds a bare object with neither attribute and asserts 503; test_backend_without_a_capabilities_attribute_is_let_through pins the complementary branch (capabilities absent but .acl present -> accepted)."
+    },
+    {
+      "finding": "[medium] multi-colon / empty-part principals not covered",
+      "test_cited": "test_validate_principal",
+      "result": "REFUTED",
+      "reason": "Covered at lines 365, 374, 385 and 395: 'user:a:b', 'user:a:b:c', ':42', 'user:', 'group:', 'user::', 'group::' — including the pinned quirk that 'user::' is ACCEPTED because partition leaves ident=':'."
+    },
+    {
+      "finding": "[low] _iso callable-vs-str fallback inconsistency",
+      "test_cited": "test_to_entry",
+      "result": "REFUTED",
+      "reason": "No such test exists. Seven _iso tests (lines 466-497) cover None, datetime, date, str fallback, int fallback, a non-callable isoformat attribute, and exception propagation."
+    },
+    {
+      "finding": "[medium] _load_manageable_memory permission branches incomplete",
+      "test_cited": "test_load_manageable_memory",
+      "result": "REFUTED",
+      "reason": "No such test exists. Fourteen gate tests (lines 591-723) cover owner, root, group-admin, non-member, non-admin member, missing group_id, invisible/empty row, and both propagation branches."
+    },
+    {
+      "finding": "[low] revoke 404 not triggered by falsy revoke_acl return",
+      "test_cited": "test_revoke_memory_acl_not_found",
+      "result": "REFUTED",
+      "reason": "test_revoke_raises_404_when_the_repository_reports_nothing_removed (line 1085) injects revoke_result=False and asserts 404 with detail 'ACL grant not found'."
+    }
+  ],
+  "measured": {
+    "tests_in_file": 122,
+    "module_line_coverage": "100% (103/103 statements, 0 missing)",
+    "ruff": "clean",
+    "full_suite_before": "53 failed, 5624 passed, 576 skipped, 2 xfailed, 3 xpassed, 42 errors",
+    "full_suite_after": "53 failed, 5746 passed, 576 skipped, 2 xfailed, 3 xpassed, 42 errors (identical failure set; +122 passing)",
+    "defects_found": "none warranting xfail(strict=True)"
+  }
+}
