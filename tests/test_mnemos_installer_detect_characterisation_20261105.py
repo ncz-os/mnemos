@@ -1572,10 +1572,12 @@ def test_check_port_free_propagates_a_non_oserror(monkeypatch):
 def test_check_port_free_does_not_listen_or_connect(monkeypatch):
     """The probe binds and closes; it never calls listen/accept/connect."""
     forbidden: list[str] = []
+    opened: list[str] = []
     real_socket = socket.socket
 
     class _Spy:
         def __init__(self, *args, **kwargs):
+            opened.append("socket")
             self._wrapped = real_socket(*args, **kwargs)
 
         def __enter__(self):
@@ -1599,9 +1601,14 @@ def test_check_port_free_does_not_listen_or_connect(monkeypatch):
 
     monkeypatch.setattr(detect_mod.socket, "socket", _Spy)
 
-    check_port_free(0)
+    result = check_port_free(0)
 
     assert forbidden == []
+    # A socket must genuinely be opened and bound: an implementation that
+    # returned early would leave `opened` empty and make the assertion above
+    # vacuous, so pin that the probe actually reached the kernel.
+    assert opened == ["socket"]
+    assert result is True
 
 
 # ---------------------------------------------------------------------------
