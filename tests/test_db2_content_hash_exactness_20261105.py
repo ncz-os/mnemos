@@ -119,7 +119,9 @@ async def test_db2_sweep_groups_by_content_hash_never_by_a_bounded_digest() -> N
 
     calls: list[Any] = []
     repo = Db2MemoryRepository()
-    await repo.find_duplicate_content_groups(SimpleNamespace(conn=SimpleNamespace(cursor=lambda: _SweepCursor(calls))))
+    await repo.find_duplicate_content_groups(
+        SimpleNamespace(conn=SimpleNamespace(cursor=lambda: _SweepCursor(calls)))
+    )
     assert calls, "the sweep issued no statement"
     sql = " ".join(calls[0][0].upper().split())
     assert "GROUP BY OWNER_ID, NAMESPACE, CONTENT_HASH" in sql
