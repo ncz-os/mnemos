@@ -1,0 +1,10 @@
+{
+  "reviewers": [
+    {
+      "model": "deepseek-flash",
+      "verdict": "blocked"
+    }
+  ],
+  "head_sha": "a2ddfad9b51ff0a227736f7f7ab5c500f242db96",
+  "reason": "Blocked: this environment cannot invoke the requested different-family reviewer model, and delivery instructions prohibit committing or pushing here. The inspected diff adds only .baseline_failures.txt with 113 unrelated pytest failures, including OAuth/authentication, connector, embedding, and path-traversal cases; it does not implement a domain portability allowlist."
+}
