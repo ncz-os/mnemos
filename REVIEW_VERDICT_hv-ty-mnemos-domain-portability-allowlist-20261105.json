@@ -5,6 +5,6 @@
       "verdict": "blocked"
     }
   ],
-  "head_sha": "a2ddfad9b51ff0a227736f7f7ab5c500f242db96",
-  "reason": "Blocked: this environment cannot invoke the requested different-family reviewer model, and delivery instructions prohibit committing or pushing here. The inspected diff adds only .baseline_failures.txt with 113 unrelated pytest failures, including OAuth/authentication, connector, embedding, and path-traversal cases; it does not implement a domain portability allowlist."
+  "head_sha": "0d3730c36bf3c207bfd8676e465f581f9a48bd0e",
+  "reason": "Cannot review the requested commit: it is not present in the checkout (git cat-file failed). The checked-out author branch is at c6c2d287b22fde088ca1343042c252601e09ea30, and origin/master resolves to f29e8ba65166be09f0d3bfee7e9ee68287c3ab8f. Reviewing the available HEAD would not satisfy the requested exact-commit review."
 }
