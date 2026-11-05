@@ -1,0 +1,63 @@
+{
+  "schema": "hive-review-verdict/v1",
+  "job_id": "01a1a9f9-c07d-782e-800d-b0a92768593c",
+  "review_job_id": "01a1abc5-5e1f-7b4c-b073-377f7fa861bd",
+  "branch": "hv/ty-mnemos-tunnels-cloudflare-bridge-20261105",
+  "head_sha": "009d5262c2849fda89044e70be38e7efb870d170",
+  "base": "master",
+  "base_sha": "37ea01076aa08268a0b6c753e1434a36c28921d3",
+  "parent_sha": "11ebfd5be61e656882e0dc783b8e045dceff4543",
+  "scope": "1 commit ahead of master (merge-base 11ebfd5b): one added file, tests/test_mnemos_tunnels_cloudflare_bridge_characterisation_20261105.py (+778, -0). No production source changed.",
+  "author": {
+    "model": "deepseek-flash",
+    "family": "deepseek"
+  },
+  "reviewers": [
+    {
+      "model": "muse-spark-1.3",
+      "family": "meta",
+      "cross_family": true,
+      "verdict": "approve",
+      "summary": "Faithful, deterministic characterisation of mnemos/tunnels/cloudflare_bridge.py (83 passed, 1 xfailed, 0.54s). Every argv, env-filter, regex, state-machine and error-string assertion was spot-checked against the source and matches. One non-blocking weakness: the strict-xfail defect test uses asyncio.wait_for(stale, 0.2), which times out identically under the proposed fix, so the pin is weaker than it appears — the leak it documents is nonetheless real (verified empirically)."
+    },
+    {
+      "model": "MiniMax-M3",
+      "family": "minimax",
+      "cross_family": true,
+      "verdict": "approve",
+      "summary": "The suite pins the tunnel API's observable contract (quick-tunnel argv, child_env allow-list, _QUICK_TUNNEL_URL acceptance/rejection matrix, _await_public_url failure paths, base-class stop/reap escalation) without network, subprocess, or clock dependence. The pinned defect (_spawn_spec discarding a blocked waiter) is genuine; the test that pins it should be tightened later (see findings). No overreach, no secrets, no flakiness observed across repeated runs."
+    }
+  ],
+  "verdict": "approve",
+  "reason": "Reviewed 009d5262 against master 37ea0107. The single added file is a pure characterisation suite for mnemos/tunnels/cloudflare_bridge.py; no production code, config, or baseline was touched. I verified the load-bearing claims directly against the source: (1) _spawn_spec returns exactly ['cloudflared','tunnel','--no-autoupdate','--url','http://localhost:<port>'] and never a supplied authtoken in argv or child env — confirmed against cloudflare_bridge.py:55-79; (2) the child env equals child_env() with MNEMOS_DATABASE_DSN/MNEMOS_MCP_TOKEN/MNEMOS_OAUTH_SIGNING_KEY withheld and PATH kept — confirmed against base.py:92-129; (3) the URL regex r\"https://[A-Za-z0-9][A-Za-z0-9-]*\\.trycloudflare\\.com\" — its acceptance/rejection matrix (leading hyphen, empty label, truncated suffix, case sensitivity, port/path/suffix variants) all match re.search semantics, and the 'first URL wins' and '_url_seen is None' guards match _on_output_line (cloudflare_bridge.py:81-88); (4) _await_public_url error strings ('cloudflared exited with code N before reporting a tunnel URL. Output: ...', 'cloudflared URL event was never created') match verbatim (cloudflare_bridge.py:98-111), and the finally-block waiter/exited cancellation makes the 'leaves no waiters' assertions sound; (5) stop() escalation via monkeypatched TERMINATE_TIMEOUT_SECONDS=0.01 correctly exercises _reap's SIGTERM->SIGKILL path (base.py:354-384). The defect pinned by the strict xfail is real: _spawn_spec replaces self._url_seen with a fresh Event without cancelling a waiter parked on the old one, so a restart that abandons a pending _await_public_url leaks a task for the life of the loop (I reproduced the parked-state empirically). However, that xfail test (test_spawn_spec_should_not_leave_a_waiter_on_the_discarded_event) proves its claim only weakly: it awaits the stale task via asyncio.wait_for(..., 0.2), which would time out identically under the docstring's proposed fix (single event created in __init__, cleared in _spawn_spec), because the test never sets the event after the restart. The xfail therefore cannot detect the fix it advertises — it xfails for the wrong reason today and would still 'xfail' after the fix (a strict xfail that no longer fails for the pinned reason would turn into an XPASS and actually break the suite, but for the wrong signal). This is a test-quality weakness in an otherwise accurate suite, not a defect in the reviewed change, and the file is honest about the defect's mechanics in its docstring. Verification: the new file runs 83 passed + 1 xfailed in 0.54s; combined with tests/test_tunnels_bridges.py and tests/test_tunnels_routes.py, 144 passed + 1 xfailed; the ABC-first ratchet guard passes; the private-literal guard passes (the file contains no private-range IP literals — the '127.0.0.1' string appears only in a negated assertion and is loopback-allowed anyway). The broader repo suite shows pre-existing environment skew (system mcp 2.3.0 vs the pinned <2 used by the hive-verify venv, which holds mcp 1.30.0 where mnemos/mcp/stdio.py's Server.list_tools exists) — every failing/erroring file in my runs is present in the base-failure baseline recorded for master 37ea0107, and none involve the tunnels surface. No overreach: only the one new test file is committed on the branch; the author branch was left untouched by this review. Non-blocking follow-up: tighten the leak test to assert the parked task is cancelled (or the waiter set is tracked) rather than relying on a wait_for that is fix-agnostic.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "minor",
+      "title": "Strict-xfail leak test is fix-agnostic: wait_for(stale, 0.2) times out under the proposed fix too",
+      "detail": "test_spawn_spec_should_not_leave_a_waiter_on_the_discarded_event (tests/test_mnemos_tunnels_cloudflare_bridge_characterisation_20261105.py:735-756) documents a real defect — _spawn_spec (cloudflare_bridge.py:55-79) replaces self._url_seen without cancelling a waiter parked on the discarded Event, so a restarted start() leaks the abandoned _await_public_url task — but the test body asserts the leak via asyncio.wait_for(stale, timeout=0.2). I verified empirically that under the docstring's proposed fix (create the event once in __init__, clear() it in _spawn_spec instead of replacing it) the same wait_for would still time out: the test never fires the event after the restart, so it cannot distinguish 'task parked on a dead event' from 'task parked on a live-but-cleared event' (both stay parked until the loop ends). As written, strict=True will XPASS into a hard failure if the defect is fixed by cancelling waiters (the task then completes), but would keep xfailing for a wrong reason if fixed by event-reuse — the pin as written only reliably trips on the cancel-the-waiter fix. Recommend asserting the waiter was cancelled (stale.cancelled() / a recorded leak counter) instead of a bounded wait. Does not block: the defect is real, documented accurately, and the suite is otherwise green."
+    },
+    {
+      "id": "F2",
+      "severity": "info",
+      "title": "Pinned cosmetic annotation: Optional[dict] env that is always a dict",
+      "detail": "test_spawn_spec_type_annotation_still_says_optional_env records that _spawn_spec's return annotation tuple[list[str], Optional[dict[str, str]]] carries a dead Optional half (child_env() always returns a dict, cloudflare_bridge.py:55-79). Correctly pinned, not a defect; noted so a future annotation narrowing is deliberate."
+    },
+    {
+      "id": "F3",
+      "severity": "info",
+      "title": "Environment skew in the review sandbox is pre-existing and base-baselined",
+      "detail": "The review host's system python3 has mcp 2.3.0 (where mcp.server.Server has no list_tools), while the repo pins mcp>=1.0.0,<2 and the hive-verify venv-mnemos holds mcp 1.30.0 where mnemos/mcp/stdio.py:37 Server.list_tools() exists. The resulting failures (tests/test_connector_smoke.py, tests/test_mcp_oauth_integration.py, tests/test_mcp_principal_cache_ttl.py and other import-time errors in mnemos/mcp/stdio.py) are environment skew, not this branch's fault: every failing file appears in the base-failure baseline recorded for master 37ea0107 (base-failures/mnemos-37ea0107...json, 152 entries), and no tunnels-surface test fails. The reviewed file itself is unaffected (it imports only mnemos.tunnels.*, which has no mcp dependency)."
+    }
+  ],
+  "verification": {
+    "new_test_file": "83 passed, 1 xfailed in 0.54s (python3 -m pytest tests/test_mnemos_tunnels_cloudflare_bridge_characterisation_20261105.py -v)",
+    "combined_with_existing_tunnel_tests": "144 passed, 1 xfailed in 1.84s (new file + tests/test_tunnels_bridges.py + tests/test_tunnels_routes.py)",
+    "abc_first_guard": "passed (scripts/check_abc_first_guard.py; no raw _lc._pool references added)",
+    "private_literal_guard": "passed (26 passed in tests/test_no_private_default_endpoints.py; new file adds no private-range literals)",
+    "defect_reproduction": "confirmed: after a second _spawn_spec, a task parked on the first event remains blocked on the discarded Event (empirical asyncio reproduction)",
+    "out_of_scope_files_touched": []
+  },
+  "commits_expected": 0,
+  "review_write_scope": "REVIEW_VERDICT_hv-ty-mnemos-tunnels-cloudflare-bridge-20261105.json only, pushed to refs/heads/review/hv/ty-mnemos-tunnels-cloudflare-bridge-20261105-01a1abc5-5e1f-7b4c-b073-377f7fa861bd"
+}
