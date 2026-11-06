@@ -1,0 +1,58 @@
+# Baseline (before) run at HEAD 782ed312 (no changes to the tree):
+
+$ /usr/bin/python3 -m pytest tests -q
+57 failed, 5694 passed, 589 skipped, 2 xfailed, 3 xpassed, 965 warnings, 42 errors in 114.49s
+
+Repeated on the clean tree (before) for stability:
+57 failed, 5694 passed, 589 skipped, 2 xfailed, 3 xpassed, 965 warnings, 42 errors in 110.67s
+
+Failure/error file distribution (both runs identical):
+- ERROR  tests/test_mcp_oauth_integration.py            30
+- FAILED tests/test_mcp_http_auth_toggle.py             25
+- FAILED tests/test_connector_smoke.py                   8
+- FAILED tests/test_mcp_nats_sse.py                     7
+- ERROR  tests/test_mcp_principal_cache_ttl.py           5
+- ERROR  tests/test_mcp_graeae_budget_ledger.py          5
+- FAILED tests/test_observability.py                     4
+- FAILED tests/test_mcp_path_traversal.py                4
+- FAILED tests/test_mcp_audit_log.py                     2
+- FAILED tests/test_embedding_contract_f06_review.py     2
+- FAILED tests/test_embedding_contract_f06.py            2
+- ERROR  tests/test_mcp_oauth_backend_lifecycle.py       2
+- FAILED tests/test_mcp_oauth_integration.py             1
+- FAILED tests/test_mcp_oauth_backend_lifecycle.py       1
+- FAILED tests/test_mcp_http_health.py                   1
+(57 failed + 42 errors total; root cause e.g. mcp `Server` has no
+`list_tools` in this environment — pre-existing, unrelated to this task.)
+
+The new test file adds 54 collected tests (52 passed + 2 xfailed), so the
+expected AFTER totals are 57 failed / 5748 passed / 2 xfailed + 2 new
+xfails (4 total) / 42 errors — i.e. failures and errors unchanged.
+
+# New suite in isolation (after):
+
+$ /usr/bin/python3 -m pytest tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py -q
+.......................................x.x............                   [100%]
+52 passed, 2 xfailed in 0.39s
+
+# Full-suite collection (after):
+
+6430 tests collected in 1.72s  (was 6376)
+
+# Ruff (after):
+
+$ /usr/bin/python3 -m ruff check tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py
+All checks passed!
+$ /usr/bin/python3 -m ruff format --check tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py
+1 file already formatted
+
+# NOTE — full-suite AFTER run was attempted three times and interrupted
+# each time after 2-4 minutes (the hive worker's own OOM guard reaps
+# pytest processes running in this job's process group: cgroup
+# memory.events showed oom_kill incrementing to 11 during the runs while
+# the host still had ~20 GB MemAvailable — the kill is per-cgroup, not
+# host-wide). The full BEFORE run completed twice on the clean tree; the
+# AFTER state is established by (a) the identical baseline failures
+# listed above, (b) the new file passing 52/52 + 2 xfail in isolation,
+# (c) collection up exactly 54 (6376 -> 6430), (d) ruff check + format
+# clean, and (e) /opt/graeae/hive_worker.py --verify-delivery exiting 0.
