@@ -214,3 +214,51 @@ def test_event_kind_has_a_content_default_so_legacy_rows_backfill(dialect):
         r"ALTER COLUMN event_kind SET DEFAULT 'content'", text
     )
     assert asserts_default, f"{dialect}: event_kind must default to 'content' so legacy rows backfill: {add.group(0)!r}"
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "mysql", "mariadb", "postgres", "oracle", "db2"])
+def test_content_branch_also_absorbs_pending_metadata_rows(dialect):
+    """A content event supersedes any pending metadata row for that memory.
+
+    On the single-trigger dialects (postgres/mysql/mariadb/db2/oracle) one
+    statement can change a content column and ``recall_count`` together. The
+    content branch then appends one event; without deleting the pending
+    metadata row the feed delivers that memory twice for identical state.
+    SQLite splits content and metadata into disjoint ``AFTER UPDATE OF``
+    triggers, so a single statement cannot hit both and it needs no DELETE
+    in its content trigger.
+    """
+    text = FILES[dialect].read_text()
+    if dialect == "sqlite":
+        # Disjoint column lists: content trigger must NOT touch recall columns.
+        content_trigger = re.search(r"CREATE TRIGGER fed_journal_update_content.*?END;", text, re.S)
+        assert content_trigger, "sqlite: no content trigger"
+        of_clause = re.search(r"AFTER UPDATE OF ([^O]+?) ON memories", content_trigger.group(0))
+        assert of_clause, "sqlite: content trigger has no column list"
+        columns = {c.strip() for c in of_clause.group(1).split(",")}
+        assert "recall_count" not in columns and "last_recalled_at" not in columns, (
+            f"sqlite: content and metadata triggers must stay disjoint, got {sorted(columns)}"
+        )
+        return
+
+    # Single-trigger dialects: the content branch must begin with the DELETE.
+    if dialect in {"postgres"}:
+        branch = re.search(r"IF content_changed THEN(.*?)ELSE", text, re.S)
+    elif dialect in {"mysql", "mariadb"}:
+        # the inner content IF opens with the long NOT(...) predicate
+        branch = re.search(r"THEN\n(.*?)ELSE", text, re.S)
+    elif dialect == "db2":
+        branch = re.search(r"IF v_is_content = 1 THEN(.*?)ELSEIF", text, re.S)
+    else:  # oracle
+        branch = re.search(r"IF v_content = 1 THEN(.*?)ELSIF", text, re.S)
+    assert branch, f"{dialect}: cannot locate the content branch"
+    body = branch.group(1)
+    delete = re.search(r"DELETE FROM federation_changes[^;]*;", body)
+    assert delete, f"{dialect}: content branch does not absorb pending metadata rows"
+    assert "'metadata'" in delete.group(0) and "seq IS NULL" in delete.group(0), (
+        f"{dialect}: content-branch DELETE is not scoped to unpublished metadata rows: {delete.group(0)!r}"
+    )
+    # It must run before the INSERT so the new event is the only pending row.
+    assert body.index(delete.group(0)) < body.index("INSERT INTO federation_changes"), (
+        f"{dialect}: absorb must precede the content INSERT"
+    )

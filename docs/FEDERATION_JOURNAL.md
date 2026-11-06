@@ -165,6 +165,19 @@ SET DEFAULT`). Rows written by the publisher's re-advertise path, which names
 neither `seq` nor `event_kind`, also inherit `'content'`. So no row can be
 left with a NULL kind and escape both branches.
 
+**Both branches absorb.** The content branch deletes any pending metadata-only
+row for the memory *before* appending its content event, because that event
+already carries the current state — leaving both queued would deliver the same
+row twice. This matters on the single-trigger dialects (Postgres, MySQL,
+MariaDB, Db2, Oracle), where one statement can change a content column and
+`recall_count` together. SQLite splits the two into disjoint `AFTER UPDATE OF`
+triggers, so a single statement cannot reach both branches and its content
+trigger needs no delete.
+
+Sequenced rows are never deleted by either branch: a published event is
+journal history, and rewriting it would move a peer's cursor semantics.
+Immutable published history is the point; only *pending* rows coalesce.
+
 **The trigger never inserts an `event_kind='metadata'` row.** That is the
 whole point: the counter may not be journaled. The absorption `DELETE
 (federation_changes … WHERE memory_id = ? AND seq IS NULL AND event_kind =

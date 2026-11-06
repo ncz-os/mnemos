@@ -49,6 +49,10 @@ BEGIN
    v_metadata := 1;
   END IF;
   IF v_content = 1 THEN
+   -- A content event carries the current state, which already supersedes any
+   -- pending metadata-only row for this memory: publishing both would deliver
+   -- the same row twice. Absorb first, then append the single content event.
+   DELETE FROM federation_changes WHERE seq IS NULL AND event_kind = 'metadata' AND memory_id = :NEW.id;
    INSERT INTO federation_changes(memory_id,changed_at,old_namespace,old_category,old_public,old_exportable,new_namespace,new_category,new_public,new_exportable,event_kind) VALUES(:NEW.id,SYS_EXTRACT_UTC(SYSTIMESTAMP),:OLD.namespace,:OLD.category,CASE WHEN MOD(:OLD.permission_mode,10)>=4 THEN 1 ELSE 0 END,CASE WHEN :OLD.federation_source IS NULL AND (:OLD.namespace IS NULL OR :OLD.namespace<>'vault') AND :OLD.deleted_at IS NULL AND :OLD.archived_at IS NULL AND :OLD.consolidated_into IS NULL THEN 1 ELSE 0 END,:NEW.namespace,:NEW.category,CASE WHEN MOD(:NEW.permission_mode,10)>=4 THEN 1 ELSE 0 END,CASE WHEN :NEW.federation_source IS NULL AND (:NEW.namespace IS NULL OR :NEW.namespace<>'vault') AND :NEW.deleted_at IS NULL AND :NEW.archived_at IS NULL AND :NEW.consolidated_into IS NULL THEN 1 ELSE 0 END,'content');
   ELSIF v_metadata = 1 THEN
    DELETE FROM federation_changes WHERE seq IS NULL AND event_kind = 'metadata' AND memory_id = :NEW.id;
