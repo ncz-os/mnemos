@@ -261,3 +261,44 @@ async def test_seq_is_publishable_so_seq_is_null_is_the_pending_marker(backend):
     assert rows, "seed insert must queue a journal row"
     assert all(row["seq"] is None for row in rows), "queued rows are pending (seq IS NULL)"
     assert all(row["event_id"] is not None for row in rows), "event_id, not seq, is the identity"
+
+
+@pytest.mark.asyncio
+async def test_recall_on_one_memory_never_absorbs_another_memory_pending_row(backend):
+    """Absorption is per-memory: recalling m1 must not touch m2's queue.
+
+    A DELETE keyed only on ``seq IS NULL AND event_kind='metadata'`` would pass
+    every single-memory test and still wipe the whole journal's pending
+    metadata on the first recall in production.
+    """
+    await _seed(backend)
+    await _exec(
+        backend,
+        "INSERT INTO memories(id, content, category, owner_id, namespace,"
+        " permission_mode, created, updated, content_hash)"
+        " VALUES ('m2', 'v', 'facts', 'alice', 'A', 644, '2020', '2020', 'h')",
+    )
+    for mid in ("m1", "m2"):
+        await _exec(
+            backend,
+            "INSERT INTO federation_changes(memory_id, changed_at, old_public,"
+            " old_exportable, new_public, new_exportable, event_kind)"
+            " VALUES (?, '2020', 1, 1, 1, 1, 'metadata')",
+            mid,
+        )
+
+    await _exec(
+        backend,
+        "UPDATE memories SET recall_count = COALESCE(recall_count, 0) + 1 WHERE id = 'm1'",
+    )
+
+    m1_meta = await _rows(
+        backend,
+        "SELECT event_id FROM federation_changes WHERE memory_id='m1' AND event_kind='metadata' AND seq IS NULL",
+    )
+    m2_meta = await _rows(
+        backend,
+        "SELECT event_id FROM federation_changes WHERE memory_id='m2' AND event_kind='metadata'",
+    )
+    assert m1_meta == [], "m1's pending metadata row should be absorbed by its own recall"
+    assert len(m2_meta) == 1, "m2's pending metadata row must survive m1's recall bump"

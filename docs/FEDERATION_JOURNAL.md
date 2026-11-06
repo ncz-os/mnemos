@@ -165,6 +165,13 @@ SET DEFAULT`). Rows written by the publisher's re-advertise path, which names
 neither `seq` nor `event_kind`, also inherit `'content'`. So no row can be
 left with a NULL kind and escape both branches.
 
+**Absorption is strictly per-memory.** Every absorption `DELETE` is keyed on
+`memory_id = NEW.id` (SQLite, Postgres, MySQL, MariaDB), `memory_id = n.id`
+(Db2) or `memory_id = :NEW.id` (Oracle), *and* on `seq IS NULL` *and*
+`event_kind = 'metadata'`. Dropping the memory key would make one recall wipe
+every other memory's pending metadata row — a defect every single-memory test
+would still pass.
+
 **Both branches absorb.** The content branch deletes any pending metadata-only
 row for the memory *before* appending its content event, because that event
 already carries the current state — leaving both queued would deliver the same

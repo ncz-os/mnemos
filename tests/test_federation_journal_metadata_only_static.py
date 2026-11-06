@@ -262,3 +262,37 @@ def test_content_branch_also_absorbs_pending_metadata_rows(dialect):
     assert body.index(delete.group(0)) < body.index("INSERT INTO federation_changes"), (
         f"{dialect}: absorb must precede the content INSERT"
     )
+
+
+@pytest.mark.parametrize("dialect", sorted(FILES))
+def test_every_absorption_delete_is_scoped_to_one_memory(dialect):
+    """No absorption DELETE may be global.
+
+    A DELETE keyed only on ``seq IS NULL AND event_kind='metadata'`` would wipe
+    every other memory's pending metadata row whenever one memory is recalled.
+    The statement may wrap across lines, so match the whole statement rather
+    than a single line.
+    """
+    text = FILES[dialect].read_text()
+    deletes = re.findall(r"DELETE FROM federation_changes(.*?);", text, re.S)
+    assert deletes, f"{dialect}: expected at least one absorption DELETE"
+    for body in deletes:
+        assert re.search(r"memory_id\s*=\s*(NEW\.id|:NEW\.id|n\.id)", body), (
+            f"{dialect}: absorption DELETE is not scoped to one memory: {' '.join(body.split())!r}"
+        )
+        assert "seq IS NULL" in body, f"{dialect}: DELETE must only target unpublished rows"
+        assert "'metadata'" in body, f"{dialect}: DELETE must only target metadata rows"
+
+
+@pytest.mark.parametrize("dialect", sorted(FILES))
+def test_no_absorption_delete_targets_published_rows(dialect):
+    """Published (sequenced) rows are journal history and must never be deleted.
+
+    Deleting them would move a peer's cursor semantics. Only pending rows
+    coalesce.
+    """
+    text = FILES[dialect].read_text()
+    for body in re.findall(r"DELETE FROM federation_changes(.*?);", text, re.S):
+        assert "seq IS NOT NULL" not in body and "seq >" not in body, (
+            f"{dialect}: a DELETE targets published rows: {' '.join(body.split())!r}"
+        )
