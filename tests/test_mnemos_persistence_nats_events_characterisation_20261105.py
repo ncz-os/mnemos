@@ -503,19 +503,17 @@ def test_vault_namespace_is_never_publishable_even_for_trusted_feed(monkeypatch)
     assert ne.is_federation_memory_publishable(_row(namespace=VAULT_NAMESPACE, permission_mode=644)) is False
 
 
-def test_world_read_gate_reads_only_the_world_digit(monkeypatch):
+def test_world_read_gate_checks_the_world_digit(monkeypatch):
     _set_include_private(monkeypatch, "0")  # world-read gate active
-    # The gate is exactly ``permission_mode % 10 >= 4``: the UNITS digit
-    # decides, alone. 644/664/646 clear it (units >= 4)...
+    # Permission modes are stored as decimal spellings of Unix mode digits
+    # (for example 644). The final digit is the world permission, so the
+    # gate's ``permission_mode % 10 >= 4`` check is the world-read check.
+    # 644/664/646 clear it (world digit >= 4)...
     assert ne.is_federation_memory_publishable(_row(permission_mode=644)) is True
     assert ne.is_federation_memory_publishable(_row(permission_mode=664)) is True
     assert ne.is_federation_memory_publishable(_row(permission_mode=646)) is True
-    # ...600, 440, 640 and 660 all have units digit 0 -> all refused,
-    # whatever their tens digit says. 640/660 carry the tens digit as
-    # the group/owner side (tens=6), so under that reading they are
-    # group-readable and world-denied: refusing them is RIGHT, but only
-    # because their units digit happens to be 0 — the tens digit never
-    # participated in the verdict (strict xfails below pin that).
+    # ...600, 440, 640 and 660 have world digit 0 -> all refused, even
+    # when the owner/group digits allow reading.
     assert ne.is_federation_memory_publishable(_row(permission_mode=600)) is False
     assert ne.is_federation_memory_publishable(_row(permission_mode=440)) is False
     assert ne.is_federation_memory_publishable(_row(permission_mode=640)) is False
@@ -750,7 +748,7 @@ def test_publish_federation_timeout_is_swallowed(monkeypatch, caplog):
 # ---------------------------------------------------------------------------
 # Suspected defects — pinned strict xfail
 #
-# Each body asserts the DESIRED behaviour, so today it fails -> xfail;
+# Each body asserts the desired behaviour, so today it fails -> xfail;
 # when the production defect is fixed the test XPASSes strictly, which is
 # the signal to convert it into an ordinary assertion. None of these fix
 # production code — they only pin the current (wrong) value.
@@ -776,88 +774,7 @@ def test_xfail_upsert_event_zero_quality_rating_is_not_defaulted(monkeypatch):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "DEFECT 2 (NATS-EVENTS-CHAR-2): the world-read gate computes only "
-        "`permission_mode % 10 >= 4` — the TENS (group/owner) digit is never "
-        "read. Under the offsite posture "
-        "(`MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE=0`) every verdict is a "
-        "function of the units digit alone: 640 and 660 (both tens=6 "
-        "group+owner) receive identical answers today (both refused on "
-        "units=0) because their units digits match, not because the gate "
-        "compared their group/owner side. The gate cannot distinguish "
-        "'world-readable' from 'group-readable' at all — it inspects "
-        "exactly one digit."
-    ),
-)
-def test_xfail_world_read_gate_requires_a_world_bit_not_a_group_bit(monkeypatch):
-    _set_include_private(monkeypatch, "0")  # offsite posture: world-read only
-    # Desired: under the offsite posture the gate must read the tens
-    # (group/owner) digit alongside the units digit, so rows that differ
-    # only in their tens digit are never decided by the units digit
-    # alone. Reading the mode as group|world|owner in descending digit
-    # order (the only layout the gate's `units >= 4` test corresponds
-    # to): 640/660 are group+owner but world-denied (units=0), 646/664
-    # are group+owner and world-readable (units>=4), 460/464 are
-    # group-only (tens=4) with world on the units side — see the 2b
-    # xfail for the companion case that separates the readings.
-    # Today the gate computes `mode % 10 >= 4` alone: every verdict a
-    # function of the units digit, the tens digit never consulted.
-    #
-    # The XPASS trigger: asserted with today's values throughout, but
-    # the 464 and 660 lines are the two a tens-reading fix must answer
-    # differently than the units digit does — 464 (group-only, units=4)
-    # passes today and must fall under the offsite posture once the
-    # tens=4 group bit is read; 660 (group+owner, units=0) is refused
-    # today and must be admitted once the tens=6 side is read. Flipping
-    # EITHER line XPASSes this strictly. The other four are invariants
-    # under every single-digit reading (646/664 keep world+group+owner,
-    # 640/460 keep world absent), so a fix must not touch them.
-    assert ne.is_federation_memory_publishable(_row(permission_mode=646)) is True
-    assert ne.is_federation_memory_publishable(_row(permission_mode=664)) is True
-    assert ne.is_federation_memory_publishable(_row(permission_mode=640)) is False
-    assert ne.is_federation_memory_publishable(_row(permission_mode=460)) is False
-    assert ne.is_federation_memory_publishable(_row(permission_mode=660)) is False
-    assert ne.is_federation_memory_publishable(_row(permission_mode=464)) is True
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DEFECT 2b (NATS-EVENTS-CHAR-2): the live half of DEFECT 2 — under "
-        "the offsite posture the gate forwards a row on its UNITS digit "
-        "regardless of the TENS (group/owner) digit: 460 (tens=4 group, "
-        "units=0) is refused while 464 (tens=4 group, units=4) is passed "
-        "— the SAME group-only row, opposite verdicts, purely because the "
-        "units digit differs. The gate never consults the tens digit, so "
-        "'group-readable' and 'owner/world-readable' rows receive the "
-        "answer their units digit dictates."
-    ),
-)
-def test_xfail_world_read_gate_rejects_group_only_rows(monkeypatch):
-    _set_include_private(monkeypatch, "0")  # offsite posture: world-read only
-    # Desired: a group-readable, world-denied row must be refused under
-    # the offsite posture, and the refusal must come from reading the
-    # tens (group/owner) digit — not from the units digit happening to
-    # be 0. Today the gate computes `mode % 10 >= 4` alone: 440 and 460
-    # (tens=4 group, units=0) refused because units=0; 464 (tens=4
-    # group, units=4) PASSED — the same group-only rows refused or
-    # forwarded purely on their units digits.
-    #
-    # The XPASS trigger is 460: asserted False (today's value) so a fix
-    # that reads the tens digit AND still refuses the group-only 460
-    # under the offsite posture keeps it False... so instead trigger on
-    # 440 vs 464: same group-only side (tens=4), opposite verdicts
-    # today. A fix that reads the tens digit must answer them from the
-    # SAME digit — flipping 464 to False (or 440 to True) XPASSes.
-    # 640 stays asserted False as the invariant no reading can flip.
-    assert ne.is_federation_memory_publishable(_row(permission_mode=440)) is False
-    assert ne.is_federation_memory_publishable(_row(permission_mode=464)) is True
-    assert ne.is_federation_memory_publishable(_row(permission_mode=640)) is False
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DEFECT 3 (NATS-EVENTS-CHAR-3): empty-string content and missing "
+        "DEFECT 2 (NATS-EVENTS-CHAR-2): empty-string content and missing "
         "content are indistinguishable in the event payload — `'' or ''` is "
         "`''`, so the `or ''` default never fires for an empty value, and a "
         "row whose content is genuinely empty is re-published to federation "
