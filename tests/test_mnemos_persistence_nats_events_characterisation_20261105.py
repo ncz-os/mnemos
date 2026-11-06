@@ -736,7 +736,11 @@ def test_publish_federation_namespace_defaults_to_default(monkeypatch):
 
 def test_publish_federation_timeout_is_swallowed(monkeypatch, caplog):
     _set_service_flag(monkeypatch, "MNEMOS_NATS_FEDERATION_ENABLED", "true")
-    _recorder(monkeypatch, _RecordedPublish(delay=1.0))
+    # The returned recorder is intentionally unused: the module calls the
+    # patched publisher directly and this test only asserts the logged
+    # warning, not any recorded call (see the shape tests above for call
+    # assertions).
+    _ = _recorder(monkeypatch, _RecordedPublish(delay=1.0))
     _set_nats_publish_timeout(monkeypatch, 0.01)
 
     with caplog.at_level(logging.WARNING, logger="mnemos.persistence.nats_events"):
