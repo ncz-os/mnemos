@@ -1,7 +1,10 @@
 """Characterisation tests (2026-11-05) for ``mnemos/mcp/tools/models.py``.
 
-Target: ``mnemos/mcp/tools/models.py`` (254 lines, referenced by 1 test
-file on master 782ed312 — ``tests/test_mcp_tools_persistence_abc.py``).
+Target: ``mnemos/mcp/tools/models.py`` (254 lines). Its direct importer on
+master 782ed312 is ``tests/test_mcp_tools_persistence_abc.py`` (the F-06
+slice-2 ABC contract); other suites touch the handlers through the MCP tool
+registry rather than importing this module. This file pins the module's own
+surface directly.
 
 These tests PIN today's behaviour of the module's public surface (the three
 handlers plus the ``TOOLS`` registry entries) and its validation helpers
@@ -41,10 +44,15 @@ from mnemos.core.config import _reset_settings_for_tests
 from mnemos.mcp.tools import models as mcp_models
 from mnemos.persistence.sqlite import SqliteBackend, _execute
 
-pytestmark = pytest.mark.asyncio
-
 ROOT = UserContext(user_id="root", group_ids=[], role="root", namespace="root", authenticated=True)
 ALICE = UserContext(user_id="alice", group_ids=[], role="user", namespace="alice-ns", authenticated=True)
+
+# ``mnemos/mcp/tools/models.py`` is async at its handler surface, but its
+# validation helpers and the ``TOOLS`` registry are plain callables. Like
+# ``test_mnemos_api_routes_tunnels_characterisation_20261105.py``, there is
+# no module-level ``pytestmark = pytest.mark.asyncio``: only async tests are
+# marked explicitly, so the sync tests do not trip pytest-asyncio's
+# "marked asyncio but not an async function" warning.
 
 
 class _NoRest:
@@ -206,10 +214,8 @@ class TestValidateCapabilities:
         with pytest.raises(ValueError, match="at most 32 items"):
             mcp_models._validate_capabilities(caps)
 
-    @pytest.mark.parametrize("bad", ["code", 42, {"code": True}, None])
+    @pytest.mark.parametrize("bad", ["code", 42, {"code": True}])
     def test_non_list_rejected(self, bad):
-        if bad is None:
-            pytest.skip("None is the documented 'no filter' value")
         with pytest.raises(ValueError, match="must be a list with at most 32 items"):
             mcp_models._validate_capabilities(bad)
 
