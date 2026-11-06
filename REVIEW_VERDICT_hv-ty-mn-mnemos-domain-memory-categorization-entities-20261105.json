@@ -60,7 +60,7 @@
       "proxy_deployment_id": null,
       "requested_model": "cerberus-reviewer",
       "response_model": "cerberus-narrator",
-      "served_by": "http://192.168.207.96:8080/v1",
+      "served_by": "http://[internal-proxy]:8080/v1",
       "slot_held": false,
       "slot_limit": 0,
       "slot_wait_ms": 0
