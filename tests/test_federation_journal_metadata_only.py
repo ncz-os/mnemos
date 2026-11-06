@@ -127,3 +127,97 @@ async def test_same_value_write_appends_nothing(backend):
     base = len(await _journal(backend, "m1"))
     await _exec(backend, "UPDATE memories SET content = content WHERE id = ?", "m1")
     assert len(await _journal(backend, "m1")) == base
+
+
+async def _pending_metadata_count(backend, memory_id):
+    rows = await _rows(
+        backend,
+        "SELECT event_id FROM federation_changes WHERE memory_id = ? AND seq IS NULL AND event_kind = 'metadata'",
+        memory_id,
+    )
+    return len(rows)
+
+
+async def _queue_metadata_row(backend, memory_id="m1"):
+    """Queue a pending metadata-only row the way the trigger would have.
+
+    The trigger inserts none (that is the point of 0072), so tests that need
+    one to be absorbed must create it directly.
+    """
+    await _exec(
+        backend,
+        "INSERT INTO federation_changes(memory_id, changed_at, old_public, "
+        "old_exportable, new_public, new_exportable, event_kind) "
+        "VALUES (?,?,0,0,0,1,'metadata')",
+        memory_id,
+        "2020-01-01T00:00:00+00:00",
+    )
+
+
+@pytest.mark.asyncio
+async def test_metadata_only_write_absorbs_pending_metadata_rows(backend):
+    """The review's stated failure mode: delete of rows that never exist.
+
+    Absorption targets rows *already queued* -- produced by an older node, a
+    restored backup, or the pre-0072 trigger -- not rows the trigger inserts.
+    A recall bump must therefore remove them, and appending nothing itself.
+    """
+    await _seed(backend)
+    await _queue_metadata_row(backend)
+    assert await _pending_metadata_count(backend, "m1") == 1
+
+    await _exec(
+        backend,
+        "UPDATE memories SET recall_count = recall_count + 1 WHERE id = ?",
+        "m1",
+    )
+
+    assert await _pending_metadata_count(backend, "m1") == 0, "pending metadata-only row was not absorbed"
+
+
+@pytest.mark.asyncio
+async def test_absorption_never_touches_published_or_content_rows(backend):
+    """Absorption must only remove *pending metadata-only* rows."""
+    await _seed(backend)
+    await _queue_metadata_row(backend)
+    # A second memory's pending metadata row, which must survive.
+    await _seed(backend, memory_id="m2")
+    await _queue_metadata_row(backend, "m2")
+    # Mark m2's row published: absorption must not reach sequenced rows either.
+    await _exec(
+        backend,
+        "UPDATE federation_changes SET seq = 7 WHERE memory_id = 'm2' AND event_kind = 'metadata'",
+    )
+
+    content_before = len(await _rows(backend, "SELECT event_id FROM federation_changes WHERE event_kind = 'content'"))
+
+    await _exec(
+        backend,
+        "UPDATE memories SET recall_count = recall_count + 1 WHERE id = ?",
+        "m1",
+    )
+
+    assert await _pending_metadata_count(backend, "m1") == 0
+    assert await _pending_metadata_count(backend, "m2") == 0, "the m2 row was sequenced, not pending"
+    published = await _rows(
+        backend,
+        "SELECT event_kind FROM federation_changes WHERE memory_id = 'm2' AND seq IS NOT NULL ORDER BY event_id",
+    )
+    assert published == [{"event_kind": "metadata"}], "a sequenced row must never be deleted"
+    content_after = len(await _rows(backend, "SELECT event_id FROM federation_changes WHERE event_kind = 'content'"))
+    assert content_after == content_before, "content events must never be absorbed"
+
+
+@pytest.mark.asyncio
+async def test_recall_between_edit_and_publish_does_not_drop_the_edit(backend):
+    """The stale-entry risk the review describes, from the other direction."""
+    await _seed(backend)
+    await _exec(backend, "UPDATE memories SET content = ? WHERE id = ?", "edited body", "m1")
+    await _exec(
+        backend,
+        "UPDATE memories SET recall_count = recall_count + 1 WHERE id = ?",
+        "m1",
+    )
+
+    rows = await _journal(backend, "m1")
+    assert [row["event_kind"] for row in rows] == ["content", "content"], rows

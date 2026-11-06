@@ -153,6 +153,20 @@ so N recalls between publisher passes leave zero extra rows, and a recall
 followed by a real edit leaves exactly one content event carrying current
 state.
 
+**The trigger never inserts an `event_kind='metadata'` row.** That is the
+whole point: the counter may not be journaled. The absorption `DELETE
+(federation_changes … WHERE memory_id = ? AND seq IS NULL AND event_kind =
+'metadata')` therefore targets rows this trigger did not create — rows left
+pending by a node still on pre-0072 code, by a restored backup, or by a
+replica that has not applied this migration yet. On a clean 0072 node it
+matches nothing and costs one indexed lookup; on a fleet mid-upgrade it
+reclaims the stale rows. It is deliberately restricted to
+`seq IS NULL` *and* `event_kind='metadata'` *and* one `memory_id`, so it can
+never delete a published event or a queued content event. Both properties are
+pinned in `tests/test_federation_journal_metadata_only_static.py`, and the
+absorption itself is driven against a real SQLite database in
+`tests/test_federation_journal_metadata_only.py`.
+
 Already-queued rows are left untouched; the publisher coalesces pending rows per
 memory on its own (one event per memory per pass, current state attached), so a
 node that has not applied 0072 yet is still not a correctness problem.

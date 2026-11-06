@@ -131,3 +131,38 @@ def test_no_reference_to_undefined_seq_predicate(dialect):
         assert "event_kind" in clause and "memory_id" in clause, (
             f"{dialect}: a seq IS NULL test is not scoped to pending metadata rows: {clause!r}"
         )
+
+
+@pytest.mark.parametrize("dialect", sorted(FILES))
+def test_metadata_branch_targets_a_delete_of_unpublished_rows(dialect):
+    """Absorption removes rows queued earlier -- never rows it inserts.
+
+    The trigger intentionally inserts no ``event_kind='metadata'`` row: the
+    whole point of 0072 is that a metadata-only write appends nothing. The
+    DELETE exists to reclaim rows left pending by a pre-0072 node, a restored
+    backup, or a replica that has not yet applied this migration. Pin that
+    shape so "deletes rows it never creates" cannot quietly become true (a
+    DELETE with no ``seq IS NULL`` would start destroying published events,
+    and one with no ``event_kind`` filter would destroy content events).
+    """
+    text = FILES[dialect].read_text()
+    deletes = re.findall(r"DELETE FROM federation_changes[^;]*;", text, re.S)
+    assert deletes, f"{dialect}: metadata-only branch has no DELETE"
+    for statement in deletes:
+        assert "event_kind" in statement and "'metadata'" in statement, (
+            f"{dialect}: absorption DELETE is not restricted to metadata rows: {statement!r}"
+        )
+        assert "seq IS NULL" in statement, (
+            f"{dialect}: absorption DELETE is not restricted to unpublished rows: {statement!r}"
+        )
+        assert "memory_id" in statement, f"{dialect}: absorption DELETE is not scoped to one memory: {statement!r}"
+
+
+@pytest.mark.parametrize("dialect", sorted(FILES))
+def test_trigger_never_inserts_a_metadata_only_event(dialect):
+    """The split must not silently degrade into "journal the counter anyway"."""
+    text = FILES[dialect].read_text()
+    for statement in re.findall(r"INSERT INTO federation_changes[^;]*;", text, re.S):
+        assert "'metadata'" not in statement, (
+            f"{dialect}: a trigger INSERT writes an event_kind='metadata' row; metadata-only writes must append nothing"
+        )
