@@ -1,0 +1,235 @@
+{
+  "chunking": {
+    "budget_bytes": 400000,
+    "chunk_cap_bytes": 32000,
+    "context_bytes": 3147,
+    "context_capped": true,
+    "diff_bytes": 37322,
+    "mode": "single",
+    "reason": "whole diff and definition context fit the single-review budget",
+    "window_tokens": 131072
+  },
+  "complete": false,
+  "confirm": [
+    {
+      "author_families": [
+        "openai"
+      ],
+      "demoted": [],
+      "effective_blocking": true,
+      "findings": [
+        {
+          "blocking": true,
+          "disposition": "confirmer_failed",
+          "id": "97a70425e120280b",
+          "location": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:790",
+          "quote": "test_xfail_world_read_gate_rejects_group_only_rows",
+          "quote_found": true,
+          "reason": "",
+          "severity": "high"
+        }
+      ],
+      "reviewer_family_recall": 0.0,
+      "reviewer_family_recall_ref": "gptoss-review-eval-20261026",
+      "reviewers": [
+        {
+          "family": "deepseek",
+          "latency_ms": 0,
+          "model": "deepseek-flash",
+          "outcome": "ok",
+          "role": "reviewer",
+          "tokens_in": 0,
+          "tokens_out": 0
+        },
+        {
+          "family": "minimax",
+          "latency_ms": 2708,
+          "model": "MiniMax-M3.1-Flash",
+          "outcome": "ok",
+          "role": "confirmer",
+          "tokens_in": 0,
+          "tokens_out": 0
+        },
+        {
+          "family": "nemotron",
+          "latency_ms": 11,
+          "model": "nemotron-3-ultra",
+          "outcome": "empty",
+          "role": "confirmer",
+          "tokens_in": 0,
+          "tokens_out": 0
+        },
+        {
+          "family": "mimo",
+          "latency_ms": 11,
+          "model": "mimo-flash",
+          "outcome": "empty",
+          "role": "confirmer",
+          "tokens_in": 0,
+          "tokens_out": 0
+        }
+      ],
+      "verdict": "request_changes",
+      "verdict_basis": "reviewer_plus_confirmer",
+      "version": 1
+    }
+  ],
+  "context": {
+    "cache_hit_tokens": 11037,
+    "cache_miss_tokens": 16474,
+    "cache_reported_calls": 3,
+    "calls": 3,
+    "completion_tokens": 3592,
+    "final_prompt_tokens": 5068,
+    "hit_share": 0.40118498055323326,
+    "peak_prompt_tokens": 11657,
+    "per_call": [
+      {
+        "cache_hit_tokens": 128,
+        "cache_miss_tokens": 11529,
+        "completion_tokens": 416,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 40875,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 11657,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 1
+      },
+      {
+        "cache_hit_tokens": 10781,
+        "cache_miss_tokens": 5,
+        "completion_tokens": 2926,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 40875,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 10786,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 2
+      },
+      {
+        "cache_hit_tokens": 128,
+        "cache_miss_tokens": 4940,
+        "completion_tokens": 250,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 61,
+          "task_bytes": 17863,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 5068,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 3
+      }
+    ],
+    "prompt_tokens": 27511,
+    "resent_prompt_tokens": 0
+  },
+  "cost_usd": 0.0039962999999999995,
+  "exclusions": {
+    "bytes": 0,
+    "count": 0,
+    "files": []
+  },
+  "failed_models": 1,
+  "failure": {
+    "class": "transient",
+    "code": "reviewers_unavailable",
+    "detail": {
+      "message": "review incomplete: 1/3 reviewers failed"
+    }
+  },
+  "filtered_findings": [],
+  "ok_models": 2,
+  "provenance": [
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 31591,
+      "health": null,
+      "latency_ms": 31648.0,
+      "ledger_wait_ms": 39,
+      "provider": "cerberus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "cerberus-reviewer",
+      "response_model": "cerberus-narrator",
+      "served_by": "http://192.168.207.96:8080/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    },
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 758,
+      "health": null,
+      "latency_ms": 3295.0,
+      "ledger_wait_ms": 39,
+      "provider": "deepseek-direct",
+      "proxy_deployment_id": null,
+      "requested_model": "deepseek-flash",
+      "response_model": "deepseek-flash",
+      "served_by": "https://api.deepseek.com/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    }
+  ],
+  "requested": 3,
+  "reviewers": [
+    {
+      "escalation_reason": null,
+      "filtered_findings": [],
+      "findings": [],
+      "forced_family_conflict": false,
+      "model": "cerberus-reviewer",
+      "next_steps": [],
+      "ok": true,
+      "summary": "No defects detected in the supplied test diff.",
+      "verdict": "approve"
+    },
+    {
+      "escalation_reason": null,
+      "filtered_findings": [],
+      "findings": [
+        {
+          "body": "The second `@pytest.mark.xfail(strict=True, reason=(\"DEFECT 2b ...\"))` decorator is not followed by a `def`. Instead the next token is another `@pytest.mark.xfail(...)` decorator, which is then followed by `def test_xfail_upsert_event_empty_content_is_reported_as_missing`. In Python, a decorator must be immediately followed by a function/class definition; a decorator followed by another decorator is a SyntaxError, so the whole module fails to import and none of the 800+ lines of tests run. Even if it parsed, the DEFECT 2b case would be silently dropped. Either attach a body to this decorator (e.g. a test asserting the 460/660 behaviour) or delete it, since the same defect is already covered by `test_xfail_world_read_gate_rejects_group_only_rows`.",
+          "location": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:790",
+          "severity": "high",
+          "title": "Orphaned xfail decorator with no function body"
+        }
+      ],
+      "forced_family_conflict": false,
+      "model": "deepseek-flash",
+      "next_steps": [
+        "Remove the orphaned `@pytest.mark.xfail` decorator for DEFECT 2b, or give it a real test function body.",
+        "Run `python -m py_compile` / `pytest --collect-only` on the file to confirm it imports and all xfail markers are attached to functions."
+      ],
+      "ok": true,
+      "summary": "The test file is largely well-constructed, but it contains a concrete defect: a `@pytest.mark.xfail(strict=True)` decorator with no function body attached. The decorator at the end of the file is immediately followed by another decorator and then a function, so the bare decorator applies to nothing and the module fails to import (SyntaxError / decorator applied to a decorator). This breaks collection of the entire file.",
+      "verdict": "request_changes"
+    },
+    {
+      "escalation_reason": null,
+      "filtered_findings": [],
+      "findings": [],
+      "forced_family_conflict": false,
+      "model": "(failed)",
+      "next_steps": [],
+      "ok": false,
+      "summary": "reviewer failed: review chunk 1/1: reviewer MiniMax-M3.1-Flash-Preview spent its whole 8192-token budget and then its doubled 16384-token budget reasoning, and returned no verdict (twice); lower its reasoning effort or raise max_tokens",
+      "verdict": "comment"
+    }
+  ],
+  "skipped_unhealthy": [],
+  "substituted": true,
+  "verdict": "request_changes"
+}

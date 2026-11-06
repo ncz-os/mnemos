@@ -1,0 +1,500 @@
+{
+  "chunking": {
+    "budget_bytes": 400000,
+    "chunk_cap_bytes": 32000,
+    "context_bytes": 3147,
+    "context_capped": true,
+    "diff_bytes": 37077,
+    "mode": "single",
+    "reason": "whole diff and definition context fit the single-review budget",
+    "window_tokens": 131072
+  },
+  "complete": true,
+  "confirm": [
+    {
+      "author_families": [
+        "openai"
+      ],
+      "demoted": [
+        {
+          "confirmer_ids": [
+            "MiniMax-M3.1-Flash"
+          ],
+          "id": "8f140a72bab4591c",
+          "reason": "The provided context does not include the cited timeout test body or the alleged standalone `_recorder(...)` call, so the claim cannot be verified.",
+          "severity": "high"
+        }
+      ],
+      "effective_blocking": false,
+      "findings": [
+        {
+          "blocking": false,
+          "disposition": "rejected",
+          "id": "8f140a72bab4591c",
+          "location": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:106",
+          "quote": "delay=1.0",
+          "quote_found": true,
+          "reason": "The provided context does not include the cited timeout test body or the alleged standalone `_recorder(...)` call, so the claim cannot be verified.",
+          "severity": "high"
+        }
+      ],
+      "reviewer_family_recall": 1.0,
+      "reviewer_family_recall_ref": "gptoss-review-eval-20261026",
+      "reviewers": [
+        {
+          "family": "gemma",
+          "latency_ms": 0,
+          "model": "tydeus-reviewer",
+          "outcome": "ok",
+          "role": "reviewer",
+          "tokens_in": 0,
+          "tokens_out": 0
+        },
+        {
+          "family": "deepseek",
+          "latency_ms": 4137,
+          "model": "deepseek-flash",
+          "outcome": "ok",
+          "role": "confirmer",
+          "tokens_in": 0,
+          "tokens_out": 0
+        },
+        {
+          "family": "minimax",
+          "latency_ms": 4106,
+          "model": "MiniMax-M3.1-Flash",
+          "outcome": "ok",
+          "role": "confirmer",
+          "tokens_in": 0,
+          "tokens_out": 0
+        }
+      ],
+      "verdict": "comment",
+      "verdict_basis": "reviewer_plus_confirmer",
+      "version": 1
+    }
+  ],
+  "context": {
+    "cache_hit_tokens": 45118,
+    "cache_miss_tokens": 10287,
+    "cache_reported_calls": 11,
+    "calls": 11,
+    "completion_tokens": 3250,
+    "final_prompt_tokens": 5196,
+    "hit_share": 0.8143308365670968,
+    "peak_prompt_tokens": 10750,
+    "per_call": [
+      {
+        "cache_hit_tokens": 3381,
+        "cache_miss_tokens": 5,
+        "completion_tokens": 86,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 10506,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 3386,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 1
+      },
+      {
+        "cache_hit_tokens": 3627,
+        "cache_miss_tokens": 5,
+        "completion_tokens": 93,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 10356,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 3632,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 2
+      },
+      {
+        "cache_hit_tokens": 3639,
+        "cache_miss_tokens": 5,
+        "completion_tokens": 99,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 10517,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 3644,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 3
+      },
+      {
+        "cache_hit_tokens": 3527,
+        "cache_miss_tokens": 5,
+        "completion_tokens": 117,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 10519,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 3532,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 4
+      },
+      {
+        "cache_hit_tokens": 10727,
+        "cache_miss_tokens": 5,
+        "completion_tokens": 1156,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 40630,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 10732,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 5
+      },
+      {
+        "cache_hit_tokens": 10727,
+        "cache_miss_tokens": 23,
+        "completion_tokens": 60,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 40735,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 10750,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 6
+      },
+      {
+        "cache_hit_tokens": 2117,
+        "cache_miss_tokens": 5,
+        "completion_tokens": 87,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 6036,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 2122,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 7
+      },
+      {
+        "cache_hit_tokens": 3655,
+        "cache_miss_tokens": 5,
+        "completion_tokens": 267,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 10426,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 3660,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 8
+      },
+      {
+        "cache_hit_tokens": 3529,
+        "cache_miss_tokens": 5,
+        "completion_tokens": 466,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 10290,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 3534,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 9
+      },
+      {
+        "cache_hit_tokens": 189,
+        "cache_miss_tokens": 5028,
+        "completion_tokens": 343,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 61,
+          "task_bytes": 18701,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 5217,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 10
+      },
+      {
+        "cache_hit_tokens": 0,
+        "cache_miss_tokens": 5196,
+        "completion_tokens": 476,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 61,
+          "task_bytes": 18701,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 5196,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 11
+      }
+    ],
+    "prompt_tokens": 55405,
+    "resent_prompt_tokens": 0
+  },
+  "cost_usd": 0.0,
+  "exclusions": {
+    "bytes": 0,
+    "count": 0,
+    "files": []
+  },
+  "failed_models": 0,
+  "filtered_findings": [
+    {
+      "body": "The test `test_wire_datetime_converts_to_utc_zulu` uses `timezone(timedelta(hours=-4))`. While `datetime` is defined in the context, `timezone` and `timedelta` are not listed in the provided definitions or context, and they are not part of the standard `datetime` namespace (they are in `datetime.timezone` and `datetime.timedelta`). This will cause a `NameError` when the test is executed.",
+      "evidence": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:49: from datetime import datetime, timedelta, timezone",
+      "location": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:78",
+      "reason": "symbol is defined or imported in the file at the reviewed head",
+      "severity": "high",
+      "symbol": "timezone",
+      "symbols": [
+        "timezone"
+      ],
+      "title": "Undefined name 'timezone' in test_wire_datetime_converts_to_utc_zulu"
+    },
+    {
+      "body": "The test file uses `@pytest.mark.xfail` decorators, but `pytest` is not imported in the provided code snippet. While imports might be in omitted parts, the diff shows the start of a new file (`new file mode 100644`), implying this is the beginning of the file content, and `pytest` is not among the defined/imported symbols in the context.",
+      "evidence": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:52: import pytest",
+      "location": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:123",
+      "reason": "symbol is defined or imported in the file at the reviewed head",
+      "severity": "medium",
+      "symbol": "pytest",
+      "symbols": [
+        "pytest"
+      ],
+      "title": "Missing pytest import"
+    }
+  ],
+  "ok_models": 2,
+  "provenance": [
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 12565,
+      "health": null,
+      "latency_ms": 12621.0,
+      "ledger_wait_ms": 39,
+      "provider": "cerberus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "cerberus-reviewer",
+      "response_model": "cerberus-narrator",
+      "served_by": "http://192.168.207.96:8080/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    },
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 710,
+      "health": null,
+      "latency_ms": 730.0,
+      "ledger_wait_ms": 4,
+      "provider": "cerberus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "cerberus-reviewer",
+      "response_model": "cerberus-narrator",
+      "served_by": "http://192.168.207.96:8080/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    },
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 5030,
+      "health": null,
+      "latency_ms": 5053.0,
+      "ledger_wait_ms": 4,
+      "provider": "tydeus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "tydeus-reviewer",
+      "response_model": "tydeus-reviewer",
+      "served_by": "http://192.168.207.73:8005/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    },
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 5962,
+      "health": null,
+      "latency_ms": 6058.0,
+      "ledger_wait_ms": 79,
+      "provider": "tydeus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "tydeus-reviewer",
+      "response_model": "tydeus-reviewer",
+      "served_by": "http://192.168.207.73:8005/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    },
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 4083,
+      "health": null,
+      "latency_ms": 4142.0,
+      "ledger_wait_ms": 39,
+      "provider": "tydeus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "tydeus-reviewer",
+      "response_model": "tydeus-reviewer",
+      "served_by": "http://192.168.207.73:8005/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    },
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 10299,
+      "health": null,
+      "latency_ms": 10359.0,
+      "ledger_wait_ms": 40,
+      "provider": "tydeus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "tydeus-reviewer",
+      "response_model": "tydeus-reviewer",
+      "served_by": "http://192.168.207.73:8005/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    },
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 4870,
+      "health": null,
+      "latency_ms": 4892.0,
+      "ledger_wait_ms": 4,
+      "provider": "tydeus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "tydeus-reviewer",
+      "response_model": "tydeus-reviewer",
+      "served_by": "http://192.168.207.73:8005/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    },
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 13041,
+      "health": null,
+      "latency_ms": 13062.0,
+      "ledger_wait_ms": 4,
+      "provider": "tydeus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "tydeus-reviewer",
+      "response_model": "tydeus-reviewer",
+      "served_by": "http://192.168.207.73:8005/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    },
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 3440,
+      "health": null,
+      "latency_ms": 3460.0,
+      "ledger_wait_ms": 4,
+      "provider": "tydeus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "tydeus-reviewer",
+      "response_model": "tydeus-reviewer",
+      "served_by": "http://192.168.207.73:8005/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    }
+  ],
+  "requested": 2,
+  "reviewers": [
+    {
+      "escalation_reason": null,
+      "filtered_findings": [],
+      "findings": [],
+      "forced_family_conflict": false,
+      "model": "cerberus-reviewer",
+      "next_steps": [],
+      "ok": true,
+      "summary": "No defects detected in the supplied test diff.",
+      "verdict": "approve"
+    },
+    {
+      "escalation_reason": null,
+      "filtered_findings": [
+        {
+          "body": "The test `test_wire_datetime_converts_to_utc_zulu` uses `timezone(timedelta(hours=-4))`. While `datetime` is defined in the context, `timezone` and `timedelta` are not listed in the provided definitions or context, and they are not part of the standard `datetime` namespace (they are in `datetime.timezone` and `datetime.timedelta`). This will cause a `NameError` when the test is executed.",
+          "evidence": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:49: from datetime import datetime, timedelta, timezone",
+          "location": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:78",
+          "reason": "symbol is defined or imported in the file at the reviewed head",
+          "severity": "high",
+          "symbol": "timezone",
+          "symbols": [
+            "timezone"
+          ],
+          "title": "Undefined name 'timezone' in test_wire_datetime_converts_to_utc_zulu"
+        },
+        {
+          "body": "The test file uses `@pytest.mark.xfail` decorators, but `pytest` is not imported in the provided code snippet. While imports might be in omitted parts, the diff shows the start of a new file (`new file mode 100644`), implying this is the beginning of the file content, and `pytest` is not among the defined/imported symbols in the context.",
+          "evidence": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:52: import pytest",
+          "location": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:123",
+          "reason": "symbol is defined or imported in the file at the reviewed head",
+          "severity": "medium",
+          "symbol": "pytest",
+          "symbols": [
+            "pytest"
+          ],
+          "title": "Missing pytest import"
+        }
+      ],
+      "findings": [
+        {
+          "body": "In `test_publish_federation_timeout_is_swallowed`, the line `_recorder(monkeypatch, _RecordedPublish(delay=1.0))` is called as a standalone function instead of being assigned to a variable (e.g., `recorder = ...`). This means the `recorder` object used for assertions is not the one configured with the `delay=1.0` parameter, and the test likely fails to actually test the timeout behavior on the intended recorder.",
+          "location": "tests/test_mnemos_persistence_nats_events_characterisation_20261105.py:106",
+          "severity": "high",
+          "title": "Incorrect recorder initialization in timeout test"
+        }
+      ],
+      "forced_family_conflict": false,
+      "model": "tydeus-reviewer",
+      "next_steps": [
+        "Import `timezone` and `timedelta` from the `datetime` module in the test file.",
+        "Fix `test_publish_federation_timeout_is_swallowed` to assign the result of `_recorder(...)` to a variable.",
+        "Ensure `import pytest` is present at the top of the file."
+      ],
+      "ok": true,
+      "summary": "Chunk 1/7: The first part of the characterisation test suite is well-structured and follows best practices for testing asynchronous code in a synchronous test runner. The use of a mock recorder to capture NATS publication details is a sound approach for characterisation tests.\nChunk 2/7: The reviewed code chunk contains a series of characterisation tests for NATS event subjects, sanitization logic, and configuration flags. The logic for subject sanitization (collapsing non-word characters to underscores and stripping leading/trailing underscores) is well-tested with various edge cases (None, empty strings, special characters, non-string types). The configuration tests correctly use monkeypatching to verify environment variable reading.\nChunk 3/7: The provided diff contains a series of characterization tests for NATS event publishing and webhook outbox insertion. The tests cover timeout handling, error propagation, feature flagging, payload construction, and utility functions. No defects were identified in the logic or test implementation within the provided chunks.\nChunk 4/7: The test suite contains a potential runtime error due to an undefined name `timezone` in the datetime conversion tests.\nChunk 5/7: The provided diff contains a series of characterisation tests for `federation_memory_upsert_event` and related logic. The tests cover various edge cases including non-mapping rows, unpublishable rows, missing IDs, metadata normalization, and datetime handling. No defects were identified in the logic presented in this chunk.\nChunk 6/7: The test file contains a logic error in the `test_publish_federation_timeout_is_swallowed` test case where the recorder is initialized incorrectly, and a missing import for `pytest` which is used for `xfail` decorators.\nChunk 7/7: The final part of the test suite adds characterisation tests for known defects in the NATS event persistence logic. These tests use `pytest.mark.xfail` to document existing incorrect behaviors regarding permission mode bitmasking and empty content handling.\n",
+      "verdict": "comment"
+    }
+  ],
+  "skipped_unhealthy": [],
+  "substituted": true,
+  "verdict": "comment"
+}

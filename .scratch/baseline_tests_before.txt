@@ -1,0 +1,703 @@
+.................................ss.ssssssssssssss...................... [  1%]
+................................................s.....s.s.s.s.s.s.s.s.s. [  2%]
+s.s.s.s.s.s.s.s.s..s.s.s.s.s.s.s..s..................................... [  3%]
+.....................X.................................................. [  4%]
+.....................................................sss.sss.sss.sss.... [  5%]
+........................................................................ [  6%]
+........................................................................ [  7%]
+........................................................................ [  8%]
+........................................................................ [  9%]
+........................................................................ [ 11%]
+....X................................................................... [ 12%]
+...........x....................................................sss..... [ 13%]
+........................................................................ [ 14%]
+..........................................ss...s...ssss.s............... [ 15%]
+........................................................................ [ 16%]
+........................................................................ [ 17%]
+..........................s........................sssssssssssssssssssss [ 18%]
+sssssssssssssssssssssssssssssssssssssss................................. [ 19%]
+....................ssssssssssss........................................ [ 21%]
+....................................................................s... [ 22%]
+........................................................................ [ 23%]
+..............................s......................................... [ 24%]
+........................................................................ [ 25%]
+.................................................................s...... [ 26%]
+........................................................................ [ 27%]
+........................................................................ [ 28%]
+ss..............................x....................................... [ 29%]
+............................................sssss.sssss.sssss.sssss.ssss [ 31%]
+s.sssss.sssss.sssssssssss............sssss.sssss.sssss.sssss.sssss.sssss [ 32%]
+........................................................................ [ 33%]
+........................................................................ [ 34%]
+......ss..........s...................................................s. [ 35%]
+s...........................................ss.......................... [ 36%]
+........................................................................ [ 37%]
+..................................ssss............ssss..ss.............. [ 38%]
+........................................................................ [ 39%]
+........................................................................ [ 41%]
+........................................................................ [ 42%]
+.................................F.Fs..........................s........ [ 43%]
+..............................................................sssss.ssss [ 44%]
+s.sssss.sssss.sssss..................................................... [ 45%]
+.....................sssss........sssss.sssss..sssss.sssss.sssss.sssss.s [ 46%]
+ssss.sssss.sssss.sssss.sssss.sssss.sssss.sssss.sssss.sssss.sssss.sssss.. [ 47%]
+sssss.sssss.sssss.sssss.sssss.sssss..............sssss.sssss.sssss..ssss [ 48%]
+s.sssss.sssss.sssss.sssss....sssss.sssssssssss.sssss.sssss.sssss.sssss.s [ 49%]
+ssss.................................................................... [ 50%]
+........................................................................ [ 52%]
+........................................................................ [ 53%]
+........................................................................ [ 54%]
+...................................................................sssss [ 55%]
+sssss.sssss......................ss.....................sssssssss....... [ 56%]
+...........................................................X....sss..... [ 57%]
+..sss.......................s...........sssssssssssssssssssss........... [ 58%]
+....ssss..................................s..............ssssssss....... [ 59%]
+........................................................................ [ 60%]
+....................ss.................................s.s.............. [ 62%]
+........ss..sss......sssssss............................................ [ 63%]
+...........sssssss................................ssssssssssss.......... [ 64%]
+........................................................................ [ 65%]
+........................................................................ [ 66%]
+........................................................................ [ 67%]
+........................................................................ [ 68%]
+......................................................................ss [ 69%]
+ssss.................................................................... [ 70%]
+......................................F................................. [ 72%]
+.......ssssssssssssssssss............................................... [ 73%]
+........................................................................ [ 74%]
+.............................................................FsssssFssss [ 75%]
+sFsssssFsssssFsssssFsssss.sssss......................................... [ 76%]
+........................................................................ [ 77%]
+........................................................................ [ 78%]
+...........................................ss........................... [ 79%]
+........................................................................ [ 80%]
+........................................................................ [ 82%]
+........................................................................ [ 83%]
+........................................................................ [ 84%]
+........................................................................ [ 85%]
+........................................................................ [ 86%]
+........................................................................ [ 87%]
+......................................................................s. [ 88%]
+...................ss..s.s.s.s.......................................... [ 89%]
+......................................................................ss [ 90%]
+........................................................................ [ 91%]
+........................................................................ [ 93%]
+.......................................................s................ [ 94%]
+........................................................................ [ 95%]
+........................................................................ [ 96%]
+...............s........................................................ [ 97%]
+........................................................................ [ 98%]
+...............ss....................................................... [ 99%]
+...........sss...                                                        [100%]
+=================================== FAILURES ===================================
+_____________ test_gpu_backend_imports_and_computes_or_falls_back ______________
+
+>   ???
+
+cupy_backends/cuda/_softlink.pyx:25: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <CDLL 'libnvrtc.so.12', handle 0 at 0x7fd585cc0690>
+name = 'libnvrtc.so.12', mode = 0, handle = None, use_errno = False
+use_last_error = False, winmode = None
+
+    def __init__(self, name, mode=DEFAULT_MODE, handle=None,
+                 use_errno=False,
+                 use_last_error=False,
+                 winmode=None):
+        if name:
+            name = _os.fspath(name)
+    
+            # If the filename that has been provided is an iOS/tvOS/watchOS
+            # .fwork file, dereference the location to the true origin of the
+            # binary.
+            if name.endswith(".fwork"):
+                with open(name) as f:
+                    name = _os.path.join(
+                        _os.path.dirname(_sys.executable),
+                        f.read().strip()
+                    )
+    
+        self._name = name
+        flags = self._func_flags_
+        if use_errno:
+            flags |= _FUNCFLAG_USE_ERRNO
+        if use_last_error:
+            flags |= _FUNCFLAG_USE_LASTERROR
+        if _sys.platform.startswith("aix"):
+            """When the name contains ".a(" and ends with ")",
+               e.g., "libFOO.a(libFOO.so)" - this is taken to be an
+               archive(member) syntax for dlopen(), and the mode is adjusted.
+               Otherwise, name is presented to dlopen() as a file argument.
+            """
+            if name and name.endswith(")") and ".a(" in name:
+                mode |= ( _os.RTLD_MEMBER | _os.RTLD_NOW )
+        if _os.name == "nt":
+            if winmode is not None:
+                mode = winmode
+            else:
+                import nt
+                mode = nt._LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+                if '/' in name or '\\' in name:
+                    self._name = nt._getfullpathname(self._name)
+                    mode |= nt._LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+    
+        class _FuncPtr(_CFuncPtr):
+            _flags_ = flags
+            _restype_ = self._func_restype_
+        self._FuncPtr = _FuncPtr
+    
+        if handle is None:
+>           self._handle = _dlopen(self._name, mode)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^
+E           OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+/usr/lib/python3.13/ctypes/__init__.py:390: OSError
+
+The above exception was the direct cause of the following exception:
+
+    def test_gpu_backend_imports_and_computes_or_falls_back():
+        gpu = importlib.import_module("mnemos.domain.kronos.backends.gpu")
+    
+>       result = gpu.ewma(np.asarray([10.0, 20.0, 30.0]), alpha=0.5)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_kronos_backends.py:26: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mnemos/domain/kronos/backends/gpu.py:40: in ewma
+    result[idx] = alpha * arr[idx] + (1.0 - alpha) * result[idx - 1]
+                  ^^^^^^^^^^^^^^^^
+cupy/_core/core.pyx:1387: in cupy._core.core._ndarray_base.__mul__
+    ???
+cupy/_core/_kernel.pyx:1374: in cupy._core._kernel.ufunc.__call__
+    ???
+cupy/_core/_kernel.pyx:1401: in cupy._core._kernel.ufunc._get_ufunc_kernel
+    ???
+cupy/_core/_kernel.pyx:1082: in cupy._core._kernel._get_ufunc_kernel
+    ???
+cupy/_core/_kernel.pyx:94: in cupy._core._kernel._get_simple_elementwise_kernel
+    ???
+cupy/_core/_kernel.pyx:82: in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+    ???
+cupy/_core/core.pyx:2375: in cupy._core.core.compile_with_cache
+    ???
+cupy/_core/core.pyx:2320: in cupy._core.core.assemble_cupy_compiler_options
+    ???
+cupy_backends/cuda/libs/nvrtc.pyx:57: in cupy_backends.cuda.libs.nvrtc.getVersion
+    ???
+cupy_backends/cuda/libs/_cnvrtc.pxi:72: in cupy_backends.cuda.libs.nvrtc.initialize
+    ???
+cupy_backends/cuda/libs/_cnvrtc.pxi:75: in cupy_backends.cuda.libs.nvrtc._initialize
+    ???
+cupy_backends/cuda/libs/_cnvrtc.pxi:153: in cupy_backends.cuda.libs.nvrtc._get_softlink
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+cupy_backends/cuda/_softlink.pyx:32: RuntimeError
+_____ test_selector_gpu_env_returns_working_backend_without_required_cupy ______
+
+>   ???
+
+cupy_backends/cuda/_softlink.pyx:25: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <CDLL 'libnvrtc.so.12', handle 0 at 0x7fd585cc0cd0>
+name = 'libnvrtc.so.12', mode = 0, handle = None, use_errno = False
+use_last_error = False, winmode = None
+
+    def __init__(self, name, mode=DEFAULT_MODE, handle=None,
+                 use_errno=False,
+                 use_last_error=False,
+                 winmode=None):
+        if name:
+            name = _os.fspath(name)
+    
+            # If the filename that has been provided is an iOS/tvOS/watchOS
+            # .fwork file, dereference the location to the true origin of the
+            # binary.
+            if name.endswith(".fwork"):
+                with open(name) as f:
+                    name = _os.path.join(
+                        _os.path.dirname(_sys.executable),
+                        f.read().strip()
+                    )
+    
+        self._name = name
+        flags = self._func_flags_
+        if use_errno:
+            flags |= _FUNCFLAG_USE_ERRNO
+        if use_last_error:
+            flags |= _FUNCFLAG_USE_LASTERROR
+        if _sys.platform.startswith("aix"):
+            """When the name contains ".a(" and ends with ")",
+               e.g., "libFOO.a(libFOO.so)" - this is taken to be an
+               archive(member) syntax for dlopen(), and the mode is adjusted.
+               Otherwise, name is presented to dlopen() as a file argument.
+            """
+            if name and name.endswith(")") and ".a(" in name:
+                mode |= ( _os.RTLD_MEMBER | _os.RTLD_NOW )
+        if _os.name == "nt":
+            if winmode is not None:
+                mode = winmode
+            else:
+                import nt
+                mode = nt._LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+                if '/' in name or '\\' in name:
+                    self._name = nt._getfullpathname(self._name)
+                    mode |= nt._LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+    
+        class _FuncPtr(_CFuncPtr):
+            _flags_ = flags
+            _restype_ = self._func_restype_
+        self._FuncPtr = _FuncPtr
+    
+        if handle is None:
+>           self._handle = _dlopen(self._name, mode)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^
+E           OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+/usr/lib/python3.13/ctypes/__init__.py:390: OSError
+
+The above exception was the direct cause of the following exception:
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd585c93310>
+
+    def test_selector_gpu_env_returns_working_backend_without_required_cupy(monkeypatch):
+        from mnemos.domain.kronos.backends.selector import get_backend
+    
+        monkeypatch.setenv("MNEMOS_KRONOS_BACKEND", "gpu")
+    
+        backend = get_backend()
+>       result = backend.ewma(np.asarray([2.0, 6.0, 10.0]), alpha=0.5)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_kronos_backends.py:51: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mnemos/domain/kronos/backends/gpu.py:40: in ewma
+    result[idx] = alpha * arr[idx] + (1.0 - alpha) * result[idx - 1]
+                  ^^^^^^^^^^^^^^^^
+cupy/_core/core.pyx:1387: in cupy._core.core._ndarray_base.__mul__
+    ???
+cupy/_core/_kernel.pyx:1374: in cupy._core._kernel.ufunc.__call__
+    ???
+cupy/_core/_kernel.pyx:1401: in cupy._core._kernel.ufunc._get_ufunc_kernel
+    ???
+cupy/_core/_kernel.pyx:1082: in cupy._core._kernel._get_ufunc_kernel
+    ???
+cupy/_core/_kernel.pyx:94: in cupy._core._kernel._get_simple_elementwise_kernel
+    ???
+cupy/_core/_kernel.pyx:82: in cupy._core._kernel._get_simple_elementwise_kernel_from_code
+    ???
+cupy/_core/core.pyx:2375: in cupy._core.core.compile_with_cache
+    ???
+cupy/_core/core.pyx:2320: in cupy._core.core.assemble_cupy_compiler_options
+    ???
+cupy_backends/cuda/libs/nvrtc.pyx:57: in cupy_backends.cuda.libs.nvrtc.getVersion
+    ???
+cupy_backends/cuda/libs/_cnvrtc.pxi:72: in cupy_backends.cuda.libs.nvrtc.initialize
+    ???
+cupy_backends/cuda/libs/_cnvrtc.pxi:75: in cupy_backends.cuda.libs.nvrtc._initialize
+    ???
+cupy_backends/cuda/libs/_cnvrtc.pxi:153: in cupy_backends.cuda.libs.nvrtc._get_softlink
+    ???
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+>   ???
+E   RuntimeError: CuPy failed to load libnvrtc.so.12: OSError: libnvrtc.so.12: cannot open shared object file: No such file or directory
+
+cupy_backends/cuda/_softlink.pyx:32: RuntimeError
+_____________ test_runtime_settings_pg_backend_overrides_toml_init _____________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd58e8c2350>
+
+    def test_runtime_settings_pg_backend_overrides_toml_init(monkeypatch):
+        """Round-44 HIGH: empirical verification that
+        _DatabaseSettings.backend uses validation_alias semantics where
+        PG_BACKEND env OVERRIDES init kwargs (TOML). This is the
+        pydantic-settings 2.10.1 behavior — codex caught my round-43
+        assumption was wrong for THIS field."""
+        from mnemos.core.config import _DatabaseSettings
+    
+        monkeypatch.setenv("PG_BACKEND", "postgres")
+        s = _DatabaseSettings(backend="sqlite")
+        # PG_BACKEND env wins.
+>       assert s.backend == "postgres"
+E       AssertionError: assert 'sqlite' == 'postgres'
+E         
+E         - postgres
+E         + sqlite
+
+tests/test_postgres_embedding_dim.py:3177: AssertionError
+________ test_required_archive_route_rolls_back_append_failure[sqlite] _________
+
+backend = <mnemos.persistence.sqlite.SqliteBackend object at 0x7fd58ebc3f00>
+audit_policy = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd58e62dc50>
+
+    @pytest.mark.asyncio
+    async def test_required_archive_route_rolls_back_append_failure(backend, audit_policy, monkeypatch):
+        from fastapi import HTTPException
+    
+        await insert(backend)
+        fail_append(backend, monkeypatch)
+        route = install_route(backend, monkeypatch)
+        with pytest.raises(HTTPException) as error:
+>           await route.persephone_archive_memory("journal_one", SimpleNamespace(user_id="root"))
+
+tests/test_required_audit_mutations.py:62: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mnemos/api/routes/admin.py:812: in persephone_archive_memory
+    await _admin_lifecycle_repo.archive_memory(tx, memory_id, user.user_id)
+mnemos/domain/admin_lifecycle_repo.py:179: in archive_memory
+    from mnemos.domain.persephone.runner import archive_memory
+mnemos/domain/persephone/__init__.py:5: in <module>
+    require_extra("persephone")
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'persephone'
+
+    def require_extra(name: str) -> None:
+        """Raise RuntimeError with install instruction if extra is missing."""
+        if not is_extra_installed(name):
+>           raise RuntimeError(f"{name} subsystem not installed. Install via: {install_hint(name)}")
+E           RuntimeError: persephone subsystem not installed. Install via: pip install mnemos-core[persephone]  (or [server]/[ml]/[full] bundle)
+
+mnemos/core/extras.py:146: RuntimeError
+___________ test_best_effort_archive_commits_append_failure[sqlite] ____________
+
+backend = <mnemos.persistence.sqlite.SqliteBackend object at 0x7fd58ebc0270>
+audit_policy = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd58e62ef90>
+
+    @pytest.mark.asyncio
+    async def test_best_effort_archive_commits_append_failure(backend, audit_policy, monkeypatch):
+        monkeypatch.setenv("MNEMOS_AUDIT_CHAIN", "on")
+        await insert(backend)
+        fail_append(backend, monkeypatch)
+        route = install_route(backend, monkeypatch)
+>       result = await route.persephone_archive_memory("journal_one", SimpleNamespace(user_id="root"))
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_required_audit_mutations.py:75: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mnemos/api/routes/admin.py:812: in persephone_archive_memory
+    await _admin_lifecycle_repo.archive_memory(tx, memory_id, user.user_id)
+mnemos/domain/admin_lifecycle_repo.py:179: in archive_memory
+    from mnemos.domain.persephone.runner import archive_memory
+mnemos/domain/persephone/__init__.py:5: in <module>
+    require_extra("persephone")
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'persephone'
+
+    def require_extra(name: str) -> None:
+        """Raise RuntimeError with install instruction if extra is missing."""
+        if not is_extra_installed(name):
+>           raise RuntimeError(f"{name} subsystem not installed. Install via: {install_hint(name)}")
+E           RuntimeError: persephone subsystem not installed. Install via: pip install mnemos-core[persephone]  (or [server]/[ml]/[full] bundle)
+
+mnemos/core/extras.py:146: RuntimeError
+____________ test_actual_archive_hash_covers_driver_vector[sqlite] _____________
+
+backend = <mnemos.persistence.sqlite.SqliteBackend object at 0x7fd58ebc0d10>
+audit_policy = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd58e8c1b00>
+
+    @pytest.mark.asyncio
+    async def test_actual_archive_hash_covers_driver_vector(backend, audit_policy, monkeypatch):
+        from mnemos.audit import route_helper
+    
+        await insert(backend)
+        await mutate(backend, "UPDATE memories SET embedding = ? WHERE id = ?", "[1,0,0]", "journal_one")
+        seen = []
+        original = route_helper.canonical_payload_hash
+    
+        def spy(**kwargs):
+            seen.append(kwargs["embedding"])
+            return original(**kwargs)
+    
+        monkeypatch.setattr(route_helper, "canonical_payload_hash", spy)
+        route = install_route(backend, monkeypatch)
+>       await route.persephone_archive_memory("journal_one", SimpleNamespace(user_id="root"))
+
+tests/test_required_audit_mutations.py:96: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mnemos/api/routes/admin.py:812: in persephone_archive_memory
+    await _admin_lifecycle_repo.archive_memory(tx, memory_id, user.user_id)
+mnemos/domain/admin_lifecycle_repo.py:179: in archive_memory
+    from mnemos.domain.persephone.runner import archive_memory
+mnemos/domain/persephone/__init__.py:5: in <module>
+    require_extra("persephone")
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'persephone'
+
+    def require_extra(name: str) -> None:
+        """Raise RuntimeError with install instruction if extra is missing."""
+        if not is_extra_installed(name):
+>           raise RuntimeError(f"{name} subsystem not installed. Install via: {install_hint(name)}")
+E           RuntimeError: persephone subsystem not installed. Install via: pip install mnemos-core[persephone]  (or [server]/[ml]/[full] bundle)
+
+mnemos/core/extras.py:146: RuntimeError
+_______________ test_required_archival_worker_rolls_back[sqlite] _______________
+
+backend = <mnemos.persistence.sqlite.SqliteBackend object at 0x7fd58ebc09e0>
+audit_policy = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd58e67d630>
+
+    @pytest.mark.asyncio
+    async def test_required_archival_worker_rolls_back(backend, audit_policy, monkeypatch):
+        await insert(backend)
+        fail_append(backend, monkeypatch)
+        with pytest.raises(AuditChainContinuityError):
+>           await sweep_for_archival(backend, namespace="A", archive_after_days=1, batch_size=5)
+
+tests/test_required_audit_mutations.py:108: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mnemos/persistence/worker_lifecycle.py:715: in sweep_for_archival
+    from mnemos.persistence.archive_format import (
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """Archive payload format shared by the Persephone runner and persistence.
+    
+    These constants and helpers describe the on-disk archive record: how a memory
+    row is flattened, JSON-encoded and zstd-compressed, and the schema version that
+    stamps it.
+    
+    They live in the persistence layer rather than in ``mnemos.domain.persephone``
+    because both layers need them and ``mnemos.persistence`` is forbidden from
+    importing ``mnemos.domain`` (import-linter contract "persistence has no upward
+    deps"). The record format is a storage concern, so this is its correct home;
+    the domain runner re-exports it for existing callers.
+    """
+    
+    from __future__ import annotations
+    
+    import json
+    from datetime import date, datetime
+    from typing import Any
+    
+>   import zstandard as zstd
+E   ModuleNotFoundError: No module named 'zstandard'
+
+mnemos/persistence/archive_format.py:20: ModuleNotFoundError
+_________ test_required_missing_secret_does_not_commit_archive[sqlite] _________
+
+backend = <mnemos.persistence.sqlite.SqliteBackend object at 0x7fd58ebc2e00>
+audit_policy = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd58e6b8910>
+
+    @pytest.mark.asyncio
+    async def test_required_missing_secret_does_not_commit_archive(backend, audit_policy, monkeypatch):
+        from mnemos.core import config
+        from fastapi import HTTPException
+    
+        await insert(backend)
+        monkeypatch.setattr(config, "get_settings", lambda: SimpleNamespace(server=SimpleNamespace(session_secret="")))
+        route = install_route(backend, monkeypatch)
+        with pytest.raises(HTTPException) as error:
+>           await route.persephone_archive_memory("journal_one", SimpleNamespace(user_id="root"))
+
+tests/test_required_audit_mutations.py:122: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mnemos/api/routes/admin.py:812: in persephone_archive_memory
+    await _admin_lifecycle_repo.archive_memory(tx, memory_id, user.user_id)
+mnemos/domain/admin_lifecycle_repo.py:179: in archive_memory
+    from mnemos.domain.persephone.runner import archive_memory
+mnemos/domain/persephone/__init__.py:5: in <module>
+    require_extra("persephone")
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'persephone'
+
+    def require_extra(name: str) -> None:
+        """Raise RuntimeError with install instruction if extra is missing."""
+        if not is_extra_installed(name):
+>           raise RuntimeError(f"{name} subsystem not installed. Install via: {install_hint(name)}")
+E           RuntimeError: persephone subsystem not installed. Install via: pip install mnemos-core[persephone]  (or [server]/[ml]/[full] bundle)
+
+mnemos/core/extras.py:146: RuntimeError
+______________ test_best_effort_sql_error_uses_savepoint[sqlite] _______________
+
+backend = <mnemos.persistence.sqlite.SqliteBackend object at 0x7fd58ebc0e20>
+audit_policy = None
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7fd58e6b86e0>
+
+    @pytest.mark.asyncio
+    async def test_best_effort_sql_error_uses_savepoint(backend, audit_policy, monkeypatch):
+        monkeypatch.setenv("MNEMOS_AUDIT_CHAIN", "on")
+        await insert(backend)
+    
+        async def sql_failure(self, tx, **kwargs):
+            await _Ops(tx, transaction_dialect(tx)).execute("INSERT INTO audit_missing_table(x) VALUES (1)")
+    
+        monkeypatch.setattr(type(backend.audit_chain), "insert_audit_entry", sql_failure)
+        route = install_route(backend, monkeypatch)
+>       await route.persephone_archive_memory("journal_one", SimpleNamespace(user_id="root"))
+
+tests/test_required_audit_mutations.py:138: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+mnemos/api/routes/admin.py:812: in persephone_archive_memory
+    await _admin_lifecycle_repo.archive_memory(tx, memory_id, user.user_id)
+mnemos/domain/admin_lifecycle_repo.py:179: in archive_memory
+    from mnemos.domain.persephone.runner import archive_memory
+mnemos/domain/persephone/__init__.py:5: in <module>
+    require_extra("persephone")
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+name = 'persephone'
+
+    def require_extra(name: str) -> None:
+        """Raise RuntimeError with install instruction if extra is missing."""
+        if not is_extra_installed(name):
+>           raise RuntimeError(f"{name} subsystem not installed. Install via: {install_hint(name)}")
+E           RuntimeError: persephone subsystem not installed. Install via: pip install mnemos-core[persephone]  (or [server]/[ml]/[full] bundle)
+
+mnemos/core/extras.py:146: RuntimeError
+=============================== warnings summary ===============================
+../../.local/lib/python3.13/site-packages/typer/params.py:946: 29 warnings
+tests/test_cli_typer_click_compat.py: 1 warning
+  /home/jasonperlow/.local/lib/python3.13/site-packages/typer/params.py:946: DeprecationWarning: The 'is_flag' and 'flag_value' parameters are not supported by Typer and will be removed entirely in a future release.
+    return OptionInfo(
+
+tests/domain/headroom/test_json_minify.py::test_json_minify_preserves_edge_numeric_lexemes_exactly[0]
+  /home/jasonperlow/hive-workspaces/01a1adf2-3893-7b7a-95ea-3bc223aa4e4b/tests/conftest.py:101: DeprecationWarning: There is no current event loop
+    asyncio.get_event_loop()
+
+tests/domain/test_federation_withdrawal.py: 2 warnings
+tests/test_federation_char_fb78_20261101.py: 634 warnings
+tests/test_federation_counters.py: 12 warnings
+tests/test_federation_f2_exportable_pullable.py: 5 warnings
+tests/test_federation_journal.py: 34 warnings
+tests/test_federation_journal_compaction.py: 38 warnings
+tests/test_federation_local_embed_queue.py: 19 warnings
+tests/test_federation_parity_reconcile.py: 43 warnings
+tests/test_federation_replica_fence.py: 5 warnings
+tests/test_federation_soft_deleted_marker.py: 24 warnings
+tests/test_kronos.py: 2 warnings
+tests/test_morpheus_backend_live.py: 21 warnings
+tests/test_required_audit_mutations.py: 14 warnings
+tests/test_universal_audit_chain.py: 4 warnings
+  /home/jasonperlow/.local/lib/python3.13/site-packages/aiosqlite/core.py:63: DeprecationWarning: The default datetime adapter is deprecated as of Python 3.12; see the sqlite3 documentation for suggested replacement recipes
+    result = function()
+
+tests/test_connector_smoke.py::test_streamable_http_mcp_smoke
+  /usr/lib/python3.13/contextlib.py:109: DeprecationWarning: Use `streamable_http_client` instead.
+    self.gen = func(*args, **kwds)
+
+tests/test_embedding_contract_f06.py::test_default_embedding_dim_matches_the_default_http_model_width
+  tests/test_embedding_contract_f06.py:40: PytestWarning: The test <Function test_default_embedding_dim_matches_the_default_http_model_width> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    def test_default_embedding_dim_matches_the_default_http_model_width():
+
+tests/test_embedding_contract_f06.py::test_embedding_dim_env_default_follows_the_model_too
+  tests/test_embedding_contract_f06.py:61: PytestWarning: The test <Function test_embedding_dim_env_default_follows_the_model_too> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    def test_embedding_dim_env_default_follows_the_model_too(monkeypatch):
+
+tests/test_embedding_contract_f06.py::test_known_model_width_recognises_every_bge_m3_spelling[bge-m3]
+  tests/test_embedding_contract_f06.py:72: PytestWarning: The test <Function test_known_model_width_recognises_every_bge_m3_spelling[bge-m3]> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    @pytest.mark.parametrize(
+
+tests/test_embedding_contract_f06.py::test_known_model_width_recognises_every_bge_m3_spelling[BAAI/bge-m3]
+  tests/test_embedding_contract_f06.py:72: PytestWarning: The test <Function test_known_model_width_recognises_every_bge_m3_spelling[BAAI/bge-m3]> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    @pytest.mark.parametrize(
+
+tests/test_embedding_contract_f06.py::test_known_model_width_recognises_every_bge_m3_spelling[/models/bge-m3.gguf]
+  tests/test_embedding_contract_f06.py:72: PytestWarning: The test <Function test_known_model_width_recognises_every_bge_m3_spelling[/models/bge-m3.gguf]> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    @pytest.mark.parametrize(
+
+tests/test_embedding_contract_f06.py::test_known_model_width_recognises_every_bge_m3_spelling[bge-m3-Q8_0.gguf]
+  tests/test_embedding_contract_f06.py:72: PytestWarning: The test <Function test_known_model_width_recognises_every_bge_m3_spelling[bge-m3-Q8_0.gguf]> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    @pytest.mark.parametrize(
+
+tests/test_embedding_contract_f06.py::test_known_model_width_recognises_every_bge_m3_spelling[bge-m3:latest]
+  tests/test_embedding_contract_f06.py:72: PytestWarning: The test <Function test_known_model_width_recognises_every_bge_m3_spelling[bge-m3:latest]> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    @pytest.mark.parametrize(
+
+tests/test_embedding_contract_f06.py::test_known_model_width_keeps_the_other_known_models[nomic-embed-text-768]
+  tests/test_embedding_contract_f06.py:83: PytestWarning: The test <Function test_known_model_width_keeps_the_other_known_models[nomic-embed-text-768]> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    @pytest.mark.parametrize(
+
+tests/test_embedding_contract_f06.py::test_known_model_width_keeps_the_other_known_models[BAAI/bge-base-en-v1.5-768]
+  tests/test_embedding_contract_f06.py:83: PytestWarning: The test <Function test_known_model_width_keeps_the_other_known_models[BAAI/bge-base-en-v1.5-768]> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    @pytest.mark.parametrize(
+
+tests/test_embedding_contract_f06.py::test_known_model_width_keeps_the_other_known_models[bge-small-zh-v1.5-512]
+  tests/test_embedding_contract_f06.py:83: PytestWarning: The test <Function test_known_model_width_keeps_the_other_known_models[bge-small-zh-v1.5-512]> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    @pytest.mark.parametrize(
+
+tests/test_embedding_contract_f06.py::test_known_model_width_is_none_for_an_unknown_model
+  tests/test_embedding_contract_f06.py:93: PytestWarning: The test <Function test_known_model_width_is_none_for_an_unknown_model> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    def test_known_model_width_is_none_for_an_unknown_model():
+
+tests/test_embedding_contract_f06.py::test_embedding_identity_uses_the_http_model_and_its_width
+  tests/test_embedding_contract_f06.py:103: PytestWarning: The test <Function test_embedding_identity_uses_the_http_model_and_its_width> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    def test_embedding_identity_uses_the_http_model_and_its_width():
+
+tests/test_embedding_contract_f06.py::test_embedding_identity_never_claims_the_configured_width_for_a_known_model
+  tests/test_embedding_contract_f06.py:113: PytestWarning: The test <Function test_embedding_identity_never_claims_the_configured_width_for_a_known_model> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    def test_embedding_identity_never_claims_the_configured_width_for_a_known_model():
+
+tests/test_embedding_contract_f06.py::test_embedding_identity_from_settings_reads_the_live_settings
+  tests/test_embedding_contract_f06.py:122: PytestWarning: The test <Function test_embedding_identity_from_settings_reads_the_live_settings> is marked with '@pytest.mark.asyncio' but it is not an async function. Please remove the asyncio mark. If the test is not marked explicitly, check for global marks applied via 'pytestmark'.
+    def test_embedding_identity_from_settings_reads_the_live_settings():
+
+tests/test_openai_compat_repo_transaction_failure.py::test_model_recommendation_degrades_to_none_when_the_transaction_cannot_open
+  /home/jasonperlow/.local/lib/python3.13/site-packages/_pytest/threadexception.py:58: PytestUnhandledThreadExceptionWarning: Exception in thread Thread-670 (_connection_worker_thread)
+  
+  Traceback (most recent call last):
+    File "/home/jasonperlow/.local/lib/python3.13/site-packages/aiosqlite/core.py", line 66, in _connection_worker_thread
+      future.get_loop().call_soon_threadsafe(set_result, future, result)
+      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "/usr/lib/python3.13/asyncio/base_events.py", line 878, in call_soon_threadsafe
+      self._check_closed()
+      ~~~~~~~~~~~~~~~~~~^^
+    File "/usr/lib/python3.13/asyncio/base_events.py", line 556, in _check_closed
+      raise RuntimeError('Event loop is closed')
+  RuntimeError: Event loop is closed
+  
+  During handling of the above exception, another exception occurred:
+  
+  Traceback (most recent call last):
+    File "/usr/lib/python3.13/threading.py", line 1043, in _bootstrap_inner
+      self.run()
+      ~~~~~~~~^^
+    File "/usr/lib/python3.13/threading.py", line 994, in run
+      self._target(*self._args, **self._kwargs)
+      ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "/home/jasonperlow/.local/lib/python3.13/site-packages/aiosqlite/core.py", line 75, in _connection_worker_thread
+      future.get_loop().call_soon_threadsafe(set_exception, future, e)
+      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+    File "/usr/lib/python3.13/asyncio/base_events.py", line 878, in call_soon_threadsafe
+      self._check_closed()
+      ~~~~~~~~~~~~~~~~~~^^
+    File "/usr/lib/python3.13/asyncio/base_events.py", line 556, in _check_closed
+      raise RuntimeError('Event loop is closed')
+  RuntimeError: Event loop is closed
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnhandledThreadExceptionWarning(msg))
+
+tests/test_styx_source.py::test_http_source_reads_large_chunked_multipage_stream_completely
+  /home/jasonperlow/.local/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+tests/test_styx_source.py::test_http_source_reads_large_chunked_multipage_stream_completely
+  /home/jasonperlow/.local/lib/python3.13/site-packages/uvicorn/protocols/websockets/websockets_impl.py:17: DeprecationWarning: websockets.server.WebSocketServerProtocol is deprecated
+    from websockets.server import WebSocketServerProtocol
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_kronos_backends.py::test_gpu_backend_imports_and_computes_or_falls_back
+FAILED tests/test_kronos_backends.py::test_selector_gpu_env_returns_working_backend_without_required_cupy
+FAILED tests/test_postgres_embedding_dim.py::test_runtime_settings_pg_backend_overrides_toml_init
+FAILED tests/test_required_audit_mutations.py::test_required_archive_route_rolls_back_append_failure[sqlite]
+FAILED tests/test_required_audit_mutations.py::test_best_effort_archive_commits_append_failure[sqlite]
+FAILED tests/test_required_audit_mutations.py::test_actual_archive_hash_covers_driver_vector[sqlite]
+FAILED tests/test_required_audit_mutations.py::test_required_archival_worker_rolls_back[sqlite]
+FAILED tests/test_required_audit_mutations.py::test_required_missing_secret_does_not_commit_archive[sqlite]
+FAILED tests/test_required_audit_mutations.py::test_best_effort_sql_error_uses_savepoint[sqlite]
+9 failed, 5834 passed, 658 skipped, 2 xfailed, 3 xpassed, 906 warnings in 157.00s (0:02:37)

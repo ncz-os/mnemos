@@ -1,0 +1,18 @@
+zoder: warning: model "nvidia/switchyard": no complete input/output pair or blended rate, skipping model
+zoder: warning: model "openrouter/auto-beta": no complete input/output pair or blended rate, skipping model
+zoder: warning: model "typesafe/jev-router": no complete input/output pair or blended rate, skipping model
+zoder: warning: skipped 3 malformed model entries in /home/jasonperlow/.zoder/pricing.json
+[zoder] still waiting for minimax-flash after 30s (server busy, queueing, prefilling or generating; request budget 120s)
+[zoder] still waiting for cerberus-reviewer after 30s (server busy, queueing, prefilling or generating; request budget 120s)
+zoder: warning: model "nvidia/switchyard": no complete input/output pair or blended rate, skipping model
+zoder: warning: model "openrouter/auto-beta": no complete input/output pair or blended rate, skipping model
+zoder: warning: model "typesafe/jev-router": no complete input/output pair or blended rate, skipping model
+zoder: warning: skipped 3 malformed model entries in /home/jasonperlow/.zoder/pricing.json
+[zoder] still waiting for minimax-flash after 30s (server busy, queueing, prefilling or generating; request budget 120s)
+[zoder] still waiting for minimax-flash after 60s (server busy, queueing, prefilling or generating; request budget 120s)
+zoder: warning: model "nvidia/switchyard": no complete input/output pair or blended rate, skipping model
+zoder: warning: model "openrouter/auto-beta": no complete input/output pair or blended rate, skipping model
+zoder: warning: model "typesafe/jev-router": no complete input/output pair or blended rate, skipping model
+zoder: warning: skipped 3 malformed model entries in /home/jasonperlow/.zoder/pricing.json
+[zoder] review: 2/3 reviewers succeeded (1 failed; partial review)
+zoder: error: review incomplete: 1/3 reviewers failed

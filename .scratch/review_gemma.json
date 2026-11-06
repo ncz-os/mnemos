@@ -1,0 +1,60 @@
+{
+  "chunking": {
+    "budget_bytes": 9000,
+    "chunk_cap_bytes": 9000,
+    "context_bytes": 2461,
+    "context_capped": true,
+    "diff_bytes": 37077,
+    "mode": "chunked",
+    "reason": "diff or definition context exceeds the single-review budget",
+    "window_tokens": null
+  },
+  "complete": false,
+  "context": {
+    "cache_hit_tokens": 0,
+    "cache_miss_tokens": 0,
+    "cache_reported_calls": 0,
+    "calls": 0,
+    "completion_tokens": 0,
+    "final_prompt_tokens": 0,
+    "hit_share": null,
+    "peak_prompt_tokens": 0,
+    "per_call": [],
+    "prompt_tokens": 0,
+    "resent_prompt_tokens": 0
+  },
+  "cost_usd": 0.0,
+  "exclusions": {
+    "bytes": 0,
+    "count": 0,
+    "files": []
+  },
+  "failed_models": 1,
+  "failure": {
+    "class": "transient",
+    "code": "reviewers_unavailable",
+    "detail": {
+      "message": "review failed: 0/1 reviewers completed (all errors; see diagnostics above). A review that no model produced must not be reported as success."
+    }
+  },
+  "filtered_findings": [],
+  "ok_models": 0,
+  "provenance": [],
+  "requested": 1,
+  "reviewers": [
+    {
+      "escalation_reason": null,
+      "filtered_findings": [],
+      "findings": [],
+      "forced_family_conflict": false,
+      "model": "(failed)",
+      "next_steps": [],
+      "ok": false,
+      "summary": "reviewer failed: review chunk 1/7: no real provider is configured for reviewer model 'gemma4-31b': no provider in the zoder config serves that id, so it would fall through to the api.example.com placeholder and fail (a model listed by `zoder models` is routable only when a provider's `serves` list covers it). Configured reviewer routes: cerberus-reviewer=cerberus-reviewer, tydeus-reviewer=tydeus-reviewer, nvidia-eih=nvidia/nemotron-3-ultra-550b-a55b. Pass `-m <model>` with one of the configured reviewer models.",
+      "verdict": "comment"
+    }
+  ],
+  "skipped_unhealthy": [],
+  "substituted": false,
+  "verdict": "request_changes"
+}
