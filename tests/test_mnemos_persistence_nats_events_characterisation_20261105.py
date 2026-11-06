@@ -809,20 +809,6 @@ def test_xfail_world_read_gate_rejects_group_only_rows(monkeypatch):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "DEFECT 2b (NATS-EVENTS-CHAR-2): the gate never inspects the tens "
-        "(group/owner) digit at all — only `mode % 10 >= 4`. A 460 row "
-        "(group-readable, world-denied under a normal reading where the UNITS "
-        "digit is the world bit) is forwarded offsite because its units digit "
-        "is 6; a 660 row (group+owner world-readable under the same reading) "
-        "is refused for its units digit being 0. The offsite posture can "
-        "therefore forward group-only rows and refuse world-readable ones."
-    ),
-)
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
         "DEFECT 3 (NATS-EVENTS-CHAR-3): empty-string content keeps the "
         "`or ''` default from firing — `'' or ''` is `''`, so content-missing "
         "and content-empty are indistinguishable in the event payload; the "
