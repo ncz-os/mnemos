@@ -166,3 +166,51 @@ def test_trigger_never_inserts_a_metadata_only_event(dialect):
         assert "'metadata'" not in statement, (
             f"{dialect}: a trigger INSERT writes an event_kind='metadata' row; metadata-only writes must append nothing"
         )
+
+
+@pytest.mark.parametrize("dialect", ["sqlite", "mysql", "mariadb", "postgres", "oracle", "db2"])
+def test_seq_is_the_pending_watermark_not_the_primary_key(dialect):
+    """``seq IS NULL`` must keep meaning "not yet published".
+
+    The absorption predicate filters on ``seq IS NULL``. That is only correct
+    because ``event_id`` is the identity column and ``seq`` is a nullable
+    watermark the publisher assigns later. Pin the 0062 shape so a future
+    "cleanup" cannot make ``seq`` the primary key, which would turn every
+    ``seq IS NULL`` check into a filter that never matches.
+    """
+    # MariaDB has no 0062 of its own: it runs the MySQL schema verbatim
+    # (wire-compatible), so the MySQL definition is the one that governs it.
+    directory = {"postgres": "migrations", "mariadb": "migrations_mysql"}.get(dialect, f"migrations_{dialect}")
+    definition = (MIGRATIONS / directory / "0062_federation_journal.sql").read_text()
+
+    table = re.search(r"CREATE TABLE[^(]*federation_changes \((.*?)\)\s*[;@']", definition, re.S)
+    assert table, f"{dialect}: cannot find the federation_changes definition"
+    body = table.group(1)
+    event_id = re.search(r"event_id ([^,]*?PRIMARY KEY)", body)
+    assert event_id, f"{dialect}: event_id is not the primary key"
+    seq = re.search(r"\bseq (\w+)", body)
+    assert seq, f"{dialect}: no seq column"
+    assert "PRIMARY KEY" not in seq.group(1) and "NOT NULL" not in seq.group(1), (
+        f"{dialect}: seq must stay a nullable watermark, never the identity: {seq.group(0)!r}"
+    )
+
+
+@pytest.mark.parametrize("dialect", sorted(FILES))
+def test_event_kind_has_a_content_default_so_legacy_rows_backfill(dialect):
+    """ADD COLUMN ... DEFAULT 'content' backfills existing rows.
+
+    Without the default, rows inserted before the migration would carry NULL
+    and escape both the content and metadata branches. With it, every
+    pre-existing row is content (which is what the old trigger meant).
+    """
+    text = FILES[dialect].read_text()
+    add = re.search(r"ADD (?:COLUMN )?(?:IF NOT EXISTS )?event_kind[^;@\n]*", text)
+    assert add, f"{dialect}: no event_kind ADD COLUMN"
+    # Postgres splits the default onto a following ALTER COLUMN ... SET DEFAULT
+    # (ADD COLUMN IF NOT EXISTS has no inline DEFAULT arm); every other dialect
+    # carries it inline.
+    same_statement = text[add.start() :].split(";", 1)[0]
+    asserts_default = "DEFAULT 'content'" in same_statement or re.search(
+        r"ALTER COLUMN event_kind SET DEFAULT 'content'", text
+    )
+    assert asserts_default, f"{dialect}: event_kind must default to 'content' so legacy rows backfill: {add.group(0)!r}"

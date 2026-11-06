@@ -153,6 +153,18 @@ so N recalls between publisher passes leave zero extra rows, and a recall
 followed by a real edit leaves exactly one content event carrying current
 state.
 
+**`seq` is a nullable watermark, not the identity.** `event_id` is the
+primary key on every dialect; `seq` is assigned by the publisher, so a queued
+row has `seq IS NULL` and a published one does not. The publisher's own
+pending selector is `WHERE seq IS NULL`. That is why the absorption predicate
+keys on it — it selects *unpublished* rows.
+
+**`event_kind` defaults to `'content'`.** The `ADD COLUMN` default backfills
+every pre-existing row (Postgres sets it via a following `ALTER COLUMN …
+SET DEFAULT`). Rows written by the publisher's re-advertise path, which names
+neither `seq` nor `event_kind`, also inherit `'content'`. So no row can be
+left with a NULL kind and escape both branches.
+
 **The trigger never inserts an `event_kind='metadata'` row.** That is the
 whole point: the counter may not be journaled. The absorption `DELETE
 (federation_changes … WHERE memory_id = ? AND seq IS NULL AND event_kind =
@@ -177,6 +189,14 @@ node that has not applied 0072 yet is still not a correctness problem.
   decision is an explicit value comparison, not `UPDATING()` (0068: `UPDATING()`
   is true even for a same-value write, so it cannot be used to decide whether
   anything changed).
+* **SQLite `IS NOT` is intentional, not a bug.** `IS NOT` is SQLite's
+  null-safe inequality: it is true for `a='x' b='y'`, true for `a=NULL b='z'`,
+  and false for `a=NULL b=NULL`. `<>` would be the wrong operator here —
+  `NULL <> 'keep this'` evaluates to NULL, so every change *to* or *from* NULL
+  (`verbatim_content` clearing, a nullable `owner_id`) would silently stop
+  being journalled. `IS NOT` is also the convention the pre-existing 0062 /
+  0064 / v7_2 SQLite triggers already use. Replacing it with `<>` breaks
+  absorption and drops null-transition events; both are pinned by tests.
 * **SQLite** — two disjoint `AFTER UPDATE OF` triggers with disjoint column
   lists: `fed_journal_update` enumerates the content columns only (so a recall
   bump can never match it) and `fed_journal_update_metadata` names exactly the

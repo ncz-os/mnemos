@@ -221,3 +221,43 @@ async def test_recall_between_edit_and_publish_does_not_drop_the_edit(backend):
 
     rows = await _journal(backend, "m1")
     assert [row["event_kind"] for row in rows] == ["content", "content"], rows
+
+
+@pytest.mark.asyncio
+async def test_null_transition_is_journalled_which_angle_brackets_would_miss(backend):
+    """``IS NOT`` is deliberate: it is SQLite's null-safe inequality.
+
+    A change *to* NULL (``verbatim_content = NULL``) is a real federated
+    change, and ``<>`` evaluates to NULL for it — so a ``<>`` predicate would
+    silently drop the event. This pins the transition that the naive
+    "IS NOT is only for NULLs, use <>" advice would break.
+    """
+    await _seed(backend)
+    await _exec(backend, "UPDATE memories SET verbatim_content = ? WHERE id = ?", "keep", "m1")
+    before = len(await _journal(backend, "m1"))
+
+    await _exec(backend, "UPDATE memories SET verbatim_content = NULL WHERE id = ?", "m1")
+
+    after = await _journal(backend, "m1")
+    assert len(after) == before + 1, "a non-NULL -> NULL content change must be journalled"
+    assert after[-1]["event_kind"] == "content"
+
+
+@pytest.mark.asyncio
+async def test_seq_is_publishable_so_seq_is_null_is_the_pending_marker(backend):
+    """``seq`` is not the primary key and is not always set.
+
+    Every queued row starts with ``seq IS NULL`` and the publisher assigns it.
+    If ``seq`` were never NULL the journal would have no pending rows at all,
+    so the absorption predicate's ``seq IS NULL`` is what selects unpublished
+    rows — not a filter that can never match.
+    """
+    await _seed(backend)
+    rows = await _rows(
+        backend,
+        "SELECT event_id, seq FROM federation_changes WHERE memory_id = ?",
+        "m1",
+    )
+    assert rows, "seed insert must queue a journal row"
+    assert all(row["seq"] is None for row in rows), "queued rows are pending (seq IS NULL)"
+    assert all(row["event_id"] is not None for row in rows), "event_id, not seq, is the identity"
