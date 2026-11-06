@@ -206,10 +206,10 @@ async def test_create_entity_with_pool_inserts_and_returns_row_id(caplog):
     insert = _statements(conn, "fetchrow")
     assert len(insert) == 1
     sql, args = insert[0]
-    # The INSERT carries the freshly generated id (NOT the returned/row id —
-    # the upsert's RETURNING decides what the caller sees), the scoped
-    # owner, the type/name, and the metadata serialised as JSON.
-    assert args[0] != entity_id  # generated id differs from the pinned row id
+    # The INSERT carries a freshly generated uuid4 (the fake always returns
+    # the pinned row, so it differs from the returned id with probability 1),
+    # the scoped owner, the type/name, and the metadata serialised as JSON.
+    assert args[0] != row["id"]  # generated insert id differs from the pinned row id
     assert args[1] == "u1"
     assert args[2] == "ns1"
     assert args[3] == "project"
