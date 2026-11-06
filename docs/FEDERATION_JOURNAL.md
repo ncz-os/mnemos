@@ -113,3 +113,69 @@ including that the skip count accumulates across pages of a single sync),
 against commit `0073bb4`; on current master those lookups live at `:5980` and
 `:5986` and no longer carry the filter.** File:line leads from that report are
 against a 48-commit-older tree — re-read before trusting them.
+
+## What writes journal events, and what is metadata-only (0072)
+
+Measured 2026-11-06 on the production source: **2,382,263** journal events for **31,730** live
+memories — **75 events per memory**. A fresh replica replaying that journal in
+pages of 100 at ~0.25 s per page needs ~1.6 hours to catch up, spends most of
+it re-delivering rows it already has (visible as "no growth for long
+stretches"), and the replica pulled 3,959,950 rows for a 29k corpus.
+
+Causes, in order of contribution:
+
+| Cause | Write | Content change? |
+|---|---|---|
+| Recall bookkeeping | `UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = ...` in `bump_recall_and_get_memory` / `bump_recall_counts` (every dialect) | **no** |
+| Embedding / compression touch | `UPDATE memories SET embedding = ...`, distill/compress rewrites | yes (embedding) |
+| Lifecycle | soft-delete, archive, consolidate, restore | yes |
+| Real edit | `content` / `metadata` / `verbatim_content` / `namespace` / `category` / `permission_mode` | yes |
+
+Recall bookkeeping dominates: it is the highest-frequency write in the system
+(every search hit that binds a memory), it does not touch any column the export
+predicate `eligible_for_federation` reads, and the current-state resolver does
+not put `recall_count` / `last_recalled_at` on the wire. An event appended for
+it can therefore only tell a peer *again* about content the peer already has.
+
+Migration `0072_federation_journal_metadata_only` (all five dialect families)
+splits the change predicate column-by-column:
+
+* **CONTENT** — `federation_source`, `content`, `category`, `namespace`,
+  `owner_id`, `permission_mode`, `deleted_at`, `archived_at`,
+  `consolidated_into`, `embedding`, `metadata`, `verbatim_content` → one
+  journal event, as before.
+* **METADATA-ONLY** — `recall_count`, `last_recalled_at` → **no event**.
+
+The outbox row records which kind it is in `federation_changes.event_kind`
+(`content` / `metadata`). A metadata-only write first absorbs any pending
+metadata-only rows already queued for that memory and then does nothing else,
+so N recalls between publisher passes leave zero extra rows, and a recall
+followed by a real edit leaves exactly one content event carrying current
+state.
+
+Already-queued rows are left untouched; the publisher coalesces pending rows per
+memory on its own (one event per memory per pass, current state attached), so a
+node that has not applied 0072 yet is still not a correctness problem.
+
+### Per-dialect notes
+
+* **PostgreSQL / MySQL / MariaDB / Db2 / Oracle** — the content/metadata
+  decision is an explicit value comparison, not `UPDATING()` (0068: `UPDATING()`
+  is true even for a same-value write, so it cannot be used to decide whether
+  anything changed).
+* **SQLite** — two disjoint `AFTER UPDATE OF` triggers with disjoint column
+  lists: `fed_journal_update` enumerates the content columns only (so a recall
+  bump can never match it) and `fed_journal_update_metadata` names exactly the
+  two bookkeeping columns. Disjoint by construction, so the unspecified firing
+  order of overlapping triggers does not matter.
+* **Column scoping everywhere** — every dialect except Postgres fires only for
+  statements whose `SET` list names a journaled column. That is not an
+  optimisation, it is what makes the METADATA-ONLY branch *absorb* rather than
+  merely stay silent: a statement that touches nothing but
+  `recall_count`/`last_recalled_at` must still delete the pending metadata-only
+  rows for that memory, and a trigger that never fires cannot do that. Postgres
+  fires per row for any UPDATE, so it branches on values alone.
+* **Oracle** — `content` / `metadata` / `verbatim_content` are CLOBs, compared
+  with `DBMS_LOB.COMPARE`; the vector column with `VECTOR_DISTANCE`.
+* **Db2** — no `ELSIF`; the split is computed into INTEGER flags and branched
+  with `IF` / `ELSEIF`.
