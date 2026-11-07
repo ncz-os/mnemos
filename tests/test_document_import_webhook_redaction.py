@@ -20,7 +20,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from mnemos.api.routes import document_import
 from tests._charon_fake_backend import install_fake_backend
 
 pytestmark = pytest.mark.asyncio

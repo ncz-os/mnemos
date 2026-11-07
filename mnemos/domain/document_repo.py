@@ -24,10 +24,37 @@ class DocumentChunkSoftDeletedConflictError(ValueError):
     """Raised when a chunk key matches a soft-deleted memory."""
 
 
+def _metadata_obj(metadata_json: str) -> dict[str, Any]:
+    """Decode persisted chunk metadata for the import outcome.
+
+    ``import_chunk`` serialises the classified metadata itself, so this
+    round-trip is well-formed; an unparsable blob degrades to the empty dict
+    rather than failing a write that already committed.
+    """
+    try:
+        decoded = json.loads(metadata_json) if metadata_json else {}
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
 @dataclass(frozen=True)
 class ImportedDocumentChunk:
+    """Outcome of one chunk write.
+
+    ``namespace`` and ``metadata`` echo what was actually PERSISTED, which can
+    differ from what the route asked for: ``import_chunk`` classifies the
+    chunk text and auto-vaults a VAULT-class chunk into ``vault``, stamping
+    ``secret_redact_fields`` / ``secret_vaulted`` into its metadata. Downstream
+    consumers of the write (notably the ``memory.created`` webhook payload)
+    must read these fields, not the route's pre-write locals, or they leak the
+    raw secret and the pre-vault namespace (MN-02 / CF-05, SEC F2.4).
+    """
+
     memory_id: str
     emit_created_event: bool = True
+    namespace: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class DocumentRepository:
@@ -133,7 +160,11 @@ class DocumentRepository:
             metadata=classified.metadata,
             writer_id=owner_id,
         )
-        return ImportedDocumentChunk(memory_id=memory_id)
+        return ImportedDocumentChunk(
+            memory_id=memory_id,
+            namespace=namespace,
+            metadata=_metadata_obj(metadata_json),
+        )
 
     async def _import_postgres_chunk(
         self,
@@ -183,6 +214,8 @@ class DocumentRepository:
             legacy_id = None
 
         if legacy_id is not None:
+            # Legacy resolution reuses an EXISTING row; its stored metadata is
+            # authoritative and ``classified.metadata`` above was never written.
             return ImportedDocumentChunk(memory_id=str(legacy_id), emit_created_event=False)
 
         canonical_id = await conn.fetchval(
@@ -210,7 +243,11 @@ class DocumentRepository:
             raise DocumentChunkSoftDeletedConflictError(
                 "Document chunk matches a soft-deleted memory; restore it before retrying this import"
             )
-        return ImportedDocumentChunk(memory_id=str(canonical_id))
+        return ImportedDocumentChunk(
+            memory_id=str(canonical_id),
+            namespace=namespace,
+            metadata=_metadata_obj(metadata_json),
+        )
 
 
 async def _write_document_import_audit_entry(
