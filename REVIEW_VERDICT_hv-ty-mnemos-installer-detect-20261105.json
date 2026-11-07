@@ -1,0 +1,10 @@
+{
+  "reviewers": [
+    {
+      "model": "nvidia/nemotron-3-ultra-550b-a55b",
+      "verdict": "approve"
+    }
+  ],
+  "head_sha": "256114bc636840732a282e5071158c3ffc03d639",
+  "reason": "The branch adds isolated characterization coverage for the installer detector. The strict xfail explicitly records the existing unmapped-distro fallback defect, with no production changes or other material review issue found."
+}
