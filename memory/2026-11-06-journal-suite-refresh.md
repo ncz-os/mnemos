@@ -9,8 +9,8 @@
   embedding-contract, mcp oauth/principal-cache, http-auth-toggle, etc.).
   Nothing new broke; the branch's own journal characterisation suite still passes
   (141 passed, 3 xfailed strict across both characterisation files).
-- Pushed the SAME branch name to ARGONAS (`origin` = ssh://192.168.207.101/mnt/datapool/git/mnemos.git);
-  local HEAD == remote SHA, upstream tracking set, worktree clean.
+- Pushed the SAME branch name to the configured remote (the `origin` remote of
+  this checkout); local HEAD == remote SHA, upstream tracking set, worktree clean.
 - `hive_worker.py --verify-delivery <workdir> ed293693...` → `delivery_ready: true`, exit 0.
 - Note: `zoder mnemos --search/--record` is unusable on this host (MNEMOS_URL unset);
   state was verified directly from Git instead.
