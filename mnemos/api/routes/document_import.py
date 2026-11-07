@@ -671,19 +671,14 @@ async def import_memories_from_document(
             raise
 
     # Side-effects done outside the per-chunk acquire so the connection isn't
-    # held while we contact Redis / schedule webhook send tasks. Cache is
-    # invalidated ONCE after the whole document — a 100-chunk document would
-    # otherwise thrash search cache N times. Send tasks for the deliveries
-    # whose outbox rows are already committed get scheduled here.
+    # held while we touch the stats cache / schedule webhook send tasks. The
+    # stats entry is invalidated ONCE after the whole document. Send tasks for
+    # the deliveries whose outbox rows are already committed get scheduled
+    # here.
     if memory_ids:
         if _lc._cache:
             try:
                 await _lc._cache.delete("stats:global")
-                try:
-                    async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                        await _lc._cache.delete(_k)
-                except Exception:
-                    pass
             except Exception:
                 pass
         if pending_delivery_ids:
