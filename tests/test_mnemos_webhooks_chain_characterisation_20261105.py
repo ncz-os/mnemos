@@ -79,14 +79,24 @@ class _FakeConn:
         return self.execute_result
 
 
-class _SqliteConn:
+class _SqliteHomeConn(_FakeConn):
+    """A recording connection whose ``__module__`` claims a sqlite family.
+
+    It records everything like ``_FakeConn`` so a test can assert on the
+    *same object* it passed to the function under test — the skip-arm
+    assertion is only meaningful if the recorded connection is the one
+    that was actually handed over.
+    """
+
+
+class _SqliteConn(_SqliteHomeConn):
     """``sqlite3``-home connection — no advisory lock is taken on it."""
 
 
 _SqliteConn.__module__ = "sqlite3"
 
 
-class _AiosqliteConn:
+class _AiosqliteConn(_SqliteHomeConn):
     """``aiosqlite``-home connection — also lock-free."""
 
 
@@ -398,6 +408,9 @@ def test_record_value_supports_asyncpg_style_mapping_and_attribute_records():
     record = _PlainRecord(url="https://a.test")
     assert chain._record_value(record, "url") == "https://a.test"
     assert chain._record_value({"url": "https://b.test"}, "url") == "https://b.test"
+    # A record exposing only ``__getitem__`` (no usable attributes) takes the
+    # mapping arm and is read by key.
+    assert chain._record_value(_MappingRecord({"url": "https://c.test"}), "url") == "https://c.test"
 
 
 # ---------------------------------------------------------------------------
@@ -636,16 +649,139 @@ def test_lock_key_returns_zero_for_an_all_zero_digest():
 
 
 # ---------------------------------------------------------------------------
+# Cross-module lock-key parity (rolling-deploy contract)
+# ---------------------------------------------------------------------------
+
+# There are three live copies of the derivation. Old leases held by
+# ``chain.py``/``lease.py`` and new leases held by the persistence layer MUST
+# derive the same int, or a rolling deploy briefly runs two mutually
+# non-excluding locks over the same chain. The docstrings call this a
+# byte-for-byte contract; these tests are what actually enforce it.
+
+
+def _lock_key_implementations():
+    """The three copies of the derivation, imported together."""
+    from mnemos.persistence import postgres as persistence_postgres
+    from mnemos.webhooks import lease
+
+    return {
+        "chain": chain._delivery_chain_lock_key,
+        "lease": lease._delivery_chain_lock_key,
+        "persistence.postgres": persistence_postgres._delivery_chain_lock_key,
+    }
+
+
+def test_lock_key_is_identical_across_every_module_copy():
+    """Byte-for-byte parity across chain.py, lease.py and persistence.postgres."""
+    implementations = _lock_key_implementations()
+    assert set(implementations) == {"chain", "lease", "persistence.postgres"}
+
+    for delivery in (
+        _DELIVERY,
+        {**_DELIVERY, "subscription_id": "sub-2"},
+        {**_DELIVERY, "event_type": "memory.updated"},
+        {**_DELIVERY, "payload_hash": "def456"},
+        {"subscription_id": 7, "event_type": "e", "payload_hash": "h"},
+        {"subscription_id": "", "event_type": "", "payload_hash": ""},
+    ):
+        derived = {name: fn(delivery) for name, fn in implementations.items()}
+        assert len(set(derived.values())) == 1, derived
+
+
+def test_lock_key_parity_holds_across_a_wide_identity_sweep():
+    """Parity is not an accident of the few identities pinned above."""
+    implementations = _lock_key_implementations()
+
+    for index in range(200):
+        delivery = {
+            "subscription_id": f"sub-{index}",
+            "event_type": f"event.{index % 7}",
+            "payload_hash": hashlib.sha256(str(index).encode()).hexdigest(),
+        }
+        derived = {fn(delivery) for fn in implementations.values()}
+        assert len(derived) == 1, (delivery, derived)
+
+
+def test_lock_key_parity_includes_signed_int64_folding():
+    """Parity must survive the fold, not just the easy positive-key cases.
+
+    ``persistence.postgres`` takes no injected hashlib, so the real digest is
+    used; the sweep above covers ~200 identities and therefore both signs.
+    This test pins that both ranges actually occur, so the sweep above cannot
+    silently decay into a positive-only comparison.
+    """
+
+    implementations = _lock_key_implementations()
+    keys = [
+        implementations["chain"]({"subscription_id": f"s{i}", "event_type": "e", "payload_hash": f"h{i}"})
+        for i in range(200)
+    ]
+
+    assert any(key >= 0 for key in keys)
+    assert any(key < 0 for key in keys)
+    for key in keys:
+        assert -(2**63) <= key < 2**63
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        (2**63).to_bytes(8, "big"),
+        (2**63 - 1).to_bytes(8, "big"),
+        (2**63 + 1).to_bytes(8, "big"),
+        (2**64 - 1).to_bytes(8, "big"),
+        b"\x00" * 8,
+    ],
+    ids=["exact-boundary", "one-below", "one-above", "max", "zero"],
+)
+def test_lock_key_parity_holds_at_the_int64_fold_boundary(monkeypatch, digest):
+    """Force the digest to the fold boundary and require all copies to agree.
+
+    A random sweep cannot reach ``key == 2**63`` (a 1-in-2**64 draw), so the
+    ``>=`` vs ``>`` distinction is only observable with a forced digest. Each
+    copy calls ``hashlib.sha256`` through the shared module, so patching that
+    attribute drives every copy from one value.
+    """
+
+    class _Digest:
+        @staticmethod
+        def digest():
+            return digest
+
+    class _Sha:
+        @staticmethod
+        def sha256(payload: bytes):
+            return _Digest()
+
+    monkeypatch.setattr(hashlib, "sha256", _Sha.sha256)
+
+    implementations = _lock_key_implementations()
+    derived = {name: fn(_DELIVERY) for name, fn in implementations.items()}
+
+    assert len(set(derived.values())) == 1, derived
+    # And the agreed value is the documented fold, not merely a consistent
+    # wrong one: an unsigned read would return 2**63 rather than -2**63.
+    raw = int.from_bytes(digest, "big", signed=False)
+    expected = raw - 2**64 if raw >= 2**63 else raw
+    assert derived["chain"] == expected
+
+
+# ---------------------------------------------------------------------------
 # _lock_delivery_chain
 # ---------------------------------------------------------------------------
 
 
 def test_lock_delivery_chain_skips_sqlite_connections():
-    conn = _FakeConn()
+    """No advisory lock is taken on either sqlite family.
 
-    assert _run(chain._lock_delivery_chain(_SqliteConn(), _DELIVERY)) is None
-    assert conn.calls == []
-    assert _run(chain._lock_delivery_chain(_AiosqliteConn(), _DELIVERY)) is None
+    The assertion must be made on the connection handed to the function:
+    an unused fake's empty call log proves nothing about the skip-arm.
+    """
+    for conn_type in (_SqliteConn, _AiosqliteConn):
+        conn = conn_type()
+
+        assert _run(chain._lock_delivery_chain(conn, _DELIVERY)) is None
+        assert conn.calls == []
 
 
 def test_lock_delivery_chain_takes_the_advisory_lock_on_postgres():
@@ -680,10 +816,15 @@ def test_lock_delivery_chain_propagates_driver_errors():
 
 
 def test_lock_delivery_chain_missing_identity_field_raises_before_executing():
-    conn = _FakeConn()
+    """The key is derived before any statement runs: no execute on failure.
+
+    Asserts on the connection actually passed in, so the "no execute before
+    the KeyError" ordering is genuinely verified.
+    """
+    conn = _AsyncpgConn()
 
     with pytest.raises(KeyError, match="event_type"):
-        _run(chain._lock_delivery_chain(_AsyncpgConn(), {"subscription_id": "s", "payload_hash": "h"}))
+        _run(chain._lock_delivery_chain(conn, {"subscription_id": "s", "payload_hash": "h"}))
     assert conn.calls == []
 
 
