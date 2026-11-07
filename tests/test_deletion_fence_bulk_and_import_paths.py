@@ -346,10 +346,21 @@ async def test_bulk_create_root_bypasses_fence_on_own_scope(
 
 
 async def test_document_import_refuses_before_first_chunk(monkeypatch):
-    """The whole document is refused; no chunk is written."""
+    """The whole document is refused; no chunk is written.
+
+    The backend is a real ``FakeBackend`` (it exposes ``memories`` and records
+    every ``insert_memory`` call), not a bare ``SimpleNamespace``. A bare
+    namespace still made this test pass, but only by accident: the fence raises
+    its 409 before the handler touches ``backend.memories``, so the missing
+    attribute never surfaced. That made the assertion depend on statement
+    order rather than on the property under test -- any later edit that touched
+    the backend first would have failed with a confusing ``AttributeError``
+    instead of a useful fence assertion. With a faithful backend the test also
+    proves the stronger claim in its name: not one chunk row was inserted.
+    """
     from mnemos.api.routes import document_import
 
-    backend = SimpleNamespace()
+    backend = install_fake_backend(monkeypatch)
     monkeypatch.setattr(document_import, "backend_or_503", lambda: backend)
     monkeypatch.setattr(document_import, "DOCLING_AVAILABLE", True)
 
@@ -373,6 +384,27 @@ async def test_document_import_refuses_before_first_chunk(monkeypatch):
         )
 
     assert excinfo.value.status_code == 409, excinfo.value.detail
+    # The refusal is a whole-document refusal: no chunk row reached storage.
+    inserts = [call for call in backend.memories.calls if call[0] == "insert_memory"]
+    assert inserts == [], f"fence refused the import but still wrote chunks: {inserts}"
+
+    # And the fence is the reason: with no active deletion the same handler
+    # proceeds past it (it fails later on unrelated fixture gaps, but it must
+    # not raise the 409). This pins the 409 to the fence rather than to any
+    # other rejection on the path.
+    with _no_fence_patch():
+        try:
+            await document_import.import_memories_from_document(
+                file=SimpleNamespace(filename="doc.md"),
+                project_tag="proj",
+                user=_user(),
+            )
+        except HTTPException as exc:
+            assert exc.status_code != 409, "a 409 was raised with no active deletion"
+        except Exception:
+            # Any other failure means the request got PAST the fence, which is
+            # the property under test.
+            pass
 
 
 @pytest.mark.asyncio
