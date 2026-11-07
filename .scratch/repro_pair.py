@@ -1,4 +1,6 @@
-import asyncio, sys, tempfile
+import asyncio
+import sys
+import tempfile
 from pathlib import Path
 sys.path.insert(0, ".scratch")
 from _pytest.monkeypatch import MonkeyPatch
@@ -10,7 +12,7 @@ async def main():
     try:
         source = await pair.open_backend(tmp/"src.db")
         replica = await pair.open_backend(tmp/"rep.db")
-        app = pair.build_source_app(source, mp)
+        pair.build_source_app(source, mp)
         peer = await pair.register_peer(replica)
         await pair.sync(replica, peer["id"])
 
@@ -48,7 +50,8 @@ async def main():
                 row = await source.federation.get_feed_memory(tx, mid, namespaces=[], categories=[])
             if row is None:
                 print("  BYID 404:", mid)
-        await source.close(); await replica.close()
+        await source.close()
+        await replica.close()
     finally:
         mp.undo()
 

@@ -2,7 +2,7 @@
 
 Some provider/model pairs can never be served, and the gateway now refuses
 them locally instead of spending a round trip discovering that upstream. The
-single source of truth is `mnemos/domain/route_policy.py`:
+single source of truth is `mnemos/core/route_policy.py`:
 `check_route(provider, model_id)` returns `None` when a pair may be
 dispatched, or a reason string naming the rule that bans it.
 

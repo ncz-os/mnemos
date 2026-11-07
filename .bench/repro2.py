@@ -1,4 +1,5 @@
-import asyncio, sys
+import asyncio
+import sys
 sys.path.insert(0, "tests")
 from unittest.mock import MagicMock
 import mnemos.api.dependencies as auth_mod
@@ -19,8 +20,11 @@ def _run_bg(coro):
         coro.close()
     return None
 lc._schedule_background = _run_bg
-req = MagicMock(); req.app.state.persistence_backend = _backend(oauth); req.cookies = {}
-creds = MagicMock(); creds.credentials = "test-key"
+req = MagicMock()
+req.app.state.persistence_backend = _backend(oauth)
+req.cookies = {}
+creds = MagicMock()
+creds.credentials = "test-key"
 print("start")
 print(asyncio.run(auth_mod.get_current_user(req, creds)))
 print("done", oauth.touch_calls)

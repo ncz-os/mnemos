@@ -94,6 +94,8 @@ mnemos serve --profile dev
 pytest -q
 ```
 
+- `tests/test_knossos_phase1.py` needs `mcp>=1.0.0,<2` (mcp 2.x removed `Server.list_tools()`); on mcp 2.x, or with mcp absent, it skips at module level with the version in the reason — see `docs/verification/knossos-collection-20261101.md`.
+
 - Run lint before handoff:
 
 ```bash

@@ -18,13 +18,72 @@ httpx is never reached. The tests run in <0.5s combined.
 from __future__ import annotations
 
 import sys
+from importlib import metadata
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
 
+# ── mcp dependency gate ──────────────────────────────────────────────────────
+# mnemos.tools.knossos_mcp registers its tools with the low-level convenience
+# decorators `Server.list_tools()` and `Server.call_tool()`. Every mcp release up
+# to 1.30.0 provides them; mcp 2.x removed them in favour of
+# `add_request_handler()` / `add_notification_handler()`. With 2.x installed the
+# import below raises
+#
+#     AttributeError: 'Server' object has no attribute 'list_tools'
+#
+# at module import, which pytest reports as a collection ERROR for the whole
+# file. The repo already pins `mcp>=1.0.0,<2`, so this is an out-of-range
+# environment, not a code defect: gate on the installed version and skip with
+# that reason. The gate skips on a version verdict only — any other import
+# failure still fails the run, so a real regression can never be hidden here.
+MCP_CEILING = (2, 0, 0)
+MCP_RANGE = "mcp>=1.0.0,<2"
+
+
+def _parse_version(text: str) -> Optional[Tuple[int, ...]]:
+    """Leading (major, minor, patch) of a version string, or None if unusable."""
+    parts: List[int] = []
+    for piece in text.split(".")[:3]:
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        if not digits:
+            return None
+        parts.append(int(digits))
+    return tuple(parts) if len(parts) == 3 else None
+
+
+def _mcp_skip_reason(installed: Optional[str] = None) -> Optional[str]:
+    """Why this module cannot run against the installed mcp; None when it can."""
+    if installed is None:
+        try:
+            installed = metadata.version("mcp")
+        except metadata.PackageNotFoundError:
+            return f"mcp is not installed (the KNOSSOS shim needs {MCP_RANGE})"
+    parsed = _parse_version(installed)
+    if parsed is None:
+        return None  # unknown version: let the import decide, never skip blind
+    if parsed >= MCP_CEILING:
+        return (
+            f"mcp {installed} dropped Server.list_tools()/call_tool(), which "
+            f"mnemos.tools.knossos_mcp registers with (needs {MCP_RANGE})"
+        )
+    return None
+
+
+_skip_reason = _mcp_skip_reason()
+if _skip_reason:
+    pytest.skip(_skip_reason, allow_module_level=True)
+
 # Importing the module redirects stdout — restore it so pytest output works.
 _real_stdout = sys.stdout
-import mnemos.tools.knossos_mcp as kn  # noqa: E402
+try:
+    import mnemos.tools.knossos_mcp as kn  # noqa: E402
+except ImportError as exc:
+    sys.stdout = _real_stdout
+    pytest.skip(
+        f"mnemos.tools.knossos_mcp is not importable in this environment: {exc}",
+        allow_module_level=True,
+    )
 
 sys.stdout = _real_stdout
 
@@ -479,3 +538,39 @@ def test_wing_axis_must_be_known_value():
         assert v in valid
     # And the module's current value is one of them.
     assert kn.WING_AXIS in valid
+
+
+# ── the mcp gate itself ──────────────────────────────────────────────────────
+
+
+def test_mcp_gate_accepts_every_supported_1x():
+    """1.x ships the decorators the shim uses, including the oldest 1.x."""
+    for v in ("1.0.0", "1.2.0", "1.9.4", "1.30.0"):
+        assert _mcp_skip_reason(v) is None
+
+
+def test_mcp_gate_rejects_mcp_2x_naming_the_version_and_api():
+    for v in ("2.0.0", "2.1.1", "2.3.0"):
+        reason = _mcp_skip_reason(v)
+        assert reason is not None
+        assert v in reason
+        assert "list_tools" in reason
+
+
+def test_mcp_gate_does_not_skip_on_unknown_version():
+    """An unparseable version must not turn into a silent skip."""
+    assert _mcp_skip_reason("nightly") is None
+    assert _mcp_skip_reason("") is None
+
+
+def test_mcp_gate_skips_when_mcp_is_absent(monkeypatch):
+    """A missing distribution skips with its own reason, not a NameError."""
+
+    def _missing(_name):
+        raise metadata.PackageNotFoundError("mcp")
+
+    monkeypatch.setattr(metadata, "version", _missing)
+    reason = _mcp_skip_reason()
+    assert reason is not None
+    assert "not installed" in reason
+    assert MCP_RANGE in reason

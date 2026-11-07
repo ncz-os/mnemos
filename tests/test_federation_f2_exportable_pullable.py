@@ -93,14 +93,14 @@ def _lan_posture(monkeypatch):
     monkeypatch.setenv("MNEMOS_EMBED_HTTP_MODEL", "bge-m3")
 
 #: The rows the source can PUBLISH: the feed's own population.
-async def feed_servable_ids(source) -> set[str]:
+async def feed_servable_ids(backend) -> set[str]:
     """Every id the source's live feed serves, read page by page."""
     served: set[str] = set()
     after_updated = None
     after_id = None
     while True:
-        async with source.transactional() as tx:
-            rows = await source.federation.feed_query(
+        async with backend.transactional() as tx:
+            rows = await backend.federation.feed_query(
                 tx,
                 since_updated=after_updated,
                 since_id=after_id,
@@ -120,13 +120,13 @@ async def feed_servable_ids(source) -> set[str]:
     return served
 
 
-async def charon_exportable_ids(source) -> set[str]:
+async def charon_exportable_ids(backend) -> set[str]:
     """Every id CHARON's export definition counts, read page by page."""
     seen: set[str] = set()
     after: str | None = None
     while True:
-        async with source.transactional() as tx:
-            rows = await source.federation.fetch_source_charon_export_keyset_page(
+        async with backend.transactional() as tx:
+            rows = await backend.federation.fetch_source_charon_export_keyset_page(
                 tx,
                 after_id=after,
                 limit=100,
@@ -141,9 +141,9 @@ async def charon_exportable_ids(source) -> set[str]:
     return seen
 
 
-async def replica_ids(replica, peer_name: str = "pythia") -> set[str]:
+async def replica_ids(backend, peer_name: str = "pythia") -> set[str]:
     """The remote ids the replica holds for ``peer_name``."""
-    rows = await fetch(replica, "SELECT id FROM memories WHERE federation_source = ?", peer_name)
+    rows = await fetch(backend, "SELECT id FROM memories WHERE federation_source = ?", peer_name)
     return {str(r["id"])[len(f"fed:{peer_name}:"):] for r in rows}
 
 
@@ -151,7 +151,7 @@ async def replica_ids(replica, peer_name: str = "pythia") -> set[str]:
 
 
 @pytest.mark.asyncio
-async def test_exportable_set_equals_the_pullable_set(synced):
+async def test_exportable_set_equals_the_pullable_set(synced):  # noqa: F811 - pytest injects imported fixture
     """The invariant F-2 asks for, asserted on a real source+replica pair.
 
     Every id the source counts as EXPORTABLE must be PULLABLE: the replica
@@ -186,7 +186,7 @@ async def test_exportable_set_equals_the_pullable_set(synced):
 
 
 @pytest.mark.asyncio
-async def test_a_row_that_arrived_from_another_peer_is_unreachable_not_missing(synced):
+async def test_a_row_that_arrived_from_another_peer_is_unreachable_not_missing(synced):  # noqa: F811 - pytest injects imported fixture
     """The F-2 population, classified correctly.
 
     A row replicated in from a third node is exportable by CHARON's
@@ -240,7 +240,7 @@ async def test_a_row_that_arrived_from_another_peer_is_unreachable_not_missing(s
 
 
 @pytest.mark.asyncio
-async def test_reconcile_never_requests_an_id_the_source_cannot_serve(synced):
+async def test_reconcile_never_requests_an_id_the_source_cannot_serve(synced):  # noqa: F811 - pytest injects imported fixture
     """The reconcile's request list is exactly the feed's population.
 
     A reconcile that asked for an unservable id would spin: the source
@@ -313,7 +313,7 @@ def test_the_export_predicate_is_a_superset_of_the_feed_predicate():
 
 
 @pytest.mark.asyncio
-async def test_the_export_page_covers_the_feed_page_plus_the_documented_gap(synced):
+async def test_the_export_page_covers_the_feed_page_plus_the_documented_gap(synced):  # noqa: F811 - pytest injects imported fixture
     """The CHARON page is the feed's population plus exactly the gap.
 
     This is the parity assertion the task asks for: the exportable id set

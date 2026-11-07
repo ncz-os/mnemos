@@ -279,15 +279,17 @@ def _local_embedding_fingerprint() -> Dict[str, Optional[Any]]:
             embed_http_model_override,
             embed_model_path_env,
             get_settings,
+            runtime_env_value,
         )
 
         backend = (embed_backend_env() or "").strip().lower()
         http_model = (embed_http_model_override() or "").strip()
         # ``embed_model_path_env()`` substitutes a default GGUF path, so a
         # non-empty result does not mean the operator chose a local model.
-        # Only an explicitly-set path names this node's weights; ``os.environ``
-        # is the only way to tell "configured" from "defaulted".
-        explicit_path = (os.environ.get("MNEMOS_EMBED_MODEL_PATH") or "").strip()
+        # Only an explicitly-set path names this node's weights; the raw
+        # environment value is the only way to tell "configured" from
+        # "defaulted".
+        explicit_path = runtime_env_value("MNEMOS_EMBED_MODEL_PATH", "").strip()
         if backend == "http" or (backend == "auto" and not explicit_path):
             # ``auto`` never selects HTTP (see embedder._select_backend), but it
             # is also what is reported when nothing is configured at all. In

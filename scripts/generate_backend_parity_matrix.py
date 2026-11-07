@@ -127,7 +127,7 @@ BACKEND_CLASSES: dict[str, tuple[str, str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Hand-verified split of the 34 "no surface, no test" cells (backlog section
+# Hand-verified split of the 33 "no surface, no test" cells (backlog section
 # 6, 2026-10-17). These two frozensets are the *authoritative* enumeration
 # and are hard-asserted against the live matrix in :func:`_render_markdown`,
 # so any future change that moves a correctly-absent cell into the surface
@@ -160,7 +160,6 @@ _REAL_BACKLOG_CELLS: frozenset[tuple[str, str]] = frozenset(
         ("consultations", "mariadb"),
         ("acl", "mysql"),
         ("acl", "mariadb"),
-        ("journal", "mysql"),
         ("journal", "mariadb"),
         ("ledger", "mysql"),
         ("ledger", "mariadb"),
@@ -170,8 +169,8 @@ _REAL_BACKLOG_CELLS: frozenset[tuple[str, str]] = frozenset(
 assert not (_CORRECTLY_ABSENT_CELLS & _REAL_BACKLOG_CELLS), (
     "correctly-absent and real-backlog cells must be disjoint"
 )
-assert len(_CORRECTLY_ABSENT_CELLS) + len(_REAL_BACKLOG_CELLS) == 34, (
-    f"34-cell split must sum to 34, got "
+assert len(_CORRECTLY_ABSENT_CELLS) + len(_REAL_BACKLOG_CELLS) == 33, (
+    f"33-cell split must sum to 33, got "
     f"{len(_CORRECTLY_ABSENT_CELLS)} + {len(_REAL_BACKLOG_CELLS)}"
 )
 
@@ -1942,7 +1941,7 @@ def _render_markdown(cells: list[Cell]) -> str:
     # so the matrix never lies about itself.
     assert full_count + impl_only + stub_with_test + gaps == len(cells), f"category counts do not sum to {len(cells)}"
 
-    # Hand-verified 34-cell split (backlog section 6): every cell in
+    # Hand-verified 33-cell split (backlog section 6): every cell in
     # _CORRECTLY_ABSENT_CELLS / _REAL_BACKLOG_CELLS must be a live "neither"
     # cell right now. If the detector regresses (a Postgres-only cell gains
     # surface, or a real-backlog cell gets a facade) the count changes and
@@ -2035,9 +2034,9 @@ def _render_markdown(cells: list[Cell]) -> str:
         f"accessor. The two signals are now reconciled: the matrix\n"
         f"reflects the surface; the flag still controls delivery.\n"
         f"\n"
-        f"## 34 'no surface, no test' cells — hand-verified split\n"
+        f"## 33 'no surface, no test' cells — hand-verified split\n"
         f"\n"
-        f"All 34 cells were hand-verified 2026-10-17. They fall into\n"
+        f"All 33 cells were hand-verified 2026-10-17. They fall into\n"
         f"two disjoint classes: **correctly absent** (25) and **real\n"
         f"backlog** (9). The split is recorded in the module-level\n"
         f"constants ``_CORRECTLY_ABSENT_CELLS`` / ``_REAL_BACKLOG_CELLS``\n"

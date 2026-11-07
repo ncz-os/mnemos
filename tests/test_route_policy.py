@@ -27,8 +27,8 @@ import re
 import httpx
 import pytest
 
-from mnemos.domain import route_policy
-from mnemos.domain.route_policy import (
+from mnemos.core import route_policy
+from mnemos.core.route_policy import (
     CLOSED_FRONTIER,
     DEEPSEEK_DIRECT,
     MINIMAX_DIRECT,

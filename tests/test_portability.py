@@ -1302,6 +1302,72 @@ def test_import_idempotent_on_id_collision(monkeypatch):
     assert stats.skipped == 1
 
 
+def test_import_idempotent_collision_ignores_server_only_metadata(monkeypatch):
+    """Server-stamped metadata on the stored row is not an envelope mismatch.
+
+    The classifier marker and the provenance block are written by the server
+    on every ingest, so a row written through the API carries keys the
+    envelope never asserts (the import strips them from the envelope before
+    classifying it). Only caller-visible metadata takes part in the conflict
+    comparison; a differing caller key is still a mismatch.
+    """
+
+    class _DupeConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            return "INSERT 0 0"
+
+    def _existing(metadata):
+        return {
+            "content": "body",
+            "category": "solutions",
+            "subcategory": None,
+            "metadata": metadata,
+            "quality_rating": 75,
+            "owner_id": "alice",
+            "namespace": "alice-ns",
+            "permission_mode": 600,
+            "source_model": None,
+            "source_provider": None,
+            "source_session": None,
+            "source_agent": None,
+            "verbatim_content": "body",
+            "created": None,
+            "updated": None,
+        }
+
+    def _import():
+        return asyncio.run(
+            portability.import_memories(
+                envelope=_envelope([_memory_record(id="mem_dupe")]),
+                preserve_owner=False,
+                user=_alice(),
+            )
+        )
+
+    stamped = {
+        "secret_field_classifiers": {"content": 1, "verbatim_content": 1},
+        "_provenance": {
+            "v": 1,
+            "principal": "alice",
+            "key_id": None,
+            "at": "2026-01-01T00:00:00+00:00",
+            "signed": False,
+            "sig": None,
+        },
+    }
+    _install(monkeypatch, _DupeConn(routed_rows={"FROM memories WHERE id = $1": [_existing(stamped)]}))
+    stats = _import()
+    assert stats.failed == 0, stats.errors
+    assert stats.skipped == 1
+
+    _install(monkeypatch, _DupeConn(routed_rows={"FROM memories WHERE id = $1": [_existing({"project": "other"})]}))
+    stats = _import()
+    assert stats.skipped == 0
+    assert stats.failed == 1
+    assert "metadata differ" in stats.errors[0]
+
+
 def test_import_idempotent_collision_compares_distinct_verbatim_from_projection(monkeypatch):
     """Older core projections omit verbatim_content on conflict retries."""
 

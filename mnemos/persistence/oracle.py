@@ -2359,15 +2359,28 @@ class OracleMemoryRepository(MemoryRepository):
             if namespace is not None:
                 where.append("namespace = :ns")
                 params["ns"] = namespace
+            # S2: the group key has to be a digest of the normalized body, never
+            # the CLOB itself -- GROUP BY on a LOB is ORA-00932, so this sweep
+            # could not run at all. The digest is the expression the content_hash
+            # backfill already writes ("LOWER(RAWTOHEX(STANDARD_HASH(...))) ") , so the
+            # key keeps the newline-folding meaning it has on the text backends.
+            #
+            # S2: the id list is aggregated as a CLOB. LISTAGG returns VARCHAR2 and
+            # dies with ORA-01489 at 4000 bytes, i.e. at roughly a hundred
+            # duplicates; XMLAGG + getClobVal has no such cap and, unlike
+            # ON OVERFLOW TRUNCATE, cannot silently drop the ids whose duplicates
+            # would then never be consolidated.
             sql = (
                 "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count, "
-                "LISTAGG(id, CHR(31)) WITHIN GROUP (ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS memory_ids, "
+                "XMLAGG(XMLELEMENT(E, id || CHR(31)) ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) "
+                ".EXTRACT('//text()').getClobVal() AS memory_ids, "
                 "MIN(id) KEEP (DENSE_RANK FIRST ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS keep_id, "
                 "MIN(id) KEEP (DENSE_RANK FIRST ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS canonical_id "
                 "FROM (SELECT id, owner_id, namespace, content_hash, created, quality_rating, "
                 "REPLACE(REPLACE(NVL(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) AS normalized_content "
                 "FROM memories WHERE " + " AND ".join(where) + ") candidates "
-                "GROUP BY owner_id, namespace, content_hash, normalized_content HAVING COUNT(*) > 1 "
+                "GROUP BY owner_id, namespace, content_hash, "
+                "LOWER(RAWTOHEX(STANDARD_HASH(normalized_content, 'SHA256'))) HAVING COUNT(*) > 1 "
                 "ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC"
             )
             await _call(cursor.execute, sql, params)

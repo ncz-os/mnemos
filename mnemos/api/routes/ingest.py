@@ -82,6 +82,8 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
                             namespace=user.namespace,
                             classified_at="session_ingest",
                             memory_id=mem_id,
+                            principal=user.user_id,
+                            api_key_id=user.api_key_id,
                         )
                         nats_intents.extend(
                             await _insert_memory_with_created_webhook(

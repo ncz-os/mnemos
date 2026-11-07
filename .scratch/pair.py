@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "1")

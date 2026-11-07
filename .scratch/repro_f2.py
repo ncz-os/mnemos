@@ -1,5 +1,6 @@
 """F2 reproduction: exportable set vs pullable set on a real SQLite source."""
-import asyncio, os, sys
+import asyncio
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,7 +59,8 @@ async def feed_served(be, limit=100):
 
 async def main():
     d = Path(".scratch/repro_src.db")
-    if d.exists(): d.unlink()
+    if d.exists():
+        d.unlink()
     be = SqliteBackend(d, S())
     await be.open()
     # a spread of row shapes

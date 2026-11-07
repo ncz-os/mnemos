@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from mnemos.core.numeric import safe_float
-from mnemos.domain.route_policy import is_route_allowed
+from mnemos.core.route_policy import is_route_allowed
 
 
 @dataclass(frozen=True)

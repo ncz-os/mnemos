@@ -226,6 +226,12 @@ def _warn_python_cosine_scale_once(*, eligible_count: int, threshold: int) -> No
     )
 
 
+#: GROUP_CONCAT result cap, in bytes. MySQL's default is 1024 and truncates
+#: silently once a duplicate group's id list passes it; 4 MB is far beyond any
+#: realistic group and still bounded per statement.
+_GROUP_CONCAT_MAX_LEN = 4 * 1024 * 1024
+
+
 def _content_hash(content: Any) -> str:
     normalized = ("" if content is None else str(content)).replace("\r\n", "\n").replace("\r", "\n")
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -2978,6 +2984,12 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
             where.append("namespace = %s")
             params.append(namespace)
         async with conn.cursor() as cursor:
+            # S3: GROUP_CONCAT caps its result at group_concat_max_len (1024 by
+            # default) and truncates silently, so the ids past the cap were
+            # dropped -- and the duplicates they belonged to were never
+            # consolidated. The cap is per session, so raise it on this
+            # connection before the statement that depends on it.
+            await cursor.execute(f"SET SESSION group_concat_max_len = {_GROUP_CONCAT_MAX_LEN}")
             await cursor.execute(
                 f"""
                 SELECT owner_id, namespace, content_hash,

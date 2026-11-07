@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,11 @@ class _Req:
         self.headers = headers
         self.json = json_body
         self.params = params or {}
+
+
+# The per-peer gauges are soft-optional: without prometheus_client the route
+# publishes no gauges, so only the gauge assertion needs the package.
+_HAS_PROMETHEUS_CLIENT = importlib.util.find_spec("prometheus_client") is not None
 
 
 class FakePeerFeed:
@@ -563,6 +569,7 @@ class TestPerPeerLagMetrics:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(not _HAS_PROMETHEUS_CLIENT, reason="prometheus_client not installed")
     async def test_injected_error_raises_failure_counter_and_gauge(self, monkeypatch):
         """A failed pull bumps consecutive_failures and the labelled gauge."""
         from mnemos.api.routes.federation import federation_status_values, sync_federation_metrics
@@ -696,7 +703,7 @@ class TestEmbedderFingerprint:
 
         assert fingerprint["embed_model"] == "bge-m3"
 
-    def test_a_missing_import_surfaces_instead_of_silently_unresolving(self):
+    def test_a_missing_import_surfaces_instead_of_silently_unresolving(self, monkeypatch):
         """A missing module-level import must not masquerade as "unresolved".
 
         The function's ``except Exception`` used to swallow ``NameError``, so a
@@ -706,6 +713,9 @@ class TestEmbedderFingerprint:
         """
         from mnemos.domain import federation
 
+        # An explicit model path selects the local-backend branch, the one
+        # that still names ``os`` directly (``os.path.basename``).
+        monkeypatch.setenv("MNEMOS_EMBED_MODEL_PATH", "/opt/mnemos/models/probe.gguf")
         real_os = federation.os
         del federation.os
         try:
@@ -1157,7 +1167,7 @@ class TestAntiEntropyDigest:
         was already whole.
         """
         from mnemos.api.routes import federation as handler
-        from mnemos.domain.replication_digest import bucket_index, build_namespace_digest
+        from mnemos.domain.replication_digest import bucket_index
 
         t0 = datetime(2026, 10, 31, 10, 0, 0, tzinfo=timezone.utc)
 

@@ -7,7 +7,10 @@ import logging
 from typing import Any
 
 from fastapi import HTTPException
-from mnemos.core.persisted_text_classification import classify_persisted_text_fields
+from mnemos.core.persisted_text_classification import (
+    classify_persisted_text_fields,
+    strip_caller_secret_metadata,
+)
 from mnemos.core.security import is_root
 from mnemos.persistence.base import (
     AuditPersistence,
@@ -328,12 +331,23 @@ async def import_memories(
                 conflicted = True
             if conflicted:
                 existing_mem = await backend.memories.fetch_memory_by_id(tx, persisted_id)
-                envelope_metadata_json = json.dumps(metadata, sort_keys=True)
+                # Compare only the caller-visible metadata. The server-only
+                # keys (``secret_*`` classification markers and the
+                # ``_provenance`` stamp) are derived per write: a row written
+                # before a marker existed, or stamped with the writer's
+                # provenance, still holds the same record as an envelope that
+                # carries none of them. Including those keys made every
+                # re-import of such a row fail with "metadata differ", and
+                # the rejected record then dropped out of the allowlist so
+                # each of its sidecars failed as a cross-tenant attachment.
+                envelope_metadata_json = json.dumps(strip_caller_secret_metadata(metadata), sort_keys=True)
                 existing_metadata_json = (
                     json.dumps(
-                        existing_mem["metadata"]
-                        if isinstance(existing_mem["metadata"], dict)
-                        else json.loads(existing_mem["metadata"] or "{}"),
+                        strip_caller_secret_metadata(
+                            existing_mem["metadata"]
+                            if isinstance(existing_mem["metadata"], dict)
+                            else json.loads(existing_mem["metadata"] or "{}")
+                        ),
                         sort_keys=True,
                     )
                     if existing_mem is not None

@@ -156,8 +156,17 @@ async def _soft_delete(backend, local_id):
 
 
 async def _sync_log(backend, peer_id):
+    """Sync-log rows for ``peer_id``, oldest first.
+
+    ``fetch_sync_log`` orders by ``started_at`` DESC, and SQLite stamps that
+    column with one-second resolution, so two syncs driven back to back
+    usually tie and come back in whatever order the engine scanned them.
+    Every test here runs one bootstrap sync (no cursor yet) followed by one
+    resumed sync, so order on that instead of the timestamp.
+    """
     async with backend.transactional() as tx:
-        return await backend.federation.fetch_sync_log(tx, peer_id, 50)
+        rows = await backend.federation.fetch_sync_log(tx, peer_id, 50)
+    return sorted(rows, key=lambda row: (row["cursor_before"] is not None, str(row["started_at"])))
 
 
 async def _peer_row(backend, peer_id):
