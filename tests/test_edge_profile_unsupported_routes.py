@@ -17,7 +17,7 @@ from mnemos.api.routes import (
     sessions,
     state,
 )
-from mnemos.persistence.base import SESSIONS_CAPABILITY, STATE_CAPABILITY, BackendCapabilityMissing
+from mnemos.persistence.base import SESSIONS_CAPABILITY, STATE_CAPABILITY
 from mnemos.persistence.sqlite import SqliteBackend
 
 
@@ -38,9 +38,7 @@ _SESSION_ROW_KEYS = {"id", "created_at", "model"}
 
 
 def _user() -> UserContext:
-    return UserContext(
-        user_id="u", group_ids=[], role="root", namespace="default", authenticated=True
-    )
+    return UserContext(user_id="u", group_ids=[], role="root", namespace="default", authenticated=True)
 
 
 def _backend(monkeypatch, tmp_path, profile):
@@ -125,14 +123,27 @@ def test_edge_profiles_do_not_reuse_each_others_storage(monkeypatch, tmp_path):
     """Two edge profiles must not be able to reach each other's rows.
 
     The fixture used to open one shared SQLite file for every test in this
-    module, so a session row created by one test was visible to the next.
-    The contract each profile claims to test is only real if that reuse is
-    impossible.
+    module, so a row created by one test was visible to the next. Path
+    inequality alone does not prove that: this writes through one profile's
+    store and reads through the other's, the way the shared fixture did.
     """
+    asyncio = pytest.importorskip("asyncio")
+
     first = _backend(monkeypatch, tmp_path, "raw-session-sqlite")
     second = _backend(monkeypatch, tmp_path, "raw-state-sqlite")
     assert first is not second
     assert first._db_path != second._db_path
+
+    async def _create_then_read_through(reader):
+        async with first.transactional() as tx:
+            row = await first.sessions.create_session(
+                tx, user_id="u", namespace="default", model="m", initial_context=None
+            )
+        async with reader.transactional() as tx:
+            return await reader.sessions.get_session(tx, row["id"], "u", "default")
+
+    assert asyncio.run(_create_then_read_through(first)) is not None
+    assert asyncio.run(_create_then_read_through(second)) is None
 
 
 def test_sessions_repository_create_session_on_raw_sqlite(monkeypatch, tmp_path):
