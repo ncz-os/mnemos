@@ -64,6 +64,74 @@ def test_safe_subject_segment_does_not_strip_edge_dots():
     assert safe_subject_segment("a.") != safe_subject_segment(".a")
 
 
+_LEGAL_SUBJECT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-")
+
+
+def _is_one_valid_subject_token(token: str) -> bool:
+    """A single NATS subject token: no separators, wildcards or exceptions."""
+    return bool(token) and not any(ch in token for ch in ". *>\t\r\n") and all(ch.isascii() for ch in token)
+
+
+@pytest.mark.parametrize(
+    "namespace",
+    [
+        "team@corp",
+        "a#b",
+        "a$b",
+        "a/b",
+        "a:b",
+        "a'b",
+        'a"b',
+        "a(b)",
+        "a[b]",
+        "a{b}",
+        "a,b",
+        "a;b",
+        "a+b",
+        "a=b",
+        "a&b",
+        "a|b",
+        "a\\b",
+        "a~b",
+        "a`b",
+        "a!b",
+        "a?b",
+        "\u00fc.x",
+        "caf\u00e9",
+        "\u65e5\u672c\u8a9e",
+    ],
+)
+def test_special_characters_are_encoded_not_passed_through(namespace):
+    """No namespace may leak an illegal character into the subject token."""
+    from mnemos.persistence.nats_events import safe_subject_segment
+
+    token = safe_subject_segment(namespace)
+    assert _is_one_valid_subject_token(token)
+    # "_" is the established rendering of ".", everything else is either
+    # a safe character or part of a percent escape.
+    assert all(ch in _LEGAL_SUBJECT_CHARS or ch in "%_" for ch in token)
+
+
+def test_special_characters_keep_the_mapping_injective():
+    from mnemos.persistence.nats_events import safe_subject_segment
+
+    # Percent-encoding is reversible, so distinct namespaces stay distinct
+    # even when they only differ by an encoded character.
+    samples = ["team@corp", "team%40corp", "a#b", "a%23b", "a/b", "a%2Fb", "ü", "%C3%BC"]
+    tokens = [safe_subject_segment(v) for v in samples]
+    assert len(set(tokens)) == len(samples)
+
+
+def test_known_special_characters_have_exact_encodings():
+    from mnemos.persistence.nats_events import safe_subject_segment
+
+    assert safe_subject_segment("team@corp") == "team%40corp"
+    assert safe_subject_segment("a#b") == "a%23b"
+    assert safe_subject_segment("a$b") == "a%24b"
+    assert safe_subject_segment("a b") == "a%20b"
+    assert safe_subject_segment("ü") == "%C3%BC"
+
+
 def test_safe_subject_segment_never_emits_a_wildcard_or_a_dot():
     from mnemos.persistence.nats_events import safe_subject_segment
 

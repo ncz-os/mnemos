@@ -31,14 +31,17 @@ each producer/consumer pair has its own independent enable flag.
 
 Every subject below ends in a `<namespace>` token. The token is produced by
 one shared encoder, `mnemos/persistence/nats_events.py:safe_subject_segment`,
-which is **injective** (CF-35/MN-17). It escapes each character in a single
-pass: `.` -> `_` (the established shape, `alice.ns` -> `alice_ns`), `_` ->
-`%5F`, `%` -> `%25`, and the NATS wildcards `*` / `>` -> `%2A` / `%3E`;
-whitespace is percent-encoded and the result is never stripped or empty. A
-namespace that literally contains an underscore therefore maps to `a%5Fb`,
-never to the `a_b` a dotted namespace produces — the two tenants cannot share
-a subject. Do not hand-roll a local `.replace(".", "_")` in a publisher; route
-through the shared encoder.
+which is both **injective** (CF-35/MN-17) and **always a valid subject
+token**. One rule gives both: `[A-Za-z0-9-]` is kept verbatim, `.` is rendered
+as `_` (the established shape, `alice.ns` -> `alice_ns`), and every other
+character — `_` -> `%5F`, `%` -> `%25`, the wildcards `*` / `>` -> `%2A` /
+`%3E`, whitespace, `@`, `/`, `:`, non-ASCII, … — is percent-encoded per UTF-8
+byte. A namespace that literally contains an underscore therefore maps to
+`a%5Fb`, never to the `a_b` a dotted namespace produces, so the two tenants
+cannot share a subject; and no namespace can leak a character the broker
+would reject or misread. The result is never stripped or empty (an empty
+namespace falls back to `default`). Do not hand-roll a local
+`.replace(".", "_")` in a publisher; route through the shared encoder.
 
 ### Memory nudges — `mnemos.memory.>` (`MNEMOS_MEMORY`)
 
