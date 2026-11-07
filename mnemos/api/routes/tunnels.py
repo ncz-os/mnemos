@@ -228,10 +228,15 @@ async def start_tunnel(
     global _active_bridge
     _require_enabled()
 
-    # Validate the request before minting anything, then resolve the
-    # credential before spawning anything. A token issued for a request
-    # that then 422s is a live credential nobody asked for; a tunnel opened
-    # before we know we have a token exposes the port for nothing.
+    # Order is deliberate and each step is load-bearing:
+    #   1. host opt-in gate     -- a disabled host mints nothing at all
+    #   2. backend resolution   -- an unknown backend 422s before any token
+    #   3. single-tunnel guard  -- a start that will 409 mints no credential
+    #   4. credential resolution -- before the spawn, so a tunnel is never
+    #      opened for an operator we cannot give a working credential to
+    #   5. bridge construction and start
+    # Steps 1-3 exist so no live credential is minted for a request that is
+    # going to be refused anyway.
     try:
         bridge_cls = get_bridge_class(request.backend)
     except KeyError:
@@ -241,10 +246,6 @@ async def start_tunnel(
         )
 
     async with _lock:
-        # The single-tunnel guard runs before the credential is resolved: a
-        # token minted for a request that then 409s is a live credential
-        # nobody asked for. Only once we know this start will actually be
-        # attempted do we spend a token on it.
         if _active_bridge is not None and _active_bridge.status() is not None:
             existing = _active_bridge.status()
             raise HTTPException(
