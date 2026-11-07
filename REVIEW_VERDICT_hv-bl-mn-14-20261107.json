@@ -1,0 +1,48 @@
+{
+  "schema": "review-verdict/1",
+  "task": "MN-14 / CF-23 \u2014 rate limit trusts left-most X-Forwarded-For",
+  "branch": "hv/bl-mn-14-20261107",
+  "base": "master",
+  "head_sha": "86535663",
+  "verdict": "approve",
+  "reviewers": [
+    {
+      "model": "muse-spark-1.3-contributor",
+      "verdict": "approve",
+      "findings": 0
+    }
+  ],
+  "reviewer_model": "muse-spark-1.3-contributor",
+  "reviewer_tier": "contributor",
+  "reviewer_route": "meta-muse-contrib=muse-spark-1.3-contributor",
+  "findings": [],
+  "next_steps": [],
+  "command": "zoder review --base master --scope branch -m muse-spark-1.3-contributor --allowed-routes meta-muse-contrib=muse-spark-1.3-contributor --allow-paid --json",
+  "adjudication": [
+    {
+      "finding": "Undefined logger in _forwarded_client_ip",
+      "reviewer": "cerberus-reviewer",
+      "raised_by": [
+        "review1 (openai family, --agent muse_contrib did NOT hold: cerberus-reviewer answered, not Muse)",
+        "review3 panel (openai family, 2 attempts)"
+      ],
+      "severity": "high",
+      "disposition": "rejected_false_positive",
+      "evidence": [
+        "mnemos/core/rate_limit.py:19 imports logging; :31 'logger = logging.getLogger(__name__)' \u2014 module level, before any use",
+        "ast check confirms the module-level assignment at line 31",
+        "the debug path runs in tests/test_rate_limit_trusted_proxy_hops.py::test_header_shorter_than_the_trusted_chain_collapses_to_the_direct_peer and 5 siblings; all pass",
+        "zoder's own confirmer (deepseek-flash) rejected the same finding as non-blocking in review1",
+        "all 7 new tests pass; full suite failure set identical to baseline (53 failed / 42 errors, all pre-existing env issues)"
+      ],
+      "note": "review3's CONFIRM row shows effective_blocking=true only because its confirmer call failed ('confirmer_failed'); the same claim was rejected when the confirmer did answer (review1). The claim is measurably false."
+    }
+  ],
+  "reviews": {
+    "requested_model": "muse-spark-1.3-contributor",
+    "tier": "contributor",
+    "muse_verdict": "approve",
+    "muse_findings": 0,
+    "rounds": 2
+  }
+}
