@@ -1,2 +1,0 @@
-[zoder] review: 0/1 reviewers succeeded (1 failed; partial review)
-zoder: error: review failed: 0/1 reviewers completed (all errors; see diagnostics above). A review that no model produced must not be reported as success.
