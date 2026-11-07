@@ -51,7 +51,6 @@ def trust_proxy(monkeypatch):
 
     return _enable
 
-
 def test_client_supplied_left_most_entry_does_not_change_the_bucket(trust_proxy):
     """The spoof this item exists for: rotating the left-most XFF entry is a no-op."""
     trust_proxy()
@@ -106,3 +105,46 @@ def test_hop_setting_is_configurable_from_the_environment(monkeypatch):
 
     monkeypatch.delenv("RATE_LIMIT_TRUSTED_PROXY_HOPS")
     assert _RateLimitSettings().trusted_proxy_hops == 1
+
+
+# ── the bucket key is ALWAYS a str, whatever the header layer hands back ──────
+#
+# Starlette 1.6 decodes header values in ``Headers.getlist``, so ``_forwarded_
+# client_ip`` sees ``str`` and this is belt-and-braces. It is worth pinning
+# anyway: the bucket key is compared and stored downstream, a ``bytes`` key
+# would never match the ``str`` peer returned by ``get_remote_address``, and
+# the raw-ASGI/other-framework shape of ``headers.getlist`` has changed across
+# versions. These tests fail if the boundary stops coercing.
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [f"{CLIENT}, {PROXY_PEER}".encode(), CLIENT.encode()],
+    ids=["comma-joined", "single"],
+)
+def test_bucket_key_is_str_even_if_the_header_layer_returns_bytes(trust_proxy, monkeypatch, raw):
+    # One trusted hop: the right-most entry is the address our proxy saw.
+    trust_proxy(hops=1)
+
+    class _BytesHeaders:
+        """A header store that returns bytes, like a non-decoding ASGI layer."""
+
+        def getlist(self, name):
+            return [raw] if name == "x-forwarded-for" else []
+
+    request = _request({"x-forwarded-for": f"{CLIENT}, {PROXY_PEER}"})
+    object.__setattr__(request, "_headers", _BytesHeaders())
+
+    key = rate_limit._client_ip(request)
+    assert isinstance(key, str), f"bucket key must be str, got {type(key).__name__}"
+    assert key == PROXY_PEER
+
+
+def test_blank_entries_can_never_become_the_bucket_key(trust_proxy):
+    """No mixture of blanks/whitespace may yield "" or a whitespace key."""
+    trust_proxy()
+
+    for header in ("   ", ",", " , , ", f"{SPOOFED},   ,", " , " + PROXY_PEER):
+        key = rate_limit._client_ip(_request({"x-forwarded-for": header}))
+        assert key.strip(), f"blank bucket key from header {header!r}"
+        assert isinstance(key, str)
