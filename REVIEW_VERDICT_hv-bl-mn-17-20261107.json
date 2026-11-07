@@ -1,0 +1,40 @@
+{
+  "branch": "hv/bl-mn-17-20261107",
+  "base": "026d9cec03f27a57723a95a468a3a5c4351bb452",
+  "reviewer_model": "muse-spark-1.3-contributor",
+  "reviewer_tier": "meta muse contributor (not standard)",
+  "verdict": "approve",
+  "reviewers": [
+    {
+      "model": "muse-spark-1.3-contributor",
+      "verdict": "approve",
+      "ok": true,
+      "summary": "Chunk 1/4: Part 1 migrates all namespace-to-subject encodings to the shared safe_subject_segment encoder to fix a.b/a_b collision; no concrete defect established in the shown lines.\nChunk 2/4: New injective per-character escaping in safe_subject_segment correctly prevents dot/underscore and escape collisions while preserving the established dotted-namespace shape; relaxed publisher test still validates single-segment wildcard-free subjects.\nChunk 3/4: Part 3 adds collision-free subject-encoding tests covering dot vs underscore, percent-escape injectivity, edge dots, wildcard exclusion, shared-encoder usage, and SSE/dedup sinks. No defect is established by the shown lines.\nChunk 4/4: Async collision test for webhook delivery subjects correctly captures published subjects for dotted vs underscored namespaces and asserts distinctness.",
+      "findings": []
+    }
+  ],
+  "rounds": [
+    {
+      "round": 1,
+      "verdict": "request_changes",
+      "fixed": [
+        "strip('_') broke edge injectivity",
+        "docs encoding order description",
+        "wildcard assertion omitted \\r"
+      ]
+    },
+    {
+      "round": 2,
+      "verdict": "comment",
+      "fixed": [
+        "mcp.http stub leaked into sys.modules",
+        "docstring overstated default fallback"
+      ]
+    },
+    {
+      "round": 3,
+      "verdict": "approve",
+      "fixed": []
+    }
+  ]
+}
