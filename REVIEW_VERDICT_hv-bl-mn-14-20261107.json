@@ -3,7 +3,7 @@
   "task": "MN-14 / CF-23 \u2014 rate limit trusts left-most X-Forwarded-For",
   "branch": "hv/bl-mn-14-20261107",
   "base": "master",
-  "head_sha": "86535663",
+  "head_sha": "85ba0384",
   "verdict": "approve",
   "reviewers": [
     {
@@ -43,6 +43,12 @@
     "tier": "contributor",
     "muse_verdict": "approve",
     "muse_findings": 0,
-    "rounds": 2
-  }
+    "rounds": 2,
+    "round2_addressed": [
+      "[high] XFF values returned as bytes -- NOT REPRODUCIBLE on Starlette 1.6 (Headers.getlist decodes: [item_value.decode('latin-1') ...]); no test failures existed (suite was 6318 passed / 53 failed / 42 errors, identical to baseline). _header_text() now coerces at the boundary anyway, with a test that uses a byte-returning header store.",
+      "[medium] empty/whitespace entry treated as valid -- NOT REPRODUCIBLE; blanks were already filtered per part and could never be the key. Per-part filtering is now explicit and pinned by test_blank_entries_can_never_become_the_bucket_key.",
+      "[low] redundant max(int(...),1) -- the guard is kept and moved into _trusted_hop_count() because the module reads the hop count as an unvalidated global; a 0 would make entries[-0] == entries[0], the client-supplied left-most entry (CF-23 again). Two tests pin it."
+    ]
+  },
+  "summary": "Chunk 1/4: Part 1 adds configurable trusted_proxy_hops with safe clamping and correct docs; no defect established in these hunks.\nChunk 2/4: Right-most hop selection with blank filtering and floor-at-1 hop count correctly fixes left-most spoofing (CF-23) and safely falls back to direct peer on short chains.\nChunk 3/4: Part 3 adds thorough regression tests for XFF trusted-proxy hop counting, including spoof resistance, hop selection, fallback to peer, blank-entry handling, and env config clamping. No defects established in the visible chunk.\nChunk 4/4: Part 4 adds bytes-header str-coercion check and blank-entry guard test; logic shown is sound with no established defect.\n"
 }
