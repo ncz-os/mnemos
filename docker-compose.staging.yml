@@ -250,7 +250,9 @@ services:
       -f /migrations/70-subscription-plan-current-limits.sql
       -f /migrations/71-memory-acl.sql
       -f /migrations/72-memory-versions-visibility.sql
-      -f /migrations/73-memory-tags.sql"
+      -f /migrations/73-memory-tags.sql
+      -f /migrations/74-api-keys-key-prefix.sql
+      -f /migrations/75-memory-index-hygiene.sql"
     restart: "no"
 
   mnemos:
