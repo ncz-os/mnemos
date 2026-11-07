@@ -41,25 +41,20 @@ router = APIRouter(prefix="/v1/memories", tags=["acl"])
 
 
 async def _invalidate_search_caches_after_acl_change() -> None:
-    """Drop the per-user search cache after an ACL grant/revoke.
+    """Bump the visibility epoch after an ACL grant/revoke.
 
-    Search responses are cached under keys derived from
-    user/group/namespace/query state — *not* ACL grant state. A grant
-    widens read visibility and a revoke narrows it, so a response cached
-    while a principal held a grant would otherwise be replayable after the
-    grant is revoked until TTL expiry — a permission-revocation leak. This
-    mirrors ``_invalidate_caches_after_mutation`` on the memories route.
+    A grant widens read visibility and a revoke narrows it, so an in-flight
+    search must not land on the new visibility state mid-read. Bumping the
+    epoch leaves such writes under the old one (orphaned) instead of
+    leaking stale visibility.
 
-    Also bumps the visibility epoch so in-flight search writes land under
-    the old epoch (orphaned) rather than leaking stale visibility.
+    The per-user search cache this used to drop is gone: it was wired to
+    ``_lc._cache``, which the lifecycle hard-wires to ``None`` (no Redis in
+    the runtime), so the read missed and the write went nowhere — along
+    with the ``SCAN MATCH "mnemos:search:*"`` sweep that only ever matched
+    keys of a cache that never existed. This mirrors
+    ``_invalidate_caches_after_mutation`` on the memories route (MN-31).
     """
-    if not _lc._cache:
-        return
-    try:
-        async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-            await _lc._cache.delete(_k)
-    except Exception:
-        pass
     try:
         await _lc._vis_epoch_get_incr()  # bump; errors silently
     except Exception:

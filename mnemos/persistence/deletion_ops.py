@@ -389,30 +389,33 @@ async def invalidate_deletion_scope_caches(
     target_user_id: str,
     target_namespace: str | None,
 ) -> None:
-    """Evict cached search/stat responses that may include this target.
+    """Evict cached stat responses that may include this target.
 
     Also bumps the visibility epoch so in-flight search writes land under
     the old epoch (orphaned) rather than leaking stale visibility.
+
+    The ``mnemos:search:*`` sweep this used to run is gone: it scanned
+    ``_lc._cache``, which the lifecycle hard-wires to ``None`` and which
+    holds no search keys since the per-user search cache was removed
+    (MN-31). The stats keys are a different cache and are still dropped.
+
+    The epoch bump does not depend on the cache existing: in the runtime
+    ``_cache`` is always ``None``, so returning early here would make the
+    bump — this function's only live effect — unreachable.
     """
     import mnemos.core.lifecycle as _lc
 
-    if not _lc._cache:
-        return
-    try:
-        await _lc._cache.delete("stats:global")
-        await _lc._cache.delete("stats:global:v2")
+    if _lc._cache:
         try:
-            async for key in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                await _lc._cache.delete(key)
+            await _lc._cache.delete("stats:global")
+            await _lc._cache.delete("stats:global:v2")
         except Exception:
-            pass
-    except Exception:
-        logger.warning(
-            "failed to invalidate deletion caches for target_user_id=%s target_namespace=%s",
-            target_user_id,
-            target_namespace,
-            exc_info=True,
-        )
+            logger.warning(
+                "failed to invalidate deletion caches for target_user_id=%s target_namespace=%s",
+                target_user_id,
+                target_namespace,
+                exc_info=True,
+            )
     try:
         await _lc._vis_epoch_get_incr()  # bump; errors silently
     except Exception:

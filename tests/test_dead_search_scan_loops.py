@@ -89,11 +89,7 @@ def _stripped_source(path: Path) -> str:
         if not isinstance(body, list) or not body:
             continue
         first = body[0]
-        if (
-            isinstance(first, ast.Expr)
-            and isinstance(first.value, ast.Constant)
-            and isinstance(first.value.value, str)
-        ):
+        if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant) and isinstance(first.value.value, str):
             for lineno in range(first.lineno, (first.end_lineno or first.lineno) + 1):
                 lines[lineno - 1] = ""
 
@@ -117,8 +113,7 @@ def test_audited_file_has_no_search_scan_in_live_code(relpath):
     assert path.is_file(), f"audit evidence points at a missing file: {relpath}"
     code = _stripped_source(path)
     assert _FORBIDDEN_FRAGMENT not in code, (
-        f"{relpath} still contains the dead `mnemos:search:*` sweep in live code "
-        "(CF-24 / MN-31)"
+        f"{relpath} still contains the dead `mnemos:search:*` sweep in live code " "(CF-24 / MN-31)"
     )
 
 
@@ -163,9 +158,11 @@ class _RecordingCache:
         self.store.pop(key, None)
 
     async def scan_iter(self, *, match: str, count: int = 0):  # noqa: ARG002
+        # An async generator, matching the cache API shape.  Reaching it is
+        # the failure this fake exists to expose.
         self.scanned += 1
-        if False:  # pragma: no cover — generator shape only
-            yield match
+        for key in ():  # pragma: no cover — never yields
+            yield key
 
 
 @pytest.fixture()
@@ -211,9 +208,7 @@ def test_deletion_ops_helper_still_drops_both_stats_keys(monkeypatch, epochs):
     cache = _RecordingCache(["stats:global", "stats:global:v2", "mnemos:search:u:q"])
     monkeypatch.setattr(_lc, "_cache", cache, raising=False)
 
-    asyncio.run(
-        deletion_ops.invalidate_deletion_scope_caches("alice", "tenant-a")
-    )
+    asyncio.run(deletion_ops.invalidate_deletion_scope_caches("alice", "tenant-a"))
 
     assert "stats:global" in cache.deleted
     assert "stats:global:v2" in cache.deleted
@@ -222,26 +217,48 @@ def test_deletion_ops_helper_still_drops_both_stats_keys(monkeypatch, epochs):
     assert epochs == [1]
 
 
-def test_deletion_ops_helper_is_a_noop_when_cache_is_none(monkeypatch, epochs):
-    """With ``_cache = None`` the helper still bumps (its only live effect)."""
+@pytest.mark.parametrize(
+    ("helper", "label"),
+    [
+        (lambda: acl_route._invalidate_search_caches_after_acl_change(), "acl"),
+        (lambda: admin_route._invalidate_memory_read_caches(), "admin"),
+        (
+            lambda: deletion_ops.invalidate_deletion_scope_caches("alice", None),
+            "deletion_ops",
+        ),
+    ],
+    ids=["acl", "admin", "deletion_ops"],
+)
+def test_helper_still_bumps_epoch_when_cache_is_none(monkeypatch, epochs, helper, label):
+    """``_cache`` is ``None`` in the runtime, so the bump must not be gated on it.
+
+    Every one of these helpers used to ``return`` early when the cache was
+    falsy — and the lifecycle hard-wires ``_cache = None``, so in production
+    the visibility-epoch bump (the MCP principal-context cache's only
+    default-epoch signal) never ran.
+    """
     monkeypatch.setattr(_lc, "_cache", None, raising=False)
 
-    asyncio.run(
-        deletion_ops.invalidate_deletion_scope_caches("alice", None)
-    )
+    asyncio.run(helper())
 
-    assert epochs == [1]
+    assert epochs == [1], f"{label}: epoch bump was skipped when _cache is None"
 
 
 # ── 3. the helpers' docstrings describe the state after the fix ──────────────
 
 
 def test_acl_helper_docstring_no_longer_promises_a_search_cache():
+    """The docstring must not read as "this drops a search cache".
+
+    Naming the removed cache in the past tense (why the sweep is gone) is
+    fine and useful; promising the drop is not.
+    """
     doc = (inspect.getdoc(acl_route._invalidate_search_caches_after_acl_change) or "").lower()
-    assert "mnemos:search" not in doc
-    assert "per-user search cache" not in doc
+    assert "drop the per-user search cache" not in doc
+    assert "search responses are cached" not in doc
 
 
 def test_deletion_ops_docstring_no_longer_promises_search_eviction():
     doc = (inspect.getdoc(deletion_ops.invalidate_deletion_scope_caches) or "").lower()
-    assert "mnemos:search" not in doc
+    assert "evict cached search" not in doc
+    assert "search/stat" not in doc

@@ -44,10 +44,11 @@ class _FakeCache:
         self.deleted.append(key)
         self.store.pop(key, None)
 
-    async def scan_iter(self, *, match: str, count: int):
-        for key in list(self.store):
-            if match == "mnemos:search:*" and key.startswith("mnemos:search:"):
-                yield key
+    async def scan_iter(self, *, match: str, count: int):  # noqa: ARG002
+        # The dead ``mnemos:search:*`` sweep was removed (MN-31); reaching
+        # this means one came back.
+        raise AssertionError("unexpected cache scan — the search sweep is gone")
+        yield  # pragma: no cover — keeps async-generator shape
 
 
 @pytest.mark.asyncio
@@ -175,9 +176,8 @@ async def test_restore_target_reverses_only_the_soft_delete_batch_timestamp():
 
 
 @pytest.mark.asyncio
-async def test_restore_target_invalidates_search_and_stats_cache(monkeypatch):
+async def test_restore_target_invalidates_stats_cache(monkeypatch):
     cache = _FakeCache()
-    cache.store["mnemos:search:primed"] = '{"count":1,"memories":[]}'
     cache.store["stats:global"] = "{}"
     cache.store["stats:global:v2"] = "{}"
     monkeypatch.setattr(lifecycle, "_cache", cache)
@@ -191,15 +191,13 @@ async def test_restore_target_invalidates_search_and_stats_cache(monkeypatch):
         datetime(2026, 5, 1, 23, 5, 0, tzinfo=timezone.utc),
     )
 
-    assert "mnemos:search:primed" in cache.deleted
     assert "stats:global" in cache.deleted
     assert "stats:global:v2" in cache.deleted
 
 
 @pytest.mark.asyncio
-async def test_worker_hard_delete_invalidates_search_and_stats_cache(monkeypatch):
+async def test_worker_hard_delete_invalidates_stats_cache(monkeypatch):
     cache = _FakeCache()
-    cache.store["mnemos:search:primed"] = '{"count":1,"memories":[]}'
     cache.store["stats:global"] = "{}"
     cache.store["stats:global:v2"] = "{}"
     monkeypatch.setattr(lifecycle, "_cache", cache)
@@ -221,7 +219,6 @@ async def test_worker_hard_delete_invalidates_search_and_stats_cache(monkeypatch
 
     await worker.process_one_hard_deletion_request(_backend_mock())
 
-    assert "mnemos:search:primed" in cache.deleted
     assert "stats:global" in cache.deleted
     assert "stats:global:v2" in cache.deleted
 

@@ -277,12 +277,13 @@ def test_revoke_handler_ok_when_grant_present(monkeypatch):
     assert acl.revoked == [("m1", "user:7")]
 
 
-# --- search-cache invalidation on ACL mutation -------------------------------
+# --- visibility-epoch bump on ACL mutation -----------------------------------
 #
-# A grant widens read visibility and a revoke narrows it. The per-user search
-# cache is keyed by user/group/namespace/query — *not* ACL state — so without
-# explicit invalidation a response cached while a principal held a grant could
-# be replayed after revoke until TTL expiry (a permission-revocation leak).
+# A grant widens read visibility and a revoke narrows it, so in-flight search
+# writes must be orphaned under the old epoch rather than landing on the new
+# visibility state. The per-user search cache this used to also drop was
+# removed (it was wired to ``_lc._cache``, which is hard-wired to ``None``),
+# and its ``SCAN MATCH "mnemos:search:*"`` sweep with it — see MN-31.
 
 
 class _FakeCache:
@@ -304,12 +305,25 @@ def _install_cache(monkeypatch, cache):
     monkeypatch.setattr(_lc, "_cache", cache, raising=False)
 
 
-def test_grant_invalidates_search_cache(monkeypatch):
+def _epoch_counter(monkeypatch):
+    """Replace the epoch bump with a counter (no NATS round-trip)."""
+    bumps: list[int] = []
+
+    async def _bump():
+        bumps.append(1)
+        return len(bumps)
+
+    monkeypatch.setattr(_lc, "_vis_epoch_get_incr", _bump)
+    return bumps
+
+
+def test_grant_bumps_visibility_epoch_and_does_not_scan(monkeypatch):
     acl = _FakeAcl()
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": "eng"}, acl=acl)
     _install(monkeypatch, backend)
     cache = _FakeCache(["mnemos:search:alice:q1", "mnemos:search:bob:q2"])
     _install_cache(monkeypatch, cache)
+    bumps = _epoch_counter(monkeypatch)
 
     asyncio.run(
         acl_route.grant_memory_acl(
@@ -318,10 +332,11 @@ def test_grant_invalidates_search_cache(monkeypatch):
             user=_user("alice"),
         )
     )
-    assert set(cache.deleted) == {"mnemos:search:alice:q1", "mnemos:search:bob:q2"}
+    assert bumps == [1]
+    assert cache.deleted == []
 
 
-def test_revoke_invalidates_search_cache(monkeypatch):
+def test_revoke_bumps_visibility_epoch_and_does_not_scan(monkeypatch):
     acl = _FakeAcl(
         grants=[{"memory_id": "m1", "principal": "user:7", "perm": 4, "granted_by": "alice", "created_at": None}]
     )
@@ -329,21 +344,25 @@ def test_revoke_invalidates_search_cache(monkeypatch):
     _install(monkeypatch, backend)
     cache = _FakeCache(["mnemos:search:user7:q1"])
     _install_cache(monkeypatch, cache)
+    bumps = _epoch_counter(monkeypatch)
 
     asyncio.run(acl_route.revoke_memory_acl("m1", "user:7", user=_user("alice")))
-    assert cache.deleted == ["mnemos:search:user7:q1"]
+    assert bumps == [1]
+    assert cache.deleted == []
 
 
-def test_revoke_404_does_not_invalidate_search_cache(monkeypatch):
+def test_revoke_404_does_not_bump_epoch(monkeypatch):
     # Nothing was removed → read visibility is unchanged → no invalidation.
     acl = _FakeAcl(grants=[])
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": "eng"}, acl=acl)
     _install(monkeypatch, backend)
     cache = _FakeCache(["mnemos:search:alice:q1"])
     _install_cache(monkeypatch, cache)
+    bumps = _epoch_counter(monkeypatch)
 
     with pytest.raises(HTTPException):
         asyncio.run(acl_route.revoke_memory_acl("m1", "user:7", user=_user("alice")))
+    assert bumps == []
     assert cache.deleted == []
 
 
