@@ -51,6 +51,7 @@ def trust_proxy(monkeypatch):
 
     return _enable
 
+
 def test_client_supplied_left_most_entry_does_not_change_the_bucket(trust_proxy):
     """The spoof this item exists for: rotating the left-most XFF entry is a no-op."""
     trust_proxy()
@@ -107,6 +108,29 @@ def test_hop_setting_is_configurable_from_the_environment(monkeypatch):
     assert _RateLimitSettings().trusted_proxy_hops == 1
 
 
+def test_trusted_hop_count_floors_at_one_for_unvalidated_settings(monkeypatch):
+    """A settings object that never ran pydantic cannot walk the index backwards.
+
+    ``RATE_LIMIT_TRUSTED_PROXY_HOPS`` reaches this module as a plain global, so
+    a reload, a monkeypatch or a non-validate-by-field settings build can put a
+    0 or a negative here. ``entries[-0]`` is ``entries[0]`` -- the left-most,
+    client-supplied entry, i.e. CF-23 reopened -- and a negative index reads
+    from the wrong end. The read site floors instead of trusting the field.
+    """
+    monkeypatch.setattr(rate_limit, "RATE_LIMIT_TRUST_PROXY", True)
+
+    for bad in (0, -1):
+        monkeypatch.setattr(rate_limit, "RATE_LIMIT_TRUSTED_PROXY_HOPS", bad)
+        key = rate_limit._client_ip(_request({"x-forwarded-for": f"{SPOOFED}, {PROXY_PEER}"}))
+        assert key == PROXY_PEER, f"hops={bad} bucketed on {key!r}"
+
+
+def test_trusted_hop_count_survives_a_non_integer_setting(monkeypatch):
+    monkeypatch.setattr(rate_limit, "RATE_LIMIT_TRUST_PROXY", True)
+    monkeypatch.setattr(rate_limit, "RATE_LIMIT_TRUSTED_PROXY_HOPS", "not-a-number")
+    assert rate_limit._client_ip(_request({"x-forwarded-for": f"{SPOOFED}, {PROXY_PEER}"})) == PROXY_PEER
+
+
 # ── the bucket key is ALWAYS a str, whatever the header layer hands back ──────
 #
 # Starlette 1.6 decodes header values in ``Headers.getlist``, so ``_forwarded_
@@ -118,11 +142,11 @@ def test_hop_setting_is_configurable_from_the_environment(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "raw",
-    [f"{CLIENT}, {PROXY_PEER}".encode(), CLIENT.encode()],
+    ("raw", "expected"),
+    [(f"{CLIENT}, {PROXY_PEER}".encode(), PROXY_PEER), (CLIENT.encode(), CLIENT)],
     ids=["comma-joined", "single"],
 )
-def test_bucket_key_is_str_even_if_the_header_layer_returns_bytes(trust_proxy, monkeypatch, raw):
+def test_bucket_key_is_str_even_if_the_header_layer_returns_bytes(trust_proxy, monkeypatch, raw, expected):
     # One trusted hop: the right-most entry is the address our proxy saw.
     trust_proxy(hops=1)
 
@@ -137,7 +161,8 @@ def test_bucket_key_is_str_even_if_the_header_layer_returns_bytes(trust_proxy, m
 
     key = rate_limit._client_ip(request)
     assert isinstance(key, str), f"bucket key must be str, got {type(key).__name__}"
-    assert key == PROXY_PEER
+    # 1 hop: the right-most entry is the one our proxy wrote, decoded to str.
+    assert key == expected
 
 
 def test_blank_entries_can_never_become_the_bucket_key(trust_proxy):
