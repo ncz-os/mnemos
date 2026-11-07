@@ -66,15 +66,49 @@ def _client_ip(request: Request) -> str:
     return get_remote_address(request)
 
 
+def _header_text(value: object) -> str:
+    """Decode one header value to ``str``, whatever the header layer returns.
+
+    Starlette's ``Headers.getlist`` decodes to ``str``, but the bucket key is
+    the identity of a rate-limit counter, so this boundary does not depend on
+    that staying true: a raw ASGI transport, a proxy library, or a future
+    Starlette revision may hand back ``bytes``. ``latin-1`` is the ASGI header
+    encoding, so it round-trips every byte value exactly as Starlette does.
+    """
+    if isinstance(value, bytes):
+        return value.decode("latin-1")
+    return str(value)
+
+
+def _trusted_hop_count() -> int:
+    """The trusted hop count, floored at 1.
+
+    ``RATE_LIMIT_TRUSTED_PROXY_HOPS`` is clamped by the settings validator, but
+    this module also reads it through monkeypatched/settings objects that never
+    ran pydantic. Flooring HERE means a 0 or a negative can never walk the
+    index backwards into a client-chosen or negative position -- the one
+    mistake that would re-open CF-23.
+    """
+    try:
+        hops = int(RATE_LIMIT_TRUSTED_PROXY_HOPS)
+    except (TypeError, ValueError):
+        return 1
+    return max(hops, 1)
+
+
 def _forwarded_client_ip(request: Request) -> str:
     """The address our own proxies saw, or "" when no header value is trustworthy."""
-    hops = max(int(RATE_LIMIT_TRUSTED_PROXY_HOPS or 1), 1)
+    hops = _trusted_hop_count()
 
     # `headers.getlist` keeps repeated header lines as separate entries; split
-    # each on commas and drop blanks so a malformed ", ," cannot shift the hop.
+    # each on commas and drop blanks so a malformed ", ," cannot shift the hop
+    # and a blank can never itself become a bucket key.
     entries: list[str] = []
     for raw in request.headers.getlist("x-forwarded-for"):
-        entries.extend(part.strip() for part in raw.split(",") if part.strip())
+        for part in _header_text(raw).split(","):
+            entry = part.strip()
+            if entry:
+                entries.append(entry)
 
     if len(entries) >= hops:
         return entries[-hops]
