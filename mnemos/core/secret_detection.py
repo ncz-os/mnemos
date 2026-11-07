@@ -135,84 +135,91 @@ _AWS_SECRET_RE = re.compile(r"(?<![0-9A-Za-z/+=])[0-9A-Za-z/+=]{40}(?![0-9A-Za-z
 
 _SPLIT_PIECE_RE = re.compile(r"(?<![0-9A-Za-z_-])[0-9A-Za-z_-]{6,}(?![0-9A-Za-z_-])")
 _SPLIT_GAP_RE = re.compile(r"[ \t]{1,2}|[ \t]*\r?\n[ \t]{0,2}")
+# A wrapped credential is reassembled as every consequent chain of pieces
+# from each start, not just the longest one: the JWT family is three pieces
+# and the Stripe family two, but the sentence before them is not part of
+# either ("jwt eyJ... eyJ... SflK..." — the safe answer is two spans that
+# leave the word "jwt" alone, not one span that swallows it).
 _SPLIT_MAX_PIECES = 6
 _SPLIT_MIN_TOTAL = 20
-# "Mostly token-grade" threshold, as a fraction of the joined length.
-_SPLIT_MIN_TOKEN_RATIO = 0.6
-# A trailing number on an all-letter fragment ("build2026") is still prose.
-_SPLIT_FRAGMENT_TRAILING_DIGITS_RE = re.compile(r"\A[A-Za-z]{3,}[0-9]+\Z")
-# A bare YYYYMMDD date is a date, not a token fragment ("payment endpoint
-# 20261017"); a JWT/base64url fragment carrying the same digits also carries
-# mixed case or a symbol, so it is still token-grade.
-_SPLIT_DATE_FRAGMENT_RE = re.compile(r"\A(?:19|20)[0-9]{6}\Z")
-# Low-entropy filler a sentence is made of, discounted before measuring how
-# token-like the joined run is: long uniform runs (all-hex/all-digit) are
-# already score 0 on their own; here they are the short forms.
+# Characters a base64url/Stripe token body is drawn from. A run whose every
+# character belongs here is a credential; a sentence brings in punctuation,
+# or digits in an ordinary place, that a token never would.
+_SPLIT_TOKEN_CHARS_RE = re.compile(r"[A-Za-z0-9_\-./+=]+")
 _SPLIT_LOW_ENTROPY_RE = re.compile(r"[0-9]{4,}|[0-9a-fA-F]{8,}")
+_SPLIT_MIN_TOKEN_RATIO = 0.6
+# Lowercase word + trailing digits ("build2026") is prose; mixed case is a
+# token tail and is left alone.
+_SPLIT_FRAGMENT_TRAILING_DIGITS_RE = re.compile(r"\A[a-z]{3,}[0-9]{1,9}\Z")
+# A bare YYYYMMDD date is a date, not a token fragment ("payment endpoint
+# 20261017"); a JWT fragment with the same digits also carries mixed case.
+_SPLIT_DATE_FRAGMENT_RE = re.compile(r"\A(?:19|20)[0-9]{6}\Z")
+# Numbers and lowercase words joined by hyphens: a UUID chunk, a version, a
+# kebab-case phrase. A credential fragment joins with "_" or not at all.
+_SPLIT_HYPHENATED_PROSE_RE = re.compile(r"\A(?:[0-9]+|[a-z]+)(?:-(?:[0-9]+|[a-z]+))+\Z")
 
 
 def _iter_split_token_spans(text: str):
     """Yield (start, end) spans of tokens split across whitespace.
 
     Adjacent fragments (separated only by a space or a single newline) are
-    joined and each joined run is tested: it must be >= 20 chars and carry
-    both a digit and a letter, which is what makes a WRAPPED credential
-    still credential-shaped while word-wrapped prose ("payment endpoint
-    20261017") does not qualify. Each returned span covers the whole run
-    including the gaps, so redaction leaves no fragment behind.
+    joined and every consequent chain of them is tested: a chain qualifies
+    when it reaches 20 chars, carries both a digit and a letter, is made
+    only of token-alphabet characters, and is not mostly date/hex filler.
+    Each returned span covers the whole chain including the gaps, so
+    redaction leaves no fragment behind.
     """
     pieces = list(_SPLIT_PIECE_RE.finditer(text))
     for first in range(len(pieces)):
-        last = first
         end = pieces[first].end()
-        while last + 1 < len(pieces) and (last - first + 1) < _SPLIT_MAX_PIECES:
-            gap = text[end : pieces[last + 1].start()]
+        run = [pieces[first].group(0)]
+        for nxt in range(first + 1, min(len(pieces), first + _SPLIT_MAX_PIECES)):
+            gap = text[end : pieces[nxt].start()]
             if not _SPLIT_GAP_RE.fullmatch(gap):
                 break
-            last += 1
-            end = pieces[last].end()
-        if last == first:
-            continue
-        run = [pieces[k].group(0) for k in range(first, last + 1)]
-        # All-word runs are sentences, not wrapped credentials: at least one
-        # fragment must be token-grade on its own (mixed case, a symbol, or
-        # high-entropy characters from the base64 tail).
-        if not any(_fragment_is_token_grade(frag) for frag in run):
-            continue
-        joined = "".join(run)
-        if len(joined) < _SPLIT_MIN_TOTAL:
-            continue
-        if not re.search(r"[0-9]", joined) or not re.search(r"[A-Za-z]", joined):
-            continue
-        if _split_run_is_prose(joined):
-            continue
-        if _SHA_CONTEXT_RE.search(text[max(0, pieces[first].start() - 30) : pieces[first].start()]):
-            continue
-        yield pieces[first].start(), end
+            end = pieces[nxt].end()
+            run.append(pieces[nxt].group(0))
+            if _split_chain_is_token(run, text, pieces, first):
+                yield pieces[first].start(), end
 
 
 def _fragment_is_token_grade(frag: str) -> bool:
     """True if one fragment alone is credential-shaped rather than a word."""
-    if _SPLIT_DATE_FRAGMENT_RE.match(frag):
+    if _SPLIT_DATE_FRAGMENT_RE.match(frag) or _SPLIT_HYPHENATED_PROSE_RE.match(frag):
         return False
-    core = _SPLIT_FRAGMENT_TRAILING_DIGITS_RE.sub("", frag)
-    if re.search(r"[A-Z]", core):
+    # A lowercase word with a short trailing number ("build2026") is prose;
+    # the same shape with a case shift is a token tail ("SflKxwRJSMeKK").
+    if _SPLIT_FRAGMENT_TRAILING_DIGITS_RE.match(frag):
+        return False
+    if re.search(r"[A-Z]", frag) or re.search(r"[^0-9A-Za-z]", frag):
         return True
-    if re.search(r"[^0-9A-Za-z]", frag):
-        return True
-    # base64url leaves long digit runs inside a token; prose does not.
-    return bool(re.search(r"[0-9]{3,}", frag))
+    # All-lowercase: token-grade only if the digits are a long run a word
+    # plus a year does not produce ("opqrstuvwxyz0123456789", not
+    # "endpoint20261017").
+    digits = re.search(r"[0-9]+\Z", frag)
+    return bool(digits) and len(digits.group(0)) >= 10
 
 
-def _split_run_is_prose(joined: str) -> bool:
-    """True when a joined run is word-wrapped text rather than a token.
-
-    A wrapped credential is mostly token-grade characters — mixed-case
-    base64url, symbols, high-entropy alphanumerics. A sentence joined the
-    same way is mostly dictionary-ish words and short numeric runs, so
-    discounting them leaves well under the token-grade share.
-    """
-    return len(_SPLIT_LOW_ENTROPY_RE.sub("", joined)) < _SPLIT_MIN_TOKEN_RATIO * len(joined)
+def _split_chain_is_token(run: list[str], text: str, pieces, first: int) -> bool:
+    """True when this chain of whitespace-separated fragments is one token."""
+    if len(run) < 2:
+        return False
+    if not any(_fragment_is_token_grade(frag) for frag in run):
+        return False
+    joined = "".join(run)
+    if len(joined) < _SPLIT_MIN_TOTAL:
+        return False
+    if not re.search(r"[0-9]", joined) or not re.search(r"[A-Za-z]", joined):
+        return False
+    if not _SPLIT_TOKEN_CHARS_RE.fullmatch(joined):
+        return False
+    if len(_SPLIT_LOW_ENTROPY_RE.sub("", joined)) < _SPLIT_MIN_TOKEN_RATIO * len(joined):
+        return False
+    # A sha/commit/digest reference is prose, exactly as for the hex-blob
+    # detector, and so is a run that merely continues one.
+    if _SHA_CONTEXT_RE.search(text[max(0, pieces[first].start() - 30) : pieces[first].start()]):
+        return False
+    return True
 
 
 # ── Generic assignment: key/secret/password/token/bearer = <value> ─────
@@ -906,9 +913,7 @@ _REVERSED_SAMPLE_FAMILIES: frozenset[str] = frozenset({"aws_secret"})
 # all-caps assignments, denylisted literals). A real secret under any key —
 # including an allowlisted one — keeps matching, so the vault stays sealed.
 _STATUS_SHA_VALUE_RE = re.compile(r"(?i)^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-_STATUS_UUID_VALUE_RE = re.compile(
-    r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
+_STATUS_UUID_VALUE_RE = re.compile(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 # Bounded identifier slug: job_review ids like "J-ab12cd34" or hash-like ids;
 # 3+ chars, no whitespace, no separators that would end a JSON string early.
 _STATUS_ID_VALUE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:/-]{2,64}$")
