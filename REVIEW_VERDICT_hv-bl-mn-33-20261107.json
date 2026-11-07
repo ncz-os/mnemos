@@ -1,0 +1,33 @@
+{
+  "task": "MN-33",
+  "branch": "hv/bl-mn-33-20261107",
+  "base": "026d9cec03f27a57723a95a468a3a5c4351bb452",
+  "tool": "zoder review --base 026d9cec --scope branch --tier strong --json",
+  "reviewers": [
+    {
+      "model": "muse-spark-1.3-contributor",
+      "tier": "contributor",
+      "provider": "meta-muse-contrib",
+      "verdict": "approve",
+      "ok": true,
+      "findings": [],
+      "summary": "Per-profile SQLite stores for every edge profile, plus sessions repository/route coverage; no blocking findings."
+    }
+  ],
+  "verdict": "approve",
+  "complete": true,
+  "iterations": [
+    {
+      "round": 1,
+      "verdict": "comment",
+      "finding": "test_edge_profiles_do_not_reuse_each_others_storage asserted only path inequality; a cross-profile read-through would still pass.",
+      "fix": "d4b716c5 — write a session through one profile's store and read it through the other's; assert None."
+    },
+    {
+      "round": 2,
+      "verdict": "approve",
+      "findings": []
+    }
+  ],
+  "note": "Muse contributor tier only (operator-approved public repositories); the standard muse tier was deliberately not used."
+}
