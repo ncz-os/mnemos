@@ -2020,26 +2020,29 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
                 await _call(cursor.execute, "SELECT COUNT(*) AS cnt FROM memories WHERE content_hash IS NULL")
                 row = await _row_to_dict(cursor, await _call(cursor.fetchone))
                 return int((row or {}).get("cnt") or 0)
+            # Db2 LUW cannot digest a CLOB in SQL: HASH() rejects LOBs (SQL-171)
+            # and CAST(... AS VARCHAR(32672)) silently truncates, so a SQL
+            # backfill would store a hash that is not the body's SHA-256. Read
+            # the batch and hash it in Python with _content_hash -- the exact
+            # function the insert and update paths already use -- so a
+            # backfilled row and a freshly written row carry the same digest.
             await _call(
                 cursor.execute,
-                """
-                UPDATE memories
-                   SET content_hash = LOWER(HEX(HASH_SHA256(
-                           REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10))
-                       ))),
-                       updated = CURRENT TIMESTAMP
-                 WHERE id IN (
-                    SELECT id
-                      FROM memories
-                     WHERE content_hash IS NULL
-                     ORDER BY created ASC, id ASC
-                     FETCH FIRST ? ROWS ONLY
-                 )
-                   AND content_hash IS NULL
-                """,
+                "SELECT id, content FROM memories WHERE content_hash IS NULL "
+                "ORDER BY created ASC, id ASC FETCH FIRST ? ROWS ONLY",
                 (int(batch_size),),
             )
-            return int(getattr(cursor, "rowcount", 0) or 0)
+            batch = await _fetch_all_dicts(cursor)
+            updated = 0
+            for row in batch:
+                await _call(
+                    cursor.execute,
+                    "UPDATE memories SET content_hash = ?, updated = CURRENT TIMESTAMP "
+                    "WHERE id = ? AND content_hash IS NULL",
+                    (_content_hash(row.get("content")), row.get("id")),
+                )
+                updated += int(getattr(cursor, "rowcount", 0) or 0)
+            return updated
         finally:
             await _call(cursor.close)
 
@@ -2065,29 +2068,28 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             if namespace is not None:
                 where.append("namespace = ?")
                 params_list.append(namespace)
-            # S2: the partition and the group key are digests of the normalized
-            # body, not the CLOB -- grouping on a LOB is SQL0134N, so this sweep
-            # could not run at all. HASH_SHA256 is the expression the content_hash
-            # backfill already uses on this port, so the folded-newline meaning is
-            # the same as on the text backends.
+            # S2: the partition cannot include the normalized CLOB -- grouping on
+            # a LOB is SQL0134N, so this sweep could not run at all. The identity
+            # is content_hash itself: the exact SHA-256 of the newline-normalized
+            # body that every insert, update and (now) backfill path writes in
+            # Python with _content_hash. This backend cannot digest a CLOB in SQL
+            # -- HASH() rejects LOBs (SQL-171) and CAST(... AS VARCHAR(32672))
+            # truncates -- and a truncated digest here would group two distinct
+            # long documents and consolidate one of them away.
             # S6: NULLS LAST, or an unrated duplicate outranks a rated one and is
             # kept as the canonical row (Postgres and Oracle keep the rated one).
             sql = (
                 "WITH ordered AS ("
                 "SELECT id, owner_id, namespace, content_hash, created, quality_rating, "
-                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) AS normalized_content, "
                 "ROW_NUMBER() OVER ("
-                "PARTITION BY owner_id, namespace, content_hash, "
-                "LOWER(HEX(HASH_SHA256("
-                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10))))) "
+                "PARTITION BY owner_id, namespace, content_hash "
                 "ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC"
                 ") AS rn "
                 "FROM memories WHERE " + " AND ".join(where) + " "
                 "), grouped AS ("
                 "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count, "
                 "LISTAGG(id, CHR(31)) WITHIN GROUP (ORDER BY rn ASC) AS memory_ids "
-                "FROM ordered GROUP BY owner_id, namespace, content_hash, "
-                "LOWER(HEX(HASH_SHA256(normalized_content))) HAVING COUNT(*) > 1"
+                "FROM ordered GROUP BY owner_id, namespace, content_hash HAVING COUNT(*) > 1"
                 ") "
                 "SELECT owner_id, namespace, content_hash, duplicate_count, memory_ids, "
                 "SUBSTR(memory_ids, 1, LOCATE(CHR(31), memory_ids || CHR(31)) - 1) AS keep_id, "
@@ -2143,18 +2145,14 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             sql = (
                 "WITH ordered AS ("
                 "SELECT id, owner_id, namespace, content_hash, "
-                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10)) AS normalized_content, "
                 "ROW_NUMBER() OVER ("
-                "PARTITION BY owner_id, namespace, content_hash, "
-                "LOWER(HEX(HASH_SHA256("
-                "REPLACE(REPLACE(COALESCE(content, ''), CHR(13) || CHR(10), CHR(10)), CHR(13), CHR(10))))) "
+                "PARTITION BY owner_id, namespace, content_hash "
                 "ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC"
                 ") AS rn "
                 "FROM memories WHERE " + " AND ".join(where) + " "
                 "), grouped AS ("
                 "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count "
-                "FROM ordered GROUP BY owner_id, namespace, content_hash, "
-                "LOWER(HEX(HASH_SHA256(normalized_content))) HAVING COUNT(*) > 1"
+                "FROM ordered GROUP BY owner_id, namespace, content_hash HAVING COUNT(*) > 1"
                 ") "
                 "SELECT owner_id, namespace, content_hash, duplicate_count FROM grouped "
                 "ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC"

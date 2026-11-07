@@ -1548,7 +1548,9 @@ class FederationPeerCreateRequest(BaseModel):
     namespace_filter: Optional[List[str]] = None
     category_filter: Optional[List[str]] = None
     enabled: bool = True
-    sync_interval_secs: int = 300
+    # The federation_peers table enforces CHECK (sync_interval_secs >= 30); validate here so a
+    # smaller value is a 422, not a database constraint error surfacing as a 500.
+    sync_interval_secs: int = Field(300, ge=30)
     # #168: Literal["strict", "permissive"] gives type-level
     # enforcement + auto-422 + OpenAPI enum, replacing the runtime
     # `if request.compat_mode not in (...)` check at the route.
@@ -1569,7 +1571,7 @@ class FederationPeerUpdateRequest(BaseModel):
     namespace_filter: Optional[List[str]] = None
     category_filter: Optional[List[str]] = None
     enabled: Optional[bool] = None
-    sync_interval_secs: Optional[int] = None
+    sync_interval_secs: Optional[int] = Field(None, ge=30)
     # #168: same Literal[...] tightening on the update path.
     compat_mode: Optional[Literal["strict", "permissive"]] = None
 
