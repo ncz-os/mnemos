@@ -31,12 +31,14 @@ each producer/consumer pair has its own independent enable flag.
 
 Every subject below ends in a `<namespace>` token. The token is produced by
 one shared encoder, `mnemos/persistence/nats_events.py:safe_subject_segment`,
-which is **injective** (CF-35/MN-17): `.` -> `_` (the established shape,
-`alice.ns` -> `alice_ns`), then `_` -> `%5F`, `%` -> `%25`, and the NATS
-wildcards `*` / `>` -> `%2A` / `%3E`. A namespace that literally contains an
-underscore therefore maps to `a%5Fb`, never to the `a_b` a dotted namespace
-produces — the two tenants cannot share a subject. Do not hand-roll a local
-`.replace(".", "_")` in a publisher; route through the shared encoder.
+which is **injective** (CF-35/MN-17). It escapes each character in a single
+pass: `.` -> `_` (the established shape, `alice.ns` -> `alice_ns`), `_` ->
+`%5F`, `%` -> `%25`, and the NATS wildcards `*` / `>` -> `%2A` / `%3E`;
+whitespace is percent-encoded and the result is never stripped or empty. A
+namespace that literally contains an underscore therefore maps to `a%5Fb`,
+never to the `a_b` a dotted namespace produces — the two tenants cannot share
+a subject. Do not hand-roll a local `.replace(".", "_")` in a publisher; route
+through the shared encoder.
 
 ### Memory nudges — `mnemos.memory.>` (`MNEMOS_MEMORY`)
 

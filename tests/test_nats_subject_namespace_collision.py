@@ -55,6 +55,15 @@ def test_safe_subject_segment_keeps_the_established_subject_shape():
     assert safe_subject_segment("") == "default"
 
 
+def test_safe_subject_segment_does_not_strip_edge_dots():
+    """A leading/trailing ``.`` must not collapse onto the bare namespace."""
+    from mnemos.persistence.nats_events import safe_subject_segment
+
+    assert safe_subject_segment(".a") != safe_subject_segment("a")
+    assert safe_subject_segment("a.") != safe_subject_segment("a")
+    assert safe_subject_segment("a.") != safe_subject_segment(".a")
+
+
 def test_safe_subject_segment_never_emits_a_wildcard_or_a_dot():
     from mnemos.persistence.nats_events import safe_subject_segment
 

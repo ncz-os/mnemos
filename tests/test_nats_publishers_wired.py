@@ -132,7 +132,7 @@ async def test_create_memory_sanitizes_nats_wildcards_and_spaces(
     subject = publish_mock.await_args.args[0]
     token = subject.rsplit(".", 1)[1]
     assert subject.startswith("mnemos.memory.created.")
-    assert not any(ch in token for ch in ".*> \t\n")
+    assert not any(ch in token for ch in ".*> \t\n\r")
 
 
 async def test_bulk_create_publishes_memory_created_per_success(
