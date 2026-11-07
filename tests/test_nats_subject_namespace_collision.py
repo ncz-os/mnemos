@@ -116,15 +116,19 @@ def _load_mcp_http():
     """
     stub = types.ModuleType("mnemos.mcp.stdio")
     stub.app = object()
-    original = sys.modules.get("mnemos.mcp.stdio")
+    saved = {name: sys.modules.get(name) for name in ("mnemos.mcp.stdio", "mnemos.mcp.http")}
     sys.modules["mnemos.mcp.stdio"] = stub
+    sys.modules.pop("mnemos.mcp.http", None)
     try:
         return importlib.import_module("mnemos.mcp.http")
     finally:
-        if original is not None:
-            sys.modules["mnemos.mcp.stdio"] = original
-        else:
-            sys.modules.pop("mnemos.mcp.stdio", None)
+        # Restore both modules so a real ``mnemos.mcp.http`` imported later
+        # in the session is not left bound to this test's stub.
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def test_sse_subject_for_dotted_namespace_is_not_flattened():
