@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.domain.portability.schemas import (
@@ -215,9 +216,7 @@ class _noop_ctx:
         return self
 
 
-async def test_ingest_session_refused_during_active_deletion(
-    client, auth_headers: dict[str, str], api_user
-):
+async def test_ingest_session_refused_during_active_deletion(client, auth_headers: dict[str, str], api_user):
     from mnemos.api.routes import ingest
 
     insert = AsyncMock(return_value=[])
@@ -232,9 +231,7 @@ async def test_ingest_session_refused_during_active_deletion(
 # ── POST /v1/import (MPF) ──────────────────────────────────────────────────
 
 
-async def test_mpf_import_refused_during_active_deletion(
-    client, auth_headers: dict[str, str], backend, api_user
-):
+async def test_mpf_import_refused_during_active_deletion(client, auth_headers: dict[str, str], backend, api_user):
     with _fence_patch():
         resp = await client.post(
             "/v1/import",
@@ -247,9 +244,7 @@ async def test_mpf_import_refused_during_active_deletion(
     assert not [call for call in backend.memories.calls if call[0] == "insert_memory"]
 
 
-async def test_mpf_import_probes_every_preserved_scope(
-    client, auth_headers: dict[str, str], backend, api_user
-):
+async def test_mpf_import_probes_every_preserved_scope(client, auth_headers: dict[str, str], backend, api_user):
     """Under ``preserve_owner`` a root caller writes to OTHER owners' scopes.
 
     The fence must probe each target (owner, namespace) pair, not just the
@@ -273,9 +268,7 @@ async def test_mpf_import_probes_every_preserved_scope(
     assert probed == {("u-a", "ns-a"), ("u-b", "ns-b")}
 
 
-async def test_mpf_import_sidecar_refused_for_active_scope(
-    client, auth_headers: dict[str, str], backend, api_user
-):
+async def test_mpf_import_sidecar_refused_for_active_scope(client, auth_headers: dict[str, str], backend, api_user):
     """A KG triple that targets a scope mid-deletion is not written either."""
     api_user["user"] = _user(role="root", user_id="root", namespace="root-ns")
     with _fence_patch():
@@ -309,7 +302,9 @@ async def test_charon_bundle_import_refused_during_active_deletion(tmp_path, bac
     from mnemos.portability import charon
 
     def _concepts(_src):
-        return [{"id": "mem_ghost", "content": "ghost", "category": "facts", "owner_id": "alice", "namespace": "alice-ns"}]
+        return [
+            {"id": "mem_ghost", "content": "ghost", "category": "facts", "owner_id": "alice", "namespace": "alice-ns"}
+        ]
 
     with _fence_patch(), patch.object(charon, "import_bundle", _concepts):
         with pytest.raises(Exception) as excinfo:
@@ -318,3 +313,160 @@ async def test_charon_bundle_import_refused_during_active_deletion(tmp_path, bac
     # The refusal must be the fence's 409, not a swallowed per-record skip.
     assert getattr(excinfo.value, "status_code", None) == 409, repr(excinfo.value)
     assert not [call for call in backend.memories.calls if call[0] == "insert_memory"]
+
+
+# ── root bypass / fence placement ──────────────────────────────────────────
+
+
+async def test_bulk_create_root_bypasses_fence_on_own_scope(
+    client,
+    auth_headers: dict[str, str],
+    backend,
+    api_user,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Root keeps the documented tombstone-injection bypass, on its own scope."""
+    from mnemos.api.routes import memories
+
+    api_user["user"] = _user(role="root", user_id="root", namespace="root-ns")
+
+    async def fake_embeddings_batch(texts):
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+    monkeypatch.setattr(memories, "_get_embeddings_batch", fake_embeddings_batch)
+
+    with _fence_patch():
+        resp = await client.post(
+            "/v1/memories/bulk",
+            json={"memories": [{"content": "tombstone", "category": "facts"}]},
+            headers=auth_headers,
+        )
+
+    assert resp.status_code == 201, resp.text
+
+
+async def test_document_import_refuses_before_first_chunk(monkeypatch):
+    """The whole document is refused; no chunk is written."""
+    from mnemos.api.routes import document_import
+
+    backend = SimpleNamespace()
+    monkeypatch.setattr(document_import, "backend_or_503", lambda: backend)
+    monkeypatch.setattr(document_import, "DOCLING_AVAILABLE", True)
+
+    async def _read(_file):
+        return b"# doc"
+
+    monkeypatch.setattr(document_import, "_read_upload_file_capped", _read)
+    monkeypatch.setattr(document_import, "_validate_permission_mode", lambda _pm, default: default)
+    monkeypatch.setattr(document_import, "_validate_project_tag", lambda _tag: _tag)
+
+    importer = SimpleNamespace(
+        parse_document=lambda *a, **k: ("text", {}, [{"content": "chunk one"}]),
+    )
+    monkeypatch.setattr(document_import, "DoclingImporter", lambda: importer)
+
+    with _fence_patch(), pytest.raises(HTTPException) as excinfo:
+        await document_import.import_memories_from_document(
+            file=SimpleNamespace(filename="doc.md"),
+            project_tag="proj",
+            user=_user(),
+        )
+
+    assert excinfo.value.status_code == 409, excinfo.value.detail
+
+
+@pytest.mark.asyncio
+async def test_fence_probe_lives_in_domain_not_api() -> None:
+    """The shared probe must be importable from below ``mnemos.api``.
+
+    ``mnemos.domain`` may not import ``mnemos.api`` (layered contract), so the
+    fence's home is ``mnemos.domain.deletion_fence`` and
+    ``mnemos.api.memory_mutations`` re-exports the SAME object.
+    """
+    from mnemos.api import memory_mutations
+    from mnemos.domain import deletion_fence
+
+    assert memory_mutations._assert_no_active_deletion is deletion_fence.assert_no_active_deletion
+    assert memory_mutations._assert_no_active_deletion_for_scopes is deletion_fence.assert_no_active_deletion_for_scopes
+
+
+# ── real-backend regression: the probe must not run inside a transaction ───
+
+
+async def _open_sqlite_backend(tmp_path):
+    from mnemos.persistence.sqlite import SqliteBackend
+
+    backend = SqliteBackend(tmp_path / "fence-real.db", SimpleNamespace(database=SimpleNamespace(embedding_dim=3)))
+    await backend.open()
+    return backend
+
+
+async def test_charon_import_probe_does_not_run_inside_the_import_transaction(tmp_path):
+    """End-to-end guard against the nested-transaction deadlock.
+
+    ``active_deletion_for_scope`` reads through a transaction of its own. When
+    the charon bundle import probed from INSIDE ``backend.transactional()``,
+    SQLite serialised on the file lock and the import hung forever -- the
+    round-trip suite never caught it because every other test mocks the probe
+    out, so the real read transaction never opened.
+
+    Here the fence is NOT mocked: a real ``SqliteBackend`` and the real probe
+    run, so a re-introduced nested transaction blocks and trips the timeout
+    instead of passing silently. The fence finds no active deletion (the table
+    is empty), so the import is allowed and must complete promptly.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    from mnemos.portability import charon
+
+    backend = await _open_sqlite_backend(tmp_path)
+    try:
+        concepts = [
+            {
+                "id": "mem_real_1",
+                "content": "real round trip",
+                "category": "facts",
+                "owner_id": "alice",
+                "namespace": "alice-ns",
+            }
+        ]
+        with patch.object(charon, "import_bundle", lambda _src: concepts):
+            await asyncio.wait_for(
+                charon.import_bundle_to_backend(backend, tmp_path / "bundle.mif"),
+                timeout=20,
+            )
+        async with backend.transactional() as tx:
+            row = await backend.memories.fetch_memory_by_id(tx, "mem_real_1")
+        assert row is not None, "import wrote no row"
+        assert row["content"] == "real round trip"
+    finally:
+        await backend.close()
+
+
+async def test_mpf_preflight_runs_before_the_import_transaction(tmp_path):
+    """The MPF route's probe is a preflight, not an in-transaction call.
+
+    Same root cause as above for ``POST /v1/import``: the route opens the
+    transaction and hands ``tx`` to ``import_memories``, so probing there would
+    nest a second handle. ``preflight_import_scope_fence`` is invoked by the
+    route BEFORE ``backend.transactional()``; calling it standalone against a
+    real backend must return promptly and leave no transaction open.
+    """
+    import asyncio
+
+    from mnemos.domain.portability.import_ import preflight_import_scope_fence
+
+    backend = await _open_sqlite_backend(tmp_path)
+    try:
+        envelope = _mpf_envelope({"content": "hello", "category": "facts"})
+        await asyncio.wait_for(
+            preflight_import_scope_fence(backend, envelope=envelope, preserve_owner=False, user=_user()),
+            timeout=20,
+        )
+        # A second in-transaction write must still succeed: the preflight
+        # closed its own read transaction rather than leaking it.
+        async with backend.transactional():
+            pass
+    finally:
+        await backend.close()

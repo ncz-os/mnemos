@@ -65,6 +65,7 @@ from pathlib import Path
 from time import time
 from typing import Any
 
+from mnemos.domain.deletion_fence import assert_no_active_deletion_for_scopes
 from mnemos.persistence.base import is_duplicate_memory_error
 from mnemos.portability import mif
 
@@ -373,6 +374,31 @@ def _coerce_embedding(value: Any) -> list[float] | None:
         return [float(item) for item in seq]
     except (TypeError, ValueError):
         return None
+
+
+def _import_bundle_scopes(
+    memories: list[dict[str, Any]],
+    *,
+    memory_rows_by_id: dict[str, dict[str, Any]],
+) -> set[tuple[str, str | None]]:
+    """Every ``(owner_id, namespace)`` an import will write memory rows to.
+
+    Resolves each concept row the same way the insert loop does (the merged
+    ``_merge_memory_import_row`` row, with the same ``"default"`` fallbacks),
+    so the CF-09 fence probes exactly the scopes that are about to be written.
+    """
+    scopes: set[tuple[str, str | None]] = set()
+    for concept_memory in memories:
+        old_mid = concept_memory.get("id")
+        base_row = memory_rows_by_id.get(str(old_mid)) if old_mid is not None else None
+        memory = _merge_memory_import_row(concept_memory, base_row)
+        scopes.add(
+            (
+                memory.get("owner_id") or "default",
+                memory.get("namespace") or "default",
+            )
+        )
+    return scopes
 
 
 def _merge_memory_import_row(concept_memory: dict[str, Any], base_row: dict[str, Any] | None) -> dict[str, Any]:
@@ -1107,6 +1133,34 @@ async def import_bundle_to_backend(
         if version_ids_require_uuid and not _is_valid_uuid(ref):
             return None
         return ref
+
+    # CF-09 GDPR fence (MN-05): a bundle import is a write path like any
+    # other, and it used to insert straight through a scope whose deletion
+    # request is inside its 30-day grace window. The rows it lands carry
+    # ``deleted_at IS NULL``, so the next sweep cannot see them and the
+    # hard-delete phase (which only removes rows already carrying
+    # ``deleted_at IS NOT NULL``) skips them -- they survive while the request
+    # records the scope as ``hard_deleted``. Probe every DISTINCT target scope
+    # of this bundle, before the first insert.
+    #
+    # The probe runs BEFORE ``backend.transactional()`` opens the import
+    # transaction, deliberately: ``active_deletion_for_scope`` reads through its
+    # own ``backend.transactional()``, so calling it from inside this one asks
+    # the backend for a second transactional handle while the first is open.
+    # SQLite serialises on the file lock and the import hangs forever (the
+    # round-trip tests deadlock); on the server backends it would at best hold
+    # two connections. Probing first costs one read before the write lock is
+    # taken -- a write that loses the race to a deletion starting in between is
+    # still caught by the hard-delete resweep+verify loop, which refuses to
+    # mark a request complete while live rows remain. Refusing here (before the
+    # first insert) rather than per record: the caller has no per-record error
+    # channel, and a partial import would report success while silently
+    # dropping part of the bundle. There is no root bypass on this API surface
+    # -- the import carries no authenticated principal.
+    await assert_no_active_deletion_for_scopes(
+        backend,
+        _import_bundle_scopes(memories, memory_rows_by_id=memory_rows_by_id),
+    )
 
     async with backend.transactional() as tx:
         if versions_sidecar_declared:
