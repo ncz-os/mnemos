@@ -101,6 +101,12 @@ def test_audit_proof_head_404_when_no_entry(monkeypatch, fake_user):
         async def get_latest_audit_entry(self, tx, mid):
             return None
 
+    class _Memories:
+        # CF-22: the handler now resolves the memory under the read
+        # visibility filter before touching the chain.
+        async def get_memory(self, tx, mid, *, visibility, include_archived=False):
+            return {"id": mid}
+
     class _TxCtx:
         async def __aenter__(self):
             return MagicMock()
@@ -110,6 +116,7 @@ def test_audit_proof_head_404_when_no_entry(monkeypatch, fake_user):
 
     class _Backend:
         audit_chain = _AuditChain()
+        memories = _Memories()
 
         def transactional(self):
             return _TxCtx()

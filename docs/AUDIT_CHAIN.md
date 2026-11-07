@@ -120,6 +120,19 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 Replicas use this to look up the containing root in `memory_audit_roots`.
 
+**Tenant scoping (CF-22).** The audit chain is keyed by memory id, not by
+tenant, so the endpoint resolves the memory first under the standard read
+visibility predicate (`VisibilityFilter.for_read` — the same one behind
+`GET /v1/memories/{id}`). A memory the caller cannot read returns the
+**same 404** as a memory that does not exist:
+
+```
+no audit entries for memory_id=<id>
+```
+
+so the response is not an existence oracle across tenants. `root` bypasses
+the predicate. Archived memories remain provable by their owner.
+
 ### `GET /v1/audit/health`
 
 Per-backend audit-chain health snapshot. Use for operator dashboards + alerts:

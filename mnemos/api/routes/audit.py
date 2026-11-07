@@ -13,6 +13,12 @@ Public surface:
 Both endpoints require authentication via the standard bearer-token
 dependency. The pubkey endpoint exposes only public-key material —
 no signing key leakage.
+
+The audit chain is keyed by memory id, not by tenant, so every endpoint
+that takes one has to apply the memories read predicate itself:
+``/proof`` resolves the memory under ``VisibilityFilter.for_read`` before
+touching the chain and 404s a memory the caller cannot see. Without that
+check the endpoint is a cross-tenant existence oracle (CF-22).
 """
 
 from __future__ import annotations
@@ -29,6 +35,8 @@ from mnemos.api.persistence_helpers import _capability_503
 from mnemos.audit import derive_writer_keypair, load_root_keypair
 from mnemos.audit.crypto import merkle_leaf, merkle_proof, merkle_root
 from mnemos.audit.route_helper import memory_id_to_audit_bytes
+from mnemos.core.security import is_root
+from mnemos.persistence.visibility import VisibilityFilter
 from mnemos.workers.audit_sealer import audit_chain_enabled
 
 logger = logging.getLogger(__name__)
@@ -110,6 +118,13 @@ async def audit_proof_head(
     follow-up; this endpoint returns the chain head sufficient for
     replicas to look up the containing root in ``memory_audit_roots``
     and re-derive the inclusion path from their own copy of the chain.
+
+    Visibility (CF-22): the chain is keyed by memory id, so the memory is
+    resolved first under ``VisibilityFilter.for_read`` -- the same
+    predicate as ``GET /v1/memories/{id}``. A memory the caller cannot
+    read returns the identical 404 as one that does not exist, so the
+    endpoint is not an existence oracle across tenants. Root bypasses the
+    predicate, as everywhere else.
     """
     if not audit_chain_enabled():
         raise HTTPException(
@@ -128,7 +143,30 @@ async def audit_proof_head(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    # CF-22: the audit chain is keyed by memory id, not by tenant, so without
+    # a visibility check this endpoint is a cross-tenant existence oracle --
+    # 200 + audit metadata for somebody else's memory, 404 otherwise. Gate it
+    # on the same read predicate every other read path uses (GET
+    # /v1/memories/{id}, the DAG reads, the ACL routes) and collapse
+    # "invisible" into the same 404 as "not found" so the response body is
+    # not an oracle either. Archived rows are included: an archive writes an
+    # audit entry that its owner must still be able to prove.
+    visibility = VisibilityFilter.for_read(
+        user,
+        namespace=None if is_root(user) else user.namespace,
+    )
     async with backend.transactional() as tx:
+        memory_row = await backend.memories.get_memory(
+            tx,
+            memory_id_str,
+            visibility=visibility,
+            include_archived=True,
+        )
+        if memory_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no audit entries for memory_id={memory_id_str}",
+            )
         row = await backend.audit_chain.get_latest_audit_entry(tx, memory_id_bytes)
 
     if row is None:
