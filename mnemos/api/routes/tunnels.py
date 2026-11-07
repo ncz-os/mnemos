@@ -240,9 +240,11 @@ async def start_tunnel(
             detail=f"Unknown tunnel backend {request.backend!r}; expected one of {list(BACKEND_NAMES)}.",
         )
 
-    token, token_source, expires_in = _issue_tunnel_token()
-
     async with _lock:
+        # The single-tunnel guard runs before the credential is resolved: a
+        # token minted for a request that then 409s is a live credential
+        # nobody asked for. Only once we know this start will actually be
+        # attempted do we spend a token on it.
         if _active_bridge is not None and _active_bridge.status() is not None:
             existing = _active_bridge.status()
             raise HTTPException(
@@ -253,6 +255,8 @@ async def start_tunnel(
                     f"DELETE /admin/tunnels/stop"
                 ),
             )
+
+        token, token_source, expires_in = _issue_tunnel_token()
 
         bridge = bridge_cls()
         try:
