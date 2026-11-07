@@ -34,8 +34,12 @@ The public surface pinned here:
 * the helpers ``_run``/``_which``/``_detect_os``/``_detect_postgres``/
   ``_detect_pgvector``/``_disk_free_gb``, which carry the branch logic.
 
-One suspected defect is pinned with ``xfail(strict=True)``: see
-``test_detect_os_swallows_any_exception_from_the_id_like_loop``.
+One defect that was reported here is now FIXED: ``_detect_os`` used to return
+``('linux', 'unknown', version_id)`` for a readable ``/etc/os-release`` naming
+an unmapped distro, never reaching the ``lsb_release`` fallback. Both
+``test_detect_os_falls_back_to_lsb_release_for_an_unmapped_distro`` and
+``test_detect_os_unmapped_distro_with_failing_lsb_release_is_unknown`` pin the
+repaired contract.
 """
 
 from __future__ import annotations
@@ -446,10 +450,23 @@ def test_detect_os_id_like_resolves_by_distro_map_order_not_file_order(os_releas
     assert _detect_os() == ("linux", "debian", "22")
 
 
-def test_detect_os_unknown_id_and_unknown_id_like_is_unknown(os_release):
-    os_release('ID="gentoo"\nID_LIKE="none"\nVERSION_ID="2.15"\n')
+def test_detect_os_unknown_id_and_unknown_id_like_falls_back_to_lsb_release(os_release, fake_run):
+    """Unmapped ``ID`` with an unresolvable ``ID_LIKE`` still resolves.
 
-    assert _detect_os() == ("linux", "unknown", "2.15")
+    ``/etc/os-release`` is readable but names nothing in ``distro_map`` and its
+    ``ID_LIKE`` resolves no key either. That is the second documented trigger
+    for the ``lsb_release`` probe, so the answer is not a bare ``unknown``.
+    """
+    os_release('ID="gentoo"\nID_LIKE="none"\nVERSION_ID="2.15"\n')
+    table = fake_run(
+        {
+            _argv("lsb_release", "-is"): _FakeCompleted(0, "Gentoo", ""),
+            _argv("lsb_release", "-rs"): _FakeCompleted(0, "2.15", ""),
+        }
+    )
+
+    assert _detect_os() == ("linux", "gentoo", "2.15")
+    assert table.commands() == ["lsb_release -is", "lsb_release -rs"]
 
 
 def test_detect_os_id_and_id_like_are_lower_cased(os_release):
@@ -477,15 +494,33 @@ def test_detect_os_version_id_may_be_unquoted(os_release):
     assert _detect_os() == ("linux", "fedora", "40")
 
 
-def test_detect_os_empty_os_release_is_unknown_linux(os_release):
-    """An empty (or comment-only) file yields ``linux/unknown/""``."""
+def test_detect_os_empty_os_release_falls_back_to_lsb_release(os_release, fake_run):
+    """An empty (or comment-only) file names no distro, so the fallback runs."""
     os_release("")
+    table = fake_run(
+        {
+            _argv("lsb_release", "-is"): _FakeCompleted(0, "Debian", ""),
+            _argv("lsb_release", "-rs"): _FakeCompleted(0, "13", ""),
+        }
+    )
 
-    assert _detect_os() == ("linux", "unknown", "")
+    assert _detect_os() == ("linux", "debian", "13")
+    assert table.commands() == ["lsb_release -is", "lsb_release -rs"]
 
+    table.calls.clear()
     os_release("# just a comment\n\n")
 
+    assert _detect_os() == ("linux", "debian", "13")
+    assert table.commands() == ["lsb_release -is", "lsb_release -rs"]
+
+
+def test_detect_os_empty_os_release_without_lsb_release_is_unknown(os_release, fake_run):
+    """No mapping and no ``lsb_release``: both probes failed, so ``unknown``."""
+    os_release("")
+    table = fake_run({_argv("lsb_release", "-is"): _FakeCompleted(1, "", "not found")})
+
     assert _detect_os() == ("linux", "unknown", "")
+    assert table.commands() == ["lsb_release -is"]
 
 
 def test_detect_os_ignores_lines_without_an_equals_sign(os_release):
@@ -503,7 +538,7 @@ def test_detect_os_splits_only_on_the_first_equals(os_release):
 
 
 def test_detect_os_missing_os_release_falls_back_to_lsb_release(os_release, fake_run):
-    """OSError on the open is the documented trigger for the lsb_release path."""
+    """OSError on the open is one documented trigger for the lsb_release path."""
     os_release(FileNotFoundError(2, "/etc/os-release"))
     table = fake_run(
         {
@@ -559,27 +594,12 @@ def test_detect_os_permission_error_on_os_release_also_falls_back(os_release, fa
     assert _detect_os() == ("linux", "fedora", "40")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DEFECT (reported, not fixed — tests-only job). mnemos/installer/detect.py "
-        "_detect_os(): the /etc/os-release parse runs inside `try:` (line 62), whose "
-        '`except Exception: pass` is line 92, and the `return "linux", distro, '
-        "version_id` at line 91 is INSIDE that try block. So when ID is unmapped and "
-        "ID_LIKE does not resolve the distro, the function returns "
-        "('linux', 'unknown', version_id) without ever reaching the lsb_release "
-        "fallback documented at line 94. A supported-but-unmapped distro (e.g. Linux "
-        "Mint without ID_LIKE) is reported as 'unknown' rather than resolved by "
-        "lsb_release. The fallback only runs when the /etc/os-release read RAISES."
-    ),
-)
 def test_detect_os_falls_back_to_lsb_release_for_an_unmapped_distro(os_release, fake_run):
-    """Pin the INTENDED contract: an unmapped, ID_LIKE-less distro still resolves.
+    """An unmapped, ID_LIKE-less distro still resolves via ``lsb_release``.
 
     ``/etc/os-release`` is readable but names nothing in ``distro_map`` and has
-    no ``ID_LIKE``. The documented fallback ("Fallback: lsb_release") should
-    therefore run. Today the early ``return`` at the end of the try body wins
-    and the answer is ``unknown`` — see the xfail reason.
+    no ``ID_LIKE``. The documented fallback ("Fallback: lsb_release") therefore
+    runs, so a supported-but-unmapped distro is not reported as ``unknown``.
     """
     os_release('ID="linuxmint"\nVERSION_ID="22"\n')
     table = fake_run(
@@ -593,17 +613,19 @@ def test_detect_os_falls_back_to_lsb_release_for_an_unmapped_distro(os_release, 
     assert table.commands() == ["lsb_release -is", "lsb_release -rs"]
 
 
-def test_detect_os_unknown_distro_short_circuits_before_lsb_release(os_release, fake_run):
-    """CURRENT behaviour, pinned: an unknown distro never reaches lsb_release.
+def test_detect_os_unmapped_distro_with_failing_lsb_release_is_unknown(os_release, fake_run):
+    """``unknown`` is reserved for a host where *both* probes fail.
 
-    This is the other half of the defect above — recorded as a passing pin so
-    the day it is fixed this test fails loudly and gets updated with it.
+    The mapping misses ``linuxmint`` and ``lsb_release`` exits non-zero, so the
+    probe genuinely cannot name the distro. The ``VERSION_ID`` from
+    ``/etc/os-release`` is not carried over, because the fallback path owns the
+    answer once it is entered.
     """
     os_release('ID="linuxmint"\nVERSION_ID="22"\n')
-    table = fake_run(default=_FakeCompleted(0, "LinuxMint", "22"))
+    table = fake_run({_argv("lsb_release", "-is"): _FakeCompleted(1, "", "not found")})
 
-    assert _detect_os() == ("linux", "unknown", "22")
-    assert table.calls == []
+    assert _detect_os() == ("linux", "unknown", "")
+    assert table.commands() == ["lsb_release -is"]
 
 
 # ---------------------------------------------------------------------------
