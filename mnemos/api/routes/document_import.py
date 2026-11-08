@@ -53,7 +53,7 @@ import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.memory_mutations import _assert_no_active_deletion
 from mnemos.api.persistence_helpers import backend_or_503
-from mnemos.api.read_policy import _validate_permission_mode
+from mnemos.api.read_policy import _redacted_for_webhook, _validate_permission_mode
 from mnemos.core.config import get_settings, runtime_env_value
 from mnemos.core.ids import new_memory_id
 from mnemos.domain.document_repo import (
@@ -618,6 +618,15 @@ async def import_memories_from_document(
                     canonical_id = imported.memory_id
                     in_flight_id = canonical_id
                     if imported.emit_created_event and getattr(backend, "supports_webhooks", True):
+                        # F2 (2026-11-06): describe the row AS STORED. import_chunk
+                        # classified the chunk -- vaulting it when it carries a
+                        # credential and recording secret spans in metadata -- so
+                        # the outbound payload must use that stored metadata to
+                        # mask content and report the post-classification
+                        # namespace. Sending chunk["content"] / user.namespace
+                        # leaked raw credentials and the pre-vault namespace to an
+                        # external HTTP endpoint.
+                        stored_namespace = imported.namespace or user.namespace
                         chunk_delivery_ids = await backend.webhooks.dispatch_event(
                             tx,
                             "memory.created",
@@ -625,13 +634,13 @@ async def import_memories_from_document(
                                 "memory_id": canonical_id,
                                 "category": category,
                                 "subcategory": subcategory,
-                                "content": chunk["content"],
+                                "content": _redacted_for_webhook(chunk["content"], imported.metadata),
                                 "owner_id": user.user_id,
-                                "namespace": user.namespace,
+                                "namespace": stored_namespace,
                                 "source": "document_import",
                             },
                             owner_id=user.user_id,
-                            namespace=user.namespace,
+                            namespace=stored_namespace,
                         )
                     elif imported.emit_created_event:
                         chunk_delivery_ids = []
