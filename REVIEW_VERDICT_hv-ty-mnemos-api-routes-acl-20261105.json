@@ -1,60 +1,50 @@
 {
-  "task": "characterisation tests for mnemos/api/routes/acl.py",
+  "verdict": "approve",
+  "reason": "Reviewed branch hv/ty-mnemos-api-routes-acl-20261105 at HEAD 60ad9b9959d5b5dc351f0d113335e6f2242b992a against base master (merge-base 026d9cec). The only branch-owned change is 0dc46307 'tests: characterise the ACL route module', which adds tests/test_mnemos_api_routes_acl_characterisation_20261105.py plus this verdict artifact. It is strictly additive: no core code, no config, and no abc_first_baseline.json or scripts/ changes, so the lint:abc-first ratchet guard is untouched. All 122 test cases (97 functions, parametrized) pass in 0.6s and ruff is clean. The fakes and assertions were verified line-by-line against mnemos/api/routes/acl.py, mnemos/api/persistence_helpers.py, and mnemos/core/lifecycle.py: capability-503 semantics, require_acl_backend's absent-capabilities passthrough, principal/perm validation branches, _iso/_to_entry coercion, the owner/root/group-admin gate including the pinned str-typed group_ids quirk, RLS neutralisation, transaction ordering, revoke 404, and the search-cache/visibility-epoch invalidation contract (including its swallowed-error paths) all match source. No defects warranting xfail were found; the 'quirks' are explicitly pinned as-is per the characterisation mandate. Reviewer note: the committed artifact carries the prior attempt's REQUEST_CHANGES record (which refuted 7 of 7 findings against source); I independently re-verified the code and its tests and found no blocking issues. Delivery policy is honoured: the author branch is left at 60ad9b99 with a clean tree; this verdict is published only on the separate review/ ref.",
+  "head_sha": "60ad9b9959d5b5dc351f0d113335e6f2242b992a",
   "branch": "hv/ty-mnemos-api-routes-acl-20261105",
-  "deliverable": "tests/test_mnemos_api_routes_acl_characterisation_20261105.py",
-  "reviewer_model": "deepseek-v4-pro (non-author)",
-  "reviewer_verdict": "REQUEST_CHANGES",
-  "author_assessment": "REJECTED — every finding was refuted against source; no finding warranted a change",
-  "verification": [
+  "base": "origin/master",
+  "base_sha": "026d9cec03f27a57723a95a468a3a5c4351bb452",
+  "job_id": "01a1b992-0687-7881-8743-3be774dc72bb",
+  "review_ref": "review/hv/ty-mnemos-api-routes-acl-20261105-01a1b9a5-f76d-7fbe-a275-575533532c28",
+  "reviewed_at": "2026-11-08T00:33:47-05:00",
+  "reviewer_model": "qwen38 (cerberus local, non-author)",
+  "findings": [
     {
-      "finding": "[high] logger.info receives principal without str() conversion",
-      "test_cited": "test_grant_memory_acl_success",
-      "result": "REFUTED",
-      "reason": "No such test exists in the file. The real test (test_grant_logs_the_grant_at_info_with_principal_perm_and_memory, line 1049) asserts the emitted message string via caplog and does not mock logger.info. It also pins the behaviour the reviewer describes as a risk: the route logs the raw request field, not a str()-converted value, exactly as acl.py:207-213 does."
-    },
-    {
-      "finding": "[high] cache-invalidation exception paths untested",
-      "test_cited": "test_invalidate_search_caches_after_acl_change",
-      "result": "REFUTED",
-      "reason": "No such test exists. Six dedicated tests cover these exact branches: no-op passthrough when _lc._cache is None (line 1175), scan failure (1196), epoch failure (1207), delete failure (test_grant_returns_the_entry_even_when_cache_delete_raises), plus the ordering/pattern assertions (1216)."
-    },
-    {
-      "finding": "[medium] backend with no capabilities attr not verified",
-      "test_cited": "test_require_acl_backend_missing_capabilities_attr",
-      "result": "REFUTED",
-      "reason": "No such test exists. test_backend_without_capabilities_or_an_acl_attribute_is_rejected (line 783) builds a bare object with neither attribute and asserts 503; test_backend_without_a_capabilities_attribute_is_let_through pins the complementary branch (capabilities absent but .acl present -> accepted)."
-    },
-    {
-      "finding": "[medium] multi-colon / empty-part principals not covered",
-      "test_cited": "test_validate_principal",
-      "result": "REFUTED",
-      "reason": "Covered at lines 365, 374, 385 and 395: 'user:a:b', 'user:a:b:c', ':42', 'user:', 'group:', 'user::', 'group::' — including the pinned quirk that 'user::' is ACCEPTED because partition leaves ident=':'."
-    },
-    {
-      "finding": "[low] _iso callable-vs-str fallback inconsistency",
-      "test_cited": "test_to_entry",
-      "result": "REFUTED",
-      "reason": "No such test exists. Seven _iso tests (lines 466-497) cover None, datetime, date, str fallback, int fallback, a non-callable isoformat attribute, and exception propagation."
-    },
-    {
-      "finding": "[medium] _load_manageable_memory permission branches incomplete",
-      "test_cited": "test_load_manageable_memory",
-      "result": "REFUTED",
-      "reason": "No such test exists. Fourteen gate tests (lines 591-723) cover owner, root, group-admin, non-member, non-admin member, missing group_id, invisible/empty row, and both propagation branches."
-    },
-    {
-      "finding": "[low] revoke 404 not triggered by falsy revoke_acl return",
-      "test_cited": "test_revoke_memory_acl_not_found",
-      "result": "REFUTED",
-      "reason": "test_revoke_raises_404_when_the_repository_reports_nothing_removed (line 1085) injects revoke_result=False and asserts 404 with detail 'ACL grant not found'."
+      "severity": "info",
+      "note": "tests_in_file metric in the previously committed artifact counts pytest cases (122), not test functions (97); the number matches the observed run output and is not a defect."
     }
   ],
-  "measured": {
-    "tests_in_file": 122,
-    "module_line_coverage": "100% (103/103 statements, 0 missing)",
-    "ruff": "clean",
-    "full_suite_before": "53 failed, 5624 passed, 576 skipped, 2 xfailed, 3 xpassed, 42 errors",
-    "full_suite_after": "53 failed, 5746 passed, 576 skipped, 2 xfailed, 3 xpassed, 42 errors (identical failure set; +122 passing)",
-    "defects_found": "none warranting xfail(strict=True)"
-  }
+  "verification": [
+    {
+      "check": "git rev-parse HEAD == task head sha",
+      "result": "pass",
+      "detail": "60ad9b9959d5b5dc351f0d113335e6f2242b992a"
+    },
+    {
+      "check": "diff vs base is strictly additive tests + verdict artifact",
+      "result": "pass",
+      "detail": "git diff --name-status origin/master...HEAD shows only A tests/test_mnemos_api_routes_acl_characterisation_20261105.py and A REVIEW_VERDICT_hv-ty-mnemos-api-routes-acl-20261105.json; no mnemos/, scripts/, or tests/abc_first_baseline.json changes"
+    },
+    {
+      "check": "pytest tests/test_mnemos_api_routes_acl_characterisation_20261105.py",
+      "result": "pass",
+      "detail": "122 passed in 0.60s, exit 0"
+    },
+    {
+      "check": "ruff check tests/test_mnemos_api_routes_acl_characterisation_20261105.py",
+      "result": "pass",
+      "detail": "All checks passed!"
+    },
+    {
+      "check": "test assertions cross-checked against source",
+      "result": "pass",
+      "detail": "acl.py lines 96-254, persistence_helpers require_backend_capability/maybe_set_pg_rls, lifecycle _persistence_backend/_cache/_vis_epoch_get_incr all consistent with the fakes and pinned behaviours"
+    },
+    {
+      "check": "author branch untouched (clean tree, HEAD unchanged)",
+      "result": "pass",
+      "detail": "git status clean on hv/ty-mnemos-api-routes-acl-20261105 at 60ad9b99; verdict committed only on the separate review/ ref"
+    }
+  ]
 }
