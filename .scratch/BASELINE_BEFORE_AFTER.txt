@@ -1,0 +1,60 @@
+# BEFORE — clean tree at base 782ed312 (branch point of this job's HEAD
+# branch; verified in a detached worktree):
+
+$ /usr/bin/python3 -m pytest tests -q
+57 failed, 5694 passed, 589 skipped, 2 xfailed, 3 xpassed, 965 warnings, 42 errors in 118.81s
+
+# AFTER — final HEAD (suite commit + verdict-artifact scrub commit +
+# baseline-note commit):
+
+$ /usr/bin/python3 -m pytest tests -q
+57 failed, 5746 passed, 589 skipped, 4 xfailed, 3 xpassed, 966 warnings, 42 errors in 109.93s
+
+The 1 new failure that existed at the INTERMEDIATE review-record commit
+(53c899b7) — tests/test_no_private_default_endpoints.py::
+test_private_ip_literal_in_live_files, caused by the raw review-proxy
+URL (RFC1918) in the committed REVIEW_VERDICT_*.json artifact — is
+scrubbed in the follow-up commit ("review: scrub private LAN address
+from verdict artifact"), which replaces the address with a placeholder.
+The final tree therefore adds ZERO failures or errors relative to the
+base: 57/42 -> 57/42, and the delta in passed (5694 -> 5746) plus 2 new
+xfailed is exactly this characterisation suite (52 passed + 2 xfailed).
+
+The per-test FAILED/ERROR lines are byte-identical between the base and
+final runs (sorted list diff: empty).
+
+# New suite in isolation (final tree):
+
+$ /usr/bin/python3 -m pytest tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py -q
+52 passed, 2 xfailed
+
+# Ruff (final tree):
+
+$ ruff check tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py
+All checks passed!
+$ ruff format --check tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py
+1 file already formatted
+
+# Review:
+
+Structured zoder review, non-author model tydeus-reviewer (distinct
+provider/engine from the author), two rounds over the branch diff:
+round 1 (request_changes, 2 findings) and round 2 (request_changes, 2
+findings).
+Findings verified against source before acting:
+  1. "Missing import logging" (critical/high) — FALSE POSITIVE, repeated
+     verbatim across chunks in both rounds. Verified at lines 54-55 of
+     the test file; the suite executes 52 passing tests including every
+     caplog.at_level(logging.ERROR) path, so the import is present and
+     exercised. The reviewer only sees diff hunks, which omit the
+     import block. Left as-is (nothing to fix); no production code or
+     import list changed.
+  2. "assert args[0] != entity_id is fragile" (comment-round finding) —
+     VALID: the assertion compared the generated insert id against the
+     method's return value rather than the pinned row constant. Fixed
+     by comparing against row["id"] directly (same invariant, no
+     dependence on the fake's return value; probability-1 hold kept
+     with an explanatory comment).
+After both rounds the only remaining findings were the false-positive
+logging ones (repeated verbatim) — no new code findings were raised in
+round 2.
