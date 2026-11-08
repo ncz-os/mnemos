@@ -105,7 +105,7 @@ def _stub_parser(monkeypatch, chunks):
     return importer
 
 
-async def _run_import(backend, monkeypatch, content: str):
+async def _run_import(backend, monkeypatch, content: str, user=None):
     """Drive the route end to end and return (payload, captured webhooks)."""
     _stub_parser(
         monkeypatch,
@@ -129,7 +129,7 @@ async def _run_import(backend, monkeypatch, content: str):
         permission_mode=None,
         project_tag="mnemos",
         allow_archive_snapshot=False,
-        user=_User(),
+        user=user if user is not None else _User(),
     )
     return payload, status_code, capturing
 
@@ -192,3 +192,64 @@ async def test_clean_chunk_webhook_is_unchanged(sqlite_backend, monkeypatch):
     assert data["content"] == clean
     assert data["namespace"] == "team"
     assert capturing.calls[0]["namespace"] == "team"
+
+
+class _BlankNamespaceUser:
+    """A caller whose stored (API-key) namespace is EMPTY.
+
+    ``namespace`` is copied verbatim out of the ``api_keys`` row
+    (``mnemos/api/dependencies.py``) and nothing validates it non-empty, so
+    this is a reachable identity -- not a contrived one. The classification
+    preserves the blank faithfully, which made the old
+    ``imported.namespace or user.namespace`` fallback a no-op: it re-supplied
+    the very value the classifier had just declined to change.
+    """
+
+    user_id = "bob"
+    namespace = ""
+    role = "user"
+    group_ids: list[str] = []
+    authenticated = True
+    api_key_id = None
+
+
+async def test_blank_caller_namespace_is_never_backfilled_into_the_webhook(
+    sqlite_backend, monkeypatch
+):
+    """The pre-vault namespace is never re-supplied when the stored one is blank.
+
+    F2 follow-up (2026-11-08): the fallback ``imported.namespace or
+    user.namespace`` read the caller's own namespace whenever the classified
+    value was falsy. With a blank stored namespace the two are equal, so the
+    fallback silently "restored" a value -- and this test pins that the
+    outbound payload never carries it, either by being absent or by being
+    described from anything other than the stored row.
+    """
+    clean = "quarterly planning notes, no credentials here"
+    payload, status_code, capturing = await _run_import(
+        sqlite_backend, monkeypatch, clean, user=_BlankNamespaceUser()
+    )
+
+    # A blank stored namespace cannot scope an external event: the chunk fails
+    # closed instead of emitting a mis-scoped payload.
+    assert payload["memories_created"] == 0
+    assert payload["errors"], payload
+    assert "namespace" in payload["errors"][0]["error"]
+    assert capturing.calls == []
+
+
+async def test_stored_namespace_is_the_only_namespace_source(
+    sqlite_backend, monkeypatch
+):
+    """Sanity check on the invariant: stored namespace == emitted namespace.
+
+    The route must not recompute or backfill: whatever the classified row
+    carries is exactly what the webhook reports (here, the vault).
+    """
+    payload, status_code, capturing = await _run_import(
+        sqlite_backend, monkeypatch, SECRET_CHUNK
+    )
+    assert status_code == 200, payload
+    assert len(capturing.calls) == 1
+    event = capturing.calls[0]
+    assert event["namespace"] == event["payload"]["namespace"] == VAULT_NAMESPACE

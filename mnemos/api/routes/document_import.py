@@ -607,7 +607,26 @@ async def import_memories_from_document(
                         # namespace. Sending chunk["content"] / user.namespace
                         # leaked raw credentials and the pre-vault namespace to an
                         # external HTTP endpoint.
-                        stored_namespace = imported.namespace or user.namespace
+                        #
+                        # The stored namespace is used EXCLUSIVELY -- there is no
+                        # `or user.namespace` fallback. Any fallback re-introduces
+                        # the caller's pre-vault namespace on exactly the rows the
+                        # classifier moved elsewhere (an empty/blank namespace on
+                        # the API key is enough), which is the leak this comment
+                        # describes. When the classified value is blank it stays
+                        # blank -- "blank as stored" is not permission to backfill
+                        # the caller's own namespace.
+                        stored_namespace = imported.namespace
+                        if not stored_namespace:
+                            # Fail closed rather than emit a mis-scoped event: an
+                            # event that cannot name the row's stored namespace
+                            # must not be described to an external endpoint with
+                            # any other one.
+                            raise RuntimeError(
+                                "document_import: import_chunk returned no stored "
+                                "namespace for a memory.created event "
+                                f"(memory_id={canonical_id})"
+                            )
                         chunk_delivery_ids = await backend.webhooks.dispatch_event(
                             tx,
                             "memory.created",

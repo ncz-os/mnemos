@@ -36,6 +36,16 @@ class ImportedDocumentChunk:
     they will leak raw credentials and the pre-vault namespace to an external
     endpoint (F2, 2026-11-06). ``metadata`` is ``None`` only when the caller
     did not classify (the legacy-resolution path, which emits no event).
+
+    When an event IS emitted, ``namespace`` is the classified value:
+    :meth:`DocumentRepository.import_chunk` stamps it from
+    :func:`classify_persisted_text_fields`, which returns the caller's
+    namespace or ``VAULT_NAMESPACE``. It can be EMPTY (a caller whose
+    namespace is blank): the classification preserves that faithfully rather
+    than inventing one. A caller must therefore never substitute its own
+    pre-classification namespace when this is falsy -- that reintroduces the
+    leak the field exists to prevent -- and must instead refuse to emit the
+    event (see the ``document_import`` route).
     """
 
     memory_id: str
