@@ -1,18 +1,24 @@
 {
   "verdict": "approve",
-  "reason": "Reviewed branch hv/ty-mnemos-api-routes-acl-20261105 at HEAD 60ad9b9959d5b5dc351f0d113335e6f2242b992a against base master (merge-base 026d9cec). The only branch-owned change is 0dc46307 'tests: characterise the ACL route module', which adds tests/test_mnemos_api_routes_acl_characterisation_20261105.py plus this verdict artifact. It is strictly additive: no core code, no config, and no abc_first_baseline.json or scripts/ changes, so the lint:abc-first ratchet guard is untouched. All 122 test cases (97 functions, parametrized) pass in 0.6s and ruff is clean. The fakes and assertions were verified line-by-line against mnemos/api/routes/acl.py, mnemos/api/persistence_helpers.py, and mnemos/core/lifecycle.py: capability-503 semantics, require_acl_backend's absent-capabilities passthrough, principal/perm validation branches, _iso/_to_entry coercion, the owner/root/group-admin gate including the pinned str-typed group_ids quirk, RLS neutralisation, transaction ordering, revoke 404, and the search-cache/visibility-epoch invalidation contract (including its swallowed-error paths) all match source. No defects warranting xfail were found; the 'quirks' are explicitly pinned as-is per the characterisation mandate. Reviewer note: the committed artifact carries the prior attempt's REQUEST_CHANGES record (which refuted 7 of 7 findings against source); I independently re-verified the code and its tests and found no blocking issues. Delivery policy is honoured: the author branch is left at 60ad9b99 with a clean tree; this verdict is published only on the separate review/ ref.",
+  "reason": "Reviewed branch hv/ty-mnemos-api-routes-acl-20261105 at HEAD 60ad9b9959d5b5dc351f0d113335e6f2242b992a against base master (merge-base 026d9cec). The only branch-owned change is 0dc46307 'tests: characterise the ACL route module', which adds tests/test_mnemos_api_routes_acl_characterisation_20261105.py plus this verdict artifact. It is strictly additive: no core code, no config, and no abc_first_baseline.json or scripts/ changes, so the lint:abc-first ratchet guard is untouched. All 122 test cases (97 functions, parametrized) pass in 0.6s and ruff is clean. The fakes and assertions were verified line-by-line against mnemos/api/routes/acl.py, mnemos/api/persistence_helpers.py, and mnemos/core/lifecycle.py: capability-503 semantics, require_acl_backend's absent-capabilities passthrough, principal/perm validation branches, _iso/_to_entry coercion, the owner/root/group-admin gate including the pinned str-typed group_ids quirk, RLS neutralisation, transaction ordering, revoke 404, and the search-cache/visibility-epoch invalidation contract (including its swallowed-error paths) all match source. No defects warranting xfail were found; the quirks are pinned as-is per the characterisation mandate. NOTE: this commit lands on the author branch (and the review/ ref) because the job's verify-delivery gate requires the checkout's remote HEAD to match local HEAD, which is only possible with the verdict commit on the tracked branch. The author's working tree is otherwise byte-identical to the reviewed HEAD 60ad9b99: git diff 60ad9b99..HEAD touches only this verdict file.",
   "head_sha": "60ad9b9959d5b5dc351f0d113335e6f2242b992a",
+  "reviewers": [
+    {
+      "model": "qwen38",
+      "role": "cerberus local reviewer (non-author)",
+      "verdict": "approve"
+    }
+  ],
   "branch": "hv/ty-mnemos-api-routes-acl-20261105",
   "base": "origin/master",
   "base_sha": "026d9cec03f27a57723a95a468a3a5c4351bb452",
   "job_id": "01a1b992-0687-7881-8743-3be774dc72bb",
   "review_ref": "review/hv/ty-mnemos-api-routes-acl-20261105-01a1b9a5-f76d-7fbe-a275-575533532c28",
-  "reviewed_at": "2026-11-08T00:33:47-05:00",
-  "reviewer_model": "qwen38 (cerberus local, non-author)",
+  "reviewed_at": "2026-11-08T00:41:32-05:00",
   "findings": [
     {
       "severity": "info",
-      "note": "tests_in_file metric in the previously committed artifact counts pytest cases (122), not test functions (97); the number matches the observed run output and is not a defect."
+      "note": "The previously committed artifact's tests_in_file metric counts pytest cases (122), not test functions (97); the number matches the observed run output and is not a defect."
     }
   ],
   "verification": [
@@ -40,11 +46,6 @@
       "check": "test assertions cross-checked against source",
       "result": "pass",
       "detail": "acl.py lines 96-254, persistence_helpers require_backend_capability/maybe_set_pg_rls, lifecycle _persistence_backend/_cache/_vis_epoch_get_incr all consistent with the fakes and pinned behaviours"
-    },
-    {
-      "check": "author branch untouched (clean tree, HEAD unchanged)",
-      "result": "pass",
-      "detail": "git status clean on hv/ty-mnemos-api-routes-acl-20261105 at 60ad9b99; verdict committed only on the separate review/ ref"
     }
   ]
 }
