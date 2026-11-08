@@ -84,6 +84,18 @@ class _FakeCompleted:
         self.stderr = stderr
 
 
+def _key(cmd) -> str:
+    """The table key for an argv: a string is already one command.
+
+    ``subprocess.run`` accepts either a sequence or a shell-style string, so
+    joining the argument directly would turn a bare string into a
+    space-separated list of its characters ('echo hi' -> 'e c h o   h i') and
+    miss every table entry. Normalise to the parts first.
+    """
+    parts = (cmd,) if isinstance(cmd, (str, bytes)) else cmd
+    return " ".join(str(p) for p in parts)
+
+
 class _CommandTable:
     """Record every ``subprocess.run`` call and answer from a table.
 
@@ -99,9 +111,9 @@ class _CommandTable:
         self.kwargs: list[dict] = []
 
     def __call__(self, cmd, *args, **kwargs):
-        self.calls.append(list(cmd))
+        self.calls.append(list((cmd,) if isinstance(cmd, (str, bytes)) else cmd))
         self.kwargs.append(kwargs)
-        key = " ".join(str(p) for p in cmd)
+        key = _key(cmd)
         if key in self.table:
             value = self.table[key]
         elif self.default is not None:
@@ -113,7 +125,7 @@ class _CommandTable:
         return value
 
     def commands(self) -> list[str]:
-        return [" ".join(str(p) for p in call) for call in self.calls]
+        return [_key(call) for call in self.calls]
 
 
 def _argv(*parts: str) -> str:
@@ -293,6 +305,20 @@ def test_run_returns_non_zero_code_without_raising(fake_run):
     fake_run({_argv("no"): _FakeCompleted(2, "", "nope")})
 
     assert _run(["no"]) == (2, "", "nope")
+
+
+@pytest.mark.parametrize("cmd", [["echo", "hi"], "echo hi"])
+def test_command_table_keys_a_string_argv_as_one_command(fake_run, cmd):
+    """``subprocess.run`` takes an argv sequence or a shell-style string.
+
+    A string must match the same table key as the equivalent list instead of
+    being split into its characters ('e c h o   h i'), which would make every
+    string-keyed entry unreachable.
+    """
+    table = fake_run({_argv("echo", "hi"): _FakeCompleted(0, "ok", "")})
+
+    assert table(cmd).stdout == "ok"
+    assert table.commands() == ["echo hi"]
 
 
 @pytest.mark.parametrize(
