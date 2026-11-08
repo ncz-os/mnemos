@@ -2,6 +2,24 @@
 
 All notable changes to MNEMOS are documented here.
 
+## 7.1.0 — 2026-11-08
+
+A minor release on the v7.0 line: about 1,800 commits since 7.0.5 (core c2dd6bfa, 2026-09-27), roughly 17,000 lines of product code,
+42 new modules and five database migrations (0067 to 0071, applied automatically at startup, no destructive changes).
+
+- **Federation** — replica health provisioning and reporting, sync counters, a narrowed journal trigger, skipped-deleted accounting,
+  digest-folded ids, and a peer sync interval that is validated against the database floor.
+- **API** — new memory-mutation and read-policy layers, a shared error model, route policy moved into core, and stricter request validation.
+- **Persistence** — SQLite, PostgreSQL, MySQL/MariaDB, Oracle and Db2 backends hardened for parity (exact content-hash dedup, NULL-namespace
+  matching, LISTAGG overflow fallback, a metadata equality index, memory index hygiene).
+- **Provenance** — server-side provenance stamping and a classified metadata channel; import conflicts compare caller metadata only.
+- **Webhooks** — secrets and the stored namespace are redacted from `memory.created` payloads; dispatch, lease and finalize paths tightened.
+- **Embeddings** — an embedding contract and a runtime embedder with an automatic remote fallback endpoint.
+- **MCP over HTTP** — bearer authentication is an environment toggle (`MNEMOS_MCP_AUTH_ENABLED`, defaulting to the REST auth setting).
+- **Tests and docs** — large characterisation suites for the API, domain and persistence layers; the documentation version pins track 7.1.0.
+
+Upgrade note: take a database backup first. Migrations 0067 to 0071 run on first start; Oracle and Db2 receive parity files.
+
 ## Pre-release history
 
 - ✅ **Webhook subscriptions** — outbound notifications on memory write, consultation completion. HMAC-signed delivery, retry with exponential backoff.
