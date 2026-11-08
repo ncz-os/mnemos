@@ -2,6 +2,10 @@
 
 All notable changes to MNEMOS are documented here.
 
+## 7.1.1 — 2026-11-08
+
+- **Oracle** — the federation replica-health write (`record_sync_lag`) bound a variable named `:rows`, a reserved word, so every peer pull on an Oracle primary failed with ORA-01745 after the sync (HTTP 500 on `/v1/federation/peers/<id>/sync`, peer status never refreshed). The bind names are renamed (`:rows_n`, `:lag_s`, `:emb_status`, and `:owner_uid` in the scoped audit-log read) and a test now rejects any reserved-word bind name in the Oracle backend.
+
 ## 7.1.0 — 2026-11-08
 
 A minor release on the v7.0 line: about 1,800 commits since 7.0.5 (core c2dd6bfa, 2026-09-27), roughly 17,000 lines of product code,
