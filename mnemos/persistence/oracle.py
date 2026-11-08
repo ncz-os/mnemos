@@ -6938,14 +6938,14 @@ class OracleConsultationsRepository(ConsultationsRepository):
                     "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
                     "FROM graeae_audit_log al "
                     "JOIN graeae_consultations c ON c.id = al.consultation_id "
-                    "WHERE c.owner_id = :uid AND c.namespace = :ns "
+                    "WHERE c.owner_id = :owner_uid AND c.namespace = :ns "
                     "AND c.deleted_at IS NULL AND al.deleted_at IS NULL) "
                     "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, prompt_hash, "
                     "response_hash, CAST(NULL AS VARCHAR2(64)) AS chain_hash, "
                     "scoped_prev_id AS prev_id, task_type, provider, quality_score, created_at "
                     "FROM visible ORDER BY global_sequence_num DESC "
                     "OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY",
-                    {"uid": user_id, "ns": namespace, "off": offset, "lim": limit},
+                    {"owner_uid": user_id, "ns": namespace, "off": offset, "lim": limit},
                 )
             return await _fetch_all_dicts(cursor)
         finally:
@@ -7657,17 +7657,17 @@ class OracleFederationRepository(FederationRepository):
                 """
                 UPDATE federation_peers SET
                     last_cursor_ts = :cts,
-                    lag_seconds = :lag,
-                    rows_last_sync = :rows,
-                    embedding_status = :status
+                    lag_seconds = :lag_s,
+                    rows_last_sync = :rows_n,
+                    embedding_status = :emb_status
                  WHERE id = :id
                 """,
                 {
                     "id": peer_id,
                     "cts": last_cursor_ts,
-                    "lag": lag_seconds,
-                    "rows": rows_pulled if rows_pulled is not None else rows_last_sync,
-                    "status": embedding_status,
+                    "lag_s": lag_seconds,
+                    "rows_n": rows_pulled if rows_pulled is not None else rows_last_sync,
+                    "emb_status": embedding_status,
                 },
             )
         finally:
