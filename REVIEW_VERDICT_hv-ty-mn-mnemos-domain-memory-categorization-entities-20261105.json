@@ -1,0 +1,86 @@
+{
+  "chunking": {
+    "budget_bytes": 400000,
+    "chunk_cap_bytes": 32000,
+    "context_bytes": 3049,
+    "context_capped": true,
+    "diff_bytes": 32179,
+    "mode": "single",
+    "reason": "whole diff and definition context fit the single-review budget",
+    "window_tokens": 131072
+  },
+  "complete": true,
+  "context": {
+    "cache_hit_tokens": 9349,
+    "cache_miss_tokens": 1,
+    "cache_reported_calls": 1,
+    "calls": 1,
+    "completion_tokens": 1319,
+    "final_prompt_tokens": 9350,
+    "hit_share": 0.9998930481283422,
+    "peak_prompt_tokens": 9350,
+    "per_call": [
+      {
+        "cache_hit_tokens": 9349,
+        "cache_miss_tokens": 1,
+        "completion_tokens": 1319,
+        "composition": {
+          "history_bytes": 0,
+          "prefix_bytes": 791,
+          "task_bytes": 35634,
+          "tool_output_bytes": 0
+        },
+        "prompt_tokens": 9350,
+        "reported_usage": true,
+        "surface": "review",
+        "turn": 1
+      }
+    ],
+    "prompt_tokens": 9350,
+    "resent_prompt_tokens": 0
+  },
+  "cost_usd": 0.0,
+  "exclusions": {
+    "bytes": 0,
+    "count": 0,
+    "files": []
+  },
+  "failed_models": 0,
+  "filtered_findings": [],
+  "ok_models": 1,
+  "provenance": [
+    {
+      "attempted_fallbacks": null,
+      "first_token_ms": null,
+      "headers_ms": 15144,
+      "health": null,
+      "latency_ms": 15170.0,
+      "ledger_wait_ms": 4,
+      "provider": "cerberus-reviewer",
+      "proxy_deployment_id": null,
+      "requested_model": "cerberus-reviewer",
+      "response_model": "cerberus-narrator",
+      "served_by": "http://[internal-proxy]:8080/v1",
+      "slot_held": false,
+      "slot_limit": 0,
+      "slot_wait_ms": 0
+    }
+  ],
+  "requested": 1,
+  "reviewers": [
+    {
+      "escalation_reason": null,
+      "filtered_findings": [],
+      "findings": [],
+      "forced_family_conflict": false,
+      "model": "cerberus-reviewer",
+      "next_steps": [],
+      "ok": true,
+      "summary": "All tests are logically consistent and correctly exercise the intended behaviour of the EntityManager. No defects were identified in the supplied diff.",
+      "verdict": "approve"
+    }
+  ],
+  "skipped_unhealthy": [],
+  "substituted": true,
+  "verdict": "approve"
+}
