@@ -22,7 +22,15 @@
   characterisation suite, which passes in isolation
   (`58 passed, 1 xfailed`, the strict xfail pinning the DELETE route's missing
   500 mapping as recorded in the verdict artifact).
-- Files touched by this refresh round: the merge commit (master's additive files
-  only) and this note. No production code, no new features, no unrelated edits.
-- `tests/test_no_private_default_endpoints.py` still passes (26 passed) — this
-  note names no internal host or private-range address.
+- Files touched by this refresh round: the merge commit (master's files, carried
+  in unchanged — nine added, one modified by master itself) and this note. No
+  production code, no new features, no unrelated edits.
+- The two guards that a refresh note can trip, run explicitly and both green on
+  the merged head: `pytest tests/test_no_private_default_endpoints.py` (26
+  passed — no live file gained a private-range IP literal) and
+  `pytest tests/test_doc_version_pins_match_code.py` (20 passed, including
+  `test_no_internal_infrastructure_detail_in_docs`). This note names no internal
+  host and carries no private-range address.
+- `ruff check` / `ruff format --check` on the branch's own deliverable
+  (`tests/test_mnemos_api_routes_journal_characterisation_20261105.py`): clean
+  and already formatted.
