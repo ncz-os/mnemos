@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -26,8 +26,22 @@ class DocumentChunkSoftDeletedConflictError(ValueError):
 
 @dataclass(frozen=True)
 class ImportedDocumentChunk:
+    """Result of one document-import chunk write.
+
+    ``metadata`` and ``namespace`` are the POST-CLASSIFICATION values the row
+    was actually persisted with (secret spans recorded in metadata, and the
+    vault namespace when the chunk was vaulted). Callers that emit side
+    effects describing the stored row -- notably the ``memory.created``
+    webhook -- must use these rather than the pre-classification inputs, or
+    they will leak raw credentials and the pre-vault namespace to an external
+    endpoint (F2, 2026-11-06). ``metadata`` is ``None`` only when the caller
+    did not classify (the legacy-resolution path, which emits no event).
+    """
+
     memory_id: str
     emit_created_event: bool = True
+    metadata: dict[str, Any] | None = None
+    namespace: str | None = None
 
 
 class DocumentRepository:
@@ -101,7 +115,11 @@ class DocumentRepository:
                     metadata=classified.metadata,
                     writer_id=owner_id,
                 )
-            return imported
+            return replace(
+                imported,
+                metadata=classified.metadata,
+                namespace=classified.namespace,
+            )
 
         now = datetime.now(timezone.utc)
         await backend.memories.insert_memory(
@@ -133,7 +151,11 @@ class DocumentRepository:
             metadata=classified.metadata,
             writer_id=owner_id,
         )
-        return ImportedDocumentChunk(memory_id=memory_id)
+        return ImportedDocumentChunk(
+            memory_id=memory_id,
+            metadata=classified.metadata,
+            namespace=classified.namespace,
+        )
 
     async def _import_postgres_chunk(
         self,
