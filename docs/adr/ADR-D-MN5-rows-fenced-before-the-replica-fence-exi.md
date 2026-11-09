@@ -114,7 +114,8 @@ load-bearing for the recommendation.
   unblocks by code, not by id.
 - **Fleet reality.** I did not measure how many rows are pre-fence-damaged —
   the 0.7 % in `tests/test_federation_replica_fence.py:9-11` is that file's
-  prose about the PROTEUS symptom, not something I re-measured. §6 asks.
+  prose about the symptom observed on one replica, not something I
+  re-measured. §6 asks.
 - **Non-`memories` tables.** The fence covers `memories` only
   (`worker_lifecycle.py:415`, `:475`, `:558`). Whether archival strands
   `memory_versions`/KG rows for a replica, I did not trace; the repair is scoped
@@ -207,7 +208,7 @@ Nothing rewrites data before the operator has seen a dry run.
 2. **Selector (read-only).** A repository read returning the peer's
    pre-fence-damaged replicas: `local_id = fed:<peer>:<remote_id>` **and** any of
    `deleted_at`, `archived_at`, `consolidated_into` set — the existing repair
-   predicate (`sqlite.py:7128-7131`) lifted from one row to a peer-wide,
+   predicate (`sqlite.py:7135-7137`) lifted from one row to a peer-wide,
    keyset-paged scan like `fetch_source_export_keyset_page` (`base.py:2903`).
    ABC method → all six backends → facade → caller, per `AGENTS.md`'s ABC-first
    rule; never read `_lc._pool`.
