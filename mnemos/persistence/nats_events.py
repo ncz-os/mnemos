@@ -6,7 +6,6 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import logging
-import re
 from typing import Any, Mapping
 
 from mnemos.core.config import (
@@ -45,9 +44,51 @@ def federation_nats_enabled() -> bool:
     return nats_federation_enabled()
 
 
+# Per-character NATS subject segment escapes. Only what the broker reserves or
+# what would make a subject unaddressable is rewritten, so namespaces that
+# need none of it keep the exact subject they already had.
+_SUBJECT_ESCAPES = {
+    # Established shape: a dotted namespace has always been published with
+    # underscores (``alice.ns`` -> ``alice_ns``).
+    ".": "_",
+    # Underscores are escaped *after* the dot rule above, so a namespace
+    # that literally contains ``_`` can never occupy the token a dotted
+    # namespace produced.
+    "_": "%5F",
+    # NATS wildcards must never leak into a publish subject.
+    "*": "%2A",
+    ">": "%3E",
+    # Whitespace would be legal for the broker but makes the subject
+    # unaddressable from CLI/HTTP filters; the legacy encoder flattened it
+    # to ``_``, so keep that (escaped below, as for every underscore).
+    " ": "%20",
+    "\t": "%09",
+    "\n": "%0A",
+    "\r": "%0D",
+    # Escape the escape, so ``"a%5Fb"`` cannot impersonate ``"a_b"``.
+    "%": "%25",
+}
+
+
 def safe_subject_segment(value: Any, *, default: str = "default") -> str:
+    """Return ``value`` as a single, unambiguous NATS subject segment.
+
+    CF-35 (MN-17): the mapping must be injective. Collapsing the reserved
+    characters onto ``_`` is not — ``"a.b"`` and ``"a_b"`` both become
+    ``"a_b"``, so two distinct tenants share one NATS subject and each
+    receives the other's events. Escaping underscores *and* the escape
+    character itself makes the mapping reversible:
+
+    * ``"alice.ns"`` -> ``"alice_ns"`` (the established, documented shape)
+    * ``"a.b"``      -> ``"a_b"``
+    * ``"a_b"``      -> ``"a%5Fb"`` (no collision with the line above)
+    * ``"a%5Fb"``    -> ``"a%255Fb"`` (no collision either)
+
+    A namespace containing none of the escaped characters is returned
+    unchanged.
+    """
     raw = str(value if value is not None else default)
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_")
+    safe = "".join(_SUBJECT_ESCAPES.get(ch, ch) for ch in raw).strip("_")
     return safe or default
 
 

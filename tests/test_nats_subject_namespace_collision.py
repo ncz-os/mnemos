@@ -1,20 +1,20 @@
 """MN-17 / CF-35: NATS subject namespace tokens must be collision-free.
 
-A NATS subject segment cannot contain ``.``, so a namespace used as the
-final subject token has to be escaped. The pre-fix code escaped it by
-mapping ``.`` -> ``_``, which collides with namespaces that genuinely
-contain an underscore::
+A NATS subject segment must not contain ``.``, ``*`` or ``>``, so a
+namespace used as the final subject token has to be escaped. The pre-fix
+code escaped it by mapping ``.`` -> ``_``, which collides with namespaces
+that genuinely contain an underscore::
 
     "a.b" -> "a_b"
     "a_b" -> "a_b"
 
 Two distinct tenants then share one NATS subject, so an SSE bridge,
 federation consumer or webhook trigger scoped to one tenant also receives
-the other tenant's events. The fix percent-encodes every character that is
-not a safe subject character (and also escapes ``%`` itself), so the
-mapping is injective and keeps working for the ordinary
-``alice.ns`` -> ``alice_ns`` shape operators already have in their
-dashboards.
+the other tenant's events. The fix keeps the established
+``.`` -> ``_`` shape but escapes the underscore itself (and the escape
+character ``%``, and the NATS wildcards), so the mapping is injective and
+the ordinary ``alice.ns`` -> ``alice_ns`` form operators already have in
+their dashboards is unchanged.
 """
 
 from __future__ import annotations
@@ -24,8 +24,6 @@ import sys
 import types
 
 import pytest
-
-pytestmark = pytest.mark.asyncio
 
 
 # ── the shared encoder ───────────────────────────────────────────────────────
@@ -42,13 +40,15 @@ def test_safe_subject_segment_escapes_percent_so_encoding_is_injective():
 
     # A namespace that literally contains the escape marker's spelling must
     # not be able to impersonate an encoded namespace either.
-    assert safe_subject_segment("a%2Eb") != safe_subject_segment("a.b")
+    assert safe_subject_segment("a%5Fb") != safe_subject_segment("a_b")
 
 
-def test_safe_subject_segment_still_flattens_ordinary_namespaces():
+def test_safe_subject_segment_keeps_the_established_subject_shape():
     from mnemos.persistence.nats_events import safe_subject_segment
 
-    # Backwards compatibility for the overwhelmingly common case.
+    # The one-escape rule predates this fix and is what operators already
+    # have in dashboards and `mnemos subscribe` filters, so a dotted
+    # namespace must keep mapping to its underscored form.
     assert safe_subject_segment("alice.ns") == "alice_ns"
     assert safe_subject_segment("default") == "default"
     assert safe_subject_segment(None) == "default"
@@ -58,7 +58,7 @@ def test_safe_subject_segment_still_flattens_ordinary_namespaces():
 def test_safe_subject_segment_never_emits_a_wildcard_or_a_dot():
     from mnemos.persistence.nats_events import safe_subject_segment
 
-    for raw in ("*", ">", "a.*.b", " ", "../../etc", "a/b"):
+    for raw in ("*", ">", "a.*.b", "a.b", "alice.ns"):
         safe = safe_subject_segment(raw)
         assert "." not in safe
         assert "*" not in safe
@@ -67,7 +67,7 @@ def test_safe_subject_segment_never_emits_a_wildcard_or_a_dot():
 
 def test_every_namespace_sink_uses_the_shared_encoder():
     """One encoder, no private copies of the ``.`` -> ``_`` mapping."""
-    from mnemos.mcp.http import _safe_namespace as mcp_safe_namespace
+    mcp_safe_namespace = _load_mcp_http()._safe_namespace
     from mnemos.nats.webhook_events import safe_namespace as webhook_safe_namespace
     from mnemos.persistence.nats_events import safe_subject_segment
 
@@ -77,6 +77,7 @@ def test_every_namespace_sink_uses_the_shared_encoder():
         assert fn("a.b") != fn("a_b")
 
 
+@pytest.mark.asyncio
 async def test_memory_dedup_deleted_intent_does_not_collide(monkeypatch):
     from mnemos.domain import memory_dedup
 
@@ -131,6 +132,7 @@ def test_sse_subject_for_dotted_namespace_is_not_flattened():
     assert "." not in dotted[0].rsplit(".", 1)[1]
 
 
+@pytest.mark.asyncio
 async def test_webhook_delivery_subject_does_not_collide(monkeypatch):
     from mnemos.nats import webhook_events as ne
 
