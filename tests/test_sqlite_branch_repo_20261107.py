@@ -37,10 +37,7 @@ METHODS = (
 
 
 def _params(func: object) -> list[tuple[str, object, object]]:
-    return [
-        (param.name, param.kind, param.default)
-        for param in inspect.signature(func).parameters.values()
-    ]
+    return [(param.name, param.kind, param.default) for param in inspect.signature(func).parameters.values()]
 
 
 class _Settings:
@@ -108,9 +105,7 @@ def test_documented_methods_are_defined_concrete_and_async() -> None:
 
 def test_parameter_contracts_match_the_base_declaration() -> None:
     for name in METHODS:
-        assert _params(SqliteBranchRepository.__dict__[name]) == _params(
-            getattr(BranchRepository, name)
-        ), name
+        assert _params(SqliteBranchRepository.__dict__[name]) == _params(getattr(BranchRepository, name)), name
 
 
 def test_dialect_guard_rejects_a_foreign_transaction() -> None:
@@ -153,23 +148,28 @@ async def test_sqlite_schema_accepts_the_documented_branch_table(backend) -> Non
 @pytest.mark.asyncio
 async def test_delete_removes_the_branch_row(backend) -> None:
     await _add_memory(backend, "mem-branch-1")
+    await _add_memory(backend, "mem-branch-2")
 
     async with backend.transactional() as tx:
-        await _execute(
-            tx.conn,
-            "INSERT INTO memory_branches (memory_id, name, head_version_id, created_by) "
-            "VALUES (?, ?, NULL, ?)",
-            ("mem-branch-1", "main", "tester"),
-        )
-        before = await _fetch_all(tx.conn, "SELECT name FROM memory_branches")
-        assert before == [{"name": "main"}]
+        for memory_id in ("mem-branch-1", "mem-branch-2"):
+            await _execute(
+                tx.conn,
+                "INSERT INTO memory_branches (memory_id, name, head_version_id, created_by) VALUES (?, ?, NULL, ?)",
+                (memory_id, "main", "tester"),
+            )
+        before = await _fetch_all(tx.conn, "SELECT memory_id, name FROM memory_branches")
+        assert before == [{"memory_id": "mem-branch-1", "name": "main"}, {"memory_id": "mem-branch-2", "name": "main"}]
 
-        await backend.memory_branches.delete_memory_branches_for_memories(
-            tx, ["mem-branch-1"]
-        )
-        after = await _fetch_all(tx.conn, "SELECT name FROM memory_branches")
+        await backend.memory_branches.delete_memory_branches_for_memories(tx, ["mem-branch-1"])
+        after = await _fetch_all(tx.conn, "SELECT memory_id, name FROM memory_branches")
+        # The memory rows themselves survive: the repository delete is scoped to the
+        # requested memory_id, not a cascade triggered by removing the memory.
+        memories = await _fetch_all(tx.conn, "SELECT id FROM memories ORDER BY id")
 
-    assert after == []
+    # mem-branch-2's row is untouched, so the deletion tracks the requested memory_id
+    # and cannot be explained by table-wide cleanup or an FK cascade.
+    assert after == [{"memory_id": "mem-branch-2", "name": "main"}]
+    assert memories == [{"id": "mem-branch-1"}, {"id": "mem-branch-2"}]
 
 
 @pytest.mark.asyncio
