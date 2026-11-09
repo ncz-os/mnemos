@@ -293,3 +293,45 @@ def test_webhook_fix_precedes_any_caller_namespace_use():
         "the memory.created dispatch call references user.namespace; that is the "
         "pre-vault namespace and reintroduces the F2 credential/namespace leak"
     )
+
+
+@async_test
+async def test_missing_stored_namespace_suppresses_webhook(sqlite_backend, monkeypatch):
+    """No post-classification namespace must mean no webhook, never a fallback.
+
+    ``stored_namespace`` used to be ``imported.namespace or user.namespace``.
+    Today ``import_chunk`` always sets the namespace on the emit path, so the
+    fallback was unreachable -- but it is dead surface that would silently
+    reopen the F2 pre-vault leak the moment any refactor returned None. Fail
+    closed instead: suppress the event rather than publish ``user.namespace``.
+
+    The chunk is committed before the event is built, so the import must still
+    succeed -- suppressing the delivery must not turn a successful write into
+    an error.
+    """
+    from mnemos.domain.document_repo import DocumentRepository, ImportedDocumentChunk
+
+    real_import_chunk = DocumentRepository.import_chunk
+
+    async def _namespace_less_import_chunk(self, backend, tx, **kwargs):
+        imported = await real_import_chunk(self, backend, tx, **kwargs)
+        # Simulate a repository that cannot name the stored row's namespace.
+        return ImportedDocumentChunk(
+            memory_id=imported.memory_id,
+            emit_created_event=imported.emit_created_event,
+            metadata=imported.metadata,
+            namespace=None,
+        )
+
+    monkeypatch.setattr(DocumentRepository, "import_chunk", _namespace_less_import_chunk)
+
+    payload, status_code, capturing = await _run_import(sqlite_backend, monkeypatch, SECRET_CHUNK)
+
+    assert status_code == 200, payload
+    assert payload["memories_created"] == 1, "the import itself must still succeed"
+
+    # No event at all: an event that cannot describe the stored namespace must
+    # not be described to an external endpoint with the caller's namespace.
+    assert capturing.calls == [], (
+        f"expected no webhook, got {capturing.calls!r}"
+    )
