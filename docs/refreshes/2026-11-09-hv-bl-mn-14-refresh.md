@@ -92,3 +92,48 @@ existing line 15.
 Re-ran the full suite after the merge: 70 failed, 6307 passed, 576 skipped,
 42 errors — the same 112 failing/erroring node ids as the pre-refresh
 baseline, empty symmetric difference. No regression.
+
+## Review follow-up, round 2 (2026-11-09)
+
+A second re-review raised a further [high] finding against the same file:
+
+> `_target_scopes` annotates its parameter `MPFEnvelope`, but the module does
+> not import it — `NameError` at import time. Suggested fix: add
+> `from mnemos.persistence.base import MPFEnvelope`.
+
+**Also not reproducible, and the suggested fix would itself be wrong.**
+`MPFEnvelope` is imported on **line 35** from `.schemas`:
+
+```python
+from .schemas import (
+    MEMORY_PAYLOAD_VERSION,
+    MPF_VERSION_PREFIX,
+    MPF_VERSION_PREFIX_V0_2,
+    ImportStats,
+    MPFEnvelope,
+)
+```
+
+`mnemos/domain/portability/schemas.py:49` is where the class is *defined*.
+`mnemos/persistence/base.py` contains no `MPFEnvelope` at all, so the
+reviewer's proposed import would raise `ImportError` — a genuine breakage
+in place of a non-existent one.
+
+Evidence, re-run:
+
+- `import mnemos.domain.portability.import_` succeeds; `MPFEnvelope` resolves
+  in the module globals to `mnemos.domain.portability.schemas.MPFEnvelope`.
+- `typing.get_type_hints()` resolves cleanly for `_target_scopes`,
+  `_validate_import_request` and `import_memories`.
+- All 10 modules in `mnemos/domain/portability/` import without error, and so
+  does the route module that calls the fence (`api/routes/portability`).
+- An AST scan of the whole package finds no unresolved global name.
+- The three fence/audit test files pass 49/49; the full suite is unchanged at
+  70 failed / 6307 passed / 42 errors with the same 112 node ids as baseline.
+
+Both parents (`origin/master`, `d5fe719c`) already carried this import on the
+same lines, so the merge did not and could not have introduced it.
+
+No code change made — the import the reviewer asks for is already present and
+correct, in the right module. Adding the reviewer's suggested line would
+import a name that does not exist and break the module for real.
