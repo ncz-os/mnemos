@@ -70,6 +70,11 @@ def ora_columns(cur, table: str) -> dict[str, str]:
     return out
 
 
+def qi(name: str) -> str:
+    """A double-quoted SQL identifier (embedded quotes doubled)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 def to_json_text(v):
     if v is None:
         return None
@@ -102,7 +107,9 @@ def converter(pg_type: str, ora_type: str):
             if v is None:
                 return None
             if isinstance(v, bytes):
-                return uuid.UUID(bytes=v) if len(v) == 16 else uuid.UUID(v.decode())
+                if len(v) == 16:
+                    return uuid.UUID(bytes=v)
+                v = v.decode(errors="replace")
             try:
                 return uuid.UUID(str(v))
             except ValueError:
@@ -131,9 +138,9 @@ def converter(pg_type: str, ora_type: str):
                 return None
             if isinstance(v, (int, float, decimal.Decimal)):
                 return dt.datetime.fromtimestamp(float(v), UTC).replace(tzinfo=None)
-            if isinstance(v, dt.datetime):
-                return v.astimezone(UTC).replace(tzinfo=None) if v.tzinfo else v
-            return dt.datetime.fromisoformat(str(v))
+            if not isinstance(v, dt.datetime):
+                v = dt.datetime.fromisoformat(str(v))
+            return v.astimezone(UTC).replace(tzinfo=None) if v.tzinfo else v
 
         return f
     if t == "date":
@@ -247,7 +254,7 @@ async def copy_table(conn, ocur, pg_table: str, ora_table: str, dry: bool) -> di
     sel = []
     for _n, _t, src in use:
         ot = ocols[src]
-        q = '"' + ORA_NAMES.get((ora_table.upper(), src), src.upper()) + '"'
+        q = qi(ORA_NAMES.get((ora_table.upper(), src), src.upper()))
         if ot.startswith("TIMESTAMP") and "TIME ZONE" in ot:
             sel.append(f"SYS_EXTRACT_UTC({q})")  # exact instant; oracledb drops the offset otherwise
         elif ot == "JSON":
@@ -271,12 +278,12 @@ async def copy_table(conn, ocur, pg_table: str, ora_table: str, dry: bool) -> di
         copied += len(recs)
     # serial / identity sequences past max(id)
     for name, _t, _g in pcols:
-        seq = await conn.fetchval("select pg_get_serial_sequence($1, $2)", f'"{pg_table}"', name)
+        seq = await conn.fetchval("select pg_get_serial_sequence($1, $2)", qi(pg_table), name)
         if seq:
             await conn.execute(
-                f'select setval(\'{seq}\', coalesce((select max("{name}") from "{pg_table}"), 0) + 1, false)'
+                f"select setval('{seq}', coalesce((select max({qi(name)}) from {qi(pg_table)}), 0) + 1, false)"
             )
-    pg_n = await conn.fetchval(f'select count(*) from "{pg_table}"')
+    pg_n = await conn.fetchval(f"select count(*) from {qi(pg_table)}")
     res.update(
         status="ok" if pg_n == ora_n else "COUNT_MISMATCH",
         pg_rows=pg_n,
@@ -304,7 +311,7 @@ async def main() -> int:
     for spec in [c for c in a.drop_constraints.split(",") if c]:
         table, cname = spec.split(".", 1)
         if not a.dry_run:
-            await conn.execute(f'ALTER TABLE "{table}" DROP CONSTRAINT IF EXISTS "{cname}"')
+            await conn.execute(f"ALTER TABLE {qi(table)} DROP CONSTRAINT IF EXISTS {qi(cname)}")
         print(json.dumps({"dropped_constraint": spec, "dry_run": a.dry_run}), flush=True)
     await conn.execute("SET session_replication_role = replica")  # bulk load: FK/trigger order does not matter
     if a.target == "hive":
@@ -324,7 +331,7 @@ async def main() -> int:
     if not a.dry_run and pairs:
         # One statement over the whole selection and no CASCADE: if a table outside the selection references one
         # inside it, postgres refuses (and nothing is emptied) instead of silently wiping the referencing table.
-        await conn.execute("TRUNCATE " + ", ".join(f'"{p}"' for p, _o in pairs))
+        await conn.execute("TRUNCATE " + ", ".join(qi(p) for p, _o in pairs))
     bad = 0
     expected: dict[str, int] = {}
     for pg_table, ora_table in pairs:
@@ -339,7 +346,7 @@ async def main() -> int:
         print(json.dumps(r, default=str), flush=True)
     # final recount after the WHOLE run: a table that changed after its own copy finished is a failure
     for pg_table, n in expected.items():
-        now_n = await conn.fetchval(f'select count(*) from "{pg_table}"')
+        now_n = await conn.fetchval(f"select count(*) from {qi(pg_table)}")
         if now_n != n:
             bad += 1
             print(

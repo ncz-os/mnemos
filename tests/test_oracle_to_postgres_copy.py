@@ -62,3 +62,19 @@ def test_array_columns_accept_lists_and_json_arrays():
     assert conv(["a", 1]) == ["a", "1"]
     assert conv('["x", "y"]') == ["x", "y"]
     assert conv("solo") == ["solo"]
+
+
+def test_timestamp_without_zone_normalises_an_iso_string_with_an_offset():
+    conv = copy.converter("timestamp without time zone", "VARCHAR2")
+    assert conv("2026-11-09T10:00:00-05:00") == dt.datetime(2026, 11, 9, 15, 0)
+    assert conv("2026-11-09T15:00:00") == dt.datetime(2026, 11, 9, 15, 0)
+
+
+def test_uuid_from_non_uuid_bytes_uses_the_same_deterministic_fallback_as_text():
+    conv = copy.converter("uuid", "RAW")
+    assert conv(b"claude-opus-4-8") == conv("claude-opus-4-8")
+
+
+def test_identifiers_are_quoted_with_embedded_quotes_doubled():
+    assert copy.qi("memories") == '"memories"'
+    assert copy.qi('we"ird') == '"we""ird"'
