@@ -607,7 +607,23 @@ async def import_memories_from_document(
                         # namespace. Sending chunk["content"] / user.namespace
                         # leaked raw credentials and the pre-vault namespace to an
                         # external HTTP endpoint.
-                        stored_namespace = imported.namespace or user.namespace
+                        # The stored namespace is authoritative: import_chunk
+                        # always returns the POST-classification namespace on
+                        # the emit path (the "vault" namespace when the chunk
+                        # carried a credential). Falling back to
+                        # user.namespace here would reintroduce the exact
+                        # pre-vault leak this fix closes, so the emit path
+                        # refuses to guess: if the repository ever stops
+                        # supplying it, that is an invariant violation, not a
+                        # reason to send the caller's namespace.
+                        if not imported.namespace:
+                            raise RuntimeError(
+                                "document import: emit_created_event=True but "
+                                "ImportedDocumentChunk.namespace is unset; "
+                                "refusing to emit a memory.created webhook "
+                                "with a pre-classification namespace (F2)"
+                            )
+                        stored_namespace = imported.namespace
                         chunk_delivery_ids = await backend.webhooks.dispatch_event(
                             tx,
                             "memory.created",

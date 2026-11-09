@@ -192,3 +192,55 @@ async def test_clean_chunk_webhook_is_unchanged(sqlite_backend, monkeypatch):
     assert data["content"] == clean
     assert data["namespace"] == "team"
     assert capturing.calls[0]["namespace"] == "team"
+
+
+async def test_unset_stored_namespace_refuses_to_emit(sqlite_backend, monkeypatch):
+    """If the repo ever withholds the stored namespace, emit fails closed.
+
+    The webhook must never fall back to ``user.namespace``: that is the
+    pre-vault namespace, and sending it is the leak F2 exists to prevent.
+    A repository that returns ``namespace=None`` on the emit path is an
+    invariant violation, so the route raises instead of guessing.
+    """
+    from mnemos.domain.document_repo import ImportedDocumentChunk
+
+    _stub_parser(
+        monkeypatch,
+        [
+            {
+                "chunk_num": 0,
+                "title": "Chunk 0",
+                "content": "ordinary notes",
+                "metadata": {"source_file": "doc.pdf", "chunk_num": 0},
+            }
+        ],
+    )
+    capturing = _CapturingWebhooks(sqlite_backend.webhooks)
+    monkeypatch.setattr(type(sqlite_backend), "webhooks", property(lambda _self: capturing))
+    monkeypatch.setattr(sqlite_backend, "supports_webhooks", True, raising=False)
+
+    async def _emit_without_namespace(_backend, _tx, **_kw):
+        return ImportedDocumentChunk(memory_id="mem_x", namespace=None)
+
+    monkeypatch.setattr(document_import._document_repo, "import_chunk", _emit_without_namespace)
+
+    payload, status_code = await document_import.import_memories_from_document(
+        file=_Upload("doc.pdf", b"%PDF-1.4\nx"),
+        category="documents",
+        subcategory=None,
+        permission_mode=None,
+        project_tag="mnemos",
+        allow_archive_snapshot=False,
+        user=_User(),
+    )
+
+    # The chunk failed closed: nothing was dispatched, so nothing leaked.
+    # Zero committed chunks is the route's established 502 "content error"
+    # contract; other chunks would still be processed independently.
+    assert capturing.calls == []
+    assert status_code == 502
+    assert payload["memories_created"] == 0
+    assert any(
+        "pre-classification namespace" in str(err.get("error", ""))
+        for err in payload["errors"]
+    ), payload["errors"]
