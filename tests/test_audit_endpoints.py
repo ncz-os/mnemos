@@ -108,8 +108,13 @@ def test_audit_proof_head_404_when_no_entry(monkeypatch, fake_user):
         async def __aexit__(self, *a):
             return False
 
+    class _Memories:
+        async def get_memory(self, tx, memory_id, *, visibility, include_archived=False):
+            return {"id": memory_id}
+
     class _Backend:
         audit_chain = _AuditChain()
+        memories = _Memories()
 
         def transactional(self):
             return _TxCtx()

@@ -20,12 +20,14 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import HTTPException
-
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext
 from mnemos.api.read_policy import _redacted_for_webhook
 from mnemos.core.ids import new_memory_id  # noqa: F401  (re-exported: routes patch it here)
+from mnemos.domain.deletion_fence import (
+    assert_no_active_deletion,
+    assert_no_active_deletion_for_scopes,
+)
 from mnemos.persistence.nats_events import safe_subject_segment
 
 logger = logging.getLogger(__name__)
@@ -91,42 +93,14 @@ def _metadata_for_audit(value) -> dict | None:
         return None
 
 
-async def _assert_no_active_deletion(
-    backend,
-    *,
-    owner_id: str,
-    namespace: str,
-) -> None:
-    """Refuse to write a row onto a scope that is currently being deleted.
-
-    Without this fence, a memory added during the 30-day grace window
-    (after the soft-delete sweep has marked the scope, before the
-    hard-delete phase runs) would survive past ``hard_deleted`` -- the
-    hard-delete only removes rows already carrying
-    ``deleted_at IS NOT NULL``, so a row inserted during grace still has
-    ``deleted_at IS NULL`` and is skipped forever, even though the
-    audit log claims the user was hard-deleted. Root is the exception:
-    operators may need to inject tombstone rows even mid-deletion.
-    """
-    from mnemos.persistence.worker_lifecycle import active_deletion_for_scope
-
-    try:
-        active = await active_deletion_for_scope(backend, target_user_id=owner_id, target_namespace=namespace)
-    except Exception:
-        # If the fence itself errors (e.g. backend doesn't expose
-        # transactional), fall through. The hard-delete resweep+verify
-        # loop added in deletion_request_worker.py is the second line of
-        # defence and refuses to mark the request complete on live rows.
-        return
-    if active is not None:
-        restore_by = active.get("restore_by")
-        detail = (
-            "This scope is currently subject to an active deletion request; "
-            "new writes are rejected until the grace window expires. "
-        )
-        if restore_by is not None:
-            detail += f"Restore deadline: {restore_by}."
-        raise HTTPException(status_code=409, detail=detail)
+# The fence is domain logic, not route policy: the MPF/CHARON importers write
+# memories from below the API layer and must run the same probe, and
+# ``mnemos.domain`` may not import ``mnemos.api`` under the layered
+# import-linter contract. Re-exported under the historical private name as the
+# SAME object -- not a wrapper -- because route modules and the tests that
+# patch ``memory_mutations._assert_no_active_deletion`` resolve this name.
+_assert_no_active_deletion = assert_no_active_deletion
+_assert_no_active_deletion_for_scopes = assert_no_active_deletion_for_scopes
 
 
 def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
