@@ -1,0 +1,8 @@
+[zoder] every MiniMax provider serving 'MiniMax-M3' is M Plan quota-exhausted (see `zoder quota minimax`); attempting the call anyway to surface the reset time
+[zoder] every MiniMax provider serving 'MiniMax-M3.1-Flash' is M Plan quota-exhausted (see `zoder quota minimax`); attempting the call anyway to surface the reset time
+[zoder] every MiniMax provider serving 'MiniMax-M3' is M Plan quota-exhausted (see `zoder quota minimax`); attempting the call anyway to surface the reset time
+[zoder] every MiniMax provider serving 'MiniMax-M3.1-Flash' is M Plan quota-exhausted (see `zoder quota minimax`); attempting the call anyway to surface the reset time
+zoder: warning: model "nvidia/switchyard": no complete input/output pair or blended rate, skipping model
+zoder: warning: model "openrouter/auto-beta": no complete input/output pair or blended rate, skipping model
+zoder: warning: model "typesafe/jev-router": no complete input/output pair or blended rate, skipping model
+zoder: warning: skipped 3 malformed model entries in /home/jasonperlow/.zoder/pricing.json
