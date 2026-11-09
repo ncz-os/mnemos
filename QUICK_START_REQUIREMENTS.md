@@ -1,6 +1,6 @@
 # MNEMOS Quick Start Requirements
 
-**Applies to**: current v7.1.0 release line
+**Applies to**: current v7.1.1 release line
 **TL;DR**: Python 3.13+ for package installs, or no host Python at all if you
 run the container image. Use SQLite for `edge`/`dev`, or PostgreSQL 16 for
 `server` — plus Redis only if you run more than one worker.
@@ -11,10 +11,10 @@ run the container image. Use SQLite for `edge`/`dev`, or PostgreSQL 16 for
 ## Container (Fastest Deploy)
 
 ```bash
-docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:7.1.0
+docker run -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:7.1.1
 ```
 
-SQLite-backed, zero configuration, no host Python. Pin an exact version (`:7.1.0`)
+SQLite-backed, zero configuration, no host Python. Pin an exact version (`:7.1.1`)
 to keep a fleet on identical code.
 
 **Total Time**: ~2 minutes
