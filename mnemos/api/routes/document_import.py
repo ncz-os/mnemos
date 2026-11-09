@@ -51,6 +51,7 @@ def _docling_max_concurrency() -> int:
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.memory_mutations import _assert_no_active_deletion
 from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.api.read_policy import _redacted_for_webhook, _validate_permission_mode
 from mnemos.core.config import get_settings, runtime_env_value
@@ -412,6 +413,24 @@ async def import_memories_from_document(
                 "archive_override_at": datetime.now(timezone.utc).isoformat(),
                 "archive_override_reason": archive_reason,
             }
+        )
+
+    # CF-09 GDPR fence (MN-05): the single memory create refuses (409) to
+    # write onto a scope whose deletion request is inside the grace window.
+    # This route wrote one memory per document chunk without that probe, so a
+    # document imported mid-deletion repopulated the scope with rows the sweep
+    # cannot see (``deleted_at IS NULL``) and the hard delete skips -- ghost
+    # rows surviving a request recorded as ``hard_deleted``. Refuse the WHOLE
+    # document before the first chunk is written, with the same 409 the single
+    # create returns; a per-chunk error list would report a successful import
+    # of nothing. Chunks are written under the caller's own scope (this route
+    # has no preserve_owner mode), so that pair is what gets probed. Root
+    # keeps the documented tombstone-injection bypass.
+    if user.role != "root":
+        await _assert_no_active_deletion(
+            backend,
+            owner_id=user.user_id,
+            namespace=user.namespace,
         )
 
     # Create memories from chunks. Match the canonical /v1/memories create
@@ -891,9 +910,20 @@ async def batch_import_documents(
     # back / unsupported ones.
     if has_partial_or_full_failure:
         per_file_statuses = [int(r.get("status_code", 0)) for r in results]
+        # CF-09 fence (MN-05): a deletion refusal is per-SCOPE, not per-file --
+        # every file in the batch writes under the caller's one (owner_id,
+        # namespace), so nothing in the request was accepted. Answer 409 as a
+        # whole (the verdict the single create gives) instead of the 207 below,
+        # which would read as "some files imported" with only a per-file error
+        # string standing in for the rejection. Checked before 503/502 for the
+        # same reason 503 precedes the all-502 path: the fence verdict is the
+        # cause, and it is not retryable.
+        any_409 = any(code == 409 for code in per_file_statuses)
         any_503 = any(code == 503 for code in per_file_statuses)
         all_502 = not any_503 and len(per_file_statuses) > 0 and all(code == 502 for code in per_file_statuses)
-        if any_503:
+        if any_409:
+            top = 409
+        elif any_503:
             top = 503
         elif all_502:
             top = 502
