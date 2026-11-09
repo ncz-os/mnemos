@@ -18,6 +18,7 @@ from mnemos.domain.portability.export import (
     export_memories as _export_memories,
 )
 from mnemos.domain.portability.import_ import import_memories as _import_memories
+from mnemos.domain.portability.import_ import preflight_import_scope_fence
 from mnemos.domain.portability.schemas import (
     MEMORY_PAYLOAD_VERSION,
     MPF_VERSION,
@@ -370,6 +371,16 @@ async def import_memories(
     # have raised AttributeError on SQLite the moment the gate was lifted. It
     # looked like an escape hatch and was not one.
     backend = backend_or_503()
+    # CF-09 GDPR fence (MN-05): probe the import's target scopes BEFORE the
+    # transaction is opened. The fence reads through a transaction of its own,
+    # which cannot nest inside this one (SQLite deadlocks); doing it first also
+    # means a refused import never starts a transaction it has to unwind.
+    await preflight_import_scope_fence(
+        backend,
+        envelope=envelope,
+        preserve_owner=preserve_owner,
+        user=user,
+    )
     async with backend.transactional() as tx:
         return await _import_memories(
             backend,

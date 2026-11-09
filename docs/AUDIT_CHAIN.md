@@ -131,7 +131,13 @@ no audit entries for memory_id=<id>
 ```
 
 so the response is not an existence oracle across tenants. `root` bypasses
-the predicate. Archived memories remain provable by their owner.
+the predicate, and — mirroring the `GET /v1/memories/{id}` explicit-fetch
+contract — may fetch the proof of a vault-namespace memory by exact id,
+while the vault stays subtracted for every non-root caller. Archived
+memories remain provable by their owner. A soft-deleted memory is invisible
+to everyone, `root` included: its proof is an operator job, not an API
+surface, and keeping it readable would re-open the oracle through the
+delete path.
 
 ### `GET /v1/audit/health`
 
