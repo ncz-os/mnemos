@@ -33,6 +33,12 @@ Contract pinned here:
   * ``/v1/audit/inclusion_proof`` is out of scope: it takes an entry_id
     that is only obtainable by already passing through this visibility
     check, so it is not an independent oracle.
+  * The route adds NO caller-supplied ``include_secrets`` /
+    ``include_archived`` flags (and none are added here): visibility is
+    derived solely from the caller's identity (root vs non-root), the
+    same trust model as the memories GET-by-id read path. An explicit
+    caller flag could only loosen that derivation and would re-open the
+    oracle for a non-root caller who sets it.
 """
 
 from __future__ import annotations
@@ -178,7 +184,10 @@ def test_audit_proof_requires_visibility(tmp_path, monkeypatch):
         assert "mem_bob_vault_note" not in exc2.value.detail
         assert "mem_never_existed" not in exc.value.detail
     finally:
-        asyncio.run(backend.close())
+        try:
+            asyncio.run(backend.close())
+        except Exception:
+            pass
 
 
 def test_audit_proof_visible_owner_still_gets_proof(tmp_path, monkeypatch):
@@ -204,7 +213,10 @@ def test_audit_proof_visible_owner_still_gets_proof(tmp_path, monkeypatch):
         assert out["payload_hash"]
         assert out["sealed"] is False
     finally:
-        asyncio.run(backend.close())
+        try:
+            asyncio.run(backend.close())
+        except Exception:
+            pass
 
 
 def test_audit_proof_root_reads_other_tenants(tmp_path, monkeypatch):
@@ -226,7 +238,10 @@ def test_audit_proof_root_reads_other_tenants(tmp_path, monkeypatch):
         assert out["memory_id"] == "mem_bob_root"
         assert out["writer_id"] == "bob"
     finally:
-        asyncio.run(backend.close())
+        try:
+            asyncio.run(backend.close())
+        except Exception:
+            pass
 
 
 def test_audit_proof_deleted_memory_invisible_even_to_root(tmp_path, monkeypatch):
@@ -267,7 +282,10 @@ def test_audit_proof_deleted_memory_invisible_even_to_root(tmp_path, monkeypatch
             _call(monkeypatch, backend, "mem_bob_deleted", alice)
         assert exc_alice.value.status_code == 404
     finally:
-        asyncio.run(backend.close())
+        try:
+            asyncio.run(backend.close())
+        except Exception:
+            pass
 
 
 def test_audit_proof_archived_memory_still_readable(tmp_path, monkeypatch):
@@ -295,7 +313,10 @@ def test_audit_proof_archived_memory_still_readable(tmp_path, monkeypatch):
         assert out["memory_id"] == "mem_alice_archived"
         assert out["op"] == "archive"
     finally:
-        asyncio.run(backend.close())
+        try:
+            asyncio.run(backend.close())
+        except Exception:
+            pass
 
 
 def test_audit_proof_vault_memory_root_only(tmp_path, monkeypatch):
@@ -325,4 +346,7 @@ def test_audit_proof_vault_memory_root_only(tmp_path, monkeypatch):
             _call(monkeypatch, backend, "mem_vault_cred", alice)
         assert exc.value.status_code == 404
     finally:
-        asyncio.run(backend.close())
+        try:
+            asyncio.run(backend.close())
+        except Exception:
+            pass
