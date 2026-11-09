@@ -110,9 +110,7 @@ def test_the_list_is_valid_sql_with_an_alias():
 def test_a_stored_timestamp_renders_iso_shaped():
     conn = memory_table()
     try:
-        conn.execute(
-            "INSERT INTO memories (created, updated) VALUES ('2026-01-01 12:34:56', '2026-01-01 12:34:56')"
-        )
+        conn.execute("INSERT INTO memories (created, updated) VALUES ('2026-01-01 12:34:56', '2026-01-01 12:34:56')")
         row = conn.execute(f"SELECT {_sqlite_memory_cols()} FROM memories").fetchone()
         assert row[SOURCE.index("created")] == "2026-01-01T12:34:56"
         assert row[SOURCE.index("updated")] == "2026-01-01T12:34:56"
