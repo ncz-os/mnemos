@@ -12,6 +12,7 @@ from mnemos.core.persisted_text_classification import (
     strip_caller_secret_metadata,
 )
 from mnemos.core.security import is_root
+from mnemos.domain.deletion_fence import assert_no_active_deletion_for_scopes
 from mnemos.persistence.base import (
     AuditPersistence,
     Transaction,
@@ -57,6 +58,73 @@ def _new_stats() -> ImportStats:
 # omitted verbatim_content from fetch_memory_by_id. That column is now part of
 # the projection on all six backends, so the shim is deleted rather than
 # translated, and with it the last driver-specific SQL in the import path.
+
+
+def _target_scopes(envelope: MPFEnvelope, *, preserve_owner: bool, user) -> set[tuple[str, str | None]]:
+    """Every ``(owner_id, namespace)`` the envelope will write memory rows to.
+
+    Mirrors the per-record resolution the insert loop performs:
+    ``preserve_owner`` (root only, enforced by ``_validate_import_request``)
+    keeps each record's own pair, otherwise everything lands on the caller's.
+    Resolved from the ENVELOPE PAYLOAD, not from the classified namespace: a
+    secret-bearing record is vaulted, which is a per-record move into the
+    ``vault`` namespace, so fencing the payload namespace is what covers the
+    scope the deletion request actually names.
+    """
+    scopes: set[tuple[str, str | None]] = set()
+    for record in envelope.records:
+        if record.kind != "memory":
+            continue
+        p = record.payload if isinstance(record.payload, dict) else {}
+        if preserve_owner:
+            scopes.add((p.get("owner_id") or user.user_id, p.get("namespace") or user.namespace))
+        else:
+            scopes.add((user.user_id, user.namespace))
+    return scopes
+
+
+async def preflight_import_scope_fence(
+    backend,
+    *,
+    envelope: MPFEnvelope,
+    preserve_owner: bool,
+    user,
+) -> None:
+    """CF-09 fence for an MPF import, probed BEFORE the caller's transaction.
+
+    An import is a write path like any other, but it used to insert straight
+    through a scope whose deletion request is inside its 30-day grace window.
+    The rows it lands carry ``deleted_at IS NULL``, so the next sweep cannot
+    see them and the hard-delete phase (which only removes rows already
+    carrying ``deleted_at IS NOT NULL``) skips them -- they survive while the
+    request and the audit log record the scope as ``hard_deleted``.
+
+    Probe every DISTINCT target scope up front:
+
+      * non-root (or no ``preserve_owner``): one scope, the caller's own;
+      * root + ``preserve_owner``: each record's own (owner_id, namespace),
+        since a restore writes rows into OTHER tenants' scopes.
+
+    Up front, not per record, for two reasons: a 10k-record envelope must not
+    become 10k probes, and a partial import that silently skipped the fenced
+    scopes would report success while writing only half the envelope. The
+    refusal is the same 409 the single create returns. Root's documented
+    tombstone-injection bypass stays, but only for the ROOT CALLER'S OWN
+    scope -- a root restore into another tenant's mid-deletion scope is a
+    repopulation the fence must still stop.
+
+    This is a SEPARATE, caller-invoked step rather than part of
+    :func:`import_memories` because that function runs inside the route's open
+    transaction, and the fence's own read transaction cannot nest inside it.
+    """
+    fence_skip: set[tuple[str, str | None]] = set()
+    if is_root(user) and preserve_owner:
+        fence_skip.add((user.user_id, user.namespace))
+    await assert_no_active_deletion_for_scopes(
+        backend,
+        _target_scopes(envelope, preserve_owner=preserve_owner, user=user),
+        skip=fence_skip,
+    )
 
 
 def _validate_import_request(envelope: MPFEnvelope, preserve_owner: bool, user) -> None:
@@ -144,6 +212,32 @@ async def import_memories(
 ) -> ImportStats:
     _validate_import_request(envelope, preserve_owner, user)
     stats = _new_stats()
+
+    # CF-09 GDPR fence (MN-05): an import is a write path like any other, but
+    # it inserted straight through a scope whose deletion request is inside
+    # its 30-day grace window. The rows it lands carry ``deleted_at IS NULL``,
+    # so the next sweep cannot see them and the hard-delete phase (which only
+    # removes rows already carrying ``deleted_at IS NOT NULL``) skips them --
+    # they survive while the request and the audit log record the scope as
+    # ``hard_deleted``. Probe every DISTINCT target scope up front:
+    #
+    #   * non-root (or no preserve_owner): one scope, the caller's own;
+    #   * root + preserve_owner: each record's own (owner_id, namespace), since
+    #     a restore writes rows into OTHER tenants' scopes.
+    #
+    # Up front, not per record, for two reasons: a 10k-record envelope must
+    # not become 10k probes, and a partial import that silently skipped the
+    # fenced scopes would report success while writing only half the envelope.
+    # The refusal is the same 409 the single create returns. Root's documented
+    # tombstone-injection bypass stays, but only for the ROOT CALLER'S OWN
+    # scope -- a root restore into another tenant's mid-deletion scope is a
+    # repopulation the fence must still stop.
+    # NOTE: this function runs INSIDE the caller's open transaction (the route
+    # opens ``backend.transactional()`` and passes ``tx``), so the fence cannot
+    # be probed from here -- ``active_deletion_for_scope`` opens a transaction
+    # of its own and the second handle deadlocks on SQLite. The probe lives in
+    # ``preflight_import_scope_fence`` and the route calls it BEFORE opening
+    # the transaction, so a refusal never leaves an open one behind.
 
     # The caller owns the outer transaction (the route opens
     # backend.transactional()), so the whole import still commits or rolls
