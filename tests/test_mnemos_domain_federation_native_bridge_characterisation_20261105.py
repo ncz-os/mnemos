@@ -943,11 +943,20 @@ def test_serialize_memory_rows_coerces_the_native_result_to_bytes(monkeypatch) -
 
 
 def test_serialize_memory_rows_redaction_happens_before_the_sequence_gate(monkeypatch) -> None:
-    # A vault row carrying a sequence is dropped first, so it must not
-    # force the pure-Python path for the remaining rows.
-    monkeypatch.setattr(native_bridge, "_NATIVE_FEDERATION", _fake_native(rows=lambda _rows: b"native-bytes"))
-    vault_row = _memory_row(id="vault_mem", namespace=VAULT_NAMESPACE, federation_sequence=7)
-    assert native_bridge.serialize_memory_rows([_memory_row(), vault_row]) == b"native-bytes"
+    # A vault row carrying a sequence is dropped first, so it must not force
+    # the pure-Python path for the remaining rows, nor reach the extension.
+    seen: list[Any] = []
+
+    def rows(payload):
+        seen.append([dict(row) for row in payload])
+        return b"native-bytes"
+
+    monkeypatch.setattr(native_bridge, "_NATIVE_FEDERATION", _fake_native(rows=rows))
+    vault_row = _memory_row(id="vault_mem", namespace=VAULT_NAMESPACE, content=SECRET, federation_sequence=7)
+    result = native_bridge.serialize_memory_rows([_memory_row(content=SECRET), vault_row])
+    assert result == b"native-bytes"
+    assert [row["id"] for row in seen[0]] == ["mem_1"]
+    assert seen[0][0]["content"] == "the root password is [REDACTED]"
 
 
 def test_memory_rows_native_path_receives_only_redacted_non_vault_rows(monkeypatch) -> None:
@@ -997,10 +1006,12 @@ def test_feed_native_path_receives_the_callers_rows_untouched(monkeypatch) -> No
         "redaction -- whereas serialize_memory_rows filters and redacts at line 184 before "
         "calling out at line 187. Whenever a native extension is installed, every row "
         "(including vault-namespace rows) reaches native code unredacted, even a single row. "
-        "Latent today: "
-        "serialize_memory_for_feed has no non-test caller in the tree, and the one route that "
-        "serializes memories (mnemos/api/routes/federation.py) uses serialize_feed_response, "
-        "which goes through the redacting rows path."
+        "Fix would be one line: pass _redacted_non_vault_rows(rows) at line 168, as the "
+        "rows path already does at line 184. Not changed here because this task is "
+        "tests-only. Latent today: serialize_memory_for_feed has no non-test caller in the "
+        "tree, and the one route that serializes memories "
+        "(mnemos/api/routes/federation.py) uses serialize_feed_response, which goes through "
+        "the redacting rows path."
     ),
 )
 def test_feed_native_path_drops_vault_rows_like_the_rows_path_does(monkeypatch) -> None:
@@ -1015,8 +1026,8 @@ def test_feed_native_path_drops_vault_rows_like_the_rows_path_does(monkeypatch) 
         _memory_row(id="vault_mem", namespace=VAULT_NAMESPACE, content=SECRET),
     ]
     native_bridge.serialize_memory_for_feed(rows)
-    assert [row["id"] for row in seen[0]] == ["plain"]
-    assert SECRET not in json.dumps(seen[0])
+    assert [row["id"] for row in seen[0]] == ["plain"]  # observed: ['plain', 'vault_mem']
+    assert SECRET not in json.dumps(seen[0])  # observed: leaked verbatim
 
 
 # --------------------------------------------------------------------------
