@@ -84,8 +84,8 @@ def safe_subject_segment(value: Any, *, default: str = "default") -> str:
     * ``"a%5Fb"``    -> ``"a%255Fb"`` (no collision either)
 
     A namespace containing none of the escaped characters is returned
-    unchanged, and the result is never empty (that would be a blank subject
-    token), so ``""`` / ``".."`` fall back to ``default``.
+    unchanged. Only an empty result (``""``, ``None``) falls back to
+    ``default`` — the token may never be blank.
     """
     raw = str(value if value is not None else default)
     safe = "".join(_SUBJECT_ESCAPES.get(ch, ch) for ch in raw)
