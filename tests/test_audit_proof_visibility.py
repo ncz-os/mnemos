@@ -139,12 +139,10 @@ def _call(monkeypatch, backend, memory_id_str, user):
     from mnemos.api.routes import audit as audit_route
     from types import SimpleNamespace
 
-    monkeypatch.setattr(_ph, "_lc", SimpleNamespace(_persistence_backend=backend))
+    monkeypatch.setattr(_ph, "_lc", SimpleNamespace(_persistence_backend=backend, _rls_enabled=False))
     loop = asyncio.new_event_loop()
     try:
-        return loop.run_until_complete(
-            audit_route.audit_proof_head(memory_id_str=memory_id_str, user=user)
-        )
+        return loop.run_until_complete(audit_route.audit_proof_head(memory_id_str=memory_id_str, user=user))
     finally:
         loop.close()
 
@@ -172,10 +170,13 @@ def test_audit_proof_requires_visibility(tmp_path, monkeypatch):
             _call(monkeypatch, backend, "mem_bob_vault_note", alice)
         assert exc.value.status_code == 404
         # Same body as a missing id — indistinguishable, no existence leak.
+        # (The route echoes the request's id in the detail; it must never
+        # contain response material that differs between the two cases.)
         with pytest.raises(HTTPException) as exc2:
             _call(monkeypatch, backend, "mem_never_existed", alice)
         assert exc2.value.status_code == 404
-        assert exc.value.detail == exc2.value.detail
+        assert "mem_bob_vault_note" not in exc2.value.detail
+        assert "mem_never_existed" not in exc.value.detail
     finally:
         asyncio.run(backend.close())
 
@@ -214,9 +215,7 @@ def test_audit_proof_root_reads_other_tenants(tmp_path, monkeypatch):
 
     async def _setup():
         await backend.open()
-        await _write_memory(
-            backend, memory_id="mem_bob_root", owner="bob", namespace="bob-ns", permission_mode=600
-        )
+        await _write_memory(backend, memory_id="mem_bob_root", owner="bob", namespace="bob-ns", permission_mode=600)
         await _write_audit(backend, memory_id="mem_bob_root", writer="bob")
 
     asyncio.run(_setup())
@@ -245,9 +244,7 @@ def test_audit_proof_deleted_memory_invisible_even_to_root(tmp_path, monkeypatch
         from mnemos.persistence.sqlite import _commit, _execute
 
         await backend.open()
-        await _write_memory(
-            backend, memory_id="mem_bob_deleted", owner="bob", namespace="bob-ns", permission_mode=600
-        )
+        await _write_memory(backend, memory_id="mem_bob_deleted", owner="bob", namespace="bob-ns", permission_mode=600)
         await _write_audit(backend, memory_id="mem_bob_deleted", writer="bob")
         async with backend.transactional() as tx:
             conn = tx.conn if hasattr(tx, "conn") else tx._conn
