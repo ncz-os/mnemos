@@ -8,12 +8,15 @@ posts batched content to the embed server, UPSERTs the vector column.
 Backend-aware: reads MNEMOS_DATABASE_DSN and dispatches on the scheme.
   • oracle://user:pass@host:port/service   -> python-oracledb, VECTOR bind
   • db2://user:pass@host:port/database      -> ibm_db_dbi, VECTOR(?, dim, FLOAT32)
-(Postgres has its own pgvector-native path in backfill_embeddings.py.)
+  • postgresql://user:pass@host:port/db     -> asyncpg, pgvector '[..]'::vector
+(backfill_embeddings.py is the in-process embedder path; this script is the HTTP-endpoint path for every
+backend, which an Oracle -> postgres migration needs to regenerate embeddings.)
 
 Idempotent: re-running picks up where it left off.
 """
 
 import asyncio
+import inspect
 import array
 import math
 import os
@@ -34,10 +37,7 @@ BATCH_SIZE = int(os.environ.get("BACKFILL_BATCH_SIZE", "32"))
 MAX_TEXT_CHARS = 6000  # ~1500 tokens safe under bge-m3 n_ctx=8192 with margin
 
 # Rows still missing an embedding. Shared by every backend.
-_SELECT_WHERE = (
-    "embedding IS NULL AND content IS NOT NULL "
-    "AND deleted_at IS NULL AND archived_at IS NULL"
-)
+_SELECT_WHERE = "embedding IS NULL AND content IS NOT NULL AND deleted_at IS NULL AND archived_at IS NULL"
 
 
 def _coerce_text(content) -> str | None:
@@ -85,6 +85,7 @@ class _OracleBackend:
 
     def connect(self):
         import oracledb
+
         print(f"[backfill] oracle host={self.host}:{self.port} svc={self.svc} user={self.user}", flush=True)
         return oracledb.connect(user=self.user, password=self.pwd, dsn=f"{self.host}:{self.port}/{self.svc}")
 
@@ -97,10 +98,7 @@ class _OracleBackend:
 
     def fetch_batch(self, conn, batch_size):
         cur = conn.cursor()
-        cur.execute(
-            f"SELECT id, content FROM memories WHERE {_SELECT_WHERE} "
-            f"FETCH FIRST {int(batch_size)} ROWS ONLY"
-        )
+        cur.execute(f"SELECT id, content FROM memories WHERE {_SELECT_WHERE} FETCH FIRST {int(batch_size)} ROWS ONLY")
         rows = cur.fetchall()
         cur.close()
         out = []
@@ -134,6 +132,7 @@ class _Db2Backend:
 
     def connect(self):
         import ibm_db_dbi
+
         conn_str = (
             f"DATABASE={self.database};HOSTNAME={self.host};PORT={self.port};"
             f"PROTOCOL=TCPIP;UID={self.uid};PWD={self.pwd};"
@@ -150,10 +149,7 @@ class _Db2Backend:
 
     def fetch_batch(self, conn, batch_size):
         cur = conn.cursor()
-        cur.execute(
-            f"SELECT id, content FROM memories WHERE {_SELECT_WHERE} "
-            f"FETCH FIRST {int(batch_size)} ROWS ONLY"
-        )
+        cur.execute(f"SELECT id, content FROM memories WHERE {_SELECT_WHERE} FETCH FIRST {int(batch_size)} ROWS ONLY")
         rows = cur.fetchall()
         cur.close()
         out = []
@@ -176,6 +172,52 @@ class _Db2Backend:
             )
         conn.commit()
         cur.close()
+
+
+class _PostgresBackend:
+    """pgvector backend over asyncpg (the driver the MNEMOS image ships). Its methods are coroutines; ``main``
+    awaits whatever a backend returns, so the sync Oracle/Db2 backends are unchanged."""
+
+    scheme = "postgres"
+
+    def __init__(self, dsn: str):
+        rest = dsn.split("://", 1)[1] if "://" in dsn else dsn
+        self.dsn = f"postgresql://{rest}"
+        parsed = urlparse(self.dsn)
+        self.host = parsed.hostname or "127.0.0.1"
+        self.port = parsed.port or 5432
+        self.database = (parsed.path or "/").lstrip("/") or "mnemos"
+        self.user = unquote(parsed.username) if parsed.username else ""
+
+    async def connect(self):
+        import asyncpg
+
+        print(f"[backfill] postgres host={self.host}:{self.port} db={self.database} user={self.user}", flush=True)
+        return await asyncpg.connect(self.dsn)
+
+    async def count_remaining(self, conn) -> int:
+        return int(await conn.fetchval(f"SELECT COUNT(*) FROM memories WHERE {_SELECT_WHERE}"))
+
+    async def fetch_batch(self, conn, batch_size):
+        rows = await conn.fetch(
+            f"SELECT id, content FROM memories WHERE {_SELECT_WHERE} ORDER BY id LIMIT $1", int(batch_size)
+        )
+        out = []
+        for r in rows:
+            text = _coerce_text(r["content"])
+            if text:
+                out.append((r["id"], text[:MAX_TEXT_CHARS]))
+        return out
+
+    async def update(self, conn, items_with_vecs):
+        async with conn.transaction():
+            await conn.executemany(
+                "UPDATE memories SET embedding = $1::vector WHERE id = $2",
+                [(_vector_literal(vec), mid) for mid, vec in items_with_vecs],
+            )
+
+    async def close(self, conn):
+        await conn.close()
 
 
 def _validate_embed_url(url: str) -> str:
@@ -221,10 +263,16 @@ def _make_backend(dsn: str):
         return _OracleBackend(dsn)
     if scheme == "db2":
         return _Db2Backend(dsn)
+    if scheme in ("postgresql", "postgres"):
+        return _PostgresBackend(dsn)
     raise SystemExit(
-        f"[backfill] unsupported DSN scheme {scheme!r}. This script handles "
-        f"oracle:// and db2://; use scripts/backfill_embeddings.py for postgres."
+        f"[backfill] unsupported DSN scheme {scheme!r}. This script handles oracle://, db2:// and postgresql://."
     )
+
+
+async def _call(value):
+    """Await a backend result when it is a coroutine (postgres); pass a sync backend's result through."""
+    return await value if inspect.isawaitable(value) else value
 
 
 # ── Embed ─────────────────────────────────────────────────────────────────
@@ -262,19 +310,21 @@ async def main():
         f"[backfill] backend={backend.scheme} EMBED_URL={embed_url} MODEL={EMBED_MODEL} BATCH={BATCH_SIZE}",
         flush=True,
     )
-    conn = backend.connect()
+    conn = await _call(backend.connect())
 
-    total_remaining = backend.count_remaining(conn)
+    total_remaining = await _call(backend.count_remaining(conn))
     print(f"[backfill] {total_remaining} rows need embedding", flush=True)
     if total_remaining == 0:
         print("[backfill] nothing to do", flush=True)
+        if hasattr(backend, "close"):
+            await _call(backend.close(conn))
         return
 
     async with httpx.AsyncClient() as client:
         done = 0
         t_start = time.monotonic()
         while True:
-            batch = backend.fetch_batch(conn, BATCH_SIZE)
+            batch = await _call(backend.fetch_batch(conn, BATCH_SIZE))
             if not batch:
                 break
             ids = [x[0] for x in batch]
@@ -288,7 +338,7 @@ async def main():
             if len(vecs) != len(ids):
                 print(f"  WARN length mismatch vecs={len(vecs)} ids={len(ids)}; using min", flush=True)
             n = min(len(vecs), len(ids))
-            backend.update(conn, [(ids[i], vecs[i]) for i in range(n)])
+            await _call(backend.update(conn, [(ids[i], vecs[i]) for i in range(n)]))
             done += n
             elapsed = time.monotonic() - t_start
             rate = done / elapsed if elapsed > 0 else 0
@@ -298,7 +348,10 @@ async def main():
                 f"embed={dt * 1000:.0f}ms rate={rate:.1f} rows/s eta={eta:.0f}s",
                 flush=True,
             )
-    conn.close()
+    if hasattr(backend, "close"):
+        await _call(backend.close(conn))
+    else:
+        conn.close()
     print("[backfill] done", flush=True)
 
 
