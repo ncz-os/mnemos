@@ -52,10 +52,9 @@ def _docling_max_concurrency() -> int:
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import backend_or_503
-from mnemos.api.read_policy import _validate_permission_mode
+from mnemos.api.read_policy import _redacted_for_webhook, _validate_permission_mode
 from mnemos.core.config import get_settings, runtime_env_value
 from mnemos.core.ids import new_memory_id
-from mnemos.core.secret_detection import redact_field_with_stored
 from mnemos.domain.document_repo import (
     DocumentChunkSoftDeletedConflictError,
     DocumentRepository,
@@ -600,16 +599,19 @@ async def import_memories_from_document(
                     canonical_id = imported.memory_id
                     in_flight_id = canonical_id
                     if imported.emit_created_event and getattr(backend, "supports_webhooks", True):
-                        # MN-02 / CF-05 (SEC F2.4): the payload leaves the
-                        # server for an external HTTP endpoint. Classification
-                        # and vault promotion happen INSIDE import_chunk, so
-                        # the route's own ``chunk_metadata`` is stale -- it has
-                        # neither the server-stamped redact spans nor the
-                        # post-classification namespace. Read both from what
-                        # was persisted, and span-redact the content exactly
-                        # like every other memory.* webhook path (F3).
-                        persisted_metadata = imported.metadata if imported.metadata is not None else chunk_metadata
-                        persisted_namespace = imported.namespace or user.namespace
+                        # F2 (2026-11-06): describe the row AS STORED. import_chunk
+                        # classified the chunk -- vaulting it when it carries a
+                        # credential and recording secret spans in metadata -- so
+                        # the outbound payload must use that stored metadata to
+                        # mask content and report the post-classification
+                        # namespace. Sending chunk["content"] / user.namespace
+                        # leaked raw credentials and the pre-vault namespace to an
+                        # external HTTP endpoint (MN-02 / CF-05, SEC F2.4).
+                        # ``metadata`` is None only on the legacy-resolution
+                        # path, which emits no event; fall back to the route's
+                        # own metadata so the content is still span-redacted.
+                        stored_metadata = imported.metadata if imported.metadata is not None else chunk_metadata
+                        stored_namespace = imported.namespace or user.namespace
                         chunk_delivery_ids = await backend.webhooks.dispatch_event(
                             tx,
                             "memory.created",
@@ -617,17 +619,13 @@ async def import_memories_from_document(
                                 "memory_id": canonical_id,
                                 "category": category,
                                 "subcategory": subcategory,
-                                "content": redact_field_with_stored(
-                                    chunk["content"],
-                                    persisted_metadata,
-                                    "content",
-                                ),
+                                "content": _redacted_for_webhook(chunk["content"], stored_metadata),
                                 "owner_id": user.user_id,
-                                "namespace": persisted_namespace,
+                                "namespace": stored_namespace,
                                 "source": "document_import",
                             },
                             owner_id=user.user_id,
-                            namespace=persisted_namespace,
+                            namespace=stored_namespace,
                         )
                     elif imported.emit_created_event:
                         chunk_delivery_ids = []

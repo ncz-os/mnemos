@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -40,21 +40,23 @@ def _metadata_obj(metadata_json: str) -> dict[str, Any]:
 
 @dataclass(frozen=True)
 class ImportedDocumentChunk:
-    """Outcome of one chunk write.
+    """Result of one document-import chunk write.
 
-    ``namespace`` and ``metadata`` echo what was actually PERSISTED, which can
-    differ from what the route asked for: ``import_chunk`` classifies the
-    chunk text and auto-vaults a VAULT-class chunk into ``vault``, stamping
-    ``secret_redact_fields`` / ``secret_vaulted`` into its metadata. Downstream
-    consumers of the write (notably the ``memory.created`` webhook payload)
-    must read these fields, not the route's pre-write locals, or they leak the
-    raw secret and the pre-vault namespace (MN-02 / CF-05, SEC F2.4).
+    ``metadata`` and ``namespace`` are the POST-CLASSIFICATION values the row
+    was actually persisted with (secret spans recorded in metadata, and the
+    vault namespace when the chunk was vaulted). Callers that emit side
+    effects describing the stored row -- notably the ``memory.created``
+    webhook -- must use these rather than the pre-classification inputs, or
+    they will leak raw credentials and the pre-vault namespace to an external
+    endpoint (MN-02 / CF-05, SEC F2.4). ``metadata`` is ``None`` only when the
+    caller did not classify (the legacy-resolution path, which emits no
+    event).
     """
 
     memory_id: str
     emit_created_event: bool = True
-    namespace: str | None = None
     metadata: dict[str, Any] | None = None
+    namespace: str | None = None
 
 
 class DocumentRepository:
@@ -128,7 +130,11 @@ class DocumentRepository:
                     metadata=classified.metadata,
                     writer_id=owner_id,
                 )
-            return imported
+            return replace(
+                imported,
+                metadata=classified.metadata,
+                namespace=classified.namespace,
+            )
 
         now = datetime.now(timezone.utc)
         await backend.memories.insert_memory(
@@ -162,8 +168,8 @@ class DocumentRepository:
         )
         return ImportedDocumentChunk(
             memory_id=memory_id,
-            namespace=namespace,
-            metadata=_metadata_obj(metadata_json),
+            metadata=classified.metadata,
+            namespace=classified.namespace,
         )
 
     async def _import_postgres_chunk(
@@ -243,10 +249,15 @@ class DocumentRepository:
             raise DocumentChunkSoftDeletedConflictError(
                 "Document chunk matches a soft-deleted memory; restore it before retrying this import"
             )
+        # Report what the INSERT actually persisted. ``metadata_json`` here is
+        # already the CLASSIFIED payload (import_chunk serialised it) and
+        # ``namespace`` is the post-classification value, so decoding the
+        # round-trip reflects the stored row on every backend, not just the
+        # ones that hand back the classifier's object.
         return ImportedDocumentChunk(
             memory_id=str(canonical_id),
-            namespace=namespace,
             metadata=_metadata_obj(metadata_json),
+            namespace=namespace,
         )
 
 
