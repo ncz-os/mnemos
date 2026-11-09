@@ -378,6 +378,7 @@ def test_revoke_404_does_not_bump_the_epoch(monkeypatch):
 
     with pytest.raises(HTTPException):
         asyncio.run(acl_route.revoke_memory_acl("m1", "user:7", user=_user("alice")))
+    assert cache.scan_calls == []
     assert cache.deleted == []
     assert bumps == []
 
@@ -463,3 +464,24 @@ def test_sqlite_acl_grant_widens_read_within_namespace(tmp_path):
             await backend.close()
 
     asyncio.run(_go())
+
+
+def test_design_doc_does_not_claim_a_search_cache_invalidation():
+    """The ACL design doc must describe what the routes now do.
+
+    The code no longer invalidates a per-user search cache on grant/revoke
+    (there is none), so the "Cache coherency" section must say so and must
+    name the visibility-epoch bump that replaced it. A doc that still
+    promises a ``mnemos:search:*`` sweep is drift a reader would act on.
+    """
+    import pathlib
+    import re
+
+    doc = pathlib.Path(__file__).resolve().parents[1] / "docs" / "MULTIUSER_ACL_DESIGN.md"
+    section = doc.read_text(encoding="utf-8").split("## Cache coherency", 1)[1]
+    section = section.split("\n## ", 1)[0]
+
+    assert "visibility epoch" in section
+    # A live claim would be prose like "invalidate the ... search cache";
+    # the remaining mention is explicitly a historical "there is none".
+    assert not re.search(r"invalidate the per-user\s+search cache", section)
