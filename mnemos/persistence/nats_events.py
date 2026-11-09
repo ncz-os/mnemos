@@ -44,54 +44,58 @@ def federation_nats_enabled() -> bool:
     return nats_federation_enabled()
 
 
-# Per-character NATS subject segment escapes, applied in ONE pass over the
-# input (so the order of the entries carries no meaning). Only what the broker
-# reserves or what would make a subject unaddressable is rewritten, so a
-# namespace that needs none of it keeps the exact subject it already had.
-_SUBJECT_ESCAPES = {
-    # Established shape: a dotted namespace has always been published with
-    # underscores (``alice.ns`` -> ``alice_ns``).
-    ".": "_",
-    # A literal underscore is escaped, so a namespace that genuinely
-    # contains ``_`` can never occupy the token a dotted namespace produced.
-    "_": "%5F",
-    # NATS wildcards must never leak into a publish subject.
-    "*": "%2A",
-    ">": "%3E",
-    # Whitespace would be legal for the broker but makes the subject
-    # unaddressable from CLI/HTTP filters, and it has always been flattened.
-    " ": "%20",
-    "\t": "%09",
-    "\n": "%0A",
-    "\r": "%0D",
-    # Escape the escape, so ``"a%5Fb"`` cannot impersonate ``"a_b"``.
-    "%": "%25",
-}
+# Characters that may appear in a NATS subject token verbatim. Everything
+# else is percent-encoded, so the token stays a valid, single subject segment
+# no matter what an operator names a namespace.
+_SUBJECT_SAFE = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-")
+
+# The two characters the encoder deliberately re-renders instead of
+# percent-encoding, because their escaped form is the established one:
+# a dotted namespace has always been published with underscores
+# (``alice.ns`` -> ``alice_ns``, the legacy regex behaviour).
+_SUBJECT_SUBSTITUTES = {".": "_"}
+
+# Everything else outside ``_SUBJECT_SAFE`` — '_', '%', '*', '>', whitespace,
+# '@', '/', ':', non-ASCII, … — is percent-encoded per UTF-8 byte. Encoding
+# '_' is what makes the mapping injective (``a_b`` -> ``a%5Fb`` cannot
+# collide with the ``a_b`` that ``a.b`` produces) and encoding '%' keeps the
+# encoding itself unforgeable.
+
+
+def _encode_subject_char(ch: str) -> str:
+    return "".join(f"%{byte:02X}" for byte in ch.encode("utf-8"))
 
 
 def safe_subject_segment(value: Any, *, default: str = "default") -> str:
     """Return ``value`` as a single, unambiguous NATS subject segment.
 
-    CF-35 (MN-17): the mapping must be injective. Collapsing the reserved
-    characters onto ``_`` is not — ``"a.b"`` and ``"a_b"`` both become
-    ``"a_b"``, so two distinct tenants share one NATS subject and each
-    receives the other's events. Escaping underscores *and* the escape
-    character itself makes the mapping reversible:
+    Two properties are required, and both come from one rule: keep only
+    ``[A-Za-z0-9-]`` verbatim, render ``.`` as ``_``, and percent-encode
+    every other character (UTF-8 bytes).
+
+    *Injective* (CF-35/MN-17): collapsing reserved characters onto ``_`` is
+    not — ``"a.b"`` and ``"a_b"`` both became ``"a_b"``, so two distinct
+    tenants shared one NATS subject and each received the other's events.
+    Encoding ``_`` and ``%`` restores reversibility:
 
     * ``"alice.ns"`` -> ``"alice_ns"`` (the established, documented shape)
     * ``"a.b"``      -> ``"a_b"``
     * ``"a_b"``      -> ``"a%5Fb"`` (no collision with the line above)
     * ``"a%5Fb"``    -> ``"a%255Fb"`` (no collision either)
 
-    A namespace containing none of the escaped characters is returned
-    unchanged. Only an empty result (``""``, ``None``) falls back to
-    ``default`` — the token may never be blank.
+    *Valid* under any namespace: characters the broker would reject or
+    misread — wildcards ``*`` / ``>``, whitespace, ``@``, ``/``, ``:``,
+    non-ASCII, … — are encoded rather than passed through, so the result is
+    always exactly one subject token.
+
+    The result is never stripped: a leading/trailing ``.`` becomes ``_`` and
+    stays, otherwise ``".a"`` and ``"a"`` would share a token. Only an empty
+    result (``""``, ``None``) falls back to ``default``.
     """
     raw = str(value if value is not None else default)
-    safe = "".join(_SUBJECT_ESCAPES.get(ch, ch) for ch in raw)
-    # No ``.strip("_")`` here: a leading/trailing ``.`` maps to ``_`` in the
-    # same pass, and stripping it would make ``".a"`` and ``"a"`` share a
-    # token — the very collision this function exists to prevent.
+    safe = "".join(
+        ch if ch in _SUBJECT_SAFE else _SUBJECT_SUBSTITUTES.get(ch) or _encode_subject_char(ch) for ch in raw
+    )
     return safe or default
 
 
