@@ -53,3 +53,42 @@ Remaining failures are pre-existing environment issues on `master`.
 
 The same head branch was pushed to ARGONAS (the canonical private bare repo);
 local HEAD, `origin` and `argonas` refs agree.
+
+## Review follow-up (2026-11-09, post-merge re-review)
+
+A re-review of the merge raised one [high] finding against
+`mnemos/domain/portability/import_.py`:
+
+> `preflight_import_scope_fence` calls `assert_no_active_deletion_for_scopes`,
+> but the module does not import it — `NameError`, fence never executes.
+
+**Not reproducible on any revision in this branch's history, and not a defect
+in the merged tree.** The module has imported both names since before this
+refresh:
+
+- `mnemos/domain/portability/import_.py:14` — `from mnemos.core.security import is_root`
+- `mnemos/domain/portability/import_.py:15` — `from mnemos.domain.deletion_fence import assert_no_active_deletion_for_scopes`
+
+Line 15 is `ca391c9c` (MN-05, the commit that introduced the fence call); line
+14 predates it. Identical lines are present in `origin/master` and in the
+pre-merge branch tip, so the merge could not have introduced the problem.
+
+Evidence gathered rather than asserted:
+
+- `import mnemos.domain.portability.import_` succeeds and both names resolve
+  to the expected callables (`deletion_fence.py:69`, `security.py:42`).
+- An AST scan of the module reports **no** unresolved global name.
+- `git blame` on the import block shows the binding and its use originate in
+  the same commit (`ca391c9c`).
+- `tests/test_deletion_fence_bulk_and_import_paths.py` passes 12/12, and those
+  tests drive `preflight_import_scope_fence` — a `NameError` there would fail
+  them.
+
+No code change was made: adding a second, duplicate import of names that are
+already imported would be an edit manufactured to satisfy a report rather than
+a fix. The reviewer's "required next step" is already satisfied verbatim by the
+existing line 15.
+
+Re-ran the full suite after the merge: 70 failed, 6307 passed, 576 skipped,
+42 errors — the same 112 failing/erroring node ids as the pre-refresh
+baseline, empty symmetric difference. No regression.
