@@ -53,10 +53,7 @@ DOCUMENTED_COLUMNS = {
 
 
 def _params(func: object) -> list[tuple[str, object, object]]:
-    return [
-        (param.name, param.kind, param.default)
-        for param in inspect.signature(func).parameters.values()
-    ]
+    return [(param.name, param.kind, param.default) for param in inspect.signature(func).parameters.values()]
 
 
 class _Settings:
@@ -161,13 +158,10 @@ async def test_sqlite_schema_accepts_the_documented_queue_table(backend) -> None
     async with backend.transactional() as tx:
         tables = await _fetch_all(
             tx.conn,
-            "SELECT name FROM sqlite_master "
-            "WHERE type='table' AND name='memory_compression_queue'",
+            "SELECT name FROM sqlite_master " "WHERE type='table' AND name='memory_compression_queue'",
         )
         columns = await _fetch_all(tx.conn, "PRAGMA table_info(memory_compression_queue)")
-        foreign_keys = await _fetch_all(
-            tx.conn, "PRAGMA foreign_key_list(memory_compression_queue)"
-        )
+        foreign_keys = await _fetch_all(tx.conn, "PRAGMA foreign_key_list(memory_compression_queue)")
 
     assert tables == [{"name": "memory_compression_queue"}]
     names = {column["name"] for column in columns}
@@ -223,9 +217,7 @@ async def test_reenqueueing_a_pending_memory_enqueues_nothing(backend) -> None:
     async with backend.transactional() as tx:
         assert await _enqueue(repo, tx, ["mem-dup"]) == ["mem-dup"]
         assert await _enqueue(repo, tx, ["mem-dup"]) == []
-        rows = await _fetch_all(
-            tx.conn, "SELECT COUNT(*) AS n FROM memory_compression_queue"
-        )
+        rows = await _fetch_all(tx.conn, "SELECT COUNT(*) AS n FROM memory_compression_queue")
 
     assert rows == [{"n": 1}]
 
@@ -240,7 +232,8 @@ async def test_mark_done_removes_the_item_from_pending(backend) -> None:
         claimed = await repo.dequeue_compression(tx, limit=1)
         await repo.mark_compression_done(tx, queue_id=claimed[0]["id"])
         status = await _fetch_all(
-            tx.conn, "SELECT status FROM memory_compression_queue WHERE id = ?",
+            tx.conn,
+            "SELECT status FROM memory_compression_queue WHERE id = ?",
             (claimed[0]["id"],),
         )
         assert await repo.dequeue_compression(tx, limit=5) == []
