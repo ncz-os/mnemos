@@ -1,42 +1,53 @@
-# Refresh record — `hv/bl-mn-14-20261107` onto `master` (450dcf52)
+# Refresh record — `hv/bl-mn-14-20261107` onto `master` (046fcd1f)
 
 **Date:** 2026-11-09
 **Branch:** `hv/bl-mn-14-20261107`
-**Target:** `origin/master` @ `450dcf520777`
-**Merge commit:** `fc162967` (`d5fe719c` + `450dcf52`)
+**Target:** `origin/master` @ `046fcd1fc542`
+**Merge commit:** `3578dd74` (`d5fe719c` + `046fcd1f`)
 **Task:** MN-14 / CF-23 — rate limit trusted the left-most `X-Forwarded-For`
+
+## Why this refresh
+
+The branch was reviewed and approved at `85ba0384` and then refreshed onto
+`450dcf52` (`fc162967`). `master` has since advanced to `046fcd1fc542`, so the
+branch was once again no longer a fast-forward of it.
 
 ## What was refreshed
 
-The branch was reviewed and approved at `85ba0384`, but `master` had since
-advanced to `450dcf520777`, so the branch was no longer a fast-forward of it.
-`origin/master` was merged into the branch (`fc162967`):
+`origin/master` was merged into the branch (`3578dd74`):
 
 - **Conflicts resolved:** none. The recipe merged cleanly — the branch's
   touched files (`mnemos/core/rate_limit.py`, `mnemos/core/config.py`,
   `tests/test_rate_limit_trusted_proxy_hops.py`, `deploy/pantheon/*`) do not
-  overlap master's newer work (document-import webhook redaction, Oracle
-  reserved-word bind names, ADR-D-MN5, version/docs pins).
-- **Branch intent preserved:** each of the five branch-touched paths is
-  byte-identical between the pre-merge branch tip `d5fe719c` and the merged
-  head — the trusted-XFF-hop fix and its 12 regression tests survived
+  overlap master's newer work (CF-22 `/v1/audit/proof` cross-tenant oracle,
+  MN-05 CF-09 deletion fence on bulk/import paths, deletion-log
+  characterisation).
+- **Branch intent preserved:** each of the branch-touched source and test
+  paths is byte-identical between the pre-merge branch tip `d5fe719c` and the
+  merged head — the trusted-XFF-hop fix and its 12 regression tests survived
   unchanged.
-- **Target's newer code present:** `450dcf520777` is an ancestor of the merged
-  head, and every file the merge brought in is a target-side path.
+- **Target's newer code present:** `046fcd1fc542` is an ancestor of the merged
+  head, and `git diff origin/master HEAD` is exactly the branch's own change
+  (7 files: the fix, its tests, the pantheon deploy note, the review verdict
+  and this record). No master-side path was reverted.
 
-## Test evidence (repository suite, `tests/`, excluding the externally-gated
-`tests/integration_nats` and `tests/integration_patroni`)
+## Test evidence
+
+Repository suite: `python3 -m pytest tests/ --ignore=tests/test_live_e2e.py`
+(the externally-gated `tests/integration_nats` / `tests/integration_patroni`
+suites are not part of `make test`).
 
 | Tree | Result |
 |---|---|
-| target `450dcf52` (pre-merge) | 69 failed, 6245 passed, 563 skipped, 42 errors |
-| branch head (post-merge) | 69 failed, 6257 passed, 563 skipped, 42 errors |
+| branch head `929c7258` (pre-merge) | 70 failed, 6257 passed, 576 skipped, 42 errors |
+| merged head `3578dd74` (post-merge) | 70 failed, 6307 passed, 576 skipped, 42 errors |
 
-The failure/error sets are identical (111 F/E node ids on each side, empty
-symmetric difference) — **failures did not grow** versus the target. The 12
-extra passes are this branch's own `tests/test_rate_limit_trusted_proxy_hops.py`
-regression tests, which all pass. Remaining failures are pre-existing
-environment issues on `master`.
+The failing/erroring node-id sets are **identical** (112 ids on each side,
+empty symmetric difference) — failures did not grow versus the target. The 50
+extra passes are the target's own new tests brought in by the merge.
+`tests/test_rate_limit_trusted_proxy_hops.py` passes 12/12, and
+`scripts/check_abc_first_guard.py` (the `lint:abc-first` ratchet) passes.
+Remaining failures are pre-existing environment issues on `master`.
 
 ## Delivery
 
