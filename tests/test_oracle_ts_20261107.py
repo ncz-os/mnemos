@@ -34,8 +34,9 @@ def test_the_z_suffix_renders_as_an_offset():
 
 def test_explicit_offsets_are_preserved():
     value = _ts_for_oracle("2026-11-07T10:11:12+02:00")
+    offset = dt.timezone(dt.timedelta(hours=2))
+    assert value == dt.datetime(2026, 11, 7, 10, 11, 12, tzinfo=offset)
     assert value.utcoffset() == dt.timedelta(hours=2)
-    assert value.hour == 10
 
 
 def test_microseconds_are_preserved():
@@ -77,7 +78,8 @@ def test_unparseable_text_is_returned_unchanged(value):
 
 def test_epoch_numbers_are_not_converted():
     assert _ts_for_oracle(1700000000) == 1700000000
-    assert isinstance(_ts_for_oracle(1700000000.5), float)
+    float_value = 1700000000.5
+    assert _ts_for_oracle(float_value) is float_value
 
 
 def test_bytes_are_not_converted():
