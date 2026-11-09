@@ -44,23 +44,22 @@ def federation_nats_enabled() -> bool:
     return nats_federation_enabled()
 
 
-# Per-character NATS subject segment escapes. Only what the broker reserves or
-# what would make a subject unaddressable is rewritten, so namespaces that
-# need none of it keep the exact subject they already had.
+# Per-character NATS subject segment escapes, applied in ONE pass over the
+# input (so the order of the entries carries no meaning). Only what the broker
+# reserves or what would make a subject unaddressable is rewritten, so a
+# namespace that needs none of it keeps the exact subject it already had.
 _SUBJECT_ESCAPES = {
     # Established shape: a dotted namespace has always been published with
     # underscores (``alice.ns`` -> ``alice_ns``).
     ".": "_",
-    # Underscores are escaped *after* the dot rule above, so a namespace
-    # that literally contains ``_`` can never occupy the token a dotted
-    # namespace produced.
+    # A literal underscore is escaped, so a namespace that genuinely
+    # contains ``_`` can never occupy the token a dotted namespace produced.
     "_": "%5F",
     # NATS wildcards must never leak into a publish subject.
     "*": "%2A",
     ">": "%3E",
     # Whitespace would be legal for the broker but makes the subject
-    # unaddressable from CLI/HTTP filters; the legacy encoder flattened it
-    # to ``_``, so keep that (escaped below, as for every underscore).
+    # unaddressable from CLI/HTTP filters, and it has always been flattened.
     " ": "%20",
     "\t": "%09",
     "\n": "%0A",
@@ -85,10 +84,14 @@ def safe_subject_segment(value: Any, *, default: str = "default") -> str:
     * ``"a%5Fb"``    -> ``"a%255Fb"`` (no collision either)
 
     A namespace containing none of the escaped characters is returned
-    unchanged.
+    unchanged, and the result is never empty (that would be a blank subject
+    token), so ``""`` / ``".."`` fall back to ``default``.
     """
     raw = str(value if value is not None else default)
-    safe = "".join(_SUBJECT_ESCAPES.get(ch, ch) for ch in raw).strip("_")
+    safe = "".join(_SUBJECT_ESCAPES.get(ch, ch) for ch in raw)
+    # No ``.strip("_")`` here: a leading/trailing ``.`` maps to ``_`` in the
+    # same pass, and stripping it would make ``".a"`` and ``"a"`` share a
+    # token — the very collision this function exists to prevent.
     return safe or default
 
 
