@@ -1,23 +1,18 @@
 {
   "branch": "hv/ty-mn-mnemos-persistence-nats-events-20261105",
   "verdict": "approve",
-  "reason": "Reviewed and approved, then refreshed onto master (e4cacdf341f8). The branch's intended change is the mnemos/persistence/nats_events.py characterisation suite plus the document-import webhook namespace fix and the v7.1.1 documentation re-pin. The refresh needed no conflict resolution: master has 0 commits the branch lacks and `git merge-tree` reported no conflicts, because master's newer work touches disjoint surfaces (Oracle reserved-word bind names, release metadata, ADR D-MN1, webhook secret redaction). Every file therefore keeps the branch's reviewed change set on top of master's newer code.",
-  "base": "e4cacdf341f83a6e2f1e135ae21262e7ec9d293a",
+  "reason": "Reviewed and approved, then re-refreshed onto master (450dcf520777). The branch's intended change is the mnemos/persistence/nats_events.py characterisation suite plus the document-import webhook namespace fix and the v7.1.1 documentation re-pin. The refresh needed no conflict resolution: master's only new work since the previous refresh (e4cacdf341f8) is the ADR-D-MN5 documentation file, which touches a disjoint surface, so `git merge-tree` reported no conflicts. Every file therefore keeps the branch's reviewed change set on top of master's newer code.",
+  "base": "450dcf520777464bbbb9ee85902578178f49abd7",
   "base_ref": "master",
   "refresh": {
-    "target": "e4cacdf341f83a6e2f1e135ae21262e7ec9d293a",
+    "target": "450dcf520777464bbbb9ee85902578178f49abd7",
     "conflicts": 0,
     "commits_master_lacks_on_branch": 0,
     "note": "origin/master is an ancestor of the branch head after the merge; the branch is ahead of master, not behind it."
   },
   "checks": [
     {
-      "name": "python3 -m pytest tests/test_mnemos_persistence_nats_events_characterisation_20261105.py tests/test_document_import_webhook_redacted.py tests/test_document_import_outbox_status.py",
-      "result": "pass",
-      "detail": "76 passed, 2 xfailed"
-    },
-    {
-      "name": "python3 -m pytest tests/ --ignore=tests/integration_nats (master e4cacdf3, before refresh)",
+      "name": "python3 -m pytest tests/ --ignore=tests/integration_nats (master 450dcf52, before refresh)",
       "result": "baseline",
       "detail": "69 failed, 42 errors, 6245 passed, 564 skipped, 9 xfailed, 3 xpassed"
     },
@@ -28,9 +23,10 @@
     }
   ],
   "notes": [
-    "The 53 remaining failures and 42 errors are pre-existing environment failures (MCP SDK) present on master before this refresh; they are identical in kind on both sides and are not introduced by this branch.",
+    "The 53 remaining failures and 42 errors are pre-existing environment failures (MCP SDK) present on master before this refresh; the branch introduces zero new failing test ids (comm -13 of the sorted FAILED/ERROR sets is empty) and fixes 16.",
     "No new features and no unrelated files: the delta against master is exactly the branch's reviewed change set.",
     "Unknown reference audit: the 16-failure improvement over master comes from the branch's own document-import and version-pin fixes, not from suppressing tests."
   ],
-  "head_sha_before_refresh_merge": "46a2db15816d0e1dab3d1882ea17f1a59baf5889"
+  "head_sha_before_refresh_merge": "eb5668f73d92abf4d33209451f99e0b71a61de8b",
+  "prior_refresh_target": "e4cacdf341f83a6e2f1e135ae21262e7ec9d293a"
 }
