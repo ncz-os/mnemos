@@ -158,7 +158,7 @@ async def test_sqlite_schema_accepts_the_documented_queue_table(backend) -> None
     async with backend.transactional() as tx:
         tables = await _fetch_all(
             tx.conn,
-            "SELECT name FROM sqlite_master " "WHERE type='table' AND name='memory_compression_queue'",
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_compression_queue'",
         )
         columns = await _fetch_all(tx.conn, "PRAGMA table_info(memory_compression_queue)")
         foreign_keys = await _fetch_all(tx.conn, "PRAGMA foreign_key_list(memory_compression_queue)")
