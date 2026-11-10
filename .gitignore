@@ -94,6 +94,13 @@ __pycache__/
 .zoder_task_*.md
 TASK_*.md
 
+# Agent run diagnostics (test-failure baselines, review-round stderr/json).
+# These are per-run scratch, not deliverables: committed logs from
+# 2026-11-07/09 were read as a code delta in review and reported as a
+# "massive test regression" when they were only snapshots of failures that
+# already exist on master.
+.scratch/
+
 # Local scripts not for distribution
 sync_argonas_git.py
 run_monthly_export.sh

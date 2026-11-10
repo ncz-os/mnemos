@@ -1002,11 +1002,6 @@ async def merge_branch(
             if _lc._cache:
                 try:
                     await _lc._cache.delete("stats:global")
-                    try:
-                        async for key in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                            await _lc._cache.delete(key)
-                    except Exception:
-                        pass
                 except Exception:
                     pass
             try:
