@@ -78,3 +78,47 @@ def test_uuid_from_non_uuid_bytes_uses_the_same_deterministic_fallback_as_text()
 def test_identifiers_are_quoted_with_embedded_quotes_doubled():
     assert copy.qi("memories") == '"memories"'
     assert copy.qi('we"ird') == '"we""ird"'
+
+
+# ── --drop-constraints validation ──────────────────────────────────────
+# The spec reaches ALTER TABLE as operator input. ``qi`` prevents identifier
+# injection, but it also quotes arbitrary junk as one legal identifier, so a
+# typo (``a.b.c``, a space, a missing dot) must be refused with a message
+# naming it rather than silently targeting a different object.
+
+
+def test_drop_constraint_spec_parses_a_table_constraint_pair():
+    assert copy.parse_drop_constraint("memories.memories_pkey") == (
+        "memories",
+        "memories_pkey",
+    )
+    assert copy.parse_drop_constraint("  hive_jobs.fk_owner  ") == ("hive_jobs", "fk_owner")
+
+
+def test_drop_constraint_spec_accepts_only_the_first_dot_as_the_separator():
+    # A constraint name cannot contain a dot, so a third component is a typo
+    # and is rejected by the identifier check, not silently truncated.
+    import pytest
+
+    with pytest.raises(ValueError, match="not 'table.constraint'"):
+        copy.parse_drop_constraint("memories")
+
+
+def test_drop_constraint_spec_rejects_non_identifier_parts():
+    import pytest
+
+    for bad in ("a.b.c", "mem ories.pk", 'mem"; DROP TABLE x; --.pk', 'memories.pk"', "1memories.pk"):
+        with pytest.raises(ValueError):
+            copy.parse_drop_constraint(bad)
+
+
+def test_drop_constraint_specs_skips_blank_entries_and_keeps_order():
+    assert copy.drop_constraint_specs("") == []
+    assert copy.drop_constraint_specs("a.one, ,b.two,") == [("a", "one"), ("b", "two")]
+
+
+def test_drop_constraint_specs_rejects_a_malformed_entry_in_the_list():
+    import pytest
+
+    with pytest.raises(ValueError, match="not 'table.constraint'"):
+        copy.drop_constraint_specs("a.one,bad")
