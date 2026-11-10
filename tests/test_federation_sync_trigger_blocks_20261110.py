@@ -128,9 +128,7 @@ async def trigger_app(tmp_path, monkeypatch):
     app.dependency_overrides[get_current_user] = root_user
     try:
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver", timeout=30.0
-        ) as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver", timeout=30.0) as client:
             yield client, peer["id"], hooks
     finally:
         app.dependency_overrides.pop(get_current_user, None)
@@ -161,15 +159,11 @@ async def test_sync_trigger_blocks_while_a_sync_is_in_flight(trigger_app, monkey
     hooks["gate"] = asyncio.Event()  # closed: the in-flight sync is gated in the pull
 
     # First trigger: begins a sync and parks inside the (slow) pull.
-    first = asyncio.create_task(
-        client.post(f"/v1/federation/peers/{peer_id}/sync")
-    )
+    first = asyncio.create_task(client.post(f"/v1/federation/peers/{peer_id}/sync"))
     await asyncio.wait_for(hooks["pull_started"].wait(), timeout=5)
 
     # Second trigger while the first is mid-sync.
-    second = asyncio.create_task(
-        client.post(f"/v1/federation/peers/{peer_id}/sync")
-    )
+    second = asyncio.create_task(client.post(f"/v1/federation/peers/{peer_id}/sync"))
     await asyncio.sleep(0.1)
 
     # Let the first pass finish; the second must then run and finish too.
@@ -183,8 +177,7 @@ async def test_sync_trigger_blocks_while_a_sync_is_in_flight(trigger_app, monkey
     )
     assert first_resp.status_code == 200, first_resp.text
     assert second_resp.status_code == 200, (
-        "concurrent sync trigger must block, then succeed — got "
-        f"{second_resp.status_code}: {second_resp.text}"
+        "concurrent sync trigger must block, then succeed — got " f"{second_resp.status_code}: {second_resp.text}"
     )
     assert second_resp.status_code != 409, "overlap must never surface as 409"
     # The first pass applied the one wire row; the second pass had an

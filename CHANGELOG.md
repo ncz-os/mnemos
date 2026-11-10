@@ -2,6 +2,10 @@
 
 All notable changes to MNEMOS are documented here.
 
+## Unreleased
+
+- **Federation** — MN-25: the concurrent-sync trigger contract is pinned. `POST /v1/federation/peers/{id}/sync` blocks on the per-peer sync lock when another pass for the peer is in flight and returns the result of its own pass — it is never a 409 (`FederationSyncInProgress` is not part of the contract; the only 409s from the trigger route remain schema-compatibility and unverifiable-schema aborts). Regression test: `tests/test_federation_sync_trigger_blocks_20261110.py`.
+
 ## 7.1.1 — 2026-11-08
 
 - **Oracle** — the federation replica-health write (`record_sync_lag`) bound a variable named `:rows`, a reserved word, so every peer pull on an Oracle primary failed with ORA-01745 after the sync (HTTP 500 on `/v1/federation/peers/<id>/sync`, peer status never refreshed). The bind names are renamed (`:rows_n`, `:lag_s`, `:emb_status`, and `:owner_uid` in the scoped audit-log read) and a test now rejects any reserved-word bind name in the Oracle backend.
