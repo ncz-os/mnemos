@@ -13,6 +13,7 @@ from typing import Any
 
 from mnemos.core.secret_detection import redact_field_with_stored
 from mnemos.nats.client import get_node_name as _nats_get_node_name
+from mnemos.persistence.nats_events import safe_subject_segment as _safe_subject_segment
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.workers.audit_sealer import audit_chain_enabled
 
@@ -135,7 +136,8 @@ async def _dispatch_delete_side_effects(
         )
 
     namespace = _row_get(row, "namespace")
-    safe_ns = (namespace or "default").replace(".", "_")
+    # CF-35/MN-17: shared encoder — "a.b" and "a_b" must not share a subject.
+    safe_ns = _safe_subject_segment(namespace)
     nats_intents = [
         (
             f"mnemos.memory.deleted.{safe_ns}",
