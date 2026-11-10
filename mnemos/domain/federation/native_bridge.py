@@ -163,12 +163,20 @@ def pure_python_serialize_memory_for_feed(rows: Sequence[Mapping[str, Any]]) -> 
 
 
 def serialize_memory_for_feed(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+    # Apply the same federation retrieval policy as serialize_memory_rows before
+    # any serializer (native extension or pure-Python) can emit bytes: vault
+    # rows never leave the node and content-bearing fields are span-redacted.
+    # Previously the native branch forwarded the caller's raw rows, so with a
+    # native extension installed vault-namespace rows and unredacted secrets
+    # reached native code (latent: no non-test caller, but the route that does
+    # serialize memories uses the redacting rows path).
+    dict_rows = _redacted_non_vault_rows(rows)
     if _NATIVE_FEDERATION is not None:
         try:
-            return list(_NATIVE_FEDERATION.serialize_memory_for_feed(rows))
+            return list(_NATIVE_FEDERATION.serialize_memory_for_feed(dict_rows))
         except Exception:
             pass
-    return pure_python_serialize_memory_for_feed(rows)
+    return pure_python_serialize_memory_for_feed(dict_rows)
 
 
 def pure_python_serialize_memory_rows(rows: Sequence[Mapping[str, Any]]) -> bytes:
