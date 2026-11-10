@@ -399,11 +399,6 @@ async def _invalidate_memory_read_caches() -> None:
         return
     try:
         await _lc._cache.delete("stats:global:v2")
-        try:
-            async for key in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                await _lc._cache.delete(key)
-        except Exception:
-            pass
     except Exception:
         pass
     try:
