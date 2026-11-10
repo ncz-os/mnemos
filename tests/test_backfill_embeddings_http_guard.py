@@ -117,3 +117,68 @@ def test_embed_batch_posts_to_given_url(script, monkeypatch):
     assert captured["url"] == "http://embed.example/v1/embeddings"
     assert captured["json"]["input"] == ["hello"]
     assert vectors == [[0.1, 0.2]]
+
+
+# ── deterministic batch pagination ──────────────────────────────────────
+# ``main`` loops ``fetch_batch`` until it returns nothing, and the WHERE
+# clause (``embedding IS NULL``) does not exclude a row until its update
+# commits. Without an explicit ORDER BY the DB2 and Oracle backends hand
+# back whatever order the engine feels like, so a long run can re-read the
+# same rows while other rows are never reached. Postgres already ordered;
+# the sync backends now match it.
+
+
+class _RecordingCursor:
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+        self.sql = None
+
+    def execute(self, sql, *args):
+        self.sql = sql
+
+    def fetchall(self):
+        return [tuple(r) for r in self.rows]
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def close(self):
+        return None
+
+
+class _RecordingConn:
+    def __init__(self, rows=()):
+        self.cursor_obj = _RecordingCursor(rows)
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        return None
+
+    def close(self):
+        return None
+
+
+@pytest.mark.parametrize("backend_name", ["_OracleBackend", "_Db2Backend"])
+def test_fetch_batch_orders_by_id_for_deterministic_pagination(script, backend_name):
+    backend = object.__new__(getattr(script, backend_name))
+    conn = _RecordingConn([("mem_1", "hello world")])
+    out = backend.fetch_batch(conn, 10)
+    sql = conn.cursor_obj.sql
+    assert "ORDER BY id" in sql, sql
+    # ORDER BY must precede the row-limit clause, or Oracle/Db2 reject it.
+    assert sql.index("ORDER BY id") < sql.index("FETCH FIRST")
+    assert out == [("mem_1", "hello world")]
+
+
+def test_fetch_batch_pagination_statements_agree_across_backends(script):
+    """Postgres and the sync backends must page identically: same order key."""
+    ora_conn = _RecordingConn()
+    object.__new__(script._OracleBackend).fetch_batch(ora_conn, 5)
+    db2_conn = _RecordingConn()
+    object.__new__(script._Db2Backend).fetch_batch(db2_conn, 5)
+    ora_sql = " ".join(ora_conn.cursor_obj.sql.split())
+    db2_sql = " ".join(db2_conn.cursor_obj.sql.split())
+    assert ora_sql == db2_sql
+    assert "ORDER BY id" in ora_sql

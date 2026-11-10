@@ -6,7 +6,6 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import logging
-import re
 from typing import Any, Mapping
 
 from mnemos.core.config import (
@@ -45,9 +44,58 @@ def federation_nats_enabled() -> bool:
     return nats_federation_enabled()
 
 
+# Characters that may appear in a NATS subject token verbatim. Everything
+# else is percent-encoded, so the token stays a valid, single subject segment
+# no matter what an operator names a namespace.
+_SUBJECT_SAFE = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-")
+
+# The two characters the encoder deliberately re-renders instead of
+# percent-encoding, because their escaped form is the established one:
+# a dotted namespace has always been published with underscores
+# (``alice.ns`` -> ``alice_ns``, the legacy regex behaviour).
+_SUBJECT_SUBSTITUTES = {".": "_"}
+
+# Everything else outside ``_SUBJECT_SAFE`` — '_', '%', '*', '>', whitespace,
+# '@', '/', ':', non-ASCII, … — is percent-encoded per UTF-8 byte. Encoding
+# '_' is what makes the mapping injective (``a_b`` -> ``a%5Fb`` cannot
+# collide with the ``a_b`` that ``a.b`` produces) and encoding '%' keeps the
+# encoding itself unforgeable.
+
+
+def _encode_subject_char(ch: str) -> str:
+    return "".join(f"%{byte:02X}" for byte in ch.encode("utf-8"))
+
+
 def safe_subject_segment(value: Any, *, default: str = "default") -> str:
+    """Return ``value`` as a single, unambiguous NATS subject segment.
+
+    Two properties are required, and both come from one rule: keep only
+    ``[A-Za-z0-9-]`` verbatim, render ``.`` as ``_``, and percent-encode
+    every other character (UTF-8 bytes).
+
+    *Injective* (CF-35/MN-17): collapsing reserved characters onto ``_`` is
+    not — ``"a.b"`` and ``"a_b"`` both became ``"a_b"``, so two distinct
+    tenants shared one NATS subject and each received the other's events.
+    Encoding ``_`` and ``%`` restores reversibility:
+
+    * ``"alice.ns"`` -> ``"alice_ns"`` (the established, documented shape)
+    * ``"a.b"``      -> ``"a_b"``
+    * ``"a_b"``      -> ``"a%5Fb"`` (no collision with the line above)
+    * ``"a%5Fb"``    -> ``"a%255Fb"`` (no collision either)
+
+    *Valid* under any namespace: characters the broker would reject or
+    misread — wildcards ``*`` / ``>``, whitespace, ``@``, ``/``, ``:``,
+    non-ASCII, … — are encoded rather than passed through, so the result is
+    always exactly one subject token.
+
+    The result is never stripped: a leading/trailing ``.`` becomes ``_`` and
+    stays, otherwise ``".a"`` and ``"a"`` would share a token. Only an empty
+    result (``""``, ``None``) falls back to ``default``.
+    """
     raw = str(value if value is not None else default)
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", raw).strip("_")
+    safe = "".join(
+        ch if ch in _SUBJECT_SAFE else _SUBJECT_SUBSTITUTES.get(ch) or _encode_subject_char(ch) for ch in raw
+    )
     return safe or default
 
 
