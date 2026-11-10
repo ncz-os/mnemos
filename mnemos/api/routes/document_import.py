@@ -625,23 +625,41 @@ async def import_memories_from_document(
                         # mask content and report the post-classification
                         # namespace. Sending chunk["content"] / user.namespace
                         # leaked raw credentials and the pre-vault namespace to an
-                        # external HTTP endpoint.
-                        stored_namespace = imported.namespace or user.namespace
-                        chunk_delivery_ids = await backend.webhooks.dispatch_event(
-                            tx,
-                            "memory.created",
-                            {
-                                "memory_id": canonical_id,
-                                "category": category,
-                                "subcategory": subcategory,
-                                "content": _redacted_for_webhook(chunk["content"], imported.metadata),
-                                "owner_id": user.user_id,
-                                "namespace": stored_namespace,
-                                "source": "document_import",
-                            },
-                            owner_id=user.user_id,
-                            namespace=stored_namespace,
-                        )
+                        # external HTTP endpoint. Trust the stored value only:
+                        # import_chunk always returns the post-classification
+                        # namespace for a chunk that emits this event (a vaulted
+                        # chunk is "vault"), so falling back to user.namespace
+                        # here would reintroduce the leak. Fail closed -- skip
+                        # the webhook rather than publish the pre-vault
+                        # namespace. The chunk is already committed, so raising
+                        # would discard a successful import over a delivery-time
+                        # fault.
+                        stored_namespace = imported.namespace
+                        if stored_namespace is None:
+                            logger.error(
+                                "[DOCLING] import_chunk returned no "
+                                "post-classification namespace for chunk %s; "
+                                "suppressing memory.created webhook rather "
+                                "than leaking the raw user namespace",
+                                chunk["chunk_num"],
+                            )
+                            chunk_delivery_ids = []
+                        else:
+                            chunk_delivery_ids = await backend.webhooks.dispatch_event(
+                                tx,
+                                "memory.created",
+                                {
+                                    "memory_id": canonical_id,
+                                    "category": category,
+                                    "subcategory": subcategory,
+                                    "content": _redacted_for_webhook(chunk["content"], imported.metadata),
+                                    "owner_id": user.user_id,
+                                    "namespace": stored_namespace,
+                                    "source": "document_import",
+                                },
+                                owner_id=user.user_id,
+                                namespace=stored_namespace,
+                            )
                     elif imported.emit_created_event:
                         chunk_delivery_ids = []
                     else:

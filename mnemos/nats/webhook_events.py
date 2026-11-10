@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import Any
 
 from mnemos import nats as nats_bus
@@ -21,10 +20,17 @@ logger = logging.getLogger(__name__)
 
 
 def safe_namespace(namespace: str | None) -> str:
-    """Return a namespace token suitable for a NATS subject segment."""
-    value = namespace or "default"
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", value).strip("_")
-    return safe or "default"
+    """Return a namespace token suitable for a NATS subject segment.
+
+    Delegates to the one shared encoder (CF-35/MN-17): a local
+    ``.`` -> ``_`` copy here would re-introduce the ``"a.b"`` / ``"a_b"``
+    subject collision that ``safe_subject_segment`` exists to prevent.
+    """
+    # Imported lazily: ``mnemos.persistence.nats_events`` imports
+    # ``mnemos.nats`` itself, so a module-level import here is circular.
+    from mnemos.persistence.nats_events import safe_subject_segment
+
+    return safe_subject_segment(namespace)
 
 
 async def publish_delivery_queued(

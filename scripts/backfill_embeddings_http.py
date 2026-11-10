@@ -98,7 +98,16 @@ class _OracleBackend:
 
     def fetch_batch(self, conn, batch_size):
         cur = conn.cursor()
-        cur.execute(f"SELECT id, content FROM memories WHERE {_SELECT_WHERE} FETCH FIRST {int(batch_size)} ROWS ONLY")
+        # ORDER BY id keeps pagination deterministic: this column is both the
+        # order key AND part of the WHERE predicate (embedding IS NULL), so a
+        # repeated row is harmless, but without an explicit order the same
+        # rows could be handed back across batches while others are starved.
+        # Postgres already orders; match it here (Oracle FETCH FIRST and Db2
+        # both honour ORDER BY the same way).
+        cur.execute(
+            f"SELECT id, content FROM memories WHERE {_SELECT_WHERE} "
+            f"ORDER BY id FETCH FIRST {int(batch_size)} ROWS ONLY"
+        )
         rows = cur.fetchall()
         cur.close()
         out = []
@@ -149,7 +158,16 @@ class _Db2Backend:
 
     def fetch_batch(self, conn, batch_size):
         cur = conn.cursor()
-        cur.execute(f"SELECT id, content FROM memories WHERE {_SELECT_WHERE} FETCH FIRST {int(batch_size)} ROWS ONLY")
+        # ORDER BY id keeps pagination deterministic: this column is both the
+        # order key AND part of the WHERE predicate (embedding IS NULL), so a
+        # repeated row is harmless, but without an explicit order the same
+        # rows could be handed back across batches while others are starved.
+        # Postgres already orders; match it here (Oracle FETCH FIRST and Db2
+        # both honour ORDER BY the same way).
+        cur.execute(
+            f"SELECT id, content FROM memories WHERE {_SELECT_WHERE} "
+            f"ORDER BY id FETCH FIRST {int(batch_size)} ROWS ONLY"
+        )
         rows = cur.fetchall()
         cur.close()
         out = []
