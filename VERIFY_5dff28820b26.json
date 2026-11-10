@@ -1,0 +1,9 @@
+{
+  "head_sha": "5dff28820b266f2e50a754d24030e75a4d0a4f05",
+  "base_sha": "782ed312fa549f4fd84a00c9c264480e3e0a5d41",
+  "tests_base": 10,
+  "tests_head": 10,
+  "base_full": {"failed": 10, "passed": 5818, "skipped": 593, "xfailed": 4, "xpassed": 3},
+  "head_full": {"failed": 10, "passed": 5866, "skipped": 593, "xfailed": 4, "xpassed": 3},
+  "note": "tests_base/tests_head are the FAILED counts per the requested JSON schema. The 10 failures are the identical set on both runs (4 in test_embedding_contract_f06 / test_embedding_contract_f06_review, 6 in test_required_audit_mutations, all [sqlite] parametrised) -- pre-existing on master, unrelated to the delivered characterisation suite. Head adds 48 passing tests (tests/test_mnemos_domain_memory_dedup_characterisation_20261105.py); no new failures, no regressions. Verification was read-only: the base was run in place at its checked-out SHA, the head in a detached read-only worktree; no branch was modified and nothing was pushed as part of the runs."
+}
