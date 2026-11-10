@@ -36,17 +36,22 @@ from __future__ import annotations
 
 # Top-level imports are deliberately kept in this one explicit block (and
 # re-documented here) so the suite never relies on a name leaking in from a
-# transitively imported module:
-#   * ``pytest``     — used as ``pytest.raises(...)`` in 40 pins and as
-#                      ``@pytest.fixture`` / ``pytest.fail`` throughout; a
-#                      missing import would raise NameError at collection.
-#   * ``logging``    — the caplog pins
-#                      (test_grant_logs_the_grant_at_info_with_principal_perm_and_memory
-#                      and test_revoke_logs_the_revocation_at_info)
-#                      reference ``logging.INFO`` and ``acl_route.logger.name``
-#                      directly, so this module must bind the standard-library
-#                      ``logging`` name at its top level, not inherit it from
-#                      ``mnemos.api.routes.acl``.
+# transitively imported module. Each line below is load-bearing — removing
+# any of them turns the next test run into a NameError:
+#   * ``pytest``          — used as ``pytest.raises(...)`` in 40 pins and as
+#                           ``@pytest.fixture`` / ``pytest.fail`` throughout.
+#   * ``HTTPException``   — imported from ``fastapi`` (the framework the
+#                           ``acl_route`` module itself targets) and used in
+#                           ``pytest.raises(HTTPException)`` pins that assert
+#                           the 403/404/422/503 status codes the routes raise.
+#   * ``logging``         — the caplog pins
+#                           (test_grant_logs_the_grant_at_info_with_principal_perm_and_memory
+#                           and test_revoke_logs_the_revocation_at_info)
+#                           reference ``logging.INFO`` and
+#                           ``acl_route.logger.name`` directly, so this module
+#                           must bind the standard-library ``logging`` name at
+#                           its top level, not inherit it from
+#                           ``mnemos.api.routes.acl``.
 import asyncio
 import datetime as _dt
 import logging
