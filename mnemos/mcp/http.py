@@ -84,6 +84,7 @@ from mnemos.mcp.tools import (
     set_mcp_backend_context,
 )
 from mnemos.persistence.base import OAuthPersistence
+from mnemos.persistence.nats_events import safe_subject_segment
 
 # stderr logging — matches mcp_server.py convention so log shipping
 # from container stdout/stderr stays consistent.
@@ -777,7 +778,12 @@ def _safe_subject_token(value: str, *, label: str) -> str:
 
 
 def _safe_namespace(namespace: str | None) -> str:
-    return (namespace or "default").replace(".", "_")
+    """Namespace token for a NATS subject segment (CF-35/MN-17).
+
+    Uses the shared encoder so ``"a.b"`` and ``"a_b"`` no longer collapse
+    onto the same subject and leak each other's events into this stream.
+    """
+    return safe_subject_segment(namespace)
 
 
 def _is_operator_context(context: MCPUserContext) -> bool:

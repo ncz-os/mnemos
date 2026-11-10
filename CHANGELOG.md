@@ -5,6 +5,7 @@ All notable changes to MNEMOS are documented here.
 ## 7.1.1 — 2026-11-08
 
 - **Oracle** — the federation replica-health write (`record_sync_lag`) bound a variable named `:rows`, a reserved word, so every peer pull on an Oracle primary failed with ORA-01745 after the sync (HTTP 500 on `/v1/federation/peers/<id>/sync`, peer status never refreshed). The bind names are renamed (`:rows_n`, `:lag_s`, `:emb_status`, and `:owner_uid` in the scoped audit-log read) and a test now rejects any reserved-word bind name in the Oracle backend.
+- **Search cache cleanup** — the dead `SCAN MATCH "mnemos:search:*"` invalidation sweeps and the `_get_cache_key` / `_vis_epoch_current` helpers they existed to serve are removed. The per-user search cache never existed in the runtime (`_lc._cache` is hard-wired to `None` with no Redis, and the search handler stopped reading a cache), so every sweep matched keys of a cache that was never written. The four remaining routes keep their `/stats`-entry invalidation, and the ACL grant/revoke path keeps its visibility-epoch bump — which the MCP principal-context cache (role/namespace authorization inputs) subscribes to — and now always runs it instead of early-returning when no cache is configured. The "Cache coherency" section of `docs/MULTIUSER_ACL_DESIGN.md` is updated to match.
 
 ## 7.1.0 — 2026-11-08
 
