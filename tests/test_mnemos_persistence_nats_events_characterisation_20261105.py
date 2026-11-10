@@ -198,41 +198,66 @@ def test_federation_nats_enabled_reads_env_flag(monkeypatch):
 
 # ---------------------------------------------------------------------------
 # safe_subject_segment — normal / edge / error
+#
+# Re-characterised 2026-11-09 onto the injective encoder (MN-17/CF-35): the
+# pre-fix "collapse every unsafe run onto one underscore" rule was not
+# injective ("a.b" and "a_b" both became "a_b"), so two distinct tenants
+# shared one NATS subject. The current encoder keeps [A-Za-z0-9-] verbatim,
+# renders "." as "_" (the established dashboard shape), and percent-encodes
+# every other character (UTF-8 bytes) — so "_" and "%" are escaped too, and
+# the result is never stripped. Only an empty/None input falls back to the
+# default. The collision-free properties are pinned separately in
+# tests/test_nats_subject_namespace_collision.py.
 # ---------------------------------------------------------------------------
 
 
 def test_safe_subject_segment_keeps_safe_characters():
-    assert ne.safe_subject_segment("alice-01_NS") == "alice-01_NS"
+    # [A-Za-z0-9-] pass through verbatim; a literal "_" is percent-encoded
+    # (that is what makes the mapping injective — "a_b" cannot collide with
+    # the "a_b" that "a.b" produces).
+    assert ne.safe_subject_segment("alice-01") == "alice-01"
+    assert ne.safe_subject_segment("alice-01_NS") == "alice-01%5FNS"
 
 
-def test_safe_subject_segment_replaces_unsafe_runs_with_single_underscore():
-    # Dotted, spaced and symbol runs each collapse to ONE underscore.
-    assert ne.safe_subject_segment("team.ns one/two") == "team_ns_one_two"
+def test_safe_subject_segment_dotted_namespace_keeps_underscore_shape():
+    # The one established escape: a dotted namespace keeps its underscored
+    # form (operators already have this in dashboards / subscribe filters).
+    assert ne.safe_subject_segment("alice.ns") == "alice_ns"
 
 
-def test_safe_subject_segment_strips_edge_underscores():
-    # Interior sanitiser output keeps interior underscores, but leading /
-    # trailing sanitiser output is stripped: ".alpha." -> "alpha".
-    assert ne.safe_subject_segment(".alpha.") == "alpha"
-    # "...///" sanitises to "___" then strips to "" -> the default wins.
-    assert ne.safe_subject_segment("///") == "default"
+def test_safe_subject_segment_percent_encodes_unsafe_characters():
+    # Every character outside [A-Za-z0-9-] (and not ".") is percent-encoded
+    # per UTF-8 byte — no run collapsing, no stripping.
+    assert ne.safe_subject_segment("team.ns one/two") == "team_ns%20one%2Ftwo"
+
+
+def test_safe_subject_segment_does_not_strip_edge_underscores():
+    # A leading/trailing "." becomes "_" and STAYS (stripping it would let
+    # ".a" and "a" share a token); a run of unsafe characters encodes in
+    # full rather than collapsing to "" or "_".
+    assert ne.safe_subject_segment(".alpha.") == "_alpha_"
+    assert ne.safe_subject_segment("///") == "%2F%2F%2F"
 
 
 def test_safe_subject_segment_none_falls_back_to_default():
     assert ne.safe_subject_segment(None) == "default"
+    # An empty string encodes to "" (nothing to encode) -> the default wins.
+    assert ne.safe_subject_segment("") == "default"
 
 
-def test_safe_subject_segment_explicit_default_is_used_when_sanitised_value_is_empty():
-    assert ne.safe_subject_segment("!!!", default="event") == "event"
+def test_safe_subject_segment_default_is_not_used_for_nonempty_encoded_value():
+    # The new encoder never strips, so a non-empty input always yields a
+    # non-empty token; the explicit default only applies to empty/None.
+    assert ne.safe_subject_segment("!!!", default="event") == "%21%21%21"
 
 
 def test_safe_subject_segment_stringifies_arbitrary_values():
-    # int / bool / type inputs are str()-ed first, then sanitised: the
-    # space in "<class 'object'>" collapses to "_" and the surrounding
-    # non-word runs are stripped by the .strip("_") tail.
+    # int / bool / type inputs are str()-ed first, then encoded: the space,
+    # quotes and angle brackets in "<class 'object'>" are each percent-
+    # encoded (UTF-8 bytes), no stripping of the edge symbols.
     assert ne.safe_subject_segment(42) == "42"
     assert ne.safe_subject_segment(False) == "False"
-    assert ne.safe_subject_segment(object) == "class_object"
+    assert ne.safe_subject_segment(object) == "%3Cclass%20%27object%27%3E"
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +270,9 @@ def test_safe_event_type_keeps_dotted_segments():
 
 
 def test_safe_event_type_sanitises_each_segment():
-    assert ne._safe_event_type("memory.created v2") == "memory.created_v2"
+    # Each dotted segment is sanitised independently: the space inside the
+    # second segment is percent-encoded (not collapsed onto a "_").
+    assert ne._safe_event_type("memory.created v2") == "memory.created%20v2"
 
 
 def test_safe_event_type_drops_empty_segments_and_falls_back_to_event():
@@ -263,7 +290,10 @@ def test_webhook_outbox_subject_joins_prefix_tenant_and_event_type():
 
 def test_webhook_outbox_subject_sanitises_tenant_and_event_type():
     subject = ne.webhook_outbox_subject(tenant="a b/c", event_type="memory.created v2")
-    assert subject == "mnemos.webhooks.outbox.a_b_c.memory.created_v2"
+    # Unsafe characters in both the tenant and the event-type segments are
+    # percent-encoded (the established "." -> "_" shape is the only literal
+    # substitution the encoder performs).
+    assert subject == "mnemos.webhooks.outbox.a%20b%2Fc.memory.created%20v2"
 
 
 def test_webhook_outbox_subject_none_tenant_uses_default_segment():
@@ -272,9 +302,13 @@ def test_webhook_outbox_subject_none_tenant_uses_default_segment():
 
 
 def test_federation_memory_subject_sanitises_namespace():
-    assert ne.federation_memory_subject("team ns") == "mnemos.federation.memory.team_ns"
+    # A space inside the namespace is percent-encoded (UTF-8 bytes); the
+    # established dotted -> underscore shape is the only literal substitution.
+    assert ne.federation_memory_subject("team ns") == "mnemos.federation.memory.team%20ns"
     assert ne.federation_memory_subject(None) == "mnemos.federation.memory.default"
-    assert ne.federation_memory_subject("///") == "mnemos.federation.memory.default"
+    # "///" encodes to "%2F%2F%2F" (non-empty), so it no longer falls back
+    # to the default — a non-empty namespace always yields a non-empty token.
+    assert ne.federation_memory_subject("///") == "mnemos.federation.memory.%2F%2F%2F"
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +738,8 @@ def test_publish_federation_subject_and_msg_id(monkeypatch):
         )
     )
 
-    assert recorder.subjects == ["mnemos.federation.memory.team_ns"]
+    # The space in the namespace is percent-encoded into the subject token.
+    assert recorder.subjects == ["mnemos.federation.memory.team%20ns"]
     assert recorder.msg_ids == ["e1"]
     payload = recorder.calls[0][1]
     assert payload["content"] == "c"  # the whole event dict is forwarded as-is
