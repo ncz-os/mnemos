@@ -39,10 +39,10 @@ async def trigger_app(tmp_path, monkeypatch):
     """Wire the sync-trigger route to a real SQLite backend and a fake feed.
 
     Yields (client, peer_id, hooks). ``hooks['gate']`` (an
-    ``asyncio.Event``, set by default) gates the feed pull, and
-    ``hooks['pull_started']`` signals that a pull is in flight — the test
-    uses them to hold a sync mid-pull and prove a second trigger blocks
-    until it finishes.
+    ``asyncio.Event``) gates the feed pull, and ``hooks['pull_started']``
+    signals that a pull is in flight — the test resets both and uses them
+    to hold a sync mid-pull and prove a second trigger blocks until the
+    first finishes.
     """
     monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "0")
     monkeypatch.setenv("MNEMOS_EMBEDDING_DIM", "3")
@@ -70,7 +70,6 @@ async def trigger_app(tmp_path, monkeypatch):
         )
 
     hooks = {"gate": asyncio.Event(), "pull_started": asyncio.Event()}
-    hooks["gate"].set()
 
     wire_row = {
         "id": "m1",
@@ -180,7 +179,10 @@ async def test_sync_trigger_blocks_while_a_sync_is_in_flight(trigger_app, monkey
         "concurrent sync trigger must block, then succeed — got " f"{second_resp.status_code}: {second_resp.text}"
     )
     assert second_resp.status_code != 409, "overlap must never surface as 409"
-    # The first pass applied the one wire row; the second pass had an
-    # empty feed (fake serves one page) and must report a clean pass.
+    # The first pass applied the one wire row. The second pass re-fetches
+    # the same one-page feed (the fake returns next_cursor=None, so no
+    # journal cursor is bootstrapped and the row is replayed from seq 0)
+    # — the durable sequence fence rejects it, so zero rows are applied
+    # and the pass reports clean.
     assert first_resp.json()["pulled"] == 1
     assert second_resp.json()["pulled"] == 0
