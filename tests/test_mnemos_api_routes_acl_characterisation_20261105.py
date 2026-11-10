@@ -20,8 +20,11 @@ Covered surface:
   group-admin branch is only consulted for members of the row's group;
 * the three handlers — happy path, capability-503 degradation, RLS
   application ordering, validation-before-transaction ordering, the
-  revoke 404, and the search-cache/visibility-epoch invalidation
-  contract including its swallowing of backend errors.
+  revoke 404, and the visibility-epoch invalidation contract: the route
+  never consults the cache object (the SCAN sweep of the per-user search
+  cache was removed in 7.1.1 — there is no such cache to drop) and the
+  epoch bump now always runs, even on the no-cache path that production
+  actually hits, swallowing bump errors.
 
 All I/O is faked: the persistence backend comes from a fake installed
 into ``mnemos.core.lifecycle._persistence_backend`` via ``monkeypatch``,
@@ -387,9 +390,7 @@ def test_validate_principal_with_unknown_kind_raises_422_with_second_message(pri
     with pytest.raises(HTTPException) as exc:
         acl_route._validate_principal(principal)
     assert exc.value.status_code == 422
-    assert exc.value.detail == (
-        "principal must be 'user:<id>' or 'group:<id>' with a non-empty id"
-    )
+    assert exc.value.detail == ("principal must be 'user:<id>' or 'group:<id>' with a non-empty id")
 
 
 @pytest.mark.parametrize("principal", ["user:", "group:", "user::", "group::"])
@@ -402,9 +403,7 @@ def test_validate_principal_with_empty_id_raises_422_with_second_message(princip
     with pytest.raises(HTTPException) as exc:
         acl_route._validate_principal(principal)
     assert exc.value.status_code == 422
-    assert exc.value.detail == (
-        "principal must be 'user:<id>' or 'group:<id>' with a non-empty id"
-    )
+    assert exc.value.detail == ("principal must be 'user:<id>' or 'group:<id>' with a non-empty id")
 
 
 def test_validate_principal_is_case_sensitive():
@@ -426,9 +425,7 @@ def test_validate_perm_rejects_everything_but_four_with_exact_message(perm):
     with pytest.raises(HTTPException) as exc:
         acl_route._validate_perm(perm)
     assert exc.value.status_code == 422
-    assert exc.value.detail == (
-        "perm must be exactly 4 (read); ACL grants only widen read visibility"
-    )
+    assert exc.value.detail == ("perm must be exactly 4 (read); ACL grants only widen read visibility")
 
 
 def test_validate_perm_rejects_write_bit_even_when_combined_with_read():
@@ -536,9 +533,7 @@ def test_to_entry_accepts_a_mapping_without_calling_get_on_the_row_class():
         def get(self, key, default=None):
             return self._data.get(key, default)
 
-    entry = acl_route._to_entry(
-        _Record({"memory_id": "m2", "principal": "group:eng", "perm": 4})
-    )
+    entry = acl_route._to_entry(_Record({"memory_id": "m2", "principal": "group:eng", "perm": 4}))
     assert entry.memory_id == "m2"
     assert entry.principal == "group:eng"
     assert entry.perm == 4
@@ -551,9 +546,7 @@ def test_to_entry_leaves_granted_by_none_when_absent():
 
 
 def test_to_entry_stringifies_non_string_memory_id_and_principal():
-    entry = acl_route._to_entry(
-        {"memory_id": 99, "principal": 7, "perm": "4", "granted_by": 12}
-    )
+    entry = acl_route._to_entry({"memory_id": 99, "principal": 7, "perm": "4", "granted_by": 12})
     assert entry.memory_id == "99"
     assert entry.principal == "7"
     assert entry.perm == 4
@@ -562,9 +555,7 @@ def test_to_entry_stringifies_non_string_memory_id_and_principal():
 
 def test_to_entry_keeps_falsy_but_not_none_granted_by_as_empty_string():
     # The guard is `get("granted_by") is None`, so "" survives as "".
-    entry = acl_route._to_entry(
-        {"memory_id": "m1", "principal": "user:7", "perm": 4, "granted_by": ""}
-    )
+    entry = acl_route._to_entry({"memory_id": "m1", "principal": "user:7", "perm": 4, "granted_by": ""})
     assert entry.granted_by == ""
 
 
@@ -653,9 +644,7 @@ def test_gate_raises_403_for_a_non_member_non_owner():
     with pytest.raises(HTTPException) as exc:
         _gate(backend, "m1", _user("alice", groups=["other"]))
     assert exc.value.status_code == 403
-    assert exc.value.detail == (
-        "ACL management requires the memory owner, root, or a group admin"
-    )
+    assert exc.value.detail == ("ACL management requires the memory owner, root, or a group admin")
     assert acl.admin_queries == []
 
 
@@ -982,20 +971,20 @@ def test_grant_allows_a_group_admin(monkeypatch):
     assert len(acl.granted) == 1
 
 
-def test_grant_invalidates_the_search_cache_before_returning(monkeypatch):
+def test_grant_does_not_touch_the_cache_even_when_one_is_configured(monkeypatch):
+    # Master (7.1.1) removed the SCAN MATCH "mnemos:search:*" sweep: there is
+    # no per-user search cache to drop (the lifecycle hard-wires _lc._cache to
+    # None and the search handler stopped reading a cache). The route must
+    # never consult the cache object even if a fake one is installed.
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": None})
     cache = _FakeCache(["mnemos:search:alice:q1", "mnemos:search:bob:q2", "other:key"])
-    epoch = _FakeEpoch()
     _install_cache(monkeypatch, cache)
-    _install_epoch(monkeypatch, epoch)
+    _install_epoch(monkeypatch, _FakeEpoch())
 
     _grant(monkeypatch, backend)
 
-    # Every key the fake scan yields is deleted (the fake ignores the match
-    # pattern, so the "other:key" entry demonstrates the route trusts the
-    # iterator rather than re-filtering).
-    assert set(cache.deleted) == {"mnemos:search:alice:q1", "mnemos:search:bob:q2", "other:key"}
-    assert cache.scan_calls == [{"match": "mnemos:search:*", "count": 500}]
+    assert cache.deleted == []
+    assert cache.scan_calls == []
 
 
 def test_grant_bumps_the_visibility_epoch_once(monkeypatch):
@@ -1008,37 +997,27 @@ def test_grant_bumps_the_visibility_epoch_once(monkeypatch):
     assert epoch.bumps == 1
 
 
-def test_grant_returns_the_entry_even_when_the_cache_scan_raises(monkeypatch):
-    # _invalidate_search_caches_after_acl_change swallows cache errors.
+def test_grant_bumps_the_visibility_epoch_even_without_a_cache(monkeypatch):
+    # The pre-7.1.1 route early-returned when _lc._cache was unset, skipping
+    # the epoch bump entirely; master removed that early return, so the bump
+    # now always runs — the case that actually occurs in production (no cache).
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": None})
-    _install_cache(monkeypatch, _FakeCache(["mnemos:search:alice:q1"], scan_raises=True))
-    _install_epoch(monkeypatch, _FakeEpoch())
-
-    entry = _grant(monkeypatch, backend)
-    assert entry.principal == "group:research"
-
-
-def test_grant_returns_the_entry_even_when_cache_delete_raises(monkeypatch):
-    backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": None})
-    cache = _FakeCache(["mnemos:search:alice:q1"], delete_raises=True)
     epoch = _FakeEpoch()
-    _install_cache(monkeypatch, cache)
+    _install_cache(monkeypatch, None)
     _install_epoch(monkeypatch, epoch)
 
-    entry = _grant(monkeypatch, backend)
-    assert entry.perm == 4
-    assert epoch.bumps == 1  # the epoch bump is still attempted after the failure
+    _grant(monkeypatch, backend)
+    assert epoch.bumps == 1
 
 
 def test_grant_returns_the_entry_even_when_the_epoch_bump_raises(monkeypatch):
+    # _invalidate_search_caches_after_acl_change swallows epoch errors.
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": None})
-    cache = _FakeCache(["mnemos:search:alice:q1"])
-    _install_cache(monkeypatch, cache)
+    _install_cache(monkeypatch, _FakeCache())
     _install_epoch(monkeypatch, _FakeEpoch(raises=True))
 
     entry = _grant(monkeypatch, backend)
     assert entry.principal == "group:research"
-    assert cache.deleted == ["mnemos:search:alice:q1"]
 
 
 def test_grant_logs_the_grant_at_info_with_principal_perm_and_memory(monkeypatch, caplog):
@@ -1055,13 +1034,14 @@ def test_grant_propagates_a_repository_failure_and_skips_invalidation(monkeypatc
             raise RuntimeError("grant failed")
 
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": None}, acl=_ExplodingAcl())
-    cache = _FakeCache(["mnemos:search:alice:q1"])
-    _install_cache(monkeypatch, cache)
-    _install_epoch(monkeypatch, _FakeEpoch())
+    _install_cache(monkeypatch, _FakeCache())
+    epoch = _FakeEpoch()
+    _install_epoch(monkeypatch, epoch)
 
     with pytest.raises(RuntimeError, match="grant failed"):
         _grant(monkeypatch, backend)
-    assert cache.deleted == []
+    # The invalidation runs only after a successful grant: no epoch bump.
+    assert epoch.bumps == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1083,9 +1063,7 @@ def test_revoke_returns_the_revoked_payload(monkeypatch):
 
 
 def test_revoke_raises_404_when_the_repository_reports_nothing_removed(monkeypatch):
-    backend = _FakeBackend(
-        memory_row={"owner_id": "alice", "group_id": None}, acl=_FakeAcl(revoke_result=False)
-    )
+    backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": None}, acl=_FakeAcl(revoke_result=False))
     with pytest.raises(HTTPException) as exc:
         _revoke(monkeypatch, backend)
     assert exc.value.status_code == 404
@@ -1093,9 +1071,7 @@ def test_revoke_raises_404_when_the_repository_reports_nothing_removed(monkeypat
 
 
 def test_revoke_404_does_not_invalidate_the_search_cache(monkeypatch):
-    backend = _FakeBackend(
-        memory_row={"owner_id": "alice", "group_id": None}, acl=_FakeAcl(revoke_result=False)
-    )
+    backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": None}, acl=_FakeAcl(revoke_result=False))
     cache = _FakeCache(["mnemos:search:alice:q1"])
     epoch = _FakeEpoch()
     _install_cache(monkeypatch, cache)
@@ -1136,7 +1112,7 @@ def test_revoke_raises_403_for_a_non_manager(monkeypatch):
     assert acl.revoked == []
 
 
-def test_revoke_invalidates_the_search_cache_and_bumps_the_epoch(monkeypatch):
+def test_revoke_does_not_touch_the_cache_but_bumps_the_epoch(monkeypatch):
     acl = _FakeAcl(grants=[{"memory_id": "m1", "principal": "user:7", "perm": 4}])
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": None}, acl=acl)
     cache = _FakeCache(["mnemos:search:alice:q1", "mnemos:search:bob:q2"])
@@ -1145,7 +1121,8 @@ def test_revoke_invalidates_the_search_cache_and_bumps_the_epoch(monkeypatch):
     _install_epoch(monkeypatch, epoch)
 
     _revoke(monkeypatch, backend)
-    assert set(cache.deleted) == {"mnemos:search:alice:q1", "mnemos:search:bob:q2"}
+    assert cache.deleted == []
+    assert cache.scan_calls == []
     assert epoch.bumps == 1
 
 
@@ -1172,29 +1149,36 @@ def test_revoke_passes_the_raw_principal_to_the_repository(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_invalidation_is_a_noop_without_a_cache(monkeypatch):
+def test_invalidation_bumps_the_epoch_even_without_a_cache(monkeypatch):
+    # The pre-7.1.1 route early-returned when _lc._cache was unset and never
+    # bumped the epoch; master removed the early return, so the epoch bump
+    # now runs on the default no-cache path — the case that occurs in
+    # production.
     _install_cache(monkeypatch, None)
     epoch = _FakeEpoch()
     _install_epoch(monkeypatch, epoch)
 
     _run(acl_route._invalidate_search_caches_after_acl_change())
-    # Early return: the epoch is NOT bumped when there is no cache at all.
-    assert epoch.bumps == 0
+    assert epoch.bumps == 1
 
 
-def test_invalidation_deletes_each_scanned_key_then_bumps_the_epoch(monkeypatch):
+def test_invalidation_bumps_the_epoch_exactly_once(monkeypatch):
     cache = _FakeCache(["k1", "k2"])
     _install_cache(monkeypatch, cache)
     epoch = _FakeEpoch()
     _install_epoch(monkeypatch, epoch)
 
     _run(acl_route._invalidate_search_caches_after_acl_change())
-    assert cache.deleted == ["k1", "k2"]
+    # The cache is never consulted: no SCAN, no deletes.
+    assert cache.scan_calls == []
+    assert cache.deleted == []
     assert epoch.bumps == 1
 
 
-def test_invalidation_still_bumps_the_epoch_when_the_scan_fails(monkeypatch):
-    cache = _FakeCache(["k1"], scan_raises=True)
+def test_invalidation_still_bumps_the_epoch_when_the_cache_would_fail(monkeypatch):
+    # The pre-7.1.1 sweep had its own error paths; now the cache is never
+    # touched at all, so a hypothetical failing cache cannot affect the bump.
+    cache = _FakeCache(["k1"], scan_raises=True, delete_raises=True)
     _install_cache(monkeypatch, cache)
     epoch = _FakeEpoch()
     _install_epoch(monkeypatch, epoch)
@@ -1205,24 +1189,13 @@ def test_invalidation_still_bumps_the_epoch_when_the_scan_fails(monkeypatch):
 
 
 def test_invalidation_swallows_epoch_errors(monkeypatch):
-    cache = _FakeCache(["k1"])
-    _install_cache(monkeypatch, cache)
+    _install_cache(monkeypatch, _FakeCache(["k1"]))
     _install_epoch(monkeypatch, _FakeEpoch(raises=True))
 
     _run(acl_route._invalidate_search_caches_after_acl_change())  # no raise
-    assert cache.deleted == ["k1"]
 
 
-def test_invalidation_uses_the_expected_scan_pattern_and_count(monkeypatch):
-    cache = _FakeCache([])
-    _install_cache(monkeypatch, cache)
-    _install_epoch(monkeypatch, _FakeEpoch())
-
-    _run(acl_route._invalidate_search_caches_after_acl_change())
-    assert cache.scan_calls == [{"match": "mnemos:search:*", "count": 500}]
-
-
-def test_invalidation_is_idempotent_across_repeated_calls(monkeypatch):
+def test_invalidation_bumps_the_epoch_for_each_call(monkeypatch):
     cache = _FakeCache(["k1", "k2"])
     _install_cache(monkeypatch, cache)
     epoch = _FakeEpoch()
@@ -1230,5 +1203,5 @@ def test_invalidation_is_idempotent_across_repeated_calls(monkeypatch):
 
     _run(acl_route._invalidate_search_caches_after_acl_change())
     _run(acl_route._invalidate_search_caches_after_acl_change())
-    assert cache.deleted == ["k1", "k2"]
+    assert cache.scan_calls == []
     assert epoch.bumps == 2
