@@ -22,16 +22,20 @@ Internal helpers exercised directly (they carry the row-shape branching):
 * ``_root_mutation_visibility`` (ROOT_BYPASS filter with the group namespace)
 * ``_dispatch_delete_side_effects`` (webhook payload, NATS subject)
 
-Documented (not clearly a defect) behaviours that are pinned here
------------------------------------------------------------------
-* ``_memory_ids_from_row`` NEVER sees a ``\\x1f``-joined string from a real
-  row: ``_row_get`` looks the key up by index, and for a raw str both
-  ``row[key]`` (IndexError) and ``row.get`` (AttributeError) fail, so the
-  default ``[]`` comes back. The split branch only runs for a mapping/row
-  with ``.get`` that returns a string, and its ``if part`` filter then also
-  drops falsy-but-present ids (e.g. the string ``"0"``).
-* ``_row_get`` maps ``None`` to the default; genuinely falsy values
-  (``0``/``""``/``[]``/``False``) pass through untouched.
+Documented behaviours that are pinned here
+------------------------------------------
+* ``_memory_ids_from_row`` handles a raw string row directly (splitting the
+  ``\\x1f``-joined column) and keeps ALL non-empty parts — the string
+  ``"0"`` is a valid, opaque memory id. Only genuinely empty segments are
+  dropped. (Both of the previous defects — the raw-string row being silently
+  dropped by the ``_row_get`` fallback, and the ``if part`` filter discarding
+  falsy-but-present ids — were FIXED in round 3; the pins are now positive.)
+* ``_row_get`` maps only ``None`` to the default (a SQL-NULL column behaves
+  like an absent one); genuinely falsy values (``0``/``""``/``[]``/``False``)
+  pass through untouched. This asymmetry is deliberate and safe: every
+  caller of ``_row_get`` either coerces through ``str(...)`` with a default
+  or treats the value as an opaque field, so a falsy-but-present value is
+  never silently replaced.
 * The dry-run ``null_count`` comes straight from the repository (it may be a
   count of eligible rows rather than NULL rows).
 * The NATS subject namespace substitution only rewrites ``.`` to ``_``.
@@ -319,18 +323,14 @@ def test_row_get_maps_none_to_the_default_but_passes_other_falsy_values_through(
 # ── _memory_ids_from_row ───────────────────────────────────────────────────
 
 
-def test_memory_ids_from_raw_unit_separator_string_returns_empty():
-    # Pinned behaviour: a raw string row is NOT split. _row_get looks the
-    # key up by index (row["memory_ids"] -> IndexError for a str), then
-    # falls back to row.get(...) which a str does not have (AttributeError),
-    # so the default [] comes back and the \x1f-joined ids are silently
-    # dropped. The str split branch is only reachable from a row whose
-    # .get() returns a string (see
-    # test_group_from_row_accepts_unit_separator_string_memory_ids); the
-    # falsy-filter defect that branch carries is pinned separately.
-    assert _memory_ids_from_row("m1\x1fm2\x1fm3") == []
-    assert _memory_ids_from_row("\x1fm1\x1f\x1fm2\x1f") == []
+def test_memory_ids_from_raw_unit_separator_string_splits_the_ids():
+    # A raw string row (GROUP_CONCAT/LISTAGG shapes) is handled directly:
+    # the \x1f-joined column is split into its ids. Only genuinely empty
+    # segments (double separators, leading/trailing \x1f) are dropped.
+    assert _memory_ids_from_row("m1\x1fm2\x1fm3") == ["m1", "m2", "m3"]
+    assert _memory_ids_from_row("\x1fm1\x1f\x1fm2\x1f") == ["m1", "m2"]
     assert _memory_ids_from_row("") == []
+    assert _memory_ids_from_row("only") == ["only"]
 
 
 def test_memory_ids_from_sequence_and_none():
@@ -344,26 +344,19 @@ def test_memory_ids_from_sequence_and_none():
     assert _memory_ids_from_row(None) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="DEFECT: a raw-string row carrying \\x1f-joined memory_ids yields "
-    "[] instead of the split ids — _row_get's str fallback drops the value "
-    "entirely (and, on the reachable str branch, 'if part' also filters "
-    "falsy-but-present ids such as the string '0')",
-)
-def test_memory_ids_drops_falsy_present_id():
-    """DEFECT pinned: a raw string row whose ``memory_ids`` is a
-    \\x1f-joined column yields ``[]`` here rather than the ids — the string
-    never reaches the split branch (see
-    ``test_memory_ids_from_raw_unit_separator_string_returns_empty``). Even
-    on the reachable str branch, the ``if part`` filter would additionally
-    drop a present-but-falsy id such as the string ``"0"``. Either way the
-    id never appears in the group's ``memory_ids``/``duplicate_ids``.
-
-    xfail(strict=True): remove this mark when a raw-string row yields its
-    split parts (or when ``memory_ids`` stops being a string).
+def test_memory_ids_preserves_falsy_present_id_on_split():
+    """Fixed: the ``\\x1f`` split keeps ALL non-empty parts. Memory ids are
+    opaque strings, so the string ``"0"`` is a valid id and must survive —
+    the previous ``if part`` filter dropped it (and every other
+    falsy-but-present part), silently corrupting dedup groups. Both the
+    raw-string row path and the mapping-with-string-value path are pinned.
     """
+    # raw string row (the previously dropped case)
     assert _memory_ids_from_row("a\x1f0\x1fb") == ["a", "0", "b"]
+    # mapping whose .get() returns a \x1f-joined string
+    assert _memory_ids_from_row({"memory_ids": "a\x1f0\x1fb"}) == ["a", "0", "b"]
+    # a lone "0" is still a valid single-id group
+    assert _memory_ids_from_row("0") == ["0"]
 
 
 # ── _best_memory_id ────────────────────────────────────────────────────────
@@ -450,6 +443,23 @@ def test_group_from_row_accepts_unit_separator_string_memory_ids():
     assert group is not None
     assert group.memory_ids == ["keep", "dup1", "dup2"]
     assert group.duplicate_ids == ["dup1", "dup2"]
+
+
+def test_group_from_raw_string_row_forms_group_with_all_ids():
+    # Fixed (round 3): a raw string row carrying the \x1f-joined id column
+    # used to form NO group at all — the ids were silently dropped, so the
+    # keeper resolution fell through to None. Now the string is split
+    # directly, the first id becomes the keeper, and every other id is a
+    # duplicate.
+    group = _group_from_row("keep\x1fdup1\x1fdup2")
+    assert group is not None
+    assert group.memory_ids == ["keep", "dup1", "dup2"]
+    assert group.keep_id == "keep"
+    assert group.duplicate_ids == ["dup1", "dup2"]
+    # ownership fields are absent from a raw-string row -> ""
+    assert group.owner_id == ""
+    assert group.namespace == ""
+    assert group.content_hash == ""
 
 
 # ── _root_mutation_visibility ──────────────────────────────────────────────

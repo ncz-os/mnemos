@@ -122,3 +122,64 @@ target `b922fabb` = 83 failed / 6635 passed / 42 errors vs fixed head =
 83 failed / 6652 passed / 42 errors. The 125-entry `FAILED`/`ERROR` sets
 are **byte-identical** to the target (diff clean); passed +17 vs target,
 xfailed -1 (the fixed defect no longer xfails). **No failure grew.**
+
+## Round 3 — the pinned memory_ids defects fixed, not characterised (2026-11-10)
+
+The review of round 2 asked for the `_memory_ids_from_row` defects to be
+**fixed** rather than pinned as xfail. Done.
+
+**Code (`mnemos/domain/memory_dedup.py`):**
+
+1. **Raw-string rows are now processed** (was the "silently drops raw string
+   memory_ids" critical defect): `_memory_ids_from_row` handles a raw string
+   row directly — `_row_get` cannot look a key up inside a str (IndexError
+   → AttributeError → default `[]`), so the string is split itself. A
+   raw-string group row (GROUP_CONCAT/LISTAGG shape) now forms a group with
+   the first id as keeper and the rest as duplicates, instead of being
+   silently discarded.
+2. **Falsy-present ids are preserved on the str branch** (was the high
+   defect): memory ids are opaque strings, so the string `"0"` is a valid
+   id. The split keeps **all** non-empty parts — only genuinely empty
+   segments (double separators, leading/trailing `\x1f`) are dropped.
+3. **`_row_get` None-vs-falsy behaviour reviewed and documented**: the
+   asymmetry (only `None` maps to the default; `0`/`""`/`[]`/`False` pass
+   through) is deliberate and safe — every `_row_get` caller either coerces
+   through `str(...)` with a default or treats the value as an opaque
+   field, so a falsy-but-present value is never silently replaced. It is
+   now stated in the helper's docstring and pinned by
+   `test_row_get_maps_none_to_the_default_but_passes_other_falsy_values_through`.
+
+**Tests:**
+
+- The two `xfail(strict=True)` pins are REMOVED and converted to positive
+  tests: `test_memory_ids_from_raw_unit_separator_string_splits_the_ids`
+  (raw string → split ids) and `test_memory_ids_preserves_falsy_present_id_on_split`
+  (`"a\x1f0\x1fb"` → `["a", "0", "b"]` on both the raw-string and
+  mapping-with-string paths; a lone `"0"` survives).
+- New `test_group_from_raw_string_row_forms_group_with_all_ids`: an
+  end-to-end `_group_from_row("keep\x1fdup1\x1fdup2")` forms a group
+  (previously it returned `None` — no group at all).
+- All six backends' `find_duplicate_content_groups` already normalise
+  `memory_ids` to a list, so this hardens the domain layer against
+  raw-column shapes (and matches the independent
+  `mnemos/domain/artemis_dedup.py` implementation, which already handled
+  raw strings).
+
+**Suite after the round-3 fixes** (same sandbox, `pytest tests/ -q`):
+target `b922fabb` = 83 failed / 6635 passed / 42 errors vs fixed head =
+83 failed / 6654 passed / 42 errors. The 125-entry `FAILED`/`ERROR` sets
+are **byte-identical** to the target (diff clean); passed +19 vs target,
+xfailed -2 (both fixed defects now pass). `lint:abc-first` guard passes.
+**No failure grew.**
+
+## Merge conflict-resolution strategy (task requirement)
+
+Both merges (`49ed6525` onto `b922fabb`, and the round-2/3 fix commits on
+top) were **clean — zero conflicting hunks** (ort strategy): master's
+additions (the memory-dedup characterisation suite + `VERIFY_5dff28820b26.json`)
+and the branch's MN-02 change-set touch disjoint files, so the branch's
+intended change and the target's newer code are both kept in full, with no
+manual resolution and no design decision required. The round-2/3 commits
+modify only files already owned by the branch's intended change-set's
+review surface (`mnemos/domain/memory_dedup.py`, its characterisation test,
+and this report) — no unrelated files.

@@ -44,6 +44,16 @@ class DedupGroup:
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    """Read ``key`` from a mapping, ``.get``-row, or sequence.
+
+    Contract: only ``None`` is replaced by the default (so a column that is
+    SQL NULL behaves like an absent column); every other value — including
+    genuinely falsy ``0``/``""``/``[]``/``False`` — passes through untouched.
+    For a raw string row, index lookup (``IndexError``) and ``.get``
+    (``AttributeError``) both fail and the default is returned; callers that
+    need string-row semantics (``_memory_ids_from_row``) read the value
+    directly instead of routing through this helper.
+    """
     try:
         value = row[key]
     except (KeyError, IndexError, TypeError):
@@ -55,14 +65,23 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
 
 
 def _memory_ids_from_row(row: Any) -> list[str]:
-    # NOTE: a ``memory_ids`` stored as a ``\\x1f``-joined string is never
-    # split here. ``_row_get`` looks the key up by index, and for a str
-    # value both ``row[key]`` (IndexError) and ``row.get`` (AttributeError)
-    # fail, so the default ``[]`` comes back. The str branch below only
-    # runs when the row is a mapping/row with a ``.get`` that returns a
-    # string; its ``if part`` filter also drops falsy-but-present ids
-    # (e.g. the string ``"0"``). Both edges are pinned in
-    # tests/test_mnemos_domain_memory_dedup_characterisation_20261105.py.
+    """Extract the group's memory ids from a duplicate-content row.
+
+    Every backend (sqlite/postgres/oracle/db2/mysql/mariadb) already
+    normalises ``memory_ids`` to a list of id strings in
+    ``find_duplicate_content_groups``; a raw string row carrying a
+    ``\\x1f``-joined column (GROUP_CONCAT/LISTAGG/ARRAY shapes) is still
+    handled here. Two rules:
+
+    * a raw string ROW is handled directly — ``_row_get`` cannot look a key
+      up inside a str, so this reads the string itself;
+    * a ``\\x1f``-joined value is split keeping ALL non-empty parts. The
+      filter removes only genuinely empty segments (double separators,
+      leading/trailing ``\\x1f``), never a present id: memory ids are opaque
+      strings, so the string ``"0"`` is a valid id and must survive.
+    """
+    if isinstance(row, str):
+        return [part for part in row.split("\x1f") if part]
     raw = _row_get(row, "memory_ids", [])
     if isinstance(raw, str):
         return [part for part in raw.split("\x1f") if part]
