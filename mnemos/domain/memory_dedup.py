@@ -55,6 +55,14 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
 
 
 def _memory_ids_from_row(row: Any) -> list[str]:
+    # NOTE: a ``memory_ids`` stored as a ``\\x1f``-joined string is never
+    # split here. ``_row_get`` looks the key up by index, and for a str
+    # value both ``row[key]`` (IndexError) and ``row.get`` (AttributeError)
+    # fail, so the default ``[]`` comes back. The str branch below only
+    # runs when the row is a mapping/row with a ``.get`` that returns a
+    # string; its ``if part`` filter also drops falsy-but-present ids
+    # (e.g. the string ``"0"``). Both edges are pinned in
+    # tests/test_mnemos_domain_memory_dedup_characterisation_20261105.py.
     raw = _row_get(row, "memory_ids", [])
     if isinstance(raw, str):
         return [part for part in raw.split("\x1f") if part]
@@ -99,6 +107,12 @@ async def _maybe_write_delete_audit(backend: Any, tx: Any, row: Any, memory_id: 
 
     if audit_chain_enabled() and supports_journal(tx):
         row = await fetch_audit_snapshot(tx, memory_id)
+    # Best-effort by design: ``write_configured_audit_entry`` swallows audit
+    # write failures and logs them (``logger.exception``) in the default
+    # ``MNEMOS_AUDIT_CHAIN=on`` mode, so a failed audit write never rolls
+    # back the soft delete. Only ``MNEMOS_AUDIT_CHAIN=required`` propagates
+    # ``AuditChainContinuityError`` so the data write rolls back with the
+    # failed chain write. See mnemos/audit/route_helper.py.
     await write_configured_audit_entry(
         backend,
         tx,
@@ -114,26 +128,34 @@ async def _dispatch_delete_side_effects(
 ) -> tuple[list[str], list[tuple[str, dict[str, Any], str]]]:
     delivery_ids: list[str] = []
     if getattr(backend, "supports_webhooks", False):
-        delivery_ids = await backend.webhooks.dispatch_event(
-            tx,
-            "memory.deleted",
-            {
-                "memory_id": _row_get(row, "id"),
-                "category": _row_get(row, "category"),
-                "subcategory": _row_get(row, "subcategory"),
-                # F3: span-redact outbound webhook content (prefer stored ingest
-                # spans, else recompute) — raw secrets must not leave the server.
-                "content": redact_field_with_stored(
-                    _row_get(row, "content"),
-                    _row_get(row, "metadata"),
-                    "content",
-                ),
-                "owner_id": _row_get(row, "owner_id"),
-                "namespace": _row_get(row, "namespace"),
-            },
-            owner_id=_row_get(row, "owner_id"),
-            namespace=_row_get(row, "namespace"),
-        )
+        # dispatch_event's contract (mnemos/persistence/base.py) is
+        # ``list[WebhookDeliveryIntent]``; callers correlate on the
+        # delivery_id, not the dataclass repr (the same extraction
+        # mnemos/api/routes/memories.py performs).
+        delivery_ids = [
+            intent.delivery_id
+            for intent in await backend.webhooks.dispatch_event(
+                tx,
+                "memory.deleted",
+                {
+                    "memory_id": _row_get(row, "id"),
+                    "category": _row_get(row, "category"),
+                    "subcategory": _row_get(row, "subcategory"),
+                    # F3: span-redact outbound webhook content (prefer stored
+                    # ingest spans, else recompute) — raw secrets must not
+                    # leave the server.
+                    "content": redact_field_with_stored(
+                        _row_get(row, "content"),
+                        _row_get(row, "metadata"),
+                        "content",
+                    ),
+                    "owner_id": _row_get(row, "owner_id"),
+                    "namespace": _row_get(row, "namespace"),
+                },
+                owner_id=_row_get(row, "owner_id"),
+                namespace=_row_get(row, "namespace"),
+            )
+        ]
 
     namespace = _row_get(row, "namespace")
     # CF-35/MN-17: shared encoder — "a.b" and "a_b" must not share a subject.
@@ -213,7 +235,9 @@ async def dedup_exact_content(backend: Any, *, namespace: str | None = None, app
                     deleted_count += 1
                     await _maybe_write_delete_audit(backend, tx, row, duplicate_id)
                     item_delivery_ids, item_nats_intents = await _dispatch_delete_side_effects(backend, tx, row)
-                    delivery_ids.extend(str(item) for item in item_delivery_ids)
+                    # item_delivery_ids already carry the delivery_id strings
+                    # (the helper extracts them from the intents).
+                    delivery_ids.extend(item_delivery_ids)
                     nats_intents.extend(item_nats_intents)
     return {
         "apply": apply,

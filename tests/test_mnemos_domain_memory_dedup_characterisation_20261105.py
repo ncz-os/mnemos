@@ -22,24 +22,27 @@ Internal helpers exercised directly (they carry the row-shape branching):
 * ``_root_mutation_visibility`` (ROOT_BYPASS filter with the group namespace)
 * ``_dispatch_delete_side_effects`` (webhook payload, NATS subject)
 
-Known defects pinned as ``xfail(strict=True)``
-----------------------------------------------
-1. ``_memory_ids_from_row`` drops falsy-but-present ids: splitting
-   ``"a\\x1f0\\x1fb"`` filters ``if part``, so the string ``"0"`` never
-   reaches the group. Likewise ``_row_get`` maps ``0``/``""``/``[]`` to the
-   default, so a keeper id of ``0`` falls through to the next candidate.
-2. ``delivery_ids`` is built with ``str(item)`` over the webhook intents.
-   ``WebhookDeliveryIntent`` has no ``__str__``, so the payload stringifies
-   via ``repr`` — an opaque ``WebhookDeliveryIntent(delivery_id='d1',
-   ..., namespace=<MagicMock ...>)`` blob instead of the delivery id.
-
-Behaviour that looks odd but is pinned as ordinary (documented) behaviour
-because it is not clearly a defect here: the dry-run ``null_count`` comes
-straight from the repository (it may be a count of eligible rows rather than
-NULL rows); ``_row_get`` maps falsy values to the default; the NATS subject
-namespace substitution only rewrites ``.`` to ``_``; ``backfill``'s apply
-loop sums ``changed or 0`` across batches so a repository that keeps
-returning ``batch_size`` never terminates.
+Documented (not clearly a defect) behaviours that are pinned here
+-----------------------------------------------------------------
+* ``_memory_ids_from_row`` NEVER sees a ``\\x1f``-joined string from a real
+  row: ``_row_get`` looks the key up by index, and for a raw str both
+  ``row[key]`` (IndexError) and ``row.get`` (AttributeError) fail, so the
+  default ``[]`` comes back. The split branch only runs for a mapping/row
+  with ``.get`` that returns a string, and its ``if part`` filter then also
+  drops falsy-but-present ids (e.g. the string ``"0"``).
+* ``_row_get`` maps ``None`` to the default; genuinely falsy values
+  (``0``/``""``/``[]``/``False``) pass through untouched.
+* The dry-run ``null_count`` comes straight from the repository (it may be a
+  count of eligible rows rather than NULL rows).
+* The NATS subject namespace substitution only rewrites ``.`` to ``_``.
+* ``backfill``'s apply loop sums ``changed or 0`` across batches so a
+  repository that keeps returning ``batch_size`` never terminates.
+* Dedup audit writes are best-effort: ``write_configured_audit_entry``
+  swallows failures and logs them in the default ``MNEMOS_AUDIT_CHAIN=on``
+  mode, so a failed audit write must NOT fail (or roll back) the dedup.
+  Only ``MNEMOS_AUDIT_CHAIN=required`` propagates
+  ``AuditChainContinuityError``. Pinned in
+  ``test_dedup_apply_best_effort_audit_write_failure_does_not_rollback``.
 
 Author: Jason Perlow <jperlow@gmail.com>
 """
@@ -295,24 +298,36 @@ def test_row_get_falls_back_from_sequence_indexing_to_get():
     assert _row_get(OnlyGet(), "nope", default="d") == "d"
 
 
-def test_row_get_maps_falsy_values_to_the_default():
-    # Documented quirk: a present-but-None value (and any value that is
-    # None after coercion) is replaced by the default; genuinely falsy
+def test_row_get_maps_none_to_the_default_but_passes_other_falsy_values_through():
+    # Documented contract: a present-but-None value is replaced by the
+    # default (and a missing key yields the default too); genuinely falsy
     # values (0, "", [], False) pass through untouched.
+    # None -> default
+    assert _row_get({"z": None}, "z", default="d") == "d"
+    assert _row_get({"z": None}, "z") is None
+    assert _row_get({}, "z", default="d") == "d"
+    # falsy but present -> value, not the default
     assert _row_get({"z": 0}, "z", default="d") == 0
     assert _row_get({"z": ""}, "z", default="d") == ""
     assert _row_get({"z": []}, "z", default="d") == []
     assert _row_get({"z": False}, "z", default="d") is False
-    assert _row_get({"z": None}, "z", default="d") == "d"
+    # truthy values pass through as well
+    assert _row_get({"z": 1}, "z", default="d") == 1
+    assert _row_get({"z": "x"}, "z", default="d") == "x"
 
 
 # ── _memory_ids_from_row ───────────────────────────────────────────────────
 
 
-def test_memory_ids_from_unit_separator_string_is_always_empty():
-    # Pinned quirk: _row_get replaces an empty-but-present string with the
-    # default ([]), so _memory_ids_from_row NEVER sees a string from a real
-    # row — a \\x1f-joined "memory_ids" column always yields [] here.
+def test_memory_ids_from_raw_unit_separator_string_returns_empty():
+    # Pinned behaviour: a raw string row is NOT split. _row_get looks the
+    # key up by index (row["memory_ids"] -> IndexError for a str), then
+    # falls back to row.get(...) which a str does not have (AttributeError),
+    # so the default [] comes back and the \x1f-joined ids are silently
+    # dropped. The str split branch is only reachable from a row whose
+    # .get() returns a string (see
+    # test_group_from_row_accepts_unit_separator_string_memory_ids); the
+    # falsy-filter defect that branch carries is pinned separately.
     assert _memory_ids_from_row("m1\x1fm2\x1fm3") == []
     assert _memory_ids_from_row("\x1fm1\x1f\x1fm2\x1f") == []
     assert _memory_ids_from_row("") == []
@@ -331,17 +346,22 @@ def test_memory_ids_from_sequence_and_none():
 
 @pytest.mark.xfail(
     strict=True,
-    reason="DEFECT: _memory_ids_from_row filters falsy parts, so a present id "
-    "'0' is dropped from \\x1f-joined memory_ids",
+    reason="DEFECT: a raw-string row carrying \\x1f-joined memory_ids yields "
+    "[] instead of the split ids — _row_get's str fallback drops the value "
+    "entirely (and, on the reachable str branch, 'if part' also filters "
+    "falsy-but-present ids such as the string '0')",
 )
 def test_memory_ids_drops_falsy_present_id():
-    """DEFECT pinned: a present-but-falsy id (e.g. the string ``"0"``) is
-    silently dropped when the row carries ``memory_ids`` as a
-    \\x1f-joined string, because the split filters ``if part``. The id then
-    never appears in the group's ``memory_ids``/``duplicate_ids``.
+    """DEFECT pinned: a raw string row whose ``memory_ids`` is a
+    \\x1f-joined column yields ``[]`` here rather than the ids — the string
+    never reaches the split branch (see
+    ``test_memory_ids_from_raw_unit_separator_string_returns_empty``). Even
+    on the reachable str branch, the ``if part`` filter would additionally
+    drop a present-but-falsy id such as the string ``"0"``. Either way the
+    id never appears in the group's ``memory_ids``/``duplicate_ids``.
 
-    xfail(strict=True): remove this mark when the filter preserves
-    non-empty parts (or when ``memory_ids`` stops being a string).
+    xfail(strict=True): remove this mark when a raw-string row yields its
+    split parts (or when ``memory_ids`` stops being a string).
     """
     assert _memory_ids_from_row("a\x1f0\x1fb") == ["a", "0", "b"]
 
@@ -373,6 +393,27 @@ def test_group_from_row_normal():
     assert group.keep_id == "mem_keep"
     assert group.duplicate_ids == ["mem_dup"]
     assert group.memory_ids == ["mem_keep", "mem_dup"]
+
+
+def test_group_from_row_maps_none_fields_to_empty_strings():
+    # None for owner_id / namespace / content_hash is replaced by
+    # _row_get's default "" before the str() coercion — a row with NULL
+    # ownership/namespace fields still forms a group, not an error.
+    row = {
+        "owner_id": None,
+        "namespace": None,
+        "content_hash": None,
+        "memory_ids": ["a", "b"],
+        "keep_id": "a",
+    }
+    group = _group_from_row(row)
+    assert group is not None
+    assert group.owner_id == ""
+    assert group.namespace == ""
+    assert group.content_hash == ""
+    assert group.keep_id == "a"
+    assert group.duplicate_ids == ["b"]
+    assert group.memory_ids == ["a", "b"]
 
 
 def test_group_from_row_uses_canonical_id_alias_when_keep_id_absent():
@@ -488,6 +529,30 @@ async def test_backfill_rejects_non_positive_batch_size_before_transaction():
     assert backend.memories.backfill_missing_content_hashes.calls == []
 
 
+@pytest.mark.asyncio
+async def test_backfill_repository_error_propagates_and_rolls_back():
+    # A repository failure during backfill is not swallowed: it propagates
+    # out of the transactional() block (rollback, not commit) so the caller
+    # — e.g. the CLI — sees the error and can decide what to do.
+    backend = Backend(backfill=[RuntimeError("backfill exploded")])
+    with pytest.raises(RuntimeError, match="backfill exploded"):
+        await backfill_content_hashes(backend)
+    assert backend.rollbacks == 1
+    assert backend.commits == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_dry_run_forwards_namespace_none_and_single_call():
+    # Default kwargs reach the repository verbatim; a single call returns.
+    backend = Backend(backfill=[3])
+    payload = await backfill_content_hashes(backend, batch_size=500, apply=False)
+    assert payload["null_count"] == 3
+    assert backend.memories.backfill_missing_content_hashes.calls[0]["kwargs"] == {
+        "batch_size": 500,
+        "apply": False,
+    }
+
+
 # ── dedup_exact_content: discovery / dry-run ───────────────────────────────
 
 
@@ -531,6 +596,30 @@ async def test_dedup_dry_run_with_no_groups():
     assert payload["group_count"] == 0
     assert payload["duplicate_count"] == 0
     assert payload["deleted_count"] == 0
+    assert payload["delivery_ids"] == []
+    assert payload["nats_intents"] == []
+    # The empty-list repository response is handled gracefully: nothing is
+    # deleted or dispatched, and the single transaction still commits.
+    assert backend.memories.soft_delete_calls == []
+    assert backend.webhooks.calls == []
+    assert backend.commits == 1
+
+
+@pytest.mark.asyncio
+async def test_dedup_apply_with_no_groups_is_a_noop_commit():
+    # Same empty-groups shape, apply=True: no soft deletes, no webhooks,
+    # no NATS intents, no delivery ids — a clean no-op commit.
+    backend = Backend(find_groups=[[]])
+    payload = await dedup_exact_content(backend, apply=True, namespace="lab")
+    assert payload["apply"] is True
+    assert payload["group_count"] == 0
+    assert payload["deleted_count"] == 0
+    assert payload["delivery_ids"] == []
+    assert payload["nats_intents"] == []
+    assert backend.memories.soft_delete_calls == []
+    assert backend.webhooks.calls == []
+    assert backend.commits == 1
+    assert backend.rollbacks == 0
 
 
 @pytest.mark.asyncio
@@ -824,7 +913,54 @@ async def test_dedup_apply_audit_chain_on_writes_delete_entry_with_dedup_writer(
     entry = backend.audit_chain.inserted[0]
     assert entry["op"] == "delete"
     assert entry["writer_id"] == "mnemos-memory-dedup"
-    # Best-effort default: a failed audit write must not fail the dedup.
+    assert backend.commits == 1
+    assert backend.rollbacks == 0
+
+
+@pytest.mark.asyncio
+async def test_dedup_apply_best_effort_audit_write_failure_does_not_rollback(monkeypatch):
+    """Best-effort audit contract (MNEMOS_AUDIT_CHAIN=on): ``_maybe_write_delete_audit``
+    funnels through ``write_configured_audit_entry``, which CATCHES audit write
+    failures and logs them (``logger.exception``) instead of raising. The soft
+    delete and its outbox commit must therefore succeed even when the audit
+    insert blows up — a dedup operation must not be rolled back because the
+    chain write failed. Only ``MNEMOS_AUDIT_CHAIN=required`` would propagate
+    the error here (see the docstring note in ``_maybe_write_delete_audit``).
+    """
+    import mnemos.audit.route_helper as route_helper
+
+    row = {
+        "id": "mem_dup",
+        "owner_id": "alice",
+        "namespace": "lab",
+        "content_hash": "a" * 64,
+        "memory_ids": ["mem_keep", "mem_dup"],
+        "keep_id": "mem_keep",
+    }
+    backend = Backend(find_groups=[[row]])
+    backend.audit_chain = RecordingAuditChain(latest=None)
+
+    # ``write_configured_audit_entry`` rebinds both flags from
+    # ``mnemos.core.config`` on every call, so patch them there; the
+    # writer it calls lives in route_helper, so patch it there too.
+    import mnemos.core.config as config
+
+    monkeypatch.setattr(config, "audit_chain_enabled_flag", lambda: True)
+    monkeypatch.setattr(config, "audit_chain_required_flag", lambda: False)  # best-effort mode
+    monkeypatch.setattr(
+        config,
+        "get_settings",
+        lambda: SimpleNamespace(server=SimpleNamespace(session_secret="x" * 32)),
+    )
+
+    async def _boom(*a, **k):
+        raise RuntimeError("audit insert exploded")
+
+    monkeypatch.setattr(route_helper, "write_audit_entry", _boom)
+
+    payload = await dedup_exact_content(backend, apply=True)
+    # The data write succeeded despite the audit failure.
+    assert payload["deleted_count"] == 1
     assert backend.commits == 1
     assert backend.rollbacks == 0
 
@@ -845,12 +981,10 @@ async def test_dispatch_delete_side_effects_returns_delivery_ids_and_nats_intent
     }
     backend = Backend(webhooks=Webhooks(delivery_ids=["d1", "d2"]))
     delivery_ids, nats_intents = await _dispatch_delete_side_effects(backend, None, row)
-    # delivery_ids are str(intent) — see the xfail'd test below for why this
-    # is an opaque repr blob rather than the delivery id.
-    assert len(delivery_ids) == 2
-    assert str(delivery_ids[0]).startswith("WebhookDeliveryIntent(delivery_id='d1'")
-    assert str(delivery_ids[1]).startswith("WebhookDeliveryIntent(delivery_id='d2'")
-    assert "namespace='lab'" in str(delivery_ids[0])
+    # delivery_ids are the intents' delivery_id values (callers correlate
+    # outbox rows / NATS nudges on them) — NOT the dataclass repr.
+    assert delivery_ids == ["d1", "d2"]
+    assert all(isinstance(d, str) for d in delivery_ids)
     assert len(backend.webhooks.calls) == 1
     assert backend.webhooks.calls[0]["event_type"] == "memory.deleted"
     assert backend.webhooks.calls[0]["payload"]["memory_id"] == "m9"
@@ -871,24 +1005,25 @@ async def test_dispatch_delete_side_effects_without_webhook_support_returns_no_d
     assert nats_intents[0][0] == "mnemos.memory.deleted.default"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="DEFECT: delivery_ids stringifies WebhookDeliveryIntent via repr, not intent.delivery_id",
-)
-def test_dispatch_delivery_ids_are_stringified_intents():
-    """DEFECT pinned: ``delivery_ids`` contains ``str(intent)`` rather than
-    ``intent.delivery_id``, because ``WebhookDeliveryIntent`` defines no
-    ``__str__`` and therefore stringifies via ``repr`` — an opaque blob
-    instead of the delivery id a caller would expect to correlate on.
-
-    xfail(strict=True): remove this mark when the payload carries
-    ``intent.delivery_id`` (or the dataclass gains a ``__str__``).
+@pytest.mark.asyncio
+async def test_dedup_apply_delivery_ids_correlate_on_delivery_id():
+    """End-to-end: the payload's ``delivery_ids`` must carry the outbox
+    delivery ids (so a caller can correlate the delivery row / post-commit
+    NATS nudge on them), not the ``WebhookDeliveryIntent`` repr.
     """
-    intent = WebhookDeliveryIntent(
-        delivery_id="d1",
-        subscription_id="sub-fake",
-        url="https://example.invalid/hook",
-        namespace="lab",
-        owner_id="alice",
-    )
-    assert str(intent) == "d1"
+    row = {
+        "id": "mem_dup",
+        "owner_id": "alice",
+        "namespace": "lab",
+        "content_hash": "a" * 64,
+        "category": "facts",
+        "content": "hello",
+        "metadata": {},
+        "memory_ids": ["mem_keep", "mem_dup"],
+        "keep_id": "mem_keep",
+    }
+    backend = Backend(find_groups=[[row]], webhooks=Webhooks(delivery_ids=["d1", "d2"]))
+    payload = await dedup_exact_content(backend, apply=True)
+    assert payload["delivery_ids"] == ["d1", "d2"]
+    assert all(isinstance(d, str) for d in payload["delivery_ids"])
+    assert not any("WebhookDeliveryIntent(" in d for d in payload["delivery_ids"])

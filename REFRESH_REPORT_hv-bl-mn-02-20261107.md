@@ -66,3 +66,59 @@ MN-02 change-set.
 
 - Branch `hv/bl-mn-02-20261107` pushed to ARGONAS (`origin`), upstream
   tracking intact, remote SHA == local HEAD.
+
+## Round 2 — review-defect fixes (2026-11-10)
+
+The first delivery was reviewed; the characterisation test file that master
+brought into this branch carried test-logic defects, plus two genuine defects
+the tests had pinned with `xfail(strict=True)`. All addressed:
+
+**Code (`mnemos/domain/memory_dedup.py`):**
+
+1. **`delivery_ids` correlation fix** (was the pinned `xfail` "stringifies
+   WebhookDeliveryIntent via repr"): `_dispatch_delete_side_effects` now
+   extracts `intent.delivery_id` from the intents `dispatch_event` returns —
+   the same extraction `mnemos/api/routes/memories.py` performs — and the
+   apply loop no longer double-wraps with `str(item)`. Callers can now
+   correlate outbox rows / post-commit NATS nudges on the delivery id.
+2. **Best-effort audit contract documented** on
+   `_maybe_write_delete_audit`: `write_configured_audit_entry` swallows
+   (and `logger.exception`s) audit write failures in the default
+   `MNEMOS_AUDIT_CHAIN=on` mode by design — a failed audit write never rolls
+   back the soft delete; only `MNEMOS_AUDIT_CHAIN=required` propagates
+   `AuditChainContinuityError`.
+3. **`_memory_ids_from_row` doc note**: a raw string row never reaches the
+   split branch (`_row_get`'s str fallback drops it), and the reachable str
+   branch's `if part` filter also drops falsy-but-present ids.
+
+**Tests (`tests/test_mnemos_domain_memory_dedup_characterisation_20261105.py`):**
+
+- `test_memory_ids_from_unit_separator_string_is_always_empty` →
+  `test_memory_ids_from_raw_unit_separator_string_returns_empty`: renamed and
+  re-documented to pin the actual mechanism (IndexError/AttributeError
+  fallback → default `[]`), and the adjacent xfail's reason/docstring now
+  state that a raw-string row is dropped entirely rather than "filters falsy
+  parts".
+- `test_row_get_maps_falsy_values_to_the_default` →
+  `test_row_get_maps_none_to_the_default_but_passes_other_falsy_values_through`:
+  explicit assertions for the `None` → default mapping (the contract it
+  actually carries) alongside the falsy pass-throughs.
+- New `test_group_from_row_maps_none_fields_to_empty_strings`: `None`
+  owner/namespace/hash fields become `""` and still form a group.
+- New `test_backfill_repository_error_propagates_and_rolls_back` (plus a
+  default-kwarg pinning test): a repository failure propagates out of
+  `transactional()` with a rollback.
+- `test_dedup_dry_run_with_no_groups` strengthened (empty-groups payload
+  fields + clean commit) and new `test_dedup_apply_with_no_groups_is_a_noop_commit`.
+- New `test_dedup_apply_best_effort_audit_write_failure_does_not_rollback`:
+  audit insert raising in `on` mode does not roll back the dedup commit.
+- The delivery_ids `xfail` removed; replaced by positive pins
+  (`test_dispatch_delete_side_effects_returns_delivery_ids_and_nats_intents`
+  asserts `delivery_ids == ["d1", "d2"]`, and the new end-to-end
+  `test_dedup_apply_delivery_ids_correlate_on_delivery_id`).
+
+**Suite after the round-2 fixes** (same sandbox, `pytest tests/ -q`):
+target `b922fabb` = 83 failed / 6635 passed / 42 errors vs fixed head =
+83 failed / 6652 passed / 42 errors. The 125-entry `FAILED`/`ERROR` sets
+are **byte-identical** to the target (diff clean); passed +17 vs target,
+xfailed -1 (the fixed defect no longer xfails). **No failure grew.**
