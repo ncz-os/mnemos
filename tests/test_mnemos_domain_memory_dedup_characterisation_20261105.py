@@ -187,6 +187,11 @@ class RecordingAuditChain:
 
     async def insert_audit_entry(self, tx, **kwargs):
         self.inserted.append(kwargs)
+        # entry_id is a keyword-only required arg of the ABC
+        # (mnemos/persistence/base.py) and the production caller
+        # (write_configured_audit_entry, mnemos/audit/route_helper.py)
+        # always passes it; .get() would silently mask a contract
+        # violation, so keep the strict index here on purpose.
         return kwargs["entry_id"]
 
 
