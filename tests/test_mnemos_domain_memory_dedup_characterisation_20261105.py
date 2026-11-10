@@ -160,7 +160,6 @@ class Webhooks:
         record = {"event_type": event_type, "payload": dict(payload)}
         record.update(kwargs)
         self.calls.append(record)
-        from mnemos.persistence.base import WebhookDeliveryIntent
 
         return [
             WebhookDeliveryIntent(
@@ -660,9 +659,14 @@ async def test_dedup_apply_webhook_payload_redacts_secret_content_via_stored_spa
     backend = Backend(find_groups=[[row]], webhooks=Webhooks(delivery_ids=["d1"]))
     payload = await dedup_exact_content(backend, apply=True)
     assert payload["deleted_count"] == 1
-    # F3: the outbound webhook content is span-redacted; the raw secret
-    # must not leave the server. Pin the exact redacted form against the
-    # same production helper the module calls.
+    # F3: the outbound webhook content is span-redacted *by the domain
+    # module itself* (dedup_exact_content builds the payload through
+    # redact_field_with_stored at the dispatch call site) — the fake
+    # backend merely RECORDS what it is handed and never transforms it,
+    # so these asserts verify the production redaction, not a mock.
+    # Mutation-verified 2026-11-10: disabling the production call site
+    # makes exactly this test fail (raw phone number reaches the fake).
+    # The raw secret must not leave the server.
     assert backend.webhooks.calls[0]["payload"]["content"] == "call me at 5[REDACTED]ow"
     assert "555-123-4567" not in backend.webhooks.calls[0]["payload"]["content"]
     assert backend.webhooks.calls[0]["payload"]["content"] == redact_field_with_stored(
