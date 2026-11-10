@@ -51,8 +51,9 @@ def _docling_max_concurrency() -> int:
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.memory_mutations import _assert_no_active_deletion
 from mnemos.api.persistence_helpers import backend_or_503
-from mnemos.api.read_policy import _validate_permission_mode
+from mnemos.api.read_policy import _redacted_for_webhook, _validate_permission_mode
 from mnemos.core.config import get_settings, runtime_env_value
 from mnemos.core.ids import new_memory_id
 from mnemos.domain.document_repo import (
@@ -414,6 +415,24 @@ async def import_memories_from_document(
             }
         )
 
+    # CF-09 GDPR fence (MN-05): the single memory create refuses (409) to
+    # write onto a scope whose deletion request is inside the grace window.
+    # This route wrote one memory per document chunk without that probe, so a
+    # document imported mid-deletion repopulated the scope with rows the sweep
+    # cannot see (``deleted_at IS NULL``) and the hard delete skips -- ghost
+    # rows surviving a request recorded as ``hard_deleted``. Refuse the WHOLE
+    # document before the first chunk is written, with the same 409 the single
+    # create returns; a per-chunk error list would report a successful import
+    # of nothing. Chunks are written under the caller's own scope (this route
+    # has no preserve_owner mode), so that pair is what gets probed. Root
+    # keeps the documented tombstone-injection bypass.
+    if user.role != "root":
+        await _assert_no_active_deletion(
+            backend,
+            owner_id=user.user_id,
+            namespace=user.namespace,
+        )
+
     # Create memories from chunks. Match the canonical /v1/memories create
     # path exactly: timestamped `mem_...` id, populate verbatim_content +
     # quality_rating + permission_mode, and fire `memory.created` webhooks +
@@ -599,21 +618,48 @@ async def import_memories_from_document(
                     canonical_id = imported.memory_id
                     in_flight_id = canonical_id
                     if imported.emit_created_event and getattr(backend, "supports_webhooks", True):
-                        chunk_delivery_ids = await backend.webhooks.dispatch_event(
-                            tx,
-                            "memory.created",
-                            {
-                                "memory_id": canonical_id,
-                                "category": category,
-                                "subcategory": subcategory,
-                                "content": chunk["content"],
-                                "owner_id": user.user_id,
-                                "namespace": user.namespace,
-                                "source": "document_import",
-                            },
-                            owner_id=user.user_id,
-                            namespace=user.namespace,
-                        )
+                        # F2 (2026-11-06): describe the row AS STORED. import_chunk
+                        # classified the chunk -- vaulting it when it carries a
+                        # credential and recording secret spans in metadata -- so
+                        # the outbound payload must use that stored metadata to
+                        # mask content and report the post-classification
+                        # namespace. Sending chunk["content"] / user.namespace
+                        # leaked raw credentials and the pre-vault namespace to an
+                        # external HTTP endpoint. Trust the stored value only:
+                        # import_chunk always returns the post-classification
+                        # namespace for a chunk that emits this event (a vaulted
+                        # chunk is "vault"), so falling back to user.namespace
+                        # here would reintroduce the leak. Fail closed -- skip
+                        # the webhook rather than publish the pre-vault
+                        # namespace. The chunk is already committed, so raising
+                        # would discard a successful import over a delivery-time
+                        # fault.
+                        stored_namespace = imported.namespace
+                        if stored_namespace is None:
+                            logger.error(
+                                "[DOCLING] import_chunk returned no "
+                                "post-classification namespace for chunk %s; "
+                                "suppressing memory.created webhook rather "
+                                "than leaking the raw user namespace",
+                                chunk["chunk_num"],
+                            )
+                            chunk_delivery_ids = []
+                        else:
+                            chunk_delivery_ids = await backend.webhooks.dispatch_event(
+                                tx,
+                                "memory.created",
+                                {
+                                    "memory_id": canonical_id,
+                                    "category": category,
+                                    "subcategory": subcategory,
+                                    "content": _redacted_for_webhook(chunk["content"], imported.metadata),
+                                    "owner_id": user.user_id,
+                                    "namespace": stored_namespace,
+                                    "source": "document_import",
+                                },
+                                owner_id=user.user_id,
+                                namespace=stored_namespace,
+                            )
                     elif imported.emit_created_event:
                         chunk_delivery_ids = []
                     else:
@@ -671,19 +717,14 @@ async def import_memories_from_document(
             raise
 
     # Side-effects done outside the per-chunk acquire so the connection isn't
-    # held while we contact Redis / schedule webhook send tasks. Cache is
-    # invalidated ONCE after the whole document — a 100-chunk document would
-    # otherwise thrash search cache N times. Send tasks for the deliveries
-    # whose outbox rows are already committed get scheduled here.
+    # held while we touch the stats cache / schedule webhook send tasks. The
+    # stats entry is invalidated ONCE after the whole document. Send tasks for
+    # the deliveries whose outbox rows are already committed get scheduled
+    # here.
     if memory_ids:
         if _lc._cache:
             try:
                 await _lc._cache.delete("stats:global")
-                try:
-                    async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                        await _lc._cache.delete(_k)
-                except Exception:
-                    pass
             except Exception:
                 pass
         if pending_delivery_ids:
@@ -882,9 +923,20 @@ async def batch_import_documents(
     # back / unsupported ones.
     if has_partial_or_full_failure:
         per_file_statuses = [int(r.get("status_code", 0)) for r in results]
+        # CF-09 fence (MN-05): a deletion refusal is per-SCOPE, not per-file --
+        # every file in the batch writes under the caller's one (owner_id,
+        # namespace), so nothing in the request was accepted. Answer 409 as a
+        # whole (the verdict the single create gives) instead of the 207 below,
+        # which would read as "some files imported" with only a per-file error
+        # string standing in for the rejection. Checked before 503/502 for the
+        # same reason 503 precedes the all-502 path: the fence verdict is the
+        # cause, and it is not retryable.
+        any_409 = any(code == 409 for code in per_file_statuses)
         any_503 = any(code == 503 for code in per_file_statuses)
         all_502 = not any_503 and len(per_file_statuses) > 0 and all(code == 502 for code in per_file_statuses)
-        if any_503:
+        if any_409:
+            top = 409
+        elif any_503:
             top = 503
         elif all_502:
             top = 502
