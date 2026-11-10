@@ -16,7 +16,9 @@ is exactly what leaves the server, so asserting on it asserts on the leak.
 
 from __future__ import annotations
 
+import ast
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -26,7 +28,11 @@ import pytest_asyncio
 from mnemos.api.routes import document_import
 from mnemos.core.secret_detection import VAULT_NAMESPACE
 
-pytestmark = pytest.mark.asyncio
+# NOTE: async tests carry an explicit ``@pytest.mark.asyncio`` rather than a
+# module-level ``pytestmark``. The static AST guards appended at the bottom of
+# this module are synchronous, and a module-level asyncio mark would claim
+# (and warn about) them.
+async_test = pytest.mark.asyncio
 
 # Synthetic, non-functional credentials. The chunk is a single text span so
 # the classifier records both spans and vaults the record (a credential-record
@@ -134,6 +140,7 @@ async def _run_import(backend, monkeypatch, content: str):
     return payload, status_code, capturing
 
 
+@async_test
 async def test_webhook_masks_secrets_and_uses_stored_namespace(sqlite_backend, monkeypatch):
     """A vaulted chunk's webhook carries masked content and namespace=vault."""
     payload, status_code, capturing = await _run_import(sqlite_backend, monkeypatch, SECRET_CHUNK)
@@ -181,6 +188,7 @@ class _Root:
     api_key_id = None
 
 
+@async_test
 async def test_clean_chunk_webhook_is_unchanged(sqlite_backend, monkeypatch):
     """A clean chunk keeps its content and pre-vault namespace (no regression)."""
     clean = "quarterly planning notes, no credentials here"
@@ -192,3 +200,138 @@ async def test_clean_chunk_webhook_is_unchanged(sqlite_backend, monkeypatch):
     assert data["content"] == clean
     assert data["namespace"] == "team"
     assert capturing.calls[0]["namespace"] == "team"
+
+
+# ---------------------------------------------------------------------------
+# Static guard on the call site itself.
+#
+# The end-to-end tests above prove the payload is correct *today*. This guard
+# pins the shape of the `dispatch_event` call so the invariant cannot be
+# quietly broken by a later edit to that block: it asserts that `content` is
+# passed through the redactor, and that BOTH the payload's "namespace" field
+# and the dispatcher's `namespace=` keyword carry `stored_namespace`, never
+# the caller's `user.namespace`. That caller value is exactly the pre-vault
+# namespace F2 removed -- reintroducing it is the leak.
+# ---------------------------------------------------------------------------
+
+
+def _document_import_tree() -> ast.Module:
+    path = Path(__file__).resolve().parents[1] / "mnemos" / "api" / "routes" / "document_import.py"
+    return ast.parse(path.read_text(encoding="utf-8"))
+
+
+def _memory_created_dispatch_call(tree: ast.Module) -> ast.Call:
+    """Find the `dispatch_event(..., "memory.created", {...})` call."""
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != "dispatch_event":
+            continue
+        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+            if node.args[1].value == "memory.created":
+                return node
+    raise AssertionError("no dispatch_event(..., 'memory.created', ...) call found")
+
+
+def _namespace_value(node: ast.AST) -> str | None:
+    """Render a namespace expression to its dotted source form."""
+    return ast.unparse(node)
+
+
+def test_memory_created_dispatch_uses_stored_namespace_not_caller_namespace():
+    """The outbound `memory.created` payload must describe the row as stored.
+
+    Guards the exact failure F2 fixed: a payload built from `user.namespace`
+    (pre-vault) instead of `stored_namespace` (post-classification).
+    """
+    call = _memory_created_dispatch_call(_document_import_tree())
+
+    payload = call.args[2]
+    assert isinstance(payload, ast.Dict), "memory.created payload must be a dict literal"
+    fields = {
+        key.value: value
+        for key, value in zip(payload.keys, payload.values)
+        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+    }
+
+    assert "namespace" in fields, "payload is missing the 'namespace' field"
+    payload_ns = _namespace_value(fields["namespace"])
+    assert payload_ns == "stored_namespace", (
+        f"payload['namespace'] is `{payload_ns}`; it must be `stored_namespace` -- "
+        "`user.namespace` is the pre-vault namespace and leaks it to the external endpoint"
+    )
+
+    # The dispatcher's own namespace kwarg scopes delivery and must agree.
+    dispatch_ns = [
+        _namespace_value(kw.value)
+        for kw in call.keywords
+        if kw.arg == "namespace"
+    ]
+    assert dispatch_ns == ["stored_namespace"], (
+        f"dispatch_event(namespace=...) is `{dispatch_ns}`; must be `stored_namespace`"
+    )
+
+    # Content must pass through the span redactor with the STORED metadata.
+    assert "content" in fields, "payload is missing the 'content' field"
+    content = fields["content"]
+    assert isinstance(content, ast.Call), "payload['content'] must be a call, not raw content"
+    assert _namespace_value(content.func) == "_redacted_for_webhook", (
+        "payload['content'] must be wrapped in _redacted_for_webhook()"
+    )
+    assert _namespace_value(content.args[1]) == "imported.metadata", (
+        "the redactor must be driven by the STORED metadata (imported.metadata)"
+    )
+
+
+def test_webhook_fix_precedes_any_caller_namespace_use():
+    """A guard against the reviewer-flagged regression: no `user.namespace`
+    may reach the dispatch call by any path."""
+    call = _memory_created_dispatch_call(_document_import_tree())
+    used = {_namespace_value(n) for n in ast.walk(call) if isinstance(n, ast.Attribute)}
+    assert "user.namespace" not in used, (
+        "the memory.created dispatch call references user.namespace; that is the "
+        "pre-vault namespace and reintroduces the F2 credential/namespace leak"
+    )
+
+
+@async_test
+async def test_missing_stored_namespace_suppresses_webhook(sqlite_backend, monkeypatch):
+    """No post-classification namespace must mean no webhook, never a fallback.
+
+    ``stored_namespace`` used to be ``imported.namespace or user.namespace``.
+    Today ``import_chunk`` always sets the namespace on the emit path, so the
+    fallback was unreachable -- but it is dead surface that would silently
+    reopen the F2 pre-vault leak the moment any refactor returned None. Fail
+    closed instead: suppress the event rather than publish ``user.namespace``.
+
+    The chunk is committed before the event is built, so the import must still
+    succeed -- suppressing the delivery must not turn a successful write into
+    an error.
+    """
+    from mnemos.domain.document_repo import DocumentRepository, ImportedDocumentChunk
+
+    real_import_chunk = DocumentRepository.import_chunk
+
+    async def _namespace_less_import_chunk(self, backend, tx, **kwargs):
+        imported = await real_import_chunk(self, backend, tx, **kwargs)
+        # Simulate a repository that cannot name the stored row's namespace.
+        return ImportedDocumentChunk(
+            memory_id=imported.memory_id,
+            emit_created_event=imported.emit_created_event,
+            metadata=imported.metadata,
+            namespace=None,
+        )
+
+    monkeypatch.setattr(DocumentRepository, "import_chunk", _namespace_less_import_chunk)
+
+    payload, status_code, capturing = await _run_import(sqlite_backend, monkeypatch, SECRET_CHUNK)
+
+    assert status_code == 200, payload
+    assert payload["memories_created"] == 1, "the import itself must still succeed"
+
+    # No event at all: an event that cannot describe the stored namespace must
+    # not be described to an external endpoint with the caller's namespace.
+    assert capturing.calls == [], (
+        f"expected no webhook, got {capturing.calls!r}"
+    )
