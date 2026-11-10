@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "kind": "review",
+  "job_id": "01a1bd07-754d-78f3-8bd8-45c8b165cb39",
+  "review_ref": "review/hv/cf-mn-dead-search-cache-scan-loops-20261106-01a1bda0-d6ac-774e-bbae-69e00925b0b7",
+  "branch": "hv/cf-mn-dead-search-cache-scan-loops-20261106",
+  "head_branch": "hv/cf-mn-dead-search-cache-scan-loops-20261106",
+  "base_branch": "master",
+  "base_sha": "e4cacdf341f83a6e2f1e135ae21262e7ec9d293a",
+  "head_sha": "b96ac2976ff1c1ca59e3787dbbb302a35e18ed3f",
+  "verdict": "approve",
+  "reviewers": [
+    {
+      "model": "qwen38",
+      "family": "qwen",
+      "verdict": "approve",
+      "role": "reviewer"
+    }
+  ],
+  "reason": "Re-review (retry; prior attempt delivered no verdict file) of the delivered head b96ac2976ff1c1ca59e3787dbbb302a35e18ed3f on hv/cf-mn-dead-search-cache-scan-loops-20261106 against base master e4cacdf341f83a6e2f1e135ae21262e7ec9d293a. The task body's b41287336e3bc2ccf24261ec09849e7650b50238 is a stale head reference from an earlier review round: the RETRY instruction pins the exact commit reviewed to b96ac297, which is the current local HEAD, the current origin remote SHA for the author branch (verified via git ls-remote), and the parent of the pre-existing verdict commits on this same review ref. Verified independently this attempt: (1) the diff against base is exactly the intended change -- removal of the dead 'SCAN MATCH mnemos:search:*' invalidation sweeps from mnemos/api/routes/{admin,dag,document_import}.py, mnemos/persistence/deletion_ops.py and mnemos/api/routes/acl.py (the latter two previously early-returned when _lc._cache was falsy), removal of _get_cache_key and _vis_epoch_current plus the now-unused hashlib import from mnemos/core/lifecycle.py, an unchanged-behavior comment retarget in mnemos/api/routes/memories.py, untracking of .scratch/ task artifacts that a prior refresh run had accidentally committed, and one CHANGELOG.md line under 7.1.1; (2) no live scan_iter loop or mnemos:search key construction remains anywhere in mnemos/ -- remaining grep hits are historical docstring prose only, and grep confirms zero callers of _get_cache_key / _vis_epoch_current; (3) every touched site keeps its stats-entry invalidation (stats:global / stats:global:v2, the /stats surface) and its _vis_epoch_get_incr() bump, whose consumer the MCP principal-context cache (role/namespace authorization inputs) was re-confirmed in lifecycle.py; (4) real behavioral improvement confirmed: invalidate_deletion_scope_caches and _invalidate_search_caches_after_acl_change no longer early-return on the default no-cache path (lifespan hard-wires _lc._cache to None, app.state.cache = None intact), so the visibility-epoch bump now runs on the production path; the bump stays best-effort silent on a broken epoch store; (5) tests were retargeted rather than deleted -- old SCAN-sweep pins became loud pins of the sweep's absence (fake scan_iter that pytest.fail if called, scan_calls == [] assertions) plus regression pins for helper removal, epoch-bump persistence, best-effort silence, and no bump on a 404 revoke; (6) touched suites pass at the head (tests/test_acl_routes.py + tests/test_recall_counters_parity.py: 56 passed, 1 xpassed; tests/test_deletion_request_worker.py + tests/test_persistence_parity.py: 54 passed, 1 skipped; tests/test_resilience.py: 31 passed), and a run of the remaining suite passed 1345+ before -x stopped on tests/test_doc_version_pins_match_code.py, which also fails on base master e4cacdf3 (README.md/DEPLOYMENT.md still read v7.1.0 while pyproject is 7.1.1 -- pre-existing release-doc drift, not in or near any file this branch touches); (7) the ABC-first ratchet guard (scripts/check_abc_first_guard.py) passes (the change removes code and adds no raw _lc._pool references). No correctness, security, or ABI regression found; the author branch is untouched by this review (HEAD before and after this review: b96ac2976ff1c1ca59e3787dbbb302a35e18ed3f; worktree clean) and the only write performed is this verdict artifact on the dedicated review ref. Verdict: approve.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "info",
+      "file": "docs/MULTIUSER_ACL_DESIGN.md",
+      "location": "Cache coherency section (~line 109)",
+      "issue": "The design doc still states ACL grant/revoke 'invalidate the per-user search cache (mnemos:search:*)'. That behavior was removed by this branch; only the visibility-epoch bump (and the MCP principal-context cache it drives) remains.",
+      "suggestion": "Update the section to describe the epoch bump. Docs-only drift, non-blocking."
+    },
+    {
+      "id": "F2",
+      "severity": "info",
+      "file": "tests/test_recall_counters_parity.py",
+      "location": "test_vis_epoch_current_accessor_is_gone / test_get_cache_key_builder_is_gone",
+      "issue": "Removals are pinned via full-module source scans (the identifier must not appear anywhere in inspect.getsource of lifecycle); a future docstring or comment mentioning either name would fail these guards spuriously.",
+      "suggestion": "Acceptable as-is; optionally narrow to AST name checks if a future reference causes a false positive. Non-blocking."
+    },
+    {
+      "id": "F3",
+      "severity": "info",
+      "file": "tests/test_deletion_request_worker.py",
+      "location": "_FakeCache and the two 'never_scans_search' tests",
+      "issue": "The retained _FakeCache's scan_iter now pytest.fail if ever called (a correct loud pin), but the primed cache.store['mnemos:search:primed'] fixtures in the two tests are inert -- that key can never be deleted, so the 'not in cache.deleted' assertions are trivially satisfiable.",
+      "suggestion": "Optional cleanup: drop the dead mnemos:search:primed fixture lines. Non-blocking."
+    },
+    {
+      "id": "F4",
+      "severity": "info",
+      "file": "mnemos/api/routes/admin.py",
+      "location": "_invalidate_memory_read_caches",
+      "issue": "Unlike the ACL path and deletion_ops, this helper keeps its 'if not _lc._cache: return' early return, so with the runtime's None cache it skips both the stats drop and the epoch bump at its call sites (compression/restore/admin ops).",
+      "suggestion": "Defensible: those are not visibility-narrowing paths, and the load-bearing epoch bump (ACL grant/revoke, deletion scope) now always runs. Not a defect; noted for completeness."
+    }
+  ],
+  "verify_delivery": {
+    "command": "/usr/bin/python3 /opt/graeae/hive_worker.py --verify-delivery /home/jasonperlow/hive-workspaces/01a1bda0-d6ac-774e-bbae-69e00925b0b7 b96ac2976ff1c1ca59e3787dbbb302a35e18ed3f",
+    "note": "Run by the reviewer after the verdict artifact commit: baseline arg b96ac297 is the review ref's pre-verdict head (== author branch head), so the single verdict commit above it satisfies delivery."
+  },
+  "review_overreach": {
+    "author_branch_touched": false,
+    "author_branch_head_before": "b96ac2976ff1c1ca59e3787dbbb302a35e18ed3f",
+    "author_branch_head_after": "b96ac2976ff1c1ca59e3787dbbb302a35e18ed3f",
+    "verdict_artifact": "REVIEW_VERDICT_hv-cf-mn-dead-search-cache-scan-loops-20261106.json",
+    "verdict_ref": "review/hv/cf-mn-dead-search-cache-scan-loops-20261106-01a1bda0-d6ac-774e-bbae-69e00925b0b7"
+  }
+}
