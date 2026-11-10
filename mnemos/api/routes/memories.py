@@ -986,10 +986,11 @@ async def search_memories(
     # ``_lc._cache``, which the lifecycle hard-wires to ``None`` (there is
     # no Redis in the runtime), so every cache read missed and every
     # cache write went nowhere. The machinery around it was not free:
-    # each search read the visibility epoch (``_vis_epoch_current``,
-    # a NATS-KV round-trip) and folded it into a 27-field cache key that
-    # was then thrown away. That per-search epoch read is gone with the
-    # cache it existed to key.
+    # each search read the visibility epoch (a NATS-KV round-trip) and
+    # folded it into a 27-field cache key that was then thrown away.
+    # That per-search epoch read is gone with the cache it existed to
+    # key, and so are the key builder and the read-only epoch accessor
+    # that only it used.
     #
     # The visibility epoch is still bumped on visibility-narrowing
     # mutations -- see ``_invalidate_caches_after_mutation`` -- because
