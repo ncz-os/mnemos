@@ -391,17 +391,15 @@ async def invalidate_deletion_scope_caches(
 ) -> None:
     """Evict cached stat responses that may include this target.
 
-    Also bumps the visibility epoch so in-flight search writes land under
-    the old epoch (orphaned) rather than leaking stale visibility.
+    There is no cached search response to evict: ``_lc._cache`` is hard-wired
+    to ``None`` (no Redis in the runtime) and the search handler reads no
+    cache at all, so the ``SCAN MATCH "mnemos:search:*"`` sweep that used to
+    run here matched keys of a cache that never existed. Only the stats
+    entries (the /stats surface) are still dropped.
 
-    The ``mnemos:search:*`` sweep this used to run is gone: it scanned
-    ``_lc._cache``, which the lifecycle hard-wires to ``None`` and which
-    holds no search keys since the per-user search cache was removed
-    (MN-31). The stats keys are a different cache and are still dropped.
-
-    The epoch bump does not depend on the cache existing: in the runtime
-    ``_cache`` is always ``None``, so returning early here would make the
-    bump — this function's only live effect — unreachable.
+    The visibility epoch is STILL bumped so in-flight writers observe the
+    narrowing of visibility (the MCP principal-context cache subscribes to
+    it).
     """
     import mnemos.core.lifecycle as _lc
 

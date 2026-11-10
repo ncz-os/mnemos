@@ -277,39 +277,39 @@ def test_revoke_handler_ok_when_grant_present(monkeypatch):
     assert acl.revoked == [("m1", "user:7")]
 
 
-# --- visibility-epoch bump on ACL mutation -----------------------------------
+# --- search-cache invalidation on ACL mutation -------------------------------
 #
-# A grant widens read visibility and a revoke narrows it, so in-flight search
-# writes must be orphaned under the old epoch rather than landing on the new
-# visibility state. The per-user search cache this used to also drop was
-# removed (it was wired to ``_lc._cache``, which is hard-wired to ``None``),
-# and its ``SCAN MATCH "mnemos:search:*"`` sweep with it — see MN-31.
+# There is no per-user search cache to invalidate. The machinery was keyed by
+# user/group/namespace/query and wired to ``_lc._cache``, which the lifecycle
+# hard-wires to ``None`` (no Redis in the runtime); the search handler stopped
+# reading a cache — and the visibility epoch — in 9f5a0409. What MUST remain
+# is the visibility-epoch bump: the MCP principal-context cache (role /
+# namespace — authorization inputs) subscribes to it, so a revoke must advance
+# the epoch promptly.
 
 
-class _FakeCache:
-    def __init__(self, keys):
-        self.keys = list(keys)
+class _ScanSpyCache:
+    def __init__(self) -> None:
+        self.scan_calls: list[dict] = []
         self.deleted: list[str] = []
 
-    async def scan_iter(self, *, match, count):  # noqa: ARG002 — signature parity
-        for k in list(self.keys):
-            yield k
+    async def scan_iter(self, *, match, count):
+        self.scan_calls.append({"match": match, "count": count})
+        return
+        yield  # pragma: no cover — keeps this an async generator
 
     async def delete(self, key):
         self.deleted.append(key)
-        if key in self.keys:
-            self.keys.remove(key)
 
 
 def _install_cache(monkeypatch, cache):
     monkeypatch.setattr(_lc, "_cache", cache, raising=False)
 
 
-def _epoch_counter(monkeypatch):
-    """Replace the epoch bump with a counter (no NATS round-trip)."""
+def _install_epoch_spy(monkeypatch) -> list[int]:
     bumps: list[int] = []
 
-    async def _bump():
+    async def _bump() -> int:
         bumps.append(1)
         return len(bumps)
 
@@ -317,53 +317,70 @@ def _epoch_counter(monkeypatch):
     return bumps
 
 
-def test_grant_bumps_visibility_epoch_and_does_not_scan(monkeypatch):
+@pytest.mark.parametrize("operation", ["grant", "revoke"])
+def test_acl_mutation_never_scans_the_search_cache(monkeypatch, operation):
+    grants = [{"memory_id": "m1", "principal": "user:7", "perm": 4, "granted_by": "alice", "created_at": None}]
+    acl = _FakeAcl(grants=grants if operation == "revoke" else [])
+    backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": "eng"}, acl=acl)
+    _install(monkeypatch, backend)
+    cache = _ScanSpyCache()
+    _install_cache(monkeypatch, cache)
+    bumps = _install_epoch_spy(monkeypatch)
+
+    if operation == "grant":
+        asyncio.run(
+            acl_route.grant_memory_acl(
+                "m1",
+                acl_route.AclGrantRequest(principal="user:7", perm=4),
+                user=_user("alice"),
+            )
+        )
+    else:
+        asyncio.run(acl_route.revoke_memory_acl("m1", "user:7", user=_user("alice")))
+
+    assert cache.scan_calls == []
+    assert cache.deleted == []
+    # The visibility-epoch bump is load-bearing (MCP principal-context cache).
+    assert bumps == [1]
+
+
+def test_acl_bump_failures_stay_silent(monkeypatch):
+    # The epoch bump is best-effort: a broken epoch store must not turn an
+    # otherwise-committed grant/revoke into a 500.
     acl = _FakeAcl()
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": "eng"}, acl=acl)
     _install(monkeypatch, backend)
-    cache = _FakeCache(["mnemos:search:alice:q1", "mnemos:search:bob:q2"])
-    _install_cache(monkeypatch, cache)
-    bumps = _epoch_counter(monkeypatch)
+    _install_cache(monkeypatch, _ScanSpyCache())
 
-    asyncio.run(
+    async def _boom() -> int:
+        raise RuntimeError("epoch store down")
+
+    monkeypatch.setattr(_lc, "_vis_epoch_get_incr", _boom)
+
+    entry = asyncio.run(
         acl_route.grant_memory_acl(
             "m1",
             acl_route.AclGrantRequest(principal="user:7", perm=4),
             user=_user("alice"),
         )
     )
-    assert bumps == [1]
-    assert cache.deleted == []
+    assert entry.principal == "user:7"
 
 
-def test_revoke_bumps_visibility_epoch_and_does_not_scan(monkeypatch):
-    acl = _FakeAcl(
-        grants=[{"memory_id": "m1", "principal": "user:7", "perm": 4, "granted_by": "alice", "created_at": None}]
-    )
-    backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": "eng"}, acl=acl)
-    _install(monkeypatch, backend)
-    cache = _FakeCache(["mnemos:search:user7:q1"])
-    _install_cache(monkeypatch, cache)
-    bumps = _epoch_counter(monkeypatch)
-
-    asyncio.run(acl_route.revoke_memory_acl("m1", "user:7", user=_user("alice")))
-    assert bumps == [1]
-    assert cache.deleted == []
-
-
-def test_revoke_404_does_not_bump_epoch(monkeypatch):
-    # Nothing was removed → read visibility is unchanged → no invalidation.
+def test_revoke_404_does_not_bump_the_epoch(monkeypatch):
+    # Nothing was removed → read visibility is unchanged → no epoch bump.
     acl = _FakeAcl(grants=[])
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": "eng"}, acl=acl)
     _install(monkeypatch, backend)
-    cache = _FakeCache(["mnemos:search:alice:q1"])
+    cache = _ScanSpyCache()
     _install_cache(monkeypatch, cache)
-    bumps = _epoch_counter(monkeypatch)
+    bumps = _install_epoch_spy(monkeypatch)
 
     with pytest.raises(HTTPException):
         asyncio.run(acl_route.revoke_memory_acl("m1", "user:7", user=_user("alice")))
-    assert bumps == []
+    assert cache.scan_calls == []
     assert cache.deleted == []
+    assert bumps == []
 
 
 # --- end-to-end SQLite: a memory_acl grant widens read visibility ---------
@@ -447,3 +464,24 @@ def test_sqlite_acl_grant_widens_read_within_namespace(tmp_path):
             await backend.close()
 
     asyncio.run(_go())
+
+
+def test_design_doc_does_not_claim_a_search_cache_invalidation():
+    """The ACL design doc must describe what the routes now do.
+
+    The code no longer invalidates a per-user search cache on grant/revoke
+    (there is none), so the "Cache coherency" section must say so and must
+    name the visibility-epoch bump that replaced it. A doc that still
+    promises a ``mnemos:search:*`` sweep is drift a reader would act on.
+    """
+    import pathlib
+    import re
+
+    doc = pathlib.Path(__file__).resolve().parents[1] / "docs" / "MULTIUSER_ACL_DESIGN.md"
+    section = doc.read_text(encoding="utf-8").split("## Cache coherency", 1)[1]
+    section = section.split("\n## ", 1)[0]
+
+    assert "visibility epoch" in section
+    # A live claim would be prose like "invalidate the ... search cache";
+    # the remaining mention is explicitly a historical "there is none".
+    assert not re.search(r"invalidate the per-user\s+search cache", section)
