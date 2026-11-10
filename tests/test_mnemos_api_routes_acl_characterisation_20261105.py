@@ -34,6 +34,12 @@ counter. No network, no sleeping, no real database.
 
 from __future__ import annotations
 
+# ``logging`` is imported here on purpose: the caplog pin below
+# (test_grant_logs_the_grant_at_info_with_principal_perm_and_memory)
+# references ``logging.INFO`` and ``acl_route.logger.name`` directly, so
+# the module must bind the standard-library ``logging`` name at its top
+# level — the suite must not rely on a transitive import leaking in from
+# ``mnemos.api.routes.acl`` or any other imported module.
 import asyncio
 import datetime as _dt
 import logging
