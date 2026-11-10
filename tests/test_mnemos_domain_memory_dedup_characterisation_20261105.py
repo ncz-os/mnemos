@@ -684,9 +684,22 @@ async def test_dedup_apply_webhook_payload_untouched_when_content_is_clean_marke
         "keep_id": "mem_keep",
     }
     backend = Backend(find_groups=[[row]], webhooks=Webhooks())
-    await dedup_exact_content(backend, apply=True)
-    # Clean marker present under the current classifier: content passes through.
+    result = await dedup_exact_content(backend, apply=True)
+    # Clean marker present under the current classifier: the redaction step
+    # skips entirely (no stored spans, and the classifier verdict is CLEAN),
+    # so the outbound webhook payload carries the ORIGINAL content verbatim.
+    # Contrast the secret-spans test above, where the same call site yields
+    # "call me at 5[REDACTED]ow" — here nothing is masked.
+    assert result["deleted_count"] == 1
     assert backend.webhooks.calls[0]["payload"]["content"] == "plain text with no secret"
+    assert "[REDACTED]" not in backend.webhooks.calls[0]["payload"]["content"]
+    # Pin the boundary explicitly: the production helper the module calls
+    # leaves CLEAN-marked content untouched — same input, same output.
+    assert backend.webhooks.calls[0]["payload"]["content"] == redact_field_with_stored(
+        "plain text with no secret",
+        {SECRET_CLEAN_MARKER_KEY: clean_marker_fields(["content"])},
+        "content",
+    )
 
 
 @pytest.mark.asyncio
