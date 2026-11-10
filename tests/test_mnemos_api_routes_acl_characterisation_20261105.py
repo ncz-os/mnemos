@@ -34,12 +34,19 @@ counter. No network, no sleeping, no real database.
 
 from __future__ import annotations
 
-# ``logging`` is imported here on purpose: the caplog pin below
-# (test_grant_logs_the_grant_at_info_with_principal_perm_and_memory)
-# references ``logging.INFO`` and ``acl_route.logger.name`` directly, so
-# the module must bind the standard-library ``logging`` name at its top
-# level — the suite must not rely on a transitive import leaking in from
-# ``mnemos.api.routes.acl`` or any other imported module.
+# Top-level imports are deliberately kept in this one explicit block (and
+# re-documented here) so the suite never relies on a name leaking in from a
+# transitively imported module:
+#   * ``pytest``     — used as ``pytest.raises(...)`` in 40 pins and as
+#                      ``@pytest.fixture`` / ``pytest.fail`` throughout; a
+#                      missing import would raise NameError at collection.
+#   * ``logging``    — the caplog pins
+#                      (test_grant_logs_the_grant_at_info_with_principal_perm_and_memory
+#                      and test_revoke_logs_the_revocation_at_info)
+#                      reference ``logging.INFO`` and ``acl_route.logger.name``
+#                      directly, so this module must bind the standard-library
+#                      ``logging`` name at its top level, not inherit it from
+#                      ``mnemos.api.routes.acl``.
 import asyncio
 import datetime as _dt
 import logging
