@@ -137,3 +137,24 @@ same lines, so the merge did not and could not have introduced it.
 No code change made — the import the reviewer asks for is already present and
 correct, in the right module. Adding the reviewer's suggested line would
 import a name that does not exist and break the module for real.
+
+## Review follow-up (2026-11-10, refresh onto master b922fabb)
+
+master advanced to `b922fabb` ("merge: refresh hv/ty-mn-mnemos-domain-memory-dedup-20261105
+onto master (1dfca0dd)"), so the branch was once again no longer a fast-forward of it.
+`origin/master` was merged into the branch (`0da45720`):
+
+- **Conflicts resolved:** none. The merge was clean — master's delta over
+  `1dfca0dd` is two additive files (`VERIFY_5dff28820b26.json`,
+  `tests/test_mnemos_domain_memory_dedup_characterisation_20261105.py`), which
+  do not overlap any branch-touched path.
+- **Branch intent preserved:** every branch-owned path (the rate-limit fix,
+  its tests, config, pantheon deploy docs, verdict) is byte-identical between
+  the pre-merge tip `8b36e1ee` and the merged head.
+- **Target's newer code present:** `b922fabb` is an ancestor of the merged
+  head; `git diff b922fabb HEAD` is exactly the branch's seven own files.
+- **Note on the target itself:** `b922fabb` is the merge of the
+  dedup-characterisation branch (first parent `6d6c3f86`) with `1dfca0dd`
+  (second parent). Its tree therefore carries the two dedup-characterisation
+  files as the only delta over `1dfca0dd` — no source-code change was lost or
+  duplicated by this refresh.
