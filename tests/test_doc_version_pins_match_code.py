@@ -479,7 +479,7 @@ _DSN_WITH_PASSWORD = re.compile(
 _PLACEHOLDER_PW = frozenset({
     "pass", "PASS", "password", "PASSWORD", "passwd", "secret", "SECRET",
     "yourpassword", "your_password", "changeme", "CHANGEME", "xxx", "XXX",
-    "mypassword", "hunter2", "REDACTED", "placeholder",
+    "mypassword", "hunter2", "REDACTED", "placeholder", "...",
 })
 
 
@@ -490,8 +490,8 @@ def test_no_internal_infrastructure_detail_in_docs():
     Unlike the currency guard, this one covers docs/history/ too: the
     archive is just as public as the rest of the tree.
 
-    Placeholder DSNs are fine — `<password>`, `$PGPASSWORD`, and `${VAR}`
-    forms are all excluded.
+    Placeholder DSNs are fine — `<password>`, `$PGPASSWORD`, `${VAR}`,
+    and `...` password tokens are all excluded.
     """
     bad: list[str] = []
     for md in sorted(REPO.rglob("*.md")):
