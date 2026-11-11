@@ -24,6 +24,20 @@ class DocumentChunkSoftDeletedConflictError(ValueError):
     """Raised when a chunk key matches a soft-deleted memory."""
 
 
+def _metadata_obj(metadata_json: str) -> dict[str, Any]:
+    """Decode persisted chunk metadata for the import outcome.
+
+    ``import_chunk`` serialises the classified metadata itself, so this
+    round-trip is well-formed; an unparsable blob degrades to the empty dict
+    rather than failing a write that already committed.
+    """
+    try:
+        decoded = json.loads(metadata_json) if metadata_json else {}
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
 @dataclass(frozen=True)
 class ImportedDocumentChunk:
     """Result of one document-import chunk write.
@@ -34,8 +48,9 @@ class ImportedDocumentChunk:
     effects describing the stored row -- notably the ``memory.created``
     webhook -- must use these rather than the pre-classification inputs, or
     they will leak raw credentials and the pre-vault namespace to an external
-    endpoint (F2, 2026-11-06). ``metadata`` is ``None`` only when the caller
-    did not classify (the legacy-resolution path, which emits no event).
+    endpoint (MN-02 / CF-05, SEC F2.4). ``metadata`` is ``None`` only when the
+    caller did not classify (the legacy-resolution path, which emits no
+    event).
     """
 
     memory_id: str
@@ -205,6 +220,8 @@ class DocumentRepository:
             legacy_id = None
 
         if legacy_id is not None:
+            # Legacy resolution reuses an EXISTING row; its stored metadata is
+            # authoritative and ``classified.metadata`` above was never written.
             return ImportedDocumentChunk(memory_id=str(legacy_id), emit_created_event=False)
 
         canonical_id = await conn.fetchval(
@@ -232,7 +249,16 @@ class DocumentRepository:
             raise DocumentChunkSoftDeletedConflictError(
                 "Document chunk matches a soft-deleted memory; restore it before retrying this import"
             )
-        return ImportedDocumentChunk(memory_id=str(canonical_id))
+        # Report what the INSERT actually persisted. ``metadata_json`` here is
+        # already the CLASSIFIED payload (import_chunk serialised it) and
+        # ``namespace`` is the post-classification value, so decoding the
+        # round-trip reflects the stored row on every backend, not just the
+        # ones that hand back the classifier's object.
+        return ImportedDocumentChunk(
+            memory_id=str(canonical_id),
+            metadata=_metadata_obj(metadata_json),
+            namespace=namespace,
+        )
 
 
 async def _write_document_import_audit_entry(

@@ -44,6 +44,16 @@ class DedupGroup:
 
 
 def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    """Read ``key`` from a mapping, ``.get``-row, or sequence.
+
+    Contract: only ``None`` is replaced by the default (so a column that is
+    SQL NULL behaves like an absent column); every other value — including
+    genuinely falsy ``0``/``""``/``[]``/``False`` — passes through untouched.
+    For a raw string row, index lookup (``IndexError``) and ``.get``
+    (``AttributeError``) both fail and the default is returned; callers that
+    need string-row semantics (``_memory_ids_from_row``) read the value
+    directly instead of routing through this helper.
+    """
     try:
         value = row[key]
     except (KeyError, IndexError, TypeError):
@@ -55,6 +65,23 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
 
 
 def _memory_ids_from_row(row: Any) -> list[str]:
+    """Extract the group's memory ids from a duplicate-content row.
+
+    Every backend (sqlite/postgres/oracle/db2/mysql/mariadb) already
+    normalises ``memory_ids`` to a list of id strings in
+    ``find_duplicate_content_groups``; a raw string row carrying a
+    ``\\x1f``-joined column (GROUP_CONCAT/LISTAGG/ARRAY shapes) is still
+    handled here. Two rules:
+
+    * a raw string ROW is handled directly — ``_row_get`` cannot look a key
+      up inside a str, so this reads the string itself;
+    * a ``\\x1f``-joined value is split keeping ALL non-empty parts. The
+      filter removes only genuinely empty segments (double separators,
+      leading/trailing ``\\x1f``), never a present id: memory ids are opaque
+      strings, so the string ``"0"`` is a valid id and must survive.
+    """
+    if isinstance(row, str):
+        return [part for part in row.split("\x1f") if part]
     raw = _row_get(row, "memory_ids", [])
     if isinstance(raw, str):
         return [part for part in raw.split("\x1f") if part]
@@ -99,6 +126,12 @@ async def _maybe_write_delete_audit(backend: Any, tx: Any, row: Any, memory_id: 
 
     if audit_chain_enabled() and supports_journal(tx):
         row = await fetch_audit_snapshot(tx, memory_id)
+    # Best-effort by design: ``write_configured_audit_entry`` swallows audit
+    # write failures and logs them (``logger.exception``) in the default
+    # ``MNEMOS_AUDIT_CHAIN=on`` mode, so a failed audit write never rolls
+    # back the soft delete. Only ``MNEMOS_AUDIT_CHAIN=required`` propagates
+    # ``AuditChainContinuityError`` so the data write rolls back with the
+    # failed chain write. See mnemos/audit/route_helper.py.
     await write_configured_audit_entry(
         backend,
         tx,
@@ -114,26 +147,34 @@ async def _dispatch_delete_side_effects(
 ) -> tuple[list[str], list[tuple[str, dict[str, Any], str]]]:
     delivery_ids: list[str] = []
     if getattr(backend, "supports_webhooks", False):
-        delivery_ids = await backend.webhooks.dispatch_event(
-            tx,
-            "memory.deleted",
-            {
-                "memory_id": _row_get(row, "id"),
-                "category": _row_get(row, "category"),
-                "subcategory": _row_get(row, "subcategory"),
-                # F3: span-redact outbound webhook content (prefer stored ingest
-                # spans, else recompute) — raw secrets must not leave the server.
-                "content": redact_field_with_stored(
-                    _row_get(row, "content"),
-                    _row_get(row, "metadata"),
-                    "content",
-                ),
-                "owner_id": _row_get(row, "owner_id"),
-                "namespace": _row_get(row, "namespace"),
-            },
-            owner_id=_row_get(row, "owner_id"),
-            namespace=_row_get(row, "namespace"),
-        )
+        # dispatch_event's contract (mnemos/persistence/base.py) is
+        # ``list[WebhookDeliveryIntent]``; callers correlate on the
+        # delivery_id, not the dataclass repr (the same extraction
+        # mnemos/api/routes/memories.py performs).
+        delivery_ids = [
+            intent.delivery_id
+            for intent in await backend.webhooks.dispatch_event(
+                tx,
+                "memory.deleted",
+                {
+                    "memory_id": _row_get(row, "id"),
+                    "category": _row_get(row, "category"),
+                    "subcategory": _row_get(row, "subcategory"),
+                    # F3: span-redact outbound webhook content (prefer stored
+                    # ingest spans, else recompute) — raw secrets must not
+                    # leave the server.
+                    "content": redact_field_with_stored(
+                        _row_get(row, "content"),
+                        _row_get(row, "metadata"),
+                        "content",
+                    ),
+                    "owner_id": _row_get(row, "owner_id"),
+                    "namespace": _row_get(row, "namespace"),
+                },
+                owner_id=_row_get(row, "owner_id"),
+                namespace=_row_get(row, "namespace"),
+            )
+        ]
 
     namespace = _row_get(row, "namespace")
     # CF-35/MN-17: shared encoder — "a.b" and "a_b" must not share a subject.
@@ -213,7 +254,9 @@ async def dedup_exact_content(backend: Any, *, namespace: str | None = None, app
                     deleted_count += 1
                     await _maybe_write_delete_audit(backend, tx, row, duplicate_id)
                     item_delivery_ids, item_nats_intents = await _dispatch_delete_side_effects(backend, tx, row)
-                    delivery_ids.extend(str(item) for item in item_delivery_ids)
+                    # item_delivery_ids already carry the delivery_id strings
+                    # (the helper extracts them from the intents).
+                    delivery_ids.extend(item_delivery_ids)
                     nats_intents.extend(item_nats_intents)
     return {
         "apply": apply,
