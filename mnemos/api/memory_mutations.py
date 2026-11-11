@@ -176,19 +176,15 @@ async def _publish_bulk_created_events(events: list[dict], source_node: str) -> 
 async def _invalidate_caches_after_mutation() -> None:
     """Invalidate read-side caches after any memory write.
 
-    The per-user SEARCH cache is gone: it was wired to ``_lc._cache``,
-    which the lifecycle hard-wires to ``None`` (no Redis in the
-    runtime), so every read missed and every write went nowhere. With
-    it goes the ``SCAN MATCH "mnemos:search:*"`` invalidation sweep
-    that only ever matched keys of a cache that never existed.
-
     The ``/stats`` cache entry (``stats:global:v2``) is still dropped:
-    it belongs to the stats surface, not the search surface.
+    it belongs to the stats surface, not the search surface. There is no
+    cached search response to evict — ``_lc._cache`` is hard-wired to
+    ``None`` (no Redis in the runtime) and the search handler reads no
+    cache.
 
     The visibility epoch is STILL bumped here: the MCP
     principal-context cache (role / namespace — authorization inputs)
-    subscribes to it, so a revoke must advance the epoch even though
-    search no longer reads one.
+    subscribes to it, so a revoke must advance the epoch.
     """
     if _lc._cache:
         try:
