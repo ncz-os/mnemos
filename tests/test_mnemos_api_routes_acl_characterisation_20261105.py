@@ -34,6 +34,24 @@ counter. No network, no sleeping, no real database.
 
 from __future__ import annotations
 
+# Top-level imports are deliberately kept in this one explicit block (and
+# re-documented here) so the suite never relies on a name leaking in from a
+# transitively imported module. Each line below is load-bearing — removing
+# any of them turns the next test run into a NameError:
+#   * ``pytest``          — used as ``pytest.raises(...)`` in 40 pins and as
+#                           ``@pytest.fixture`` / ``pytest.fail`` throughout.
+#   * ``HTTPException``   — imported from ``fastapi`` (the framework the
+#                           ``acl_route`` module itself targets) and used in
+#                           ``pytest.raises(HTTPException)`` pins that assert
+#                           the 403/404/422/503 status codes the routes raise.
+#   * ``logging``         — the caplog pins
+#                           (test_grant_logs_the_grant_at_info_with_principal_perm_and_memory
+#                           and test_revoke_logs_the_revocation_at_info)
+#                           reference ``logging.INFO`` and
+#                           ``acl_route.logger.name`` directly, so this module
+#                           must bind the standard-library ``logging`` name at
+#                           its top level, not inherit it from
+#                           ``mnemos.api.routes.acl``.
 import asyncio
 import datetime as _dt
 import logging
@@ -482,6 +500,10 @@ def test_iso_falls_back_to_str_for_integers():
 
 
 def test_iso_ignores_a_non_callable_isoformat_attribute():
+    # _iso guards with callable(getattr(value, "isoformat", None)) BEFORE
+    # invoking it: an object carrying a non-callable ``isoformat`` attribute
+    # must fall through to the ``str(value)`` fallback instead of raising
+    # ``TypeError: 'str' object is not callable``.
     class _Weird:
         isoformat = "not callable"
 
@@ -912,6 +934,10 @@ def test_grant_returns_the_repository_row_not_the_request(monkeypatch):
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": None}, acl=acl)
     entry = _grant(monkeypatch, backend, memory_id="requested")
     assert entry.memory_id == "m-canonical"
+    # AclEntry.created_at is declared Optional[str]: _to_entry normalises
+    # the repository row's datetime through _iso (isoformat()), so the
+    # response field is an ISO-8601 string, never a datetime object.
+    assert isinstance(entry.created_at, str)
     assert entry.created_at == "2026-11-05T09:00:00"
 
 
@@ -1011,13 +1037,19 @@ def test_grant_bumps_the_visibility_epoch_even_without_a_cache(monkeypatch):
 
 
 def test_grant_returns_the_entry_even_when_the_epoch_bump_raises(monkeypatch):
-    # _invalidate_search_caches_after_acl_change swallows epoch errors.
+    # _invalidate_search_caches_after_acl_change swallows epoch errors, so
+    # the response is still built from the grant_acl row. The entry's
+    # principal must be the one the fake repository row carries (the
+    # default _FakeAcl.grant_row echoes back the request's principal,
+    # "group:research" from _grant's default) — NOT the grant's caller
+    # ("alice"), which is only stamped into granted_by.
     backend = _FakeBackend(memory_row={"owner_id": "alice", "group_id": None})
     _install_cache(monkeypatch, _FakeCache())
     _install_epoch(monkeypatch, _FakeEpoch(raises=True))
 
     entry = _grant(monkeypatch, backend)
     assert entry.principal == "group:research"
+    assert entry.granted_by == "alice"
 
 
 def test_grant_logs_the_grant_at_info_with_principal_perm_and_memory(monkeypatch, caplog):
