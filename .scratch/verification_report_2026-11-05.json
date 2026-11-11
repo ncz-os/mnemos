@@ -1,0 +1,23 @@
+{
+  "task": "read-only verification of 009d5262c284",
+  "head_sha": "009d5262c284",
+  "tests_base": {
+    "ref": "master (origin/master = 782ed312)",
+    "command": "pytest tests/ -q --ignore=tests/test_live_e2e.py",
+    "passed": 5853,
+    "failed": 0,
+    "skipped": 574,
+    "xfailed": 2,
+    "xpassed": 3
+  },
+  "tests_head": {
+    "ref": "009d5262c284",
+    "command": "pytest tests/ -q --ignore=tests/test_live_e2e.py",
+    "passed": 5803,
+    "failed": 0,
+    "skipped": 574,
+    "xfailed": 3,
+    "xpassed": 3
+  },
+  "notes": "First head run showed 1 failed (test_the_accessor_keeps_its_old_name_only_as_the_renamed_one) — caused by the ephemeral origin/master worktree still existing in-repo; passes cleanly once removed. No code changes; nothing committed to the branch; branch untouched at 7e94c10c83c0894e9b09b02d1288ef7183d9d478, clean and remote-verified."
+}
