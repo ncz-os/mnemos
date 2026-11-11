@@ -625,14 +625,15 @@ async def import_memories_from_document(
                         # mask content and report the post-classification
                         # namespace. Sending chunk["content"] / user.namespace
                         # leaked raw credentials and the pre-vault namespace to an
-                        # external HTTP endpoint. Trust the stored value only:
-                        # import_chunk always returns the post-classification
-                        # namespace for a chunk that emits this event (a vaulted
-                        # chunk is "vault"), so falling back to user.namespace
-                        # here would reintroduce the leak. Fail closed -- skip
-                        # the webhook rather than publish the pre-vault
-                        # namespace. The chunk is already committed, so raising
-                        # would discard a successful import over a delivery-time
+                        # external HTTP endpoint (MN-02 / CF-05, SEC F2.4).
+                        # Trust the stored value only: import_chunk always
+                        # returns the post-classification namespace for a
+                        # chunk that emits this event (a vaulted chunk is
+                        # "vault"), so falling back to user.namespace here
+                        # would reintroduce the leak. Fail closed -- skip the
+                        # webhook rather than publish the pre-vault namespace.
+                        # The chunk is already committed, so raising would
+                        # discard a successful import over a delivery-time
                         # fault.
                         stored_namespace = imported.namespace
                         if stored_namespace is None:

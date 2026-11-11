@@ -451,6 +451,78 @@ def test_every_sqlite_migration_list_entry_exists_on_disk():
     assert not missing, f"SQLite migration entries reference files that don't exist: {missing}."
 
 
+def _extract_docker_compose_upgrade_psql_args(compose_path: Path) -> tuple[list[str], list[str]]:
+    """Return ``(mounted, applied)`` for the ``postgres-upgrade`` service.
+
+    ``mounted`` is the ordered list of ``/migrations/NN-name.sql`` targets the
+    service bind-mounts; ``applied`` is the ordered list of the same paths as
+    they appear after ``-f`` in the ``psql`` command line. Both are the
+    container-side paths, so a mismatch is directly meaningful: a mount that
+    no ``-f`` references is SQL that ships but never runs against an existing
+    volume (MN-23).
+    """
+    import re
+
+    text = compose_path.read_text()
+    # Isolate the postgres-upgrade service block: from its key to the next
+    # two-space-indented sibling service key.
+    try:
+        block = text.split("\n  postgres-upgrade:", 1)[1]
+    except IndexError as exc:
+        raise AssertionError(f"{compose_path} has no postgres-upgrade service") from exc
+    block = re.split(r"\n  [a-zA-Z0-9_.-]+:", block, maxsplit=1)[0]
+
+    # `- ./mnemos/db_migrations/<file>:<target>[:ro]` -> `<target>`.
+    # split(":", 2)[1] is the target field, so an optional `:ro` suffix on the
+    # mount never reaches the comparison against the `-f` paths.
+    mounted: list[str] = []
+    for line in block.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("- ./mnemos/db_migrations/"):
+            continue
+        if "/migrations/" not in stripped:
+            continue
+        mounted.append(stripped.split(":", 2)[1])
+    applied = re.findall(r"-f\s+(/migrations/\S+?\.sql)", block)
+    return mounted, applied
+
+
+def test_compose_upgrade_applies_every_mounted_migration():
+    """MN-23: the ``-f`` list must not stop short of what is mounted.
+
+    The upgrade service bind-mounts each Postgres migration into
+    ``/migrations/NN-name.sql`` and then ``psql -f`` each one in order.
+    Docker does not care whether a mounted file is referenced, so a mount can
+    exist with no matching ``-f``: the migration ships in the image context but
+    never runs against an already-initialized volume. The audit found the list
+    stopped at ``73-memory-tags.sql`` while ``74-api-keys-key-prefix.sql`` and
+    ``75-memory-index-hygiene.sql`` were mounted — meaning ``api_keys.key_prefix``
+    and the ``(updated, id)``/``(namespace, created DESC)`` indexes were missing
+    on every upgraded database.
+
+    ``test_docker_compose_migration_lists_match_installer`` only checks the
+    ``docker-entrypoint-initdb.d`` *mount* list (fresh volumes); it never looked
+    at the ``-f`` arguments, which is how the gap survived. This pins the two
+    lists together for both compose files, in order.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    for compose_name in ("docker-compose.yml", "docker-compose.staging.yml"):
+        mounted, applied = _extract_docker_compose_upgrade_psql_args(repo_root / compose_name)
+        assert mounted, f"{compose_name}: no /migrations/ mounts found for postgres-upgrade"
+        assert applied, f"{compose_name}: no `-f` migrations found for postgres-upgrade"
+        unapplied = [path for path in mounted if path not in applied]
+        assert not unapplied, (
+            f"{compose_name}: postgres-upgrade mounts these migrations but never "
+            f"applies them with `-f` (they are skipped on an existing volume): "
+            f"{unapplied}"
+        )
+        assert mounted == applied, (
+            f"{compose_name}: postgres-upgrade `-f` order/list has drifted from "
+            f"its mounts.\n  mounted ({len(mounted)}): {mounted}\n"
+            f"  applied ({len(applied)}): {applied}"
+        )
+
+
 def _extract_docker_compose_migrations(compose_path: Path) -> list[str]:
     """Pull migration filenames from docker-compose volume
     mounts. Each mount looks like:

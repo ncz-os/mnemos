@@ -1,0 +1,160 @@
+# Refresh record — `hv/bl-mn-14-20261107` onto `master` (046fcd1f)
+
+**Date:** 2026-11-09
+**Branch:** `hv/bl-mn-14-20261107`
+**Target:** `origin/master` @ `046fcd1fc542`
+**Merge commit:** `3578dd74` (`d5fe719c` + `046fcd1f`)
+**Task:** MN-14 / CF-23 — rate limit trusted the left-most `X-Forwarded-For`
+
+## Why this refresh
+
+The branch was reviewed and approved at `85ba0384` and then refreshed onto
+`450dcf52` (`fc162967`). `master` has since advanced to `046fcd1fc542`, so the
+branch was once again no longer a fast-forward of it.
+
+## What was refreshed
+
+`origin/master` was merged into the branch (`3578dd74`):
+
+- **Conflicts resolved:** none. The recipe merged cleanly — the branch's
+  touched files (`mnemos/core/rate_limit.py`, `mnemos/core/config.py`,
+  `tests/test_rate_limit_trusted_proxy_hops.py`, `deploy/pantheon/*`) do not
+  overlap master's newer work (CF-22 `/v1/audit/proof` cross-tenant oracle,
+  MN-05 CF-09 deletion fence on bulk/import paths, deletion-log
+  characterisation).
+- **Branch intent preserved:** each of the branch-touched source and test
+  paths is byte-identical between the pre-merge branch tip `d5fe719c` and the
+  merged head — the trusted-XFF-hop fix and its 12 regression tests survived
+  unchanged.
+- **Target's newer code present:** `046fcd1fc542` is an ancestor of the merged
+  head, and `git diff origin/master HEAD` is exactly the branch's own change
+  (7 files: the fix, its tests, the pantheon deploy note, the review verdict
+  and this record). No master-side path was reverted.
+
+## Test evidence
+
+Repository suite: `python3 -m pytest tests/ --ignore=tests/test_live_e2e.py`
+(the externally-gated `tests/integration_nats` / `tests/integration_patroni`
+suites are not part of `make test`).
+
+| Tree | Result |
+|---|---|
+| branch head `929c7258` (pre-merge) | 70 failed, 6257 passed, 576 skipped, 42 errors |
+| merged head `3578dd74` (post-merge) | 70 failed, 6307 passed, 576 skipped, 42 errors |
+
+The failing/erroring node-id sets are **identical** (112 ids on each side,
+empty symmetric difference) — failures did not grow versus the target. The 50
+extra passes are the target's own new tests brought in by the merge.
+`tests/test_rate_limit_trusted_proxy_hops.py` passes 12/12, and
+`scripts/check_abc_first_guard.py` (the `lint:abc-first` ratchet) passes.
+Remaining failures are pre-existing environment issues on `master`.
+
+## Delivery
+
+The same head branch was pushed to ARGONAS (the canonical private bare repo);
+local HEAD, `origin` and `argonas` refs agree.
+
+## Review follow-up (2026-11-09, post-merge re-review)
+
+A re-review of the merge raised one [high] finding against
+`mnemos/domain/portability/import_.py`:
+
+> `preflight_import_scope_fence` calls `assert_no_active_deletion_for_scopes`,
+> but the module does not import it — `NameError`, fence never executes.
+
+**Not reproducible on any revision in this branch's history, and not a defect
+in the merged tree.** The module has imported both names since before this
+refresh:
+
+- `mnemos/domain/portability/import_.py:14` — `from mnemos.core.security import is_root`
+- `mnemos/domain/portability/import_.py:15` — `from mnemos.domain.deletion_fence import assert_no_active_deletion_for_scopes`
+
+Line 15 is `ca391c9c` (MN-05, the commit that introduced the fence call); line
+14 predates it. Identical lines are present in `origin/master` and in the
+pre-merge branch tip, so the merge could not have introduced the problem.
+
+Evidence gathered rather than asserted:
+
+- `import mnemos.domain.portability.import_` succeeds and both names resolve
+  to the expected callables (`deletion_fence.py:69`, `security.py:42`).
+- An AST scan of the module reports **no** unresolved global name.
+- `git blame` on the import block shows the binding and its use originate in
+  the same commit (`ca391c9c`).
+- `tests/test_deletion_fence_bulk_and_import_paths.py` passes 12/12, and those
+  tests drive `preflight_import_scope_fence` — a `NameError` there would fail
+  them.
+
+No code change was made: adding a second, duplicate import of names that are
+already imported would be an edit manufactured to satisfy a report rather than
+a fix. The reviewer's "required next step" is already satisfied verbatim by the
+existing line 15.
+
+Re-ran the full suite after the merge: 70 failed, 6307 passed, 576 skipped,
+42 errors — the same 112 failing/erroring node ids as the pre-refresh
+baseline, empty symmetric difference. No regression.
+
+## Review follow-up, round 2 (2026-11-09)
+
+A second re-review raised a further [high] finding against the same file:
+
+> `_target_scopes` annotates its parameter `MPFEnvelope`, but the module does
+> not import it — `NameError` at import time. Suggested fix: add
+> `from mnemos.persistence.base import MPFEnvelope`.
+
+**Also not reproducible, and the suggested fix would itself be wrong.**
+`MPFEnvelope` is imported on **line 35** from `.schemas`:
+
+```python
+from .schemas import (
+    MEMORY_PAYLOAD_VERSION,
+    MPF_VERSION_PREFIX,
+    MPF_VERSION_PREFIX_V0_2,
+    ImportStats,
+    MPFEnvelope,
+)
+```
+
+`mnemos/domain/portability/schemas.py:49` is where the class is *defined*.
+`mnemos/persistence/base.py` contains no `MPFEnvelope` at all, so the
+reviewer's proposed import would raise `ImportError` — a genuine breakage
+in place of a non-existent one.
+
+Evidence, re-run:
+
+- `import mnemos.domain.portability.import_` succeeds; `MPFEnvelope` resolves
+  in the module globals to `mnemos.domain.portability.schemas.MPFEnvelope`.
+- `typing.get_type_hints()` resolves cleanly for `_target_scopes`,
+  `_validate_import_request` and `import_memories`.
+- All 10 modules in `mnemos/domain/portability/` import without error, and so
+  does the route module that calls the fence (`api/routes/portability`).
+- An AST scan of the whole package finds no unresolved global name.
+- The three fence/audit test files pass 49/49; the full suite is unchanged at
+  70 failed / 6307 passed / 42 errors with the same 112 node ids as baseline.
+
+Both parents (`origin/master`, `d5fe719c`) already carried this import on the
+same lines, so the merge did not and could not have introduced it.
+
+No code change made — the import the reviewer asks for is already present and
+correct, in the right module. Adding the reviewer's suggested line would
+import a name that does not exist and break the module for real.
+
+## Review follow-up (2026-11-10, refresh onto master b922fabb)
+
+master advanced to `b922fabb` ("merge: refresh hv/ty-mn-mnemos-domain-memory-dedup-20261105
+onto master (1dfca0dd)"), so the branch was once again no longer a fast-forward of it.
+`origin/master` was merged into the branch (`0da45720`):
+
+- **Conflicts resolved:** none. The merge was clean — master's delta over
+  `1dfca0dd` is two additive files (`VERIFY_5dff28820b26.json`,
+  `tests/test_mnemos_domain_memory_dedup_characterisation_20261105.py`), which
+  do not overlap any branch-touched path.
+- **Branch intent preserved:** every branch-owned path (the rate-limit fix,
+  its tests, config, pantheon deploy docs, verdict) is byte-identical between
+  the pre-merge tip `8b36e1ee` and the merged head.
+- **Target's newer code present:** `b922fabb` is an ancestor of the merged
+  head; `git diff b922fabb HEAD` is exactly the branch's seven own files.
+- **Note on the target itself:** `b922fabb` is the merge of the
+  dedup-characterisation branch (first parent `6d6c3f86`) with `1dfca0dd`
+  (second parent). Its tree therefore carries the two dedup-characterisation
+  files as the only delta over `1dfca0dd` — no source-code change was lost or
+  duplicated by this refresh.
