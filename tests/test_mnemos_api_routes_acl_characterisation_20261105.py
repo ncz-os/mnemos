@@ -998,7 +998,7 @@ def test_grant_allows_a_group_admin(monkeypatch):
 
 
 def test_grant_does_not_touch_the_cache_even_when_one_is_configured(monkeypatch):
-    # Master (7.1.1) removed the SCAN MATCH "mnemos:search:*" sweep: there is
+    # Master (7.1.1) removed the dead "mnemos:search:*" sweep (CF-24): there is
     # no per-user search cache to drop (the lifecycle hard-wires _lc._cache to
     # None and the search handler stopped reading a cache). The route must
     # never consult the cache object even if a fake one is installed.
