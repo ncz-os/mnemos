@@ -21,6 +21,7 @@ import asyncio
 import datetime as dt
 import decimal
 import json
+import re
 import sys
 import time
 import uuid
@@ -73,6 +74,45 @@ def ora_columns(cur, table: str) -> dict[str, str]:
 def qi(name: str) -> str:
     """A double-quoted SQL identifier (embedded quotes doubled)."""
     return '"' + name.replace('"', '""') + '"'
+
+
+# A Postgres identifier as accepted in ``--drop-constraints``: unquoted
+# letters/digits/underscore (cannot start with a digit) plus the $
+# continuation character Postgres allows. Anything else -- a dot, a quoting
+# character, whitespace, ``;`` -- is refused rather than quoted, so an
+# operator typo cannot silently target a different (or a multi-part) name.
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def parse_drop_constraint(spec: str) -> tuple[str, str]:
+    """``table.constraint`` -> ``(table, constraint)``; ValueError otherwise.
+
+    ``--drop-constraints`` is operator input, so it is validated as a strict
+    two-part ``table.constraint`` pair before either part reaches
+    ``ALTER TABLE``. ``qi`` already makes identifier-based injection
+    impossible, but it would ALSO happily quote ``"a.b"`` / ``"x y"`` /
+    ``"t; DROP"`` as one legal identifier, and ``spec.split(".", 1)`` alone
+    turns a missing dot into an unhandled ``ValueError`` from ``main``. Both
+    are operator errors that deserve a message naming the offending spec.
+    """
+    spec = spec.strip()
+    table, dot, cname = spec.partition(".")
+    if not dot or not table or not cname:
+        raise ValueError(
+            f"--drop-constraints entry {spec!r} is not 'table.constraint'"
+        )
+    for part, label in ((table, "table"), (cname, "constraint")):
+        if not _IDENT_RE.match(part):
+            raise ValueError(
+                f"--drop-constraints entry {spec!r} has an invalid {label} "
+                f"name {part!r} (expected an unquoted identifier)"
+            )
+    return table, cname
+
+
+def drop_constraint_specs(raw: str) -> list[tuple[str, str]]:
+    """Parse the whole ``--drop-constraints`` argument (comma-separated)."""
+    return [parse_drop_constraint(s) for s in raw.split(",") if s.strip()]
 
 
 def to_json_text(v):
@@ -303,16 +343,22 @@ async def main() -> int:
     ap.add_argument("--drop-constraints", default="", help="table.constraint,... dropped on the target before loading")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
+    # Validate --drop-constraints BEFORE connecting: a malformed entry is an
+    # operator error, and finding it mid-run would already have TRUNCATEd the
+    # target's first table.
+    try:
+        drop_specs = drop_constraint_specs(a.drop_constraints)
+    except ValueError as exc:
+        ap.error(str(exc))
     ocon = ora_connect(a.oracle)
     ocur = ocon.cursor()
     import asyncpg
 
     conn = await asyncpg.connect(a.pg)
-    for spec in [c for c in a.drop_constraints.split(",") if c]:
-        table, cname = spec.split(".", 1)
+    for table, cname in drop_specs:
         if not a.dry_run:
             await conn.execute(f"ALTER TABLE {qi(table)} DROP CONSTRAINT IF EXISTS {qi(cname)}")
-        print(json.dumps({"dropped_constraint": spec, "dry_run": a.dry_run}), flush=True)
+        print(json.dumps({"dropped_constraint": f"{table}.{cname}", "dry_run": a.dry_run}), flush=True)
     await conn.execute("SET session_replication_role = replica")  # bulk load: FK/trigger order does not matter
     if a.target == "hive":
         pairs = list(HIVE_MAP.items())

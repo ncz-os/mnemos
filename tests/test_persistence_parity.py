@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import json
 import uuid
@@ -1676,3 +1677,69 @@ def test_sqlite_migration_files_are_nonempty():
     for name in sqlite_persistence.SQLITE_MIGRATION_FILES:
         path = os.path.join(sqlite_dir, name)
         assert os.path.getsize(path) > 0
+
+
+def _scan_spy_cache() -> Any:
+    """A fake cache that records SCAN use and fails nothing.
+
+    ``_lc._cache`` is hard-wired to ``None`` (no Redis in the runtime), so the
+    ``SCAN MATCH "mnemos:search:*"`` invalidation sweep that outlived the
+    search cache only ever matched keys of a cache that never existed. A route
+    must not reach for ``scan_iter`` at all.
+    """
+
+    class ScanSpy:
+        def __init__(self) -> None:
+            self.scan_calls: list[dict] = []
+            self.deleted: list[str] = []
+
+        async def scan_iter(self, *, match: str, count: int):
+            self.scan_calls.append({"match": match, "count": count})
+            yield  # pragma: no cover — keeps this an async generator
+
+        async def delete(self, key: str) -> None:
+            self.deleted.append(key)
+
+    return ScanSpy()
+
+
+def test_admin_read_cache_invalidation_never_scans_search_cache(monkeypatch):
+    """M4 residual: the PERSEPHONE/compression invalidation helper.
+
+    It still drops the ``/stats`` entry (``stats:global:v2`` — the stats
+    surface, not the search surface) and still bumps the visibility epoch,
+    but the ``SCAN MATCH "mnemos:search:*"`` loop it used to run is gone.
+    """
+    from unittest.mock import AsyncMock
+
+    from mnemos.api.routes import admin as admin_route
+
+    cache = _scan_spy_cache()
+    monkeypatch.setattr(lifecycle, "_cache", cache)
+    epoch_bumps: list[int] = []
+    monkeypatch.setattr(
+        lifecycle,
+        "_vis_epoch_get_incr",
+        AsyncMock(side_effect=lambda: epoch_bumps.append(1) or 0),
+    )
+
+    asyncio.run(admin_route._invalidate_memory_read_caches())
+
+    assert cache.scan_calls == []
+    assert cache.deleted == ["stats:global:v2"]
+    assert epoch_bumps == [1]
+
+
+def test_acl_default_cache_is_disabled():
+    """``conftest``/lifecycle neutrality: no Redis-backed search cache exists.
+
+    Pins the premise the removals rest on: there is no code path that
+    populates ``lifecycle._cache`` with a Redis client, so any search-cache
+    invalidation loop is unreachable in production.
+    """
+    import inspect
+
+    from mnemos.core import lifecycle as lifecycle_module
+
+    source = inspect.getsource(lifecycle_module.lifespan)
+    assert "app.state.cache = None" in source
