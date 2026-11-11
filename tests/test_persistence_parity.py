@@ -296,14 +296,13 @@ async def _ensure_user(case: BackendCase, tx: Any, user_id: str, namespace: str 
             user_id,
             user_id,
             namespace,
-            sqlite_sql=("INSERT OR IGNORE INTO users (id, username, role, namespace) " "VALUES (?, ?, 'user', ?)"),
+            sqlite_sql=("INSERT OR IGNORE INTO users (id, username, role, namespace) VALUES (?, ?, 'user', ?)"),
         )
     else:
         await _raw_execute(
             case,
             tx,
-            "INSERT INTO users (id, username, role, namespace) VALUES ($1, $2, 'user', $3) "
-            "ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO users (id, username, role, namespace) VALUES ($1, $2, 'user', $3) ON CONFLICT (id) DO NOTHING",
             user_id,
             user_id,
             namespace,
@@ -1680,12 +1679,11 @@ def test_sqlite_migration_files_are_nonempty():
 
 
 def _scan_spy_cache() -> Any:
-    """A fake cache that records SCAN use and fails nothing.
+    """A fake cache that records deletes and proves SCAN is never reached.
 
-    ``_lc._cache`` is hard-wired to ``None`` (no Redis in the runtime), so the
-    ``SCAN MATCH "mnemos:search:*"`` invalidation sweep that outlived the
-    search cache only ever matched keys of a cache that never existed. A route
-    must not reach for ``scan_iter`` at all.
+    ``_lc._cache`` is hard-wired to ``None`` (no Redis in the runtime), so
+    the dead ``mnemos:search:*`` invalidation sweeps that once ran against
+    it are gone (CF-24). A route must not reach for ``scan_iter`` at all.
     """
 
     class ScanSpy:
@@ -1704,11 +1702,11 @@ def _scan_spy_cache() -> Any:
 
 
 def test_admin_read_cache_invalidation_never_scans_search_cache(monkeypatch):
-    """M4 residual: the PERSEPHONE/compression invalidation helper.
+    """The PERSEPHONE/compression invalidation helper (CF-24).
 
-    It still drops the ``/stats`` entry (``stats:global:v2`` — the stats
-    surface, not the search surface) and still bumps the visibility epoch,
-    but the ``SCAN MATCH "mnemos:search:*"`` loop it used to run is gone.
+    It drops the ``/stats`` entry (``stats:global:v2`` — the stats
+    surface, not the search surface) and bumps the visibility epoch, but
+    the dead ``mnemos:search:*`` SCAN loop is gone (CF-24).
     """
     from unittest.mock import AsyncMock
 

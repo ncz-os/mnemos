@@ -24,14 +24,11 @@ Run it first: it must FAIL on the base commit where the dead machinery
 still sits, and PASS once the loops and helpers are deleted.
 """
 
-import asyncio
 import inspect
-import pathlib
 from unittest.mock import AsyncMock
 
 import pytest
 
-from mnemos import api as mnemos_api
 from mnemos.api import memory_mutations
 from mnemos.api.routes import admin as admin_route
 from mnemos.api.routes import acl as acl_route
@@ -55,11 +52,7 @@ def _source_of(module, name: str) -> str:
     src = inspect.getsource(obj)
     # Strip pure comment lines so prose about the removal does not
     # register as live code.
-    return "\n".join(
-        line
-        for line in src.splitlines()
-        if not line.lstrip().startswith("#")
-    )
+    return "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
 
 
 @pytest.mark.parametrize(
@@ -70,17 +63,13 @@ def _source_of(module, name: str) -> str:
 def test_invalidation_helper_has_no_dead_scan_loop(module, name):
     """CF-24: the ``SCAN MATCH "mnemos:search:*"`` loop is dead code."""
     src = _source_of(module, name)
-    assert "scan_iter" not in src, (
-        f"{module.__name__}.{name} still runs the dead search-cache SCAN sweep"
-    )
+    assert "scan_iter" not in src, f"{module.__name__}.{name} still runs the dead search-cache SCAN sweep"
 
 
 def test_document_import_route_never_scans_search_keys():
     """CF-24 site: document_import.py used to sweep search keys after import."""
     src = inspect.getsource(di_route)
-    code = "\n".join(
-        line for line in src.splitlines() if not line.lstrip().startswith("#")
-    )
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
     assert "scan_iter" not in code
     assert "mnemos:search:" not in code
 
@@ -88,9 +77,7 @@ def test_document_import_route_never_scans_search_keys():
 def test_dag_route_never_scans_search_keys():
     """CF-24 site: dag.py used to sweep search keys after branch merges."""
     src = inspect.getsource(dag_route)
-    code = "\n".join(
-        line for line in src.splitlines() if not line.lstrip().startswith("#")
-    )
+    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
     assert "scan_iter" not in code
     assert "mnemos:search:" not in code
 
@@ -99,12 +86,8 @@ def test_no_search_key_namespace_remains_in_any_of_the_five_modules():
     """``mnemos:search:`` belonged to the removed cache; it must not linger."""
     for module in (acl_route, admin_route, dag_route, di_route, deletion_ops):
         src = inspect.getsource(module)
-        code = "\n".join(
-            line for line in src.splitlines() if not line.lstrip().startswith("#")
-        )
-        assert "mnemos:search:" not in code, (
-            f"dead search-key namespace still present in {module.__name__}"
-        )
+        code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+        assert "mnemos:search:" not in code, f"dead search-key namespace still present in {module.__name__}"
 
 
 def test_dead_cache_helpers_are_gone_from_lifecycle():
@@ -138,9 +121,7 @@ async def test_acl_path_bumps_epoch_without_any_cache(monkeypatch):
     """With ``_lc._cache`` None (the production path) the epoch still bumps."""
     monkeypatch.setattr(lifecycle, "_cache", None)
     bumps: list[int] = []
-    monkeypatch.setattr(
-        lifecycle, "_vis_epoch_get_incr", AsyncMock(side_effect=lambda: bumps.append(1) or 0)
-    )
+    monkeypatch.setattr(lifecycle, "_vis_epoch_get_incr", AsyncMock(side_effect=lambda: bumps.append(1) or 0))
     await acl_route._invalidate_search_caches_after_acl_change()
     assert bumps == [1], "ACL grant/revoke must bump the visibility epoch"
 
@@ -150,9 +131,7 @@ async def test_deletion_scope_invalidation_bumps_epoch_without_any_cache(monkeyp
     """Same contract on the deletion-worker invalidation path."""
     monkeypatch.setattr(lifecycle, "_cache", None)
     bumps: list[int] = []
-    monkeypatch.setattr(
-        lifecycle, "_vis_epoch_get_incr", AsyncMock(side_effect=lambda: bumps.append(1) or 0)
-    )
+    monkeypatch.setattr(lifecycle, "_vis_epoch_get_incr", AsyncMock(side_effect=lambda: bumps.append(1) or 0))
     await deletion_ops.invalidate_deletion_scope_caches("alice", None)
     assert bumps == [1]
 
@@ -163,9 +142,7 @@ async def test_admin_stats_invalidator_keeps_stats_and_epoch(monkeypatch):
     cache = _SpyCache()
     monkeypatch.setattr(lifecycle, "_cache", cache)
     bumps: list[int] = []
-    monkeypatch.setattr(
-        lifecycle, "_vis_epoch_get_incr", AsyncMock(side_effect=lambda: bumps.append(1) or 0)
-    )
+    monkeypatch.setattr(lifecycle, "_vis_epoch_get_incr", AsyncMock(side_effect=lambda: bumps.append(1) or 0))
     await admin_route._invalidate_memory_read_caches()
     assert cache.deleted == ["stats:global:v2"]
     assert bumps == [1]
@@ -174,9 +151,7 @@ async def test_admin_stats_invalidator_keeps_stats_and_epoch(monkeypatch):
 def test_dag_merge_branch_keeps_epoch_bump_in_live_merge_path():
     """The merge branch that touches live tracks must keep the epoch bump."""
     src = inspect.getsource(dag_route)
-    assert "_vis_epoch_get_incr" in src, (
-        "the live-merge path must keep bumping the visibility epoch"
-    )
+    assert "_vis_epoch_get_incr" in src, "the live-merge path must keep bumping the visibility epoch"
 
 
 def test_document_import_keeps_stats_invalidation_once_per_document():
@@ -191,9 +166,7 @@ async def test_memory_mutation_path_keeps_stats_and_epoch(monkeypatch):
     cache = _SpyCache()
     monkeypatch.setattr(lifecycle, "_cache", cache)
     bumps: list[int] = []
-    monkeypatch.setattr(
-        lifecycle, "_vis_epoch_get_incr", AsyncMock(side_effect=lambda: bumps.append(1) or 0)
-    )
+    monkeypatch.setattr(lifecycle, "_vis_epoch_get_incr", AsyncMock(side_effect=lambda: bumps.append(1) or 0))
     await memory_mutations._invalidate_caches_after_mutation()
     assert cache.deleted == ["stats:global:v2"]
     assert bumps == [1]
