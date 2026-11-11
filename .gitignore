@@ -127,3 +127,11 @@ htmlcov/
 # review round 3); never on an author branch where they would merge into
 # the code tree.
 REVIEW_VERDICT_*.json
+
+# Agent run diagnostics dropped at the repo root by review/delivery loops
+# (review-round stderr/json, suite-verification reports). Per-run scratch,
+# not deliverables (MN-33 review round 2/3: stray artifacts read as code
+# deltas).
+.review1.json
+.review1.err
+VERIFY_*.json

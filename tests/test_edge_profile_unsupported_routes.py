@@ -124,11 +124,16 @@ def test_edge_profiles_do_not_reuse_each_others_storage(monkeypatch, tmp_path):
 
     The fixture used to open one shared SQLite file for every test in this
     module, so a row created by one test was visible to the next. Path
-    inequality alone does not prove that: this writes through one profile's
-    store and reads through the other's, the way the shared fixture did.
-    Both directions are asserted (review finding F2): the shared-file
-    regression is symmetric, so ``first -> second`` alone would have missed
-    a leak that only flowed the other way.
+    inequality alone does not prove that: this writes a session through one
+    profile's store and reads it back through the other's, the way the shared
+    fixture did.
+
+    The write direction is an explicit argument (review finding F2, round 2):
+    ``first -> second`` alone would only catch a leak that flowed one way.
+    Both directions are asserted -- write in ``first`` read through
+    ``second``, and write in ``second`` read through ``first`` -- plus each
+    profile's own round-trip, so the isolation contract holds regardless of
+    which profile writes first.
     """
     asyncio = pytest.importorskip("asyncio")
 
@@ -137,7 +142,8 @@ def test_edge_profiles_do_not_reuse_each_others_storage(monkeypatch, tmp_path):
     assert first is not second
     assert first._db_path != second._db_path
 
-    async def _create_then_read_through(writer, reader):
+    async def _create_then_read_through(writer: SqliteBackend, reader: SqliteBackend):
+        """Write a session through ``writer``; read it back through ``reader``."""
         async with writer.transactional() as tx:
             row = await writer.sessions.create_session(
                 tx, user_id="u", namespace="default", model="m", initial_context=None
@@ -145,9 +151,11 @@ def test_edge_profiles_do_not_reuse_each_others_storage(monkeypatch, tmp_path):
         async with reader.transactional() as tx:
             return await reader.sessions.get_session(tx, row["id"], "u", "default")
 
+    # Same-profile round-trips must succeed...
     assert asyncio.run(_create_then_read_through(first, first)) is not None
-    assert asyncio.run(_create_then_read_through(first, second)) is None
     assert asyncio.run(_create_then_read_through(second, second)) is not None
+    # ...and neither profile may see the other's row, in either direction.
+    assert asyncio.run(_create_then_read_through(first, second)) is None
     assert asyncio.run(_create_then_read_through(second, first)) is None
 
 
