@@ -1,6 +1,5 @@
 """Shared globals, lifespan, and DB/cache helpers for MNEMOS API."""
 
-import hashlib
 import importlib
 import ipaddress
 import json
@@ -1161,26 +1160,6 @@ async def lifespan(app):
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 
-def _get_cache_key(prefix: str, *args) -> str:
-    """Generate a stable, prefixed cache key.
-
-    The namespace prefix ("mnemos:<prefix>:") is preserved so a pattern-based
-    invalidation (SCAN MATCH "mnemos:search:*") can target only our keys.
-
-    Args are serialized as a JSON list with stable separators before
-    hashing. JSON's quoted strings + escaped delimiters mean two
-    distinct argument tuples can never collide on the wire — e.g.
-    (category='a:b', subcategory='c') and (category='a',
-    subcategory='b:c') were previously both joined to "a:b:c" via
-    the old ':'.join encoding and produced the same MD5 digest;
-    JSON encoding produces ["a:b","c"] vs ["a","b:c"], distinct
-    even before hashing.
-    """
-    serialized = json.dumps(list(args), separators=(",", ":"), default=str)
-    digest = hashlib.md5(serialized.encode(), usedforsecurity=False).hexdigest()
-    return f"mnemos:{prefix}:{digest}"
-
-
 # #184: removed `_get_db` — dead code. Callers use
 # `get_pool_manager().acquire()` directly (which the
 # `require_postgres_pool_or_503` helper enforces).
@@ -1307,11 +1286,6 @@ async def _vis_epoch_get_incr() -> int:
     epoch = await _vis_epoch().bump()
     _notify_visibility_epoch(epoch)
     return epoch
-
-
-async def _vis_epoch_current() -> int:
-    """Read the current epoch without bumping it."""
-    return await _vis_epoch().current()
 
 
 async def _get_embedding(text: str) -> list:
