@@ -12,6 +12,8 @@ import ast
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 EXPECTED_MIGRATIONS = [
     "migrations.sql",
     "migrations_v1_multiuser.sql",
@@ -908,3 +910,49 @@ def test_canonical_migration_helper_fails_on_missing_paths():
         )
     finally:
         Path(fake).unlink()
+
+
+@pytest.mark.parametrize(
+    "compose_path",
+    ["docker-compose.yml", "docker-compose.staging.yml"],
+)
+def test_postgres_upgrade_psql_command_is_well_formed(compose_path: str) -> None:
+    """The ``postgres-upgrade`` ``sh -c`` string must parse and be balanced.
+
+    A review round flagged the trailing ``"`` after ``75-memory-index-hygiene.sql``
+    as a YAML syntax error that would break ``docker compose``. It is not: the
+    command is a folded scalar ``sh -c "psql ... -f ...sql"`` where that final
+    ``"`` *closes* the shell string opened after ``sh -c``. Removing it would
+    leave the shell command unterminated and break the upgrade.
+
+    This pins both invariants the review cared about:
+      1. the compose file parses as YAML (so ``docker compose`` can load it), and
+      2. the folded command has balanced double quotes (so ``sh -c`` is valid).
+    """
+    import yaml
+
+    repo = Path(__file__).resolve().parents[1]
+    data = yaml.safe_load((repo / compose_path).read_text(encoding="utf-8"))
+    command = data["services"]["postgres-upgrade"]["command"]
+    assert isinstance(command, str), f"{compose_path}: command must fold to a string"
+    assert command.count('"') % 2 == 0, (
+        f"{compose_path}: unbalanced double quotes in postgres-upgrade command — "
+        f"the trailing quote after the last -f entry closes the sh -c string"
+    )
+    assert command.startswith("sh -c "), f"{compose_path}: command must be a sh -c invocation"
+    # The migration the review flagged must be present with no stray quote
+    # attached to the filename itself. The command's final `"` is the shell
+    # string closer (opened after `sh -c `), so strip it before inspecting
+    # the last -f argument — that stripped value is what psql actually sees.
+    body = command[len("sh -c ") :].rstrip()
+    assert body.startswith('"') and body.endswith('"'), (
+        f"{compose_path}: sh -c argument should be one double-quoted string"
+    )
+    inner = body[1:-1]
+    last_f = inner.rsplit("-f ", 1)[-1].strip()
+    assert last_f.endswith(".sql"), (
+        f"{compose_path}: last -f argument {last_f!r} should end in .sql"
+    )
+    assert '"' not in last_f, (
+        f"{compose_path}: a double quote leaked into the migration filename {last_f!r}"
+    )

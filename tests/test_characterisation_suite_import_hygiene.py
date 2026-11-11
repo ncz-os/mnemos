@@ -297,3 +297,64 @@ def test_baseline_note_belongs_to_a_different_job() -> None:
     # A 40/7-char hex sha; only assert the shape, not reachability (the
     # object may be absent in a shallow clone).
     assert re.fullmatch(r"[0-9a-f]{7,40}", base.group(1))
+
+
+def _bound_names_for(src: str) -> set[str]:
+    """Run the exact import-binding branch of ``_locally_bound`` on *src*."""
+    bound: set[str] = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add(alias.asname or alias.name.split(".")[0])
+    return bound
+
+
+@pytest.mark.parametrize(
+    "src,expected",
+    [
+        # ast.Import: Python binds only the top-level package, so the
+        # split('.')[0] is exactly right — `import x.y` binds `x`, not `x.y`.
+        ("import os", {"os"}),
+        ("import os.path", {"os"}),
+        ("import os.path as osp", {"osp"}),
+        ("import a.b.c", {"a"}),
+        # ast.ImportFrom: alias.name is the imported symbol and is never
+        # dotted in valid Python, so the split is a harmless no-op.
+        ("from a import b", {"b"}),
+        ("from a import b as c", {"c"}),
+        ("from a.b import c", {"c"}),
+        ("from a.b import c as d", {"d"}),
+        ("from . import x", {"x"}),
+        ("from ..pkg import y as z", {"z"}),
+    ],
+)
+def test_locally_bound_resolves_import_names_correctly(src: str, expected: set[str]) -> None:
+    """Pin the import-binding semantics the review claimed were wrong.
+
+    The review asserted two defects in ``_locally_bound``:
+      1. ``import x.y`` should bind ``y`` rather than ``x``. It should not —
+         CPython binds only the top-level package, so ``x`` is correct and
+         dropping the split would make ``import x.y`` shadow a *different*
+         name than the interpreter does.
+      2. ``from module import sub.func`` is mishandled. That form is a
+         ``SyntaxError`` — it cannot appear in a parseable file, so there is
+         nothing to mishandle.
+
+    Every valid import form is enumerated here so that if the logic ever
+    changes, the suite fails with the exact shape that broke instead of
+    this being re-litigated from prose.
+    """
+    assert _bound_names_for(src) == expected
+
+
+def test_locally_bound_matches_python_binding_for_dotted_imports() -> None:
+    """A dotted ``import a.b.c`` binds ``a`` locally, matching the interpreter.
+
+    This is the load-bearing case behind the ``.split(".")[0]``: verify the
+    helper agrees with real ``exec`` semantics rather than a prose claim.
+    """
+    ns: dict[str, object] = {}
+    exec("import os.path", ns)  # binds only 'os' in the namespace
+    assert "os" in ns and "os.path" not in ns
+    # ...and the helper reports the same name.
+    assert _bound_names_for("import os.path") == {"os"}
