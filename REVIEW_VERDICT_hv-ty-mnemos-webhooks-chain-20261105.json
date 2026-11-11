@@ -6,15 +6,16 @@
     }
   ],
   "head_sha": "7ab6fc76c10ea112a476150f8f54bba5737ba2af",
-  "refreshed_sha": "aa63adb92a8ae9191eea410b95cb12653a5ad44c",
-  "refresh_target": "e4cacdf341f8",
-  "reason": "The branch adds isolated characterisation coverage for the MNEMOS webhook delivery chain. The refresh merged origin/master (e4cacdf341f8) into the approval head (7ab6fc76) with no conflicts: the branch changes only tests/test_mnemos_webhooks_chain_characterisation_20261105.py, while the newer target commits touch disjoint files, so both the branch change and the target code are preserved in full. The repository suite after the merge reports the same 38 failures as the refresh target, so failures did not grow; the net increase in passes is exactly the new characterisation suite. No production code is changed.",
+  "refreshed_sha": "fdd71dedb028ae139d13b2e2f13a560a0404b70c",
+  "refresh_target": "f041dcfbded34879921073aa30087f5bb0cd9374",
+  "reason": "The branch adds isolated characterisation coverage for the MNEMOS webhook delivery chain. The refresh merged origin/master (f041dcfb) into the approval head (7ab6fc76) with no conflicts: the branch changes tests/test_mnemos_webhooks_chain_characterisation_20261105.py plus doc-only updates to the dedup and entities characterisation tests, while the newer target commits touch disjoint production files (mnemos/persistence/deletion_ops.py), so both the branch change and the target code are preserved in full. The repository suite after the merge reports an identical failure set (76 failed / 42 errors) versus the refresh target, so failures did not grow; the net increase in passes is exactly the new characterisation suites (220 passed, 4 xfailed). No production code is changed.",
   "verified_notes": {
-    "conflicts": "none - disjoint file sets between branch and target",
-    "failures_vs_target": "identical failure set (38 failed) before and after the merge",
+    "conflicts": "none - disjoint file sets between branch and target (master touched mnemos/persistence/deletion_ops.py; branch touched only tests/)",
+    "failures_vs_target": "identical failure set (76 failed / 42 errors) before and after the merge; 7040 passed vs 6910 on target",
     "files_changed_vs_master": [
       "REVIEW_VERDICT_hv-ty-mnemos-webhooks-chain-20261105.json",
       "tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py",
+      "tests/test_mnemos_domain_memory_dedup_characterisation_20261105.py",
       "tests/test_mnemos_webhooks_chain_characterisation_20261105.py"
     ],
     "no_production_changes": true
