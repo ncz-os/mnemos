@@ -39,6 +39,11 @@ from mnemos.persistence import deletion_ops
 
 # The five helpers named in CF-24 (acl, admin, dag, document_import,
 # deletion_ops) plus the shared mutation invalidation they mirror.
+# ``dag`` and ``document_import`` are covered module-wide (see
+# ``test_document_import_route_never_scans_search_keys`` /
+# ``test_dag_route_never_scans_search_keys``): after the CF-24 removal
+# they carry no ``scan_iter``/``mnemos:search:`` residue at all, and
+# neither exposes a named invalidation helper anymore.
 _INVALIDATION_HELPERS = [
     (acl_route, "_invalidate_search_caches_after_acl_change"),
     (admin_route, "_invalidate_memory_read_caches"),
@@ -47,12 +52,27 @@ _INVALIDATION_HELPERS = [
 ]
 
 
-def _source_of(module, name: str) -> str:
-    obj = getattr(module, name)
-    src = inspect.getsource(obj)
-    # Strip pure comment lines so prose about the removal does not
-    # register as live code.
+def _module_source(module) -> str:
+    """Read the module's source file directly.
+
+    ``inspect.getsource`` requires a function/class definition (module
+    objects are not supported in that form), so for module-wide checks
+    we read ``module.__file__`` and return the raw text.
+    """
+    with open(module.__file__, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _strip_comments(src: str) -> str:
+    """Strip pure comment lines so prose about the removal does not
+    register as live code."""
     return "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+
+
+def _function_source(module, name: str) -> str:
+    """Source of a specific function exported by ``module``."""
+    obj = getattr(module, name)
+    return _strip_comments(inspect.getsource(obj))
 
 
 @pytest.mark.parametrize(
@@ -62,39 +82,36 @@ def _source_of(module, name: str) -> str:
 )
 def test_invalidation_helper_has_no_dead_scan_loop(module, name):
     """CF-24: the ``SCAN MATCH "mnemos:search:*"`` loop is dead code."""
-    src = _source_of(module, name)
+    src = _function_source(module, name)
     assert "scan_iter" not in src, f"{module.__name__}.{name} still runs the dead search-cache SCAN sweep"
 
 
 def test_document_import_route_never_scans_search_keys():
     """CF-24 site: document_import.py used to sweep search keys after import."""
-    src = inspect.getsource(di_route)
-    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
-    assert "scan_iter" not in code
-    assert "mnemos:search:" not in code
+    src = _strip_comments(_module_source(di_route))
+    assert "scan_iter" not in src
+    assert "mnemos:search:" not in src
 
 
 def test_dag_route_never_scans_search_keys():
     """CF-24 site: dag.py used to sweep search keys after branch merges."""
-    src = inspect.getsource(dag_route)
-    code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
-    assert "scan_iter" not in code
-    assert "mnemos:search:" not in code
+    src = _strip_comments(_module_source(dag_route))
+    assert "scan_iter" not in src
+    assert "mnemos:search:" not in src
 
 
 def test_no_search_key_namespace_remains_in_any_of_the_five_modules():
     """``mnemos:search:`` belonged to the removed cache; it must not linger."""
     for module in (acl_route, admin_route, dag_route, di_route, deletion_ops):
-        src = inspect.getsource(module)
-        code = "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
-        assert "mnemos:search:" not in code, f"dead search-key namespace still present in {module.__name__}"
+        src = _strip_comments(_module_source(module))
+        assert "mnemos:search:" not in src, f"dead search-key namespace still present in {module.__name__}"
 
 
 def test_dead_cache_helpers_are_gone_from_lifecycle():
     """``_get_cache_key`` / ``_vis_epoch_current`` existed only for the cache."""
     assert not hasattr(lifecycle, "_get_cache_key")
     assert not hasattr(lifecycle, "_vis_epoch_current")
-    src = inspect.getsource(lifecycle)
+    src = _strip_comments(_module_source(lifecycle))
     assert "_get_cache_key" not in src
     assert "_vis_epoch_current" not in src
 
@@ -150,13 +167,13 @@ async def test_admin_stats_invalidator_keeps_stats_and_epoch(monkeypatch):
 
 def test_dag_merge_branch_keeps_epoch_bump_in_live_merge_path():
     """The merge branch that touches live tracks must keep the epoch bump."""
-    src = inspect.getsource(dag_route)
+    src = _module_source(dag_route)
     assert "_vis_epoch_get_incr" in src, "the live-merge path must keep bumping the visibility epoch"
 
 
 def test_document_import_keeps_stats_invalidation_once_per_document():
     """The post-import block must still drop the stats entry once."""
-    src = inspect.getsource(di_route)
+    src = _module_source(di_route)
     assert "stats:global" in src
 
 
