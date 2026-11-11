@@ -20,12 +20,14 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import HTTPException
-
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext
 from mnemos.api.read_policy import _redacted_for_webhook
 from mnemos.core.ids import new_memory_id  # noqa: F401  (re-exported: routes patch it here)
+from mnemos.domain.deletion_fence import (
+    assert_no_active_deletion,
+    assert_no_active_deletion_for_scopes,
+)
 from mnemos.persistence.nats_events import safe_subject_segment
 
 logger = logging.getLogger(__name__)
@@ -91,42 +93,14 @@ def _metadata_for_audit(value) -> dict | None:
         return None
 
 
-async def _assert_no_active_deletion(
-    backend,
-    *,
-    owner_id: str,
-    namespace: str,
-) -> None:
-    """Refuse to write a row onto a scope that is currently being deleted.
-
-    Without this fence, a memory added during the 30-day grace window
-    (after the soft-delete sweep has marked the scope, before the
-    hard-delete phase runs) would survive past ``hard_deleted`` -- the
-    hard-delete only removes rows already carrying
-    ``deleted_at IS NOT NULL``, so a row inserted during grace still has
-    ``deleted_at IS NULL`` and is skipped forever, even though the
-    audit log claims the user was hard-deleted. Root is the exception:
-    operators may need to inject tombstone rows even mid-deletion.
-    """
-    from mnemos.persistence.worker_lifecycle import active_deletion_for_scope
-
-    try:
-        active = await active_deletion_for_scope(backend, target_user_id=owner_id, target_namespace=namespace)
-    except Exception:
-        # If the fence itself errors (e.g. backend doesn't expose
-        # transactional), fall through. The hard-delete resweep+verify
-        # loop added in deletion_request_worker.py is the second line of
-        # defence and refuses to mark the request complete on live rows.
-        return
-    if active is not None:
-        restore_by = active.get("restore_by")
-        detail = (
-            "This scope is currently subject to an active deletion request; "
-            "new writes are rejected until the grace window expires. "
-        )
-        if restore_by is not None:
-            detail += f"Restore deadline: {restore_by}."
-        raise HTTPException(status_code=409, detail=detail)
+# The fence is domain logic, not route policy: the MPF/CHARON importers write
+# memories from below the API layer and must run the same probe, and
+# ``mnemos.domain`` may not import ``mnemos.api`` under the layered
+# import-linter contract. Re-exported under the historical private name as the
+# SAME object -- not a wrapper -- because route modules and the tests that
+# patch ``memory_mutations._assert_no_active_deletion`` resolve this name.
+_assert_no_active_deletion = assert_no_active_deletion
+_assert_no_active_deletion_for_scopes = assert_no_active_deletion_for_scopes
 
 
 def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
@@ -202,19 +176,15 @@ async def _publish_bulk_created_events(events: list[dict], source_node: str) -> 
 async def _invalidate_caches_after_mutation() -> None:
     """Invalidate read-side caches after any memory write.
 
-    The per-user SEARCH cache is gone: it was wired to ``_lc._cache``,
-    which the lifecycle hard-wires to ``None`` (no Redis in the
-    runtime), so every read missed and every write went nowhere. With
-    it goes the ``SCAN MATCH "mnemos:search:*"`` invalidation sweep
-    that only ever matched keys of a cache that never existed.
-
     The ``/stats`` cache entry (``stats:global:v2``) is still dropped:
-    it belongs to the stats surface, not the search surface.
+    it belongs to the stats surface, not the search surface. There is no
+    cached search response to evict — ``_lc._cache`` is hard-wired to
+    ``None`` (no Redis in the runtime) and the search handler reads no
+    cache.
 
     The visibility epoch is STILL bumped here: the MCP
     principal-context cache (role / namespace — authorization inputs)
-    subscribes to it, so a revoke must advance the epoch even though
-    search no longer reads one.
+    subscribes to it, so a revoke must advance the epoch.
     """
     if _lc._cache:
         try:

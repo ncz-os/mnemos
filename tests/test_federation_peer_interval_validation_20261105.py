@@ -7,9 +7,7 @@ from mnemos.domain.models import FederationPeerCreateRequest, FederationPeerUpda
 
 
 def _create(**kw):
-    return FederationPeerCreateRequest(
-        name="peer-one", base_url="http://peer.example:5002", auth_token="t", **kw
-    )
+    return FederationPeerCreateRequest(name="peer-one", base_url="http://peer.example:5002", auth_token="t", **kw)
 
 
 @pytest.mark.parametrize("secs", [0, 1, 10, 29])

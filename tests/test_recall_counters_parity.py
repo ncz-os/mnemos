@@ -327,26 +327,30 @@ async def test_bump_recall_counters_swallows_backend_failure(monkeypatch, caplog
 
 @pytest.mark.asyncio
 async def test_search_does_not_read_the_visibility_epoch(monkeypatch, _no_decay):
-    """A search must NOT read the visibility epoch.
+    """A search must NOT touch the epoch store at all.
 
     The epoch existed only to key the search cache.  With the cache
     gone, the per-search epoch read is a pure cost — a NATS-KV
-    round-trip on every single search.
-
-    The test fails on the base revision (the epoch IS read) and passes
-    once the read is deleted.
+    round-trip on every single search.  The read-only accessor
+    (``_vis_epoch_current``) was removed with it, so an attempt to read
+    -- by name or through the epoch store -- must never happen.
     """
     from tests._fake_backend import install_fake_backend
 
     install_fake_backend(monkeypatch)
 
-    calls: list[int] = []
+    hits: list[str] = []
 
-    async def _tracking_epoch_current() -> int:
-        calls.append(1)
-        return 0
+    class _EpochSpy:
+        async def current(self) -> int:
+            hits.append("current")
+            return 0
 
-    monkeypatch.setattr(_lc, "_vis_epoch_current", _tracking_epoch_current)
+        async def bump(self) -> int:
+            hits.append("bump")
+            return 1
+
+    monkeypatch.setattr(_lc, "_vis_epoch", lambda: _EpochSpy())
     monkeypatch.setattr(memories_handler, "load_decay_table", _empty_decay)
 
     await memories_handler.search_memories(
@@ -354,7 +358,22 @@ async def test_search_does_not_read_the_visibility_epoch(monkeypatch, _no_decay)
         user=_root(),
     )
 
-    assert calls == [], "search must not read the visibility epoch"
+    assert hits == [], "search must not read or bump the visibility epoch"
+
+
+def test_vis_epoch_current_accessor_is_gone():
+    """The read-only epoch accessor existed only to key the search cache."""
+    assert not hasattr(_lc, "_vis_epoch_current")
+    source = inspect.getsource(_lc)
+    assert "_vis_epoch_current" not in source
+
+
+def test_get_cache_key_builder_is_gone():
+    """The cache-key builder existed only for the removed search cache."""
+    assert not hasattr(_lc, "_get_cache_key")
+    source = inspect.getsource(_lc)
+    assert "_get_cache_key" not in source
+    assert "mnemos:search:" not in source, "the dead search-key namespace must not linger"
 
 
 def test_search_endpoint_docstring_does_not_advertise_response_caching():
@@ -379,7 +398,7 @@ def test_search_handler_source_has_no_cache_key_build():
 
 
 def test_invalidate_caches_after_mutation_has_no_search_scan():
-    """The ``SCAN MATCH "mnemos:search:*"`` sweep is dead code.
+    """The dead ``mnemos:search:*`` sweep is gone (CF-24).
 
     It only ever matched keys of a cache that never existed
     (``_lc._cache`` is hard-wired to ``None``).  The visibility-epoch

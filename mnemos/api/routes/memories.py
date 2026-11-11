@@ -30,6 +30,7 @@ from mnemos.api.persistence_helpers import (
 # and in-module call sites reference ``memories.<name>``.
 from mnemos.api.memory_mutations import (
     _assert_no_active_deletion,
+    _assert_no_active_deletion_for_scopes,
     _invalidate_caches_after_mutation,
     _metadata_for_audit,
     _publish_bulk_created_events,
@@ -445,8 +446,7 @@ async def list_memories(
         None,
         max_length=METADATA_EQ_MAX_KEYS,
         description=(
-            "Exact-match filter on top-level metadata string fields, "
-            "repeatable as ``key:value``; all pairs must match"
+            "Exact-match filter on top-level metadata string fields, repeatable as ``key:value``; all pairs must match"
         ),
     ),
     user: UserContext = Depends(get_current_user),
@@ -986,10 +986,11 @@ async def search_memories(
     # ``_lc._cache``, which the lifecycle hard-wires to ``None`` (there is
     # no Redis in the runtime), so every cache read missed and every
     # cache write went nowhere. The machinery around it was not free:
-    # each search read the visibility epoch (``_vis_epoch_current``,
-    # a NATS-KV round-trip) and folded it into a 27-field cache key that
-    # was then thrown away. That per-search epoch read is gone with the
-    # cache it existed to key.
+    # each search read the visibility epoch (a NATS-KV round-trip) and
+    # folded it into a 27-field cache key that was then thrown away.
+    # That per-search epoch read is gone with the cache it existed to
+    # key, and so are the key builder and the read-only epoch accessor
+    # that only it used.
     #
     # The visibility epoch is still bumped on visibility-narrowing
     # mutations -- see ``_invalidate_caches_after_mutation`` -- because
@@ -1616,6 +1617,22 @@ async def bulk_create_memories(
                 embedding_content=_content_redacted_for_embedding(mem.content, _classified),
             )
         )
+
+    # CF-09 GDPR fence (MN-05): the single create at POST /v1/memories refuses
+    # (409) to write onto a scope whose deletion request is inside its 30-day
+    # grace window, but this route inserted straight through. A row landed
+    # during grace carries ``deleted_at IS NULL``, so the next sweep cannot see
+    # it and the hard-delete phase skips it -- it survives while the request is
+    # recorded as ``hard_deleted``. Probe once per DISTINCT (owner_id,
+    # namespace) pair (not per item, so a 1000-item batch stays one probe per
+    # scope) and refuse the WHOLE batch: a per-item error list would read as
+    # "processed" when nothing was accepted. Root keeps the documented
+    # tombstone-injection bypass, but only on its own scope.
+    await _assert_no_active_deletion_for_scopes(
+        backend,
+        {(candidate.owner_id, candidate.namespace) for candidate in candidates},
+        skip={(user.user_id, user.namespace)} if user.role == "root" else set(),
+    )
 
     if candidates:
         try:

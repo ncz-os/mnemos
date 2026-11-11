@@ -1,0 +1,25 @@
+# FB1003 refresh (2026-11-11) -- repository-suite failure comparison, head vs target.
+#
+# Environment: venv pinning the repo's declared ranges (mcp<2 -> 1.30.0,
+# fastapi<0.137 -> 0.136.3, starlette 0.46.2; host mcp 2.3.0 violates the
+# range and breaks mnemos/mcp/stdio.py at import). ~7450 tests collected on
+# both trees, identical id sets.
+#
+#  head (3e8a639f, this branch -- merge of origin/master 22195ab5 into
+#         freebuff/FB1003-20261107):
+#    21 failed, 6927 passed, 578 skipped, 12 xfailed, 3 xpassed in 384.58s
+#  target (22195ab5, origin/master == ARGONAS head):
+#    21 failed, 6916 passed, 578 skipped, 12 xfailed, 3 xpassed in 516.60s
+#
+#  The FAILED+ERROR test-id sets are byte-identical on head and target
+#  (verified by sorted diff: zero head-only, zero target-only):
+#    - test_doc_version_pins_match_code (15)
+#    - test_embedding_contract_f06 (2, [sqlite])
+#    - test_embedding_contract_f06_review (2, [sqlite])
+#  -> all pre-existing on the target, ZERO new failures on the branch.
+#  Head additionally passes 11 tests: tests/test_sqlite_branch_repo_20261107.py
+#  (the FB1003 sqlite branch-repository contract suite).
+#
+# Prior refresh record (replaced by this file) compared head ba44da38
+# against target e9ce7f0c (master/ARGONAS at that time): 30 failed on both
+# sides, identical sets, head +11 passing (the same FB1003 suite).

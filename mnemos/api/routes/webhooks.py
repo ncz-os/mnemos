@@ -115,7 +115,11 @@ async def create_webhook(
     # NATS publish after commit (outside transaction context)
     from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
-    safe_ns = (namespace or "default").replace(".", "_")
+    from mnemos.persistence.nats_events import safe_subject_segment
+
+    # CF-35/MN-17: the shared encoder, not a local "." -> "_" copy, so
+    # namespaces "a.b" and "a_b" do not publish to the same subject.
+    safe_ns = safe_subject_segment(namespace)
     await _nats_publish_event(
         f"mnemos.webhook.subscription.created.{safe_ns}",
         {
