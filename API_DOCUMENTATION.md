@@ -412,7 +412,9 @@ Common codes:
 - `401` — missing or invalid auth
 - `403` — role check failed
 - `404` — entity not found
-- `409` — conflict requiring operator action, including incompatible federation schema and `MN001` branch-state reconciliation
+- `409` — conflict requiring operator action, including incompatible federation schema and `MN001` branch-state reconciliation.
+  A federation sync in progress is NOT a 409: `POST /v1/federation/peers/{id}/sync`
+  blocks on the per-peer sync lock and returns the result of its own pass (MN-25).
 - `413` — request body exceeds `MAX_BODY_BYTES` (default 5 MB)
 - `429` — rate-limited (when `RATE_LIMIT_ENABLED=true`)
 - `503` — database pool unavailable, OR the route's subsystem extra isn't
