@@ -188,6 +188,10 @@ SQLITE_MIGRATION_FILES = [
     # M12 items 1/2: federation_peers lag/health columns + peer fingerprint
     # (SQLite mirror of 0071_federation_replica_health).
     "migrations_v7_4_federation_replica_health_sqlite.sql",
+    # Recall bookkeeping (recall_count/last_recalled_at) stops appending
+    # journal events: it cannot change federated content (SQLite mirror of
+    # 0072_federation_journal_metadata_only).
+    "migrations_v7_5_federation_journal_metadata_only_sqlite.sql",
 ]
 
 
