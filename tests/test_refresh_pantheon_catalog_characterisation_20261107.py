@@ -149,7 +149,7 @@ def test_an_integer_return_passes_through(monkeypatch: pytest.MonkeyPatch, code:
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [("5", 5), (2.9, 2), (True, 1), (-1, -1), ("", 0)],
+    [("5", 5), (2.9, 2), (True, 1), (-1, -1)],
 )
 def test_truthy_junk_is_int_coerced(monkeypatch: pytest.MonkeyPatch, value, expected: int) -> None:
     # ``int(pantheon_main() or 0)``: the wrapper trusts the add-on's return
@@ -158,6 +158,16 @@ def test_truthy_junk_is_int_coerced(monkeypatch: pytest.MonkeyPatch, value, expe
     _install_addon(monkeypatch, lambda v=value: v)
 
     assert tool.main() == expected
+
+
+@pytest.mark.parametrize("value", [0, "", [], None])
+def test_a_falsy_return_is_zero_via_or(monkeypatch: pytest.MonkeyPatch, value) -> None:
+    # The falsy cases take the ``or 0`` short-circuit, not the ``int(...)``
+    # coercion path pinned above: they are documented here separately so the
+    # two behaviours stay named correctly.
+    _install_addon(monkeypatch, lambda v=value: v)
+
+    assert tool.main() == 0
 
 
 def test_only_import_failures_are_caught(monkeypatch: pytest.MonkeyPatch) -> None:
