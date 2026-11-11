@@ -25,9 +25,26 @@ _ADDON_MODULE = "mnemos.domain.pantheon.pricing"
 
 @pytest.fixture
 def no_addon(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make the add-on genuinely unimportable for the test."""
+    """Make the add-on genuinely unimportable for the test.
+
+    Drops any cached module objects and blocks the import machinery: if the
+    add-on is genuinely installed in the environment, the block still forces
+    the ``ImportError`` branch instead of letting a cached or path-resolvable
+    module slip through.
+    """
     monkeypatch.delitem(sys.modules, _ADDON_MODULE, raising=False)
     monkeypatch.delitem(sys.modules, _ADDON_PACKAGE, raising=False)
+
+    real_import = builtins.__import__
+
+    def _blocked_import(name, *args, **kwargs):
+        # The wrapper imports exactly these two names; match them exactly so
+        # an unrelated sibling import is never intercepted.
+        if name in (_ADDON_PACKAGE, _ADDON_MODULE):
+            raise ModuleNotFoundError(f"No module named {name!r}", name=name)
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_import)
 
 
 def _install_addon(monkeypatch: pytest.MonkeyPatch, func, calls: list | None = None) -> None:
@@ -76,7 +93,10 @@ def test_missing_add_on_reports_the_package_and_repair_hint(no_addon: None, caps
     assert printed.err.startswith(
         "refresh-pantheon-catalog requires the mnemos-pantheon add-on package and its dependencies."
     )
-    assert "could not be imported (mnemos.domain.pantheon: " in printed.err
+    # The package is the first import tried, so its name is the missing one
+    # reported here; when it resolves but a dependency is broken the pricing
+    # module (or the failing dependency) is named instead.
+    assert "could not be imported (mnemos.domain.pantheon" in printed.err
     assert "pip install mnemos-pantheon and its dependencies." in printed.err
 
 
@@ -90,7 +110,9 @@ def test_an_import_error_without_a_name_is_labelled_unknown(monkeypatch: pytest.
     real_import = builtins.__import__
 
     def _fake_import(name, *args, **kwargs):
-        if name.startswith(_ADDON_PACKAGE):
+        # Exact match only: a sibling like 'mnemos.domain.pantheon_extra' is
+        # not the pricing module and must not be intercepted.
+        if name in (_ADDON_PACKAGE, _ADDON_MODULE):
             raise ImportError("kaboom")
         return real_import(name, *args, **kwargs)
 
@@ -125,15 +147,17 @@ def test_an_integer_return_passes_through(monkeypatch: pytest.MonkeyPatch, code:
     assert tool.main() == code
 
 
-def test_truthy_junk_is_int_coerced(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("5", 5), (2.9, 2), (True, 1), (-1, -1), ("", 0)],
+)
+def test_truthy_junk_is_int_coerced(monkeypatch: pytest.MonkeyPatch, value, expected: int) -> None:
     # ``int(pantheon_main() or 0)``: the wrapper trusts the add-on's return
-    # value completely. Pinned as observed rather than as intended.
-    results = {}
-    for value in ("5", 2.9, True, -1, ""):
-        _install_addon(monkeypatch, lambda v=value: v)
-        results[repr(value)] = tool.main()
+    # value completely. Pinned as observed rather than as intended. Each case
+    # gets a fresh monkeypatch so no state leaks between values.
+    _install_addon(monkeypatch, lambda v=value: v)
 
-    assert results == {"'5'": 5, "2.9": 2, "True": 1, "-1": -1, "''": 0}
+    assert tool.main() == expected
 
 
 def test_only_import_failures_are_caught(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -153,7 +177,9 @@ def test_a_failing_dependency_is_reported_as_a_missing_add_on(monkeypatch: pytes
     real_import = builtins.__import__
 
     def _fake_import(name, *args, **kwargs):
-        if name.startswith(_ADDON_PACKAGE):
+        # The wrapper imports exactly these two names; match them exactly so
+        # an unrelated sibling import is never intercepted.
+        if name in (_ADDON_PACKAGE, _ADDON_MODULE):
             raise ModuleNotFoundError("No module named 'httpx_socks'", name="httpx_socks")
         return real_import(name, *args, **kwargs)
 
