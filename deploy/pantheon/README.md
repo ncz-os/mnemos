@@ -47,10 +47,17 @@ rate-limit counters, use a shared `limits` storage backend instead of
 ```env
 RATE_LIMIT_STORAGE_URI=redis://127.0.0.1:6379/2
 RATE_LIMIT_TRUST_PROXY=true
+RATE_LIMIT_TRUSTED_PROXY_HOPS=1
 ```
 
 `RATE_LIMIT_TRUST_PROXY=true` is safe only when Caddy is the sole ingress and
-strips/replaces client-supplied forwarding headers.
+strips/replaces client-supplied forwarding headers. The limiter buckets on the
+`RATE_LIMIT_TRUSTED_PROXY_HOPS`-th `X-Forwarded-For` entry counted from the
+right (default **1**), because that is the entry your own proxy wrote; the
+left-most entry is whatever the client sent and is never used. Raise it to 2
+for a chain such as CDN -> Caddy -> worker. If a request carries fewer XFF
+entries than the configured hop count, the limiter buckets on the direct
+socket peer instead of on client-controlled text.
 
 ## Install / start
 

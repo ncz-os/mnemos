@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "kind": "review",
+  "task": "MN-31 (mnemos, CF-24: dead mnemos:search:* SCAN loops)",
+  "job_id": "01a1c88d-2c76-7c5a-a3d1-d3f382f2da81",
+  "branch": "hv/bk-mn-31-20261109",
+  "base_branch": "master",
+  "base_sha": "da29ed04685fad982af628ae8076f808324c30fc",
+  "head_sha": "4c78748a",
+  "verdict": "approve",
+  "reviewers": [
+    {
+      "model": "gemini-3.6-flash",
+      "family": "google",
+      "provider": "google-gemini-flash",
+      "verdict": "approve",
+      "role": "reviewer"
+    }
+  ],
+  "findings": [],
+  "reason": "Complete review of head 4c78748a vs base da29ed04 (4 chunks, all reviewed). The diff removes dead mnemos:search:* SCAN-loop residue (docstring paragraphs in acl.py/deletion_ops.py/memory_mutations.py, stale M4-residual test annotations) and adds tests/test_cf24_dead_search_scan_loops_removed.py pinning: no scan_iter loop in any of the five invalidation helpers, no mnemos:search:* namespace in any of the five production modules, no _get_cache_key/_vis_epoch_current in lifecycle, while every affected path keeps its /stats invalidation and visibility-epoch bump. No functional issues identified in any chunk. Evidence was re-verified first: the live SCAN loops were already gone at the base tip (master 7.1.1, commit 9f5a0409/02834131); only prose/test fixtures lingered. Full-suite parity: 39 failed / 6938 passed on base (da29ed04) vs 39 failed / 6952 passed on head (8fc3b670) — identical failure set (pre-existing doc-version drift and sqlite parametrised failures), zero new failures, +14 passing audit tests.",
+  "verified_against_source": true
+}

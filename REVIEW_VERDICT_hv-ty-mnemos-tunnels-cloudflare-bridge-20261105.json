@@ -1,0 +1,54 @@
+{
+  "schema": "hive-review-verdict/v1",
+  "job_id": "01a1b52d-9c78-748b-bec2-413def37c4f6",
+  "re_review": true,
+  "branch": "hv/ty-mnemos-tunnels-cloudflare-bridge-20261105",
+  "head_sha": "0b609ea44eeeb0b8a642ebd1fc2c5444656a7f23",
+  "head_inspected": "3db25c3260508617b374b50b77e4b7769bd9e7a1",
+  "base": "master",
+  "base_sha": "e4cacdf341f83a6e2f1e135ae21262e7ec9d293a",
+  "merge_base_sha": "026d9cec03f27a57723a95a468a3a5c4351bb452",
+  "verdict": "approve",
+  "reason": "Re-review of the cloudflare tunnel bridge characterisation suite. Requested head 0b609ea4 is an ancestor of the branch tip; the checkout delivered as 3db25c32 (0b609ea4 + 4 master merge commits, no new author work) was inspected and 0b609ea4 was confirmed present in its history, so the verdict applies transitively to the requested head. Author-only delta against merge-base 026d9cec is three added files, zero modifications, zero deletions: the 778-line characterisation suite, the prior review's verdict JSON, and a scratch verification report. No production source, config, or ABC baseline is touched. The suite imports only mnemos.tunnels.* (no mcp dependency) and pins real observable contract: quick-tunnel argv ['cloudflared','tunnel','--no-autoupdate','--url','http://localhost:PORT'] (PORT interpolated from target_port; the fake process uses 5005) with the supplied authtoken correctly absent from both argv and child env; child_env() redaction of MNEMOS_DATABASE_DSN / MNEMOS_MCP_TOKEN / MNEMOS_OAUTH_SIGNING_KEY with PATH retained; the _QUICK_TUNNEL_URL acceptance/rejection matrix ('first URL wins' and the _url_seen None guard) matching re.search on the module's regex; both _await_public_url error strings verbatim; and stop()/reap SIGTERM->SIGKILL escalation under a monkeypatched TERMINATE_TIMEOUT_SECONDS. I re-verified the load-bearing claims against mnemos/tunnels/cloudflare_bridge.py (115 lines) directly rather than inheriting them. Results are deterministic: 83 passed + 1 xfailed in ~0.5s across four consecutive runs, no network, no real subprocess, no wall-clock sleep. The one strict xfail pins a genuine defect: _spawn_spec (cloudflare_bridge.py:55-79) replaces self._url_seen with a fresh Event without cancelling a waiter parked on the discarded one, leaking a task for the life of the loop on every abandoned restart; I reproduced the parked state empirically. I also independently confirmed the prior review's F1 caveat: under the docstring's own proposed fix (create the event once in __init__, clear() it in _spawn_spec) the stale task stays parked identically, so wait_for(stale, 0.2) cannot detect that fix. That is a test-quality weakness in a test-only change, not a defect in shipped behaviour, and it is documented here as a non-blocking follow-up rather than a blocker. Regression isolation: full-suite failures on this head (11 distinct files) are a strict subset of master's own failures (12) in this sandbox -- the sole difference is tests/test_doc_version_pins_match_code.py, which fails on master because the branch has not merged master's 7.1.x version-pin commits; no new failure is introduced. tests/test_document_import_webhook_redacted.py and tests/test_oracle_bind_names_reserved.py appear as deletions only against current master but are absent at the merge-base as well, i.e. they are master's newer work not yet merged, not removals by this branch (git diff --diff-filter=D 026d9cec..HEAD = 0). The ABC-first ratchet guard passes. Combined tunnels-surface run is 144 passed + 1 xfailed. Working tree clean; the author branch was not modified.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "minor",
+      "title": "Strict-xfail leak test is fix-agnostic: wait_for(stale, 0.2) stays parked under the docstring's proposed fix",
+      "detail": "test_spawn_spec_should_not_leave_a_waiter_on_the_discarded_event (tests/test_mnemos_tunnels_cloudflare_bridge_characterisation_20261105.py:753-761) documents a real defect in _spawn_spec (cloudflare_bridge.py:55-79): it replaces self._url_seen with a fresh asyncio.Event without cancelling waiters parked on the discarded one. Verified independently: after a second _spawn_spec, a task issued from the first _await_public_url is still pending, so a restart that abandons a pending start leaks a task for the life of the loop. The assertion, asyncio.wait_for(stale, timeout=0.2), is weaker than it appears -- I reproduced that under the module docstring's own proposed fix (single Event created in __init__, clear() in _spawn_spec) the stale task remains parked and the wait_for still times out, because the test never sets the event after the restart. It therefore cannot distinguish a dead discarded event from a live-but-cleared one. With strict=True the pin reliably trips only on a cancel-the-waiter fix; an event-reuse fix would leave it xfailing for the wrong reason. Recommend asserting stale.cancelled() or a tracked waiter count instead of a bounded wait. Non-blocking: test-only, defect genuinely present and accurately documented, suite otherwise green."
+    },
+    {
+      "id": "F2",
+      "severity": "info",
+      "title": "Committed .scratch/verification_report_2026-11-05.json contains stale, self-contradicting counts",
+      "detail": ".scratch/verification_report_2026-11-05.json (added by 7fec236b) records tests_base passed=5853 and tests_head passed=5803 with failed=0 on both sides. A head that adds 778 lines of passing tests cannot pass fewer tests than its base, and my own runs in this sandbox observe many failures on both base and head; the recorded zero-failure figures are not reproducible here. It is a scratch artifact, is not consumed by any test or build step, and does not affect the reviewed contract -- noted so the numbers are not mistaken for verified evidence at merge time."
+    },
+    {
+      "id": "F3",
+      "severity": "info",
+      "title": "Prior review's verdict JSON is committed on the author branch",
+      "detail": "REVIEW_VERDICT_hv-ty-mnemos-tunnels-cloudflare-bridge-20261105.json (added by 7e94c10c) sits on the author branch rather than only on its review ref. Its content is accurate for 009d5262 and harmless, but a review artifact on the author branch is the class of review overreach the delivery policy forbids for review jobs. It predates this job and was not added by it; flagging so the merge does not carry a stale review artifact into master. Not a blocker for this change."
+    },
+    {
+      "id": "F4",
+      "severity": "info",
+      "title": "Branch is 3 commits behind master; version-pin test fails until merged",
+      "detail": "origin/master is 3 commits ahead (e4cacdf3, 6a7f730e, 50730e50: 7.1.0/7.1.1 version and docs pins, oracle bind-name rename, webhook redaction). tests/test_doc_version_pins_match_code.py fails on this head against current master purely because those version-pin commits are unmerged; it is the only failure-set difference and it is master-side, not a defect in the reviewed change. The branch's four 'Merge remote-tracking branch origin/master' commits bring it to the merge-base at 026d9cec, so a fresh merge is required before merge-ready."
+    }
+  ],
+  "commits_expected": 0,
+  "review_write_scope": "REVIEW_VERDICT_hv-ty-mnemos-tunnels-cloudflare-bridge-20261105.json only, pushed to refs/heads/review/hv/ty-mnemos-tunnels-cloudflare-bridge-20261105-01a1bcd6-f08e-71ff-b4bc-39e604c5d698",
+  "verification": {
+    "reviewed_test_file": "83 passed, 1 xfailed in ~0.5s across 4 consecutive runs (deterministic, no network/subprocess/sleep)",
+    "combined_tunnels_surface": "144 passed, 1 xfailed (new file + tests/test_tunnels_bridges.py + tests/test_tunnels_routes.py)",
+    "abc_first_guard": "passed (scripts/check_abc_first_guard.py; no raw _lc._pool increase)",
+    "full_suite_regression_isolation": "head failures 11 files; master failures 12 files; head-only new failures: none. Sole difference is tests/test_doc_version_pins_match_code.py failing on master due to unmerged 7.1.x version pins.",
+    "deletion_check": "git diff --diff-filter=D 026d9cec..HEAD = 0; the two test files appearing deleted vs current master are absent at the merge-base too (master-only work, not branch removals)",
+    "defect_reproduction": "confirmed empirically: a task parked on the discarded Event remains pending after a subsequent _spawn_spec; and the E1-style fix (clear() on the same Event) leaves it equally parked",
+    "author_branch_modified": false
+  },
+  "verify_delivery": {
+    "command": "/usr/bin/python3 /opt/graeae/hive_worker.py --verify-delivery /home/jasonperlow/hive-workspaces/01a1bcd6-f08e-71ff-b4bc-39e604c5d698 3db25c3260508617b374b50b77e4b7769bd9e7a1",
+    "baseline_note": "The verifier compares HEAD against the baseline it is given (the job's pre-verdict HEAD). commits-in-range and files-changed are therefore empty until the verdict artifact is committed on top of that baseline; delivery_ready flips to true once the verdict commit is pushed to the review ref, with files_changed = [REVIEW_VERDICT_hv-ty-mnemos-tunnels-cloudflare-bridge-20261105.json]."
+  }
+}
