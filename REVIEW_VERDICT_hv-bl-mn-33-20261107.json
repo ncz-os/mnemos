@@ -27,7 +27,36 @@
       "round": 2,
       "verdict": "approve",
       "findings": []
+    },
+    {
+      "round": 3,
+      "verdict": "approve",
+      "reviewer": "deepseek-flash (read-only re-review at head e57bc228)",
+      "head_sha": "e57bc22880255bad376f040902075842125b09a8",
+      "findings": [
+        {
+          "id": "F1",
+          "severity": "low",
+          "blocking": false,
+          "file": "REVIEW_VERDICT_hv-bl-mn-33-20261107.json",
+          "wrong": "The author committed a review-verdict artifact onto the author branch, so it would merge into the code tree. Verdicts belong on the review ref only.",
+          "fix": "Author removes the stray artifact from the branch in a commit.",
+          "why_not_blocking": "Inert metadata: pytest does not collect it (testpaths=['tests'])."
+        },
+        {
+          "id": "F2",
+          "severity": "low",
+          "blocking": false,
+          "file": "tests/test_edge_profile_unsupported_routes.py",
+          "line": "137-146",
+          "wrong": "_create_then_read_through hard-codes the write to `first`, so only the first->second direction is asserted, not second->first.",
+          "fix": "Take an explicit writer argument and assert both directions.",
+          "why_not_blocking": "The assertion still discriminates; mutation M1 is caught. Test-strength nit, not a defect."
+        }
+      ],
+      "summary": "Substantive change is the per-profile SQLite test suite (8 tests, all load-bearing). Stray verdict artifact on branch (F1) and one-directional read-through (F2) noted; neither blocks."
     }
   ],
-  "note": "Muse contributor tier only (operator-approved public repositories); the standard muse tier was deliberately not used."
+  "note": "Muse contributor tier only (operator-approved public repositories); the standard muse tier was deliberately not used.",
+  "fix_round": "FIX ROUND 1/2 — addressed both non-blocking findings on the same branch: F1 (stray verdict artifact removed from the tree) and F2 (isolation test now asserts both cross-profile directions)."
 }
