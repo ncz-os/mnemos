@@ -122,3 +122,8 @@ mnemos_os.egg-info/
 .coverage
 .coverage.*
 htmlcov/
+
+# Review verdict artifacts — these live on review refs only (F1, MN-33
+# review round 3); never on an author branch where they would merge into
+# the code tree.
+REVIEW_VERDICT_*.json
