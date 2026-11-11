@@ -391,11 +391,9 @@ async def invalidate_deletion_scope_caches(
 ) -> None:
     """Evict cached stat responses that may include this target.
 
-    There is no cached search response to evict: ``_lc._cache`` is hard-wired
-    to ``None`` (no Redis in the runtime) and the search handler reads no
-    cache at all, so the ``SCAN MATCH "mnemos:search:*"`` sweep that used to
-    run here matched keys of a cache that never existed. Only the stats
-    entries (the /stats surface) are still dropped.
+    Only the ``/stats`` entries are dropped: there is no cached search
+    response to evict (``_lc._cache`` is hard-wired to ``None`` and the
+    search handler reads no cache).
 
     The visibility epoch is STILL bumped so in-flight writers observe the
     narrowing of visibility (the MCP principal-context cache subscribes to

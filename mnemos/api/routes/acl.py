@@ -41,20 +41,16 @@ router = APIRouter(prefix="/v1/memories", tags=["acl"])
 
 
 async def _invalidate_search_caches_after_acl_change() -> None:
-    """Propagate an ACL grant/revoke to the visibility epoch.
+    """Bump the visibility epoch after an ACL grant/revoke.
 
     Kept under its historical name so the call sites (and the tests that
     pin them) do not churn. There is no per-user search cache to drop:
-    ``_lc._cache`` is hard-wired to ``None`` (no Redis in the runtime), and
-    the search handler stopped reading a cache (and the visibility epoch)
-    entirely, so the ``SCAN MATCH "mnemos:search:*"`` sweep that used to run
-    here matched keys of a cache that never existed. This mirrors
-    ``_invalidate_caches_after_mutation`` on the memories route.
+    ``_lc._cache`` is hard-wired to ``None`` (no Redis in the runtime) and
+    the search handler reads no cache, so only the epoch bump remains.
 
-    The visibility epoch is STILL bumped: a grant widens read visibility and
-    a revoke narrows it, and the MCP principal-context cache (role /
-    namespace — authorization inputs) subscribes to the epoch, so a revoke
-    must advance it even though search no longer reads one.
+    A grant widens read visibility and a revoke narrows it, and the MCP
+    principal-context cache (role / namespace — authorization inputs)
+    subscribes to the epoch, so a revoke must advance it.
     """
     try:
         await _lc._vis_epoch_get_incr()  # bump; errors silently
