@@ -1,0 +1,9 @@
+verdict: request_changes   ($0.0000)   [complete (1 reviewer)]
+
+── cerberus-reviewer :: request_changes ──
+The diff introduces a missing guard for the `apply` flag in the Db2 backfill logic, causing updates to run even when `apply=False`. This alters the intended semantics and could lead to unintended data modifications. No other defects were identified.
+  • (high) Missing apply guard in Db2 backfill [mnemos/persistence/db2.py:2020-2035]
+      The `backfill_missing_content_hashes` method now executes the UPDATE statements unconditionally, ignoring the `apply` parameter. The original implementation only performed updates when `apply` was truthy. This change can cause data to be modified even when the caller intends a dry‑run. The test suite does not cover the `apply=False` case, so the defect is not currently detected by tests.
+  next:
+    - Add an `if apply:` guard around the UPDATE loop in `backfill_missing_content_hashes`. Ensure that when `apply` is False the method returns 0 and performs no updates. Update the corresponding tests to verify the dry‑run behavior.
+
