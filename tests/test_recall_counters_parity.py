@@ -398,7 +398,7 @@ def test_search_handler_source_has_no_cache_key_build():
 
 
 def test_invalidate_caches_after_mutation_has_no_search_scan():
-    """The ``SCAN MATCH "mnemos:search:*"`` sweep is dead code.
+    """The dead ``mnemos:search:*`` sweep is gone (CF-24).
 
     It only ever matched keys of a cache that never existed
     (``_lc._cache`` is hard-wired to ``None``).  The visibility-epoch
