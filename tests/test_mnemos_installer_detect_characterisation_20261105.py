@@ -36,10 +36,13 @@ The public surface pinned here:
 
 One defect that was reported here is now FIXED: ``_detect_os`` used to return
 ``('linux', 'unknown', version_id)`` for a readable ``/etc/os-release`` naming
-an unmapped distro, never reaching the ``lsb_release`` fallback. Both
-``test_detect_os_falls_back_to_lsb_release_for_an_unmapped_distro`` and
-``test_detect_os_unmapped_distro_with_failing_lsb_release_is_unknown`` pin the
-repaired contract.
+an unmapped distro, never reaching the ``lsb_release`` fallback. The repaired
+contract is pinned by ``test_detect_os_falls_back_to_lsb_release_for_an_unmapped_distro``,
+``test_detect_os_unknown_id_and_unknown_id_like_falls_back_to_lsb_release``,
+``test_detect_os_unmapped_distro_with_failing_lsb_release_keeps_version_id``,
+and ``test_detect_os_lsb_release_empty_release_string_keeps_os_release_version``
+(the last two pin that the readable file's ``VERSION_ID`` survives the fallback
+even when ``lsb_release`` is missing or answers no release string).
 """
 
 from __future__ import annotations
@@ -549,6 +552,38 @@ def test_detect_os_empty_os_release_without_lsb_release_is_unknown(os_release, f
     assert table.commands() == ["lsb_release -is"]
 
 
+def test_detect_os_unmapped_distro_with_failing_lsb_release_keeps_version_id(os_release, fake_run):
+    """``/etc/os-release`` was readable but ``lsb_release`` is missing.
+
+    The distro degrades to ``unknown`` (both probes failed for it), yet the
+    ``VERSION_ID`` parsed from the readable file must still be reported
+    rather than a blank string.
+    """
+    os_release('ID="gentoo"\nID_LIKE="none"\nVERSION_ID="2.15"\n')
+    table = fake_run({_argv("lsb_release", "-is"): _FakeCompleted(1, "", "not found")})
+
+    assert _detect_os() == ("linux", "unknown", "2.15")
+    assert table.commands() == ["lsb_release -is"]
+
+
+def test_detect_os_lsb_release_empty_release_string_keeps_os_release_version(os_release, fake_run):
+    """``lsb_release`` answers the distro but ``-rs`` returns nothing.
+
+    The release string falls back to the ``VERSION_ID`` already parsed from
+    ``/etc/os-release`` instead of reporting an empty version.
+    """
+    os_release('ID="gentoo"\nID_LIKE="none"\nVERSION_ID="2.15"\n')
+    table = fake_run(
+        {
+            _argv("lsb_release", "-is"): _FakeCompleted(0, "Gentoo", ""),
+            _argv("lsb_release", "-rs"): _FakeCompleted(0, "", ""),
+        }
+    )
+
+    assert _detect_os() == ("linux", "gentoo", "2.15")
+    assert table.commands() == ["lsb_release -is", "lsb_release -rs"]
+
+
 def test_detect_os_ignores_lines_without_an_equals_sign(os_release):
     """Only ``KEY=VALUE`` lines are parsed; junk lines are skipped silently."""
     os_release('garbage line\nID="debian"\nno equals here\nVERSION_ID="12"\n')
@@ -643,14 +678,14 @@ def test_detect_os_unmapped_distro_with_failing_lsb_release_is_unknown(os_releas
     """``unknown`` is reserved for a host where *both* probes fail.
 
     The mapping misses ``linuxmint`` and ``lsb_release`` exits non-zero, so the
-    probe genuinely cannot name the distro. The ``VERSION_ID`` from
-    ``/etc/os-release`` is not carried over, because the fallback path owns the
-    answer once it is entered.
+    probe genuinely cannot name the distro. But the readable ``/etc/os-release``
+    still contributes its ``VERSION_ID`` — the fallback never blanks a version
+    it already knows.
     """
     os_release('ID="linuxmint"\nVERSION_ID="22"\n')
     table = fake_run({_argv("lsb_release", "-is"): _FakeCompleted(1, "", "not found")})
 
-    assert _detect_os() == ("linux", "unknown", "")
+    assert _detect_os() == ("linux", "unknown", "22")
     assert table.commands() == ["lsb_release -is"]
 
 

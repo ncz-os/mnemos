@@ -49,19 +49,23 @@ def _which(name: str) -> bool:
     return rc == 0
 
 
-def _detect_os_via_lsb_release() -> tuple[str, str, str]:
+def _detect_os_via_lsb_release(version_fallback: str = "") -> tuple[str, str, str]:
     """Fallback probe: resolve the distro with ``lsb_release``.
 
     Used when ``/etc/os-release`` is unreadable and when it is readable but
     names a distro the map does not cover (see ``_detect_os``). A missing or
-    failing ``lsb_release`` degrades to ``("linux", "unknown", "")``.
+    failing ``lsb_release`` degrades to ``("linux", "unknown", <version>)``
+    where ``<version>`` is the ``VERSION_ID`` read from ``/etc/os-release``
+    (empty when the file was unreadable too). A successful ``lsb_release``
+    keeps its own release string, but an empty ``-rs`` answer falls back to
+    that same ``VERSION_ID`` rather than reporting a blank version.
     """
     rc, out, _ = _run(["lsb_release", "-is"])
     if rc == 0:
         distro = out.lower()
         _, ver, _ = _run(["lsb_release", "-rs"])
-        return "linux", distro, ver
-    return "linux", "unknown", ""
+        return "linux", distro, (ver or version_fallback)
+    return "linux", "unknown", version_fallback
 
 
 def _detect_os() -> tuple[str, str, str]:
@@ -121,9 +125,10 @@ def _detect_os() -> tuple[str, str, str]:
             # nothing: fall through to lsb_release instead of reporting
             # "unknown" for a distro someone may well be running.
         except Exception:
-            pass
-        # Fallback: lsb_release
-        return _detect_os_via_lsb_release()
+            version_id = ""
+        # Fallback: lsb_release (keeps the os-release VERSION_ID when the
+        # probe itself cannot answer for the version).
+        return _detect_os_via_lsb_release(version_fallback=version_id)
     return "unknown", "unknown", ""
 
 
