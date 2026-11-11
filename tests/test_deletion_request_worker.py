@@ -45,8 +45,8 @@ class _FakeCache:
         self.store.pop(key, None)
 
     async def scan_iter(self, *, match: str, count: int):
-        # M4 residual: the ``SCAN MATCH "mnemos:search:*"`` invalidation sweep
-        # is dead code (the search cache never existed — ``_lc._cache`` is
+        # CF-24: the dead ``mnemos:search:*`` invalidation sweep was
+        # removed (the search cache never existed — ``_lc._cache`` is
         # hard-wired to ``None``). Fail loudly: the remaining assertions can
         # only see ``deleted``, and an empty SCAN would leave that empty too —
         # a sweep must never be issued in the first place.
