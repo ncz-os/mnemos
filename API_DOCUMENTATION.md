@@ -1,7 +1,7 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5002`
-**Version**: v7.0.5 current
+**Version**: v7.1.0 current
 **Format**: JSON
 
 ---
@@ -63,7 +63,7 @@ Liveness + readiness check (no auth required).
   "status": "healthy",
   "timestamp": "2026-05-02T14:30:00.000Z",
   "database_connected": true,
-  "version": "7.0.5",
+  "version": "7.1.0",
   "profile": "edge",
   "distillation_worker": "idle"
 }
@@ -412,7 +412,9 @@ Common codes:
 - `401` — missing or invalid auth
 - `403` — role check failed
 - `404` — entity not found
-- `409` — conflict requiring operator action, including incompatible federation schema and `MN001` branch-state reconciliation
+- `409` — conflict requiring operator action, including incompatible federation schema and `MN001` branch-state reconciliation.
+  A federation sync in progress is NOT a 409: `POST /v1/federation/peers/{id}/sync`
+  blocks on the per-peer sync lock and returns the result of its own pass (MN-25).
 - `413` — request body exceeds `MAX_BODY_BYTES` (default 5 MB)
 - `429` — rate-limited (when `RATE_LIMIT_ENABLED=true`)
 - `503` — database pool unavailable, OR the route's subsystem extra isn't

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "kind": "review",
+  "job_id": "01a1b998-71f3-7842-8125-7f3d45a35f2b",
+  "head_branch": "hv/ty-mn-mnemos-api-routes-journal-20261105",
+  "base_branch": "master",
+  "base_sha": "026d9cec03f27a57723a95a468a3a5c4351bb452",
+  "head_sha": "0d10815a256a9cfa820028727f0658299f37e5cf",
+  "verdict": "approve",
+  "final_verdict": "approve",
+  "reason": "Re-review (this job's review evidence did not name the delivered head). Reviewed head 0d10815a256a9cfa820028727f0658299f37e5cf, confirmed byte-identical to the remote branch tip (git ls-remote). The branch is a clean 14-commit superset of master (026d9cec): 9 added files, 1182 insertions, zero deletions, no production code changed (git diff 026d9cec..HEAD -- mnemos/ is empty). The deliverable is a tests-only characterisation suite for mnemos/api/routes/journal.py (676 lines, 58 tests: request-model pins, per-owner/per-namespace scoping, date parsing, 503/403/404/422/500 contracts via direct coroutine calls and a real TestClient over the actual router) plus an import-hygiene meta-test (299 lines) that converts previously repeated false 'truncated/undefined' review findings into executable guards. All verified by execution on this exact head: both suites give 98 passed, 1 xfailed; the single xfail(strict=True) pin is real -- DELETE /journal/{entry_id} genuinely lacks the try/except->500 mapping its sibling routes have, which was confirmed by reading mnemos/api/routes/journal.py at this head. ruff check and ruff format --check are clean; the repo's private-endpoint and doc-version guards (46 tests) pass; the earlier in-branch verdict naming stale head e242ee96 (an ancestor) is superseded by this one. No findings.",
+  "reviewers": [
+    {
+      "model": "deepseek-flash",
+      "provider": "deepseek",
+      "role": "reviewer",
+      "ok": true,
+      "verdict": "approve",
+      "summary": "Tests-only characterisation coverage for the journal routes with all externals faked and no production code touched. Verified green on the delivered head; ruff clean; the pinned DELETE-route defect is real and correctly xfail(strict=True), which will force a revisit if production code is later fixed.",
+      "findings": [],
+      "next_steps": []
+    }
+  ],
+  "verification": {
+    "command": "/usr/bin/python3 /opt/graeae/hive_worker.py --verify-delivery <workspace> 0d10815a256a9cfa820028727f0658299f37e5cf",
+    "tests": {
+      "tests/test_mnemos_api_routes_journal_characterisation_20261105.py": "58 passed, 1 xfailed",
+      "tests/test_characterisation_suite_import_hygiene.py": "40 passed",
+      "tests/test_no_private_default_endpoints.py + tests/test_doc_version_pins_match_code.py": "46 passed",
+      "combined_run": "98 passed, 1 xfailed"
+    },
+    "lint": "ruff check: All checks passed; ruff format --check: 2 files already formatted",
+    "scope_check": "git diff --numstat 026d9cec..HEAD shows 1182 insertions, 0 deletions, 9 files all added; git diff 026d9cec..HEAD -- mnemos/ is empty; origin/master is an ancestor of HEAD; HEAD equals the remote branch tip"
+  },
+  "findings": [],
+  "next_steps": [
+    "Optional follow-up (not blocking this tests-only branch): give DELETE /journal/{entry_id} the same try/except->500 mapping as its sibling routes; that will flip the xfail(strict=True) pin to XPASS->FAIL, which is the intended signal to update the assertion."
+  ],
+  "note": "Re-review: the previously committed artifact on this branch recorded head e242ee96, which is now an ancestor of the delivered head. This verdict reviews and supersedes it for the actual delivered head 0d10815a256a9cfa820028727f0658299f37e5cf. The author branch carries the updated artifact; this commit is delivered on the separate review ref review/hv/ty-mn-mnemos-api-routes-journal-20261105-01a1b9e7-ac97-7f6b-b995-bb8f0d6b3efd and no other ref."
+}

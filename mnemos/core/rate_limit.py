@@ -6,7 +6,11 @@ On by default (`RATE_LIMIT_ENABLED=true`). Tune via environment variables:
     RATE_LIMIT_DEFAULT=300/minute    # global ceiling per client
     RATE_LIMIT_STORAGE_URI=redis://localhost:6379/1  # or memory:// (single-worker)
     RATE_LIMIT_TRUST_PROXY=false     # set true ONLY behind a trusted reverse proxy
-                                     # that rewrites X-Forwarded-For.
+                                     # that appends X-Forwarded-For.
+    RATE_LIMIT_TRUSTED_PROXY_HOPS=1  # how many of YOUR proxies append XFF; the
+                                     # client address is that many entries from
+                                     # the RIGHT (client-supplied entries to its
+                                     # left are ignored, never bucketed on)
 
 Route-specific limits (e.g. on `/v1/consultations`) are applied via
 `@limiter.limit()` in the relevant handler.
@@ -31,26 +35,95 @@ RATE_LIMIT_ENABLED = _RATE_LIMIT_SETTINGS.enabled
 RATE_LIMIT_DEFAULT = _RATE_LIMIT_SETTINGS.default
 RATE_LIMIT_STORAGE = _RATE_LIMIT_SETTINGS.storage_uri
 RATE_LIMIT_TRUST_PROXY = _RATE_LIMIT_SETTINGS.trust_proxy
+RATE_LIMIT_TRUSTED_PROXY_HOPS = _RATE_LIMIT_SETTINGS.trusted_proxy_hops
 
 
 def _client_ip(request: Request) -> str:
     """Resolve the client IP for rate-limit bucketing.
 
-    By default we trust only the direct TCP peer (safe anywhere). When
-    RATE_LIMIT_TRUST_PROXY=true, we honour the left-most entry in
-    X-Forwarded-For — only enable this when the server sits behind a proxy
-    that you control and that strips client-supplied XFF headers, otherwise
-    clients can spoof their IP and evade rate limits.
+    By default we trust only the direct TCP peer (safe anywhere).
+
+    When ``RATE_LIMIT_TRUST_PROXY=true``, a proxy we control sits in front of
+    us and appends the address it actually saw to ``X-Forwarded-For``. The
+    header is a list of hops, and only the right-most ``hops`` entries were
+    written by infrastructure: a proxy APPENDS to whatever the client sent, so
+    anything further left is arbitrary client-supplied text. Bucketing on the
+    left-most entry -- as this used to -- let any client mint a fresh bucket
+    per request by rotating a made-up value, i.e. it disabled rate limiting
+    for exactly the deployments that turned the trust switch ON (CF-23).
+
+    So we count in from the right by ``RATE_LIMIT_TRUSTED_PROXY_HOPS`` (the
+    number of proxies of ours that append; default 1). If the header carries
+    fewer entries than that chain, it did not traverse our full proxy path (or
+    the client sent it itself), so every entry is client-influenced and the
+    request is bucketed on the direct peer -- the one address the client cannot
+    choose.
     """
     if RATE_LIMIT_TRUST_PROXY:
-        xff = request.headers.get("x-forwarded-for")
-        if xff:
-            # Left-most is the original client per RFC convention.
-            return xff.split(",")[0].strip()
-        real_ip = request.headers.get("x-real-ip")
-        if real_ip:
-            return real_ip.strip()
+        client = _forwarded_client_ip(request)
+        if client:
+            return client
     return get_remote_address(request)
+
+
+def _header_text(value: object) -> str:
+    """Decode one header value to ``str``, whatever the header layer returns.
+
+    Starlette's ``Headers.getlist`` decodes to ``str``, but the bucket key is
+    the identity of a rate-limit counter, so this boundary does not depend on
+    that staying true: a raw ASGI transport, a proxy library, or a future
+    Starlette revision may hand back ``bytes``. ``latin-1`` is the ASGI header
+    encoding, so it round-trips every byte value exactly as Starlette does.
+    """
+    if isinstance(value, bytes):
+        return value.decode("latin-1")
+    return str(value)
+
+
+def _trusted_hop_count() -> int:
+    """The trusted hop count, floored at 1.
+
+    ``RATE_LIMIT_TRUSTED_PROXY_HOPS`` is clamped by the settings validator, but
+    this module also reads it through monkeypatched/settings objects that never
+    ran pydantic. Flooring HERE means a 0 or a negative can never walk the
+    index backwards into a client-chosen or negative position -- the one
+    mistake that would re-open CF-23.
+    """
+    try:
+        hops = int(RATE_LIMIT_TRUSTED_PROXY_HOPS)
+    except (TypeError, ValueError):
+        return 1
+    return max(hops, 1)
+
+
+def _forwarded_client_ip(request: Request) -> str:
+    """The address our own proxies saw, or "" when no header value is trustworthy."""
+    hops = _trusted_hop_count()
+
+    # `headers.getlist` keeps repeated header lines as separate entries; split
+    # each on commas and drop blanks so a malformed ", ," cannot shift the hop
+    # and a blank can never itself become a bucket key.
+    entries: list[str] = []
+    for raw in request.headers.getlist("x-forwarded-for"):
+        for part in _header_text(raw).split(","):
+            entry = part.strip()
+            if entry:
+                entries.append(entry)
+
+    if len(entries) >= hops:
+        return entries[-hops]
+
+    # The chain is shorter than the number of proxies we trust, so this request
+    # did not traverse the whole path, or the client sent the header itself.
+    # Either way its contents are client-influenced and unusable: fall through
+    # to the direct peer, the one address the client cannot choose.
+    logger.debug(
+        "x-forwarded-for has %d usable entr%s but %d trusted proxy hop(s) are configured; bucketing on the direct peer",
+        len(entries),
+        "y" if len(entries) == 1 else "ies",
+        hops,
+    )
+    return ""
 
 
 class _FailOpenLimiter(Limiter):
