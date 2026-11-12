@@ -49,8 +49,39 @@ def _which(name: str) -> bool:
     return rc == 0
 
 
+def _detect_os_via_lsb_release(version_fallback: str = "") -> tuple[str, str, str]:
+    """Fallback probe: resolve the distro with ``lsb_release``.
+
+    Used when ``/etc/os-release`` is unreadable and when it is readable but
+    names a distro the map does not cover (see ``_detect_os``). A missing or
+    failing ``lsb_release`` degrades to ``("linux", "unknown", <version>)``
+    where ``<version>`` is the ``VERSION_ID`` read from ``/etc/os-release``
+    (empty when the file was unreadable too). A successful ``lsb_release``
+    keeps its own release string, but an empty ``-rs`` answer falls back to
+    that same ``VERSION_ID`` rather than reporting a blank version.
+    """
+    rc, out, _ = _run(["lsb_release", "-is"])
+    if rc == 0:
+        distro = out.lower()
+        _, ver, _ = _run(["lsb_release", "-rs"])
+        return "linux", distro, (ver or version_fallback)
+    return "linux", "unknown", version_fallback
+
+
 def _detect_os() -> tuple[str, str, str]:
-    """Return (os_type, distro, distro_version)."""
+    """Return (os_type, distro, distro_version).
+
+    The ``/etc/os-release`` parse is the fast path, but it is not authoritative:
+    when its ``ID`` is not in ``distro_map`` and ``ID_LIKE`` does not resolve
+    either, the reported distro would be a bare ``"unknown"`` even on a distro
+    MNEMOS supports. Both failure modes therefore fall through to the
+    ``lsb_release`` probe:
+
+    * the file cannot be opened/parsed, or
+    * the file parses but yields an unmapped distro.
+
+    Returning ``"unknown"`` is reserved for a host where *both* probes fail.
+    """
     system = platform.system().lower()
     if system == "darwin":
         mac_ver = platform.mac_ver()[0]  # e.g. '15.4'
@@ -88,16 +119,16 @@ def _detect_os() -> tuple[str, str, str]:
                     if key in id_like:
                         distro = distro_map[key]
                         break
-            return "linux", distro, version_id
+            if distro != "unknown":
+                return "linux", distro, version_id
+            # Readable, but the distro is unmapped and ID_LIKE resolved
+            # nothing: fall through to lsb_release instead of reporting
+            # "unknown" for a distro someone may well be running.
         except Exception:
-            pass
-        # Fallback: lsb_release
-        rc, out, _ = _run(["lsb_release", "-is"])
-        if rc == 0:
-            distro = out.lower()
-            _, ver, _ = _run(["lsb_release", "-rs"])
-            return "linux", distro, ver
-        return "linux", "unknown", ""
+            version_id = ""
+        # Fallback: lsb_release (keeps the os-release VERSION_ID when the
+        # probe itself cannot answer for the version).
+        return _detect_os_via_lsb_release(version_fallback=version_id)
     return "unknown", "unknown", ""
 
 

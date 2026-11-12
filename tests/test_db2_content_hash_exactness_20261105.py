@@ -25,10 +25,15 @@ def _normalized(content: str) -> str:
 
 
 class _BackfillCursor:
-    """Serves one SELECT batch, then records the UPDATE parameters."""
+    """Serves one SELECT batch, then records the UPDATE parameters.
 
-    def __init__(self, batch: list[tuple[str, str]]) -> None:
+    ``count`` is what the dry-run (``apply=False``) COUNT(*) query returns;
+    it defaults to the batch length so both paths agree on the row count.
+    """
+
+    def __init__(self, batch: list[tuple[str, str]], count: int | None = None) -> None:
         self._batch = batch
+        self._count = len(batch) if count is None else count
         self.statements: list[tuple[str, Any]] = []
         self.description: Any = None
         self.rowcount = 0
@@ -37,7 +42,10 @@ class _BackfillCursor:
         text = " ".join(str(sql).split())
         self.statements.append((text, params))
         upper = text.upper()
-        if upper.startswith("SELECT"):
+        if "COUNT(*)" in upper:
+            self.description = [("cnt",)]
+            self.rowcount = 0
+        elif upper.startswith("SELECT"):
             self.description = [("id",), ("content",)]
             self.rowcount = 0
         else:
@@ -49,6 +57,8 @@ class _BackfillCursor:
         return list(self._batch)
 
     async def fetchone(self) -> Any:
+        if self.description and self.description[0][0] == "cnt":
+            return (self._count,)
         return None
 
     async def close(self) -> None:
@@ -111,6 +121,59 @@ async def test_db2_backfill_hashes_the_whole_body_in_python() -> None:
     assert digest == hashlib.sha256(_normalized(long_body).encode("utf-8")).hexdigest()
     truncated = hashlib.sha256(_normalized(long_body)[:32672].encode("utf-8")).hexdigest()
     assert digest != truncated
+
+
+@pytest.mark.asyncio
+async def test_db2_backfill_dry_run_returns_the_count_and_writes_nothing() -> None:
+    """``apply=False`` must be a pure read: report the backlog, issue no UPDATE.
+
+    The batch is populated so a missing ``apply`` check would hash it and
+    write; the assertion is that nothing is written and the reported number
+    is the unhashed row count, not the batch size.
+    """
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    cursor = _BackfillCursor([("mem-1", "body"), ("mem-2", "other")], count=7)
+    repo = Db2MemoryRepository()
+    reported = await repo.backfill_missing_content_hashes(
+        SimpleNamespace(conn=SimpleNamespace(cursor=lambda: cursor)),
+        apply=False,
+        batch_size=10,
+    )
+    assert reported == 7
+    writes = [
+        sql for sql, _ in cursor.statements if not sql.upper().startswith("SELECT")
+    ]
+    assert writes == [], f"dry run issued a write: {writes}"
+    assert all("COUNT(*)" in sql.upper() for sql, _ in cursor.statements)
+
+
+@pytest.mark.asyncio
+async def test_db2_backfill_hashes_a_null_body_as_the_empty_string() -> None:
+    """A NULL ``content`` must hash like ``COALESCE(content, '')``, not raise.
+
+    Db2 returns a NULL CLOB for a stored NULL; passing ``None`` straight to
+    the hasher would crash the backfill mid-batch. The empty-string digest is
+    exactly what the previous SQL form (``COALESCE(content, '')``) produced,
+    so the value a backfilled row gets is unchanged by the Python rewrite.
+    """
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    cursor = _BackfillCursor([("mem-null", None), ("mem-text", "body")])
+    repo = Db2MemoryRepository()
+    applied = await repo.backfill_missing_content_hashes(
+        SimpleNamespace(conn=SimpleNamespace(cursor=lambda: cursor)),
+        apply=True,
+        batch_size=10,
+    )
+    assert applied == 2
+    digests = [
+        params[0]
+        for sql, params in cursor.statements
+        if sql.upper().startswith("UPDATE")
+    ]
+    assert digests[0] == hashlib.sha256(b"").hexdigest()
+    assert digests[1] == hashlib.sha256(b"body").hexdigest()
 
 
 @pytest.mark.asyncio

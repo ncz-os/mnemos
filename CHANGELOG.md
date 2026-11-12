@@ -2,6 +2,33 @@
 
 All notable changes to MNEMOS are documented here.
 
+## Unreleased
+
+- **Federation** — MN-25: the concurrent-sync trigger contract is pinned. `POST /v1/federation/peers/{id}/sync` blocks on the per-peer sync lock when another pass for the peer is in flight and returns the result of its own pass — it is never a 409 (`FederationSyncInProgress` is not part of the contract; the only 409s from the trigger route remain schema-compatibility and unverifiable-schema aborts). Regression test: `tests/test_federation_sync_trigger_blocks_20261110.py`.
+
+## 7.1.1 — 2026-11-08
+
+- **Oracle** — the federation replica-health write (`record_sync_lag`) bound a variable named `:rows`, a reserved word, so every peer pull on an Oracle primary failed with ORA-01745 after the sync (HTTP 500 on `/v1/federation/peers/<id>/sync`, peer status never refreshed). The bind names are renamed (`:rows_n`, `:lag_s`, `:emb_status`, and `:owner_uid` in the scoped audit-log read) and a test now rejects any reserved-word bind name in the Oracle backend.
+- **Search cache cleanup** — the dead `SCAN MATCH "mnemos:search:*"` invalidation sweeps and the `_get_cache_key` / `_vis_epoch_current` helpers they existed to serve are removed. The per-user search cache never existed in the runtime (`_lc._cache` is hard-wired to `None` with no Redis, and the search handler stopped reading a cache), so every sweep matched keys of a cache that was never written. The four remaining routes keep their `/stats`-entry invalidation, and the ACL grant/revoke path keeps its visibility-epoch bump — which the MCP principal-context cache (role/namespace authorization inputs) subscribes to — and now always runs it instead of early-returning when no cache is configured. The "Cache coherency" section of `docs/MULTIUSER_ACL_DESIGN.md` is updated to match.
+
+## 7.1.0 — 2026-11-08
+
+A minor release on the v7.0 line: about 1,800 commits since 7.0.5 (core c2dd6bfa, 2026-09-27), roughly 17,000 lines of product code,
+42 new modules and five database migrations (0067 to 0071, applied automatically at startup, no destructive changes).
+
+- **Federation** — replica health provisioning and reporting, sync counters, a narrowed journal trigger, skipped-deleted accounting,
+  digest-folded ids, and a peer sync interval that is validated against the database floor.
+- **API** — new memory-mutation and read-policy layers, a shared error model, route policy moved into core, and stricter request validation.
+- **Persistence** — SQLite, PostgreSQL, MySQL/MariaDB, Oracle and Db2 backends hardened for parity (exact content-hash dedup, NULL-namespace
+  matching, LISTAGG overflow fallback, a metadata equality index, memory index hygiene).
+- **Provenance** — server-side provenance stamping and a classified metadata channel; import conflicts compare caller metadata only.
+- **Webhooks** — secrets and the stored namespace are redacted from `memory.created` payloads; dispatch, lease and finalize paths tightened.
+- **Embeddings** — an embedding contract and a runtime embedder with an automatic remote fallback endpoint.
+- **MCP over HTTP** — bearer authentication is an environment toggle (`MNEMOS_MCP_AUTH_ENABLED`, defaulting to the REST auth setting).
+- **Tests and docs** — large characterisation suites for the API, domain and persistence layers; the documentation version pins track 7.1.0.
+
+Upgrade note: take a database backup first. Migrations 0067 to 0071 run on first start; Oracle and Db2 receive parity files.
+
 ## Pre-release history
 
 - ✅ **Webhook subscriptions** — outbound notifications on memory write, consultation completion. HMAC-signed delivery, retry with exponential backoff.
