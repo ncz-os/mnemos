@@ -60,9 +60,12 @@ def _validate_max_cost(value: float | None) -> float | None:
 
 
 def _validate_model_or_alias(value: str) -> str:
-    if not isinstance(value, str) or not _MODEL_ALIAS_RE.match(value) or not value.strip():
+    if not isinstance(value, str):
         raise ValueError("model_or_alias must be a non-empty string")
-    return value.strip()
+    stripped = value.strip()
+    if not stripped or not _MODEL_ALIAS_RE.match(stripped):
+        raise ValueError("model_or_alias must be a non-empty string")
+    return stripped
 
 
 async def tool_recommend_model(
