@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -31,6 +32,7 @@ PROFILE_STORAGE = {
     "raw-route-sqlite": "raw-routes.sqlite3",
     "raw-session-sqlite": "raw-sessions.sqlite3",
     "raw-state-sqlite": "raw-state.sqlite3",
+    "raw-session-sqlite-copy": "raw-session-copy.sqlite3",
 }
 # What ``SessionsRepository.create_session`` returns on every backend (the
 # Postgres implementation selects exactly these three columns).
@@ -64,8 +66,10 @@ def _route_client():
 
 @pytest.fixture
 def edge_client(monkeypatch, tmp_path):
-    _backend(monkeypatch, tmp_path, "raw-route-sqlite")
-    return _route_client()
+    backend = _backend(monkeypatch, tmp_path, "raw-route-sqlite")
+    yield _route_client()
+    # Release the provisioned file handle before the next profile opens.
+    asyncio.run(backend.close())
 
 
 def test_edge_profile_postgres_only_routes_return_503(edge_client):
@@ -135,28 +139,31 @@ def test_edge_profiles_do_not_reuse_each_others_storage(monkeypatch, tmp_path):
     profile's own round-trip, so the isolation contract holds regardless of
     which profile writes first.
     """
-    asyncio = pytest.importorskip("asyncio")
-
     first = _backend(monkeypatch, tmp_path, "raw-session-sqlite")
     second = _backend(monkeypatch, tmp_path, "raw-state-sqlite")
-    assert first is not second
-    assert first._db_path != second._db_path
+    try:
+        assert first is not second
+        assert first._db_path != second._db_path
 
-    async def _create_then_read_through(writer: SqliteBackend, reader: SqliteBackend):
-        """Write a session through ``writer``; read it back through ``reader``."""
-        async with writer.transactional() as tx:
-            row = await writer.sessions.create_session(
-                tx, user_id="u", namespace="default", model="m", initial_context=None
-            )
-        async with reader.transactional() as tx:
-            return await reader.sessions.get_session(tx, row["id"], "u", "default")
+        async def _create_then_read_through(writer: SqliteBackend, reader: SqliteBackend):
+            """Write a session through ``writer``; read it back through ``reader``."""
+            async with writer.transactional() as tx:
+                row = await writer.sessions.create_session(
+                    tx, user_id="u", namespace="default", model="m", initial_context=None
+                )
+            async with reader.transactional() as tx:
+                return await reader.sessions.get_session(tx, row["id"], "u", "default")
 
-    # Same-profile round-trips must succeed...
-    assert asyncio.run(_create_then_read_through(first, first)) is not None
-    assert asyncio.run(_create_then_read_through(second, second)) is not None
-    # ...and neither profile may see the other's row, in either direction.
-    assert asyncio.run(_create_then_read_through(first, second)) is None
-    assert asyncio.run(_create_then_read_through(second, first)) is None
+        # Same-profile round-trips must succeed...
+        assert asyncio.run(_create_then_read_through(first, first)) is not None
+        assert asyncio.run(_create_then_read_through(second, second)) is not None
+        # ...and neither profile may see the other's row, in either direction.
+        assert asyncio.run(_create_then_read_through(first, second)) is None
+        assert asyncio.run(_create_then_read_through(second, first)) is None
+    finally:
+        # Release both file handles before the next profile provisions.
+        asyncio.run(first.close())
+        asyncio.run(second.close())
 
 
 def test_sessions_repository_create_session_on_raw_sqlite(monkeypatch, tmp_path):
@@ -169,34 +176,49 @@ def test_sessions_repository_create_session_on_raw_sqlite(monkeypatch, tmp_path)
     the two surfaces as a None/partial row here instead of as a 500 in the
     route.
     """
-    asyncio = pytest.importorskip("asyncio")
-
     backend = _backend(monkeypatch, tmp_path, "raw-session-sqlite")
-    other_store = SqliteBackend(tmp_path / "raw-session-sqlite-copy.sqlite3", SimpleNamespace())
+    # The "no reuse across stores" check needs a second, equally provisioned
+    # store. Provision it through ``_backend`` too — same tmp dir, same
+    # lifecycle registration, same per-profile file invariant — then flip
+    # the lifecycle back to ``backend``. Both handles are closed below.
+    other_store = _backend(monkeypatch, tmp_path, "raw-session-sqlite-copy")
+    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+    monkeypatch.setattr(lifecycle, "_pool", None)
+    monkeypatch.setattr(lifecycle, "_pool_manager", None)
 
-    async def create(store):
-        async with store.transactional() as tx:
-            return await store.sessions.create_session(
-                tx, user_id="u", namespace="default", model="m", initial_context=None
-            )
+    try:
+        async def create(store):
+            async with store.transactional() as tx:
+                return await store.sessions.create_session(
+                    tx, user_id="u", namespace="default", model="m", initial_context=None
+                )
 
-    async def read(store, session_id, namespace="default"):
-        async with store.transactional() as tx:
-            return await store.sessions.get_session(tx, session_id, "u", namespace)
+        async def read(store, session_id, namespace="default"):
+            async with store.transactional() as tx:
+                return await store.sessions.get_session(tx, session_id, "u", namespace)
 
-    first = asyncio.run(create(backend))
-    second = asyncio.run(create(backend))
+        first = asyncio.run(create(backend))
+        second = asyncio.run(create(backend))
 
-    assert first is not None and second is not None
-    assert first["id"] and second["id"]
-    assert first["id"] != second["id"], "two sessions must not share one id"
-    assert set(first.keys()) == _SESSION_ROW_KEYS
+        assert first is not None and second is not None
+        assert first["id"] and second["id"]
+        assert first["id"] != second["id"], "two sessions must not share one id"
+        # Contract, not projection drift: every backend returns at least the
+        # session identity columns. The SQLite projection may not gain extra
+        # keys without a matching contract change, so hold the upper bound too
+        # — but the load-bearing check is that the contract columns are present.
+        assert _SESSION_ROW_KEYS <= set(first.keys())
+        assert set(first.keys()) == _SESSION_ROW_KEYS
 
-    assert asyncio.run(read(backend, first["id"]))["id"] == first["id"]
+        assert asyncio.run(read(backend, first["id"]))["id"] == first["id"]
 
-    # The row belongs to one namespace and one store, not to the process.
-    assert asyncio.run(read(backend, first["id"], namespace="elsewhere")) is None
-    assert asyncio.run(read(other_store, first["id"])) is None
+        # The row belongs to one namespace and one store, not to the process.
+        assert asyncio.run(read(backend, first["id"], namespace="elsewhere")) is None
+        assert asyncio.run(read(other_store, first["id"])) is None
+    finally:
+        # Release both file handles before the next profile provisions.
+        asyncio.run(backend.close())
+        asyncio.run(other_store.close())
 
 
 def test_edge_profile_sessions_route_does_not_require_postgres(edge_client):
