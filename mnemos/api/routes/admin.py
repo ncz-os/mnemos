@@ -397,7 +397,7 @@ CompressionProfile = Literal["balanced", "quality_first", "speed_first", "custom
 async def _invalidate_memory_read_caches() -> None:
     """Drop the stats cache and bump the visibility epoch after a rewrite.
 
-    The ``mnemos:search:*`` sweep this used to run is gone: it scanned
+    The search-key sweep this used to run is gone: it scanned
     ``_lc._cache``, which the lifecycle hard-wires to ``None`` and which
     holds no search keys since the per-user search cache was removed
     (MN-31). ``stats:global:v2`` belongs to the stats surface and is a
