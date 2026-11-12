@@ -9,7 +9,7 @@ Refresh the reviewed-and-approved branch `hv/bl-mn-17-20261107` onto
 branch. Merge `origin/master` into the branch, resolve every conflict keeping
 the branch's intended change and the target's newer code, run the repository
 test suite before and after (failures must not grow versus the target), and
-push the same head branch to ARGONAS. No new features, no unrelated files.
+push the same head branch to `origin`. No new features, no unrelated files.
 
 ## What the merge produced
 
@@ -84,5 +84,5 @@ no increase in raw `_lc._pool` references outside `mnemos/persistence/`.
 Failures did not grow versus the target `450dcf52`, master's newer code
 (webhook redaction, release 7.1.1 / Oracle bind renames, ADR-D-MN5) is in the
 tree verbatim, and the intended MN-17/CF-35 change is preserved. The same
-head branch `hv/bl-mn-17-20261107` was pushed to ARGONAS (`origin`) with
+head branch `hv/bl-mn-17-20261107` was pushed to `origin` with
 upstream tracking; the remote SHA is verified equal to local HEAD.
