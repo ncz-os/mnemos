@@ -319,6 +319,11 @@ def test_edge_profile_sessions_route_requires_the_sessions_capability(monkeypatc
             self._real = real_backend
 
         def __getattr__(self, name):
+            if name == "sessions":
+                raise AssertionError(
+                    "capability gate bypassed: the route touched 'sessions' "
+                    "on a backend that does not advertise SESSIONS_CAPABILITY"
+                )
             return getattr(self._real, name)
 
         @property
