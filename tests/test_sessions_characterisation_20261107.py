@@ -559,12 +559,11 @@ def test_add_message_inserts_a_system_prompt_when_the_history_has_none(
     assert seen["messages"][1] == {"role": "user", "content": "hi"}
 
 
-def test_add_message_appends_context_to_the_first_message_when_a_system_row_exists(
+def test_add_message_appends_context_to_the_system_row_when_it_is_not_first(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The handler appends to ``messages[0]`` after testing that SOME row is a
-    # system row, so an ordering where the system row is not first appends the
-    # memory context to a user message. Pinned as observed, not repaired.
+    # The handler appends to the actual system row, even when the system row
+    # is not first in the history ordering.
     repo = _Repo()
     repo.history = [
         {"role": "user", "content": "hi", "timestamp": CREATED, "model": "m"},
@@ -577,11 +576,11 @@ def test_add_message_appends_context_to_the_first_message_when_a_system_row_exis
 
     client.post("/v1/sessions/sess_1/messages", json={"role": "user", "content": "q"})
 
-    assert seen["messages"][0] == {
-        "role": "user",
-        "content": "hi\n\n[MNEMOS Context - 1 memories]\n[Memory]\nctx",
+    assert seen["messages"][0] == {"role": "user", "content": "hi"}
+    assert seen["messages"][1] == {
+        "role": "system",
+        "content": "late rules\n\n[MNEMOS Context - 1 memories]\n[Memory]\nctx",
     }
-    assert seen["messages"][1] == {"role": "system", "content": "late rules"}
     assert len(seen["messages"]) == 2
 
 
