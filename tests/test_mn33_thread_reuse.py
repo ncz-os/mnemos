@@ -22,7 +22,6 @@ fails to recycle an id.
 from __future__ import annotations
 
 import sqlite3
-import tempfile
 import threading
 from types import SimpleNamespace
 
@@ -150,7 +149,7 @@ def test_context_managed_client_matches_connection_owning_thread(edge_app, edge_
     )
 
 
-def test_raw_connection_rejects_cross_thread_use_deterministically():
+def test_raw_connection_rejects_cross_thread_use_deterministically(tmp_path):
     """The failure mode MN-33 hid: a raw sqlite3 connection is thread-bound.
 
     Provoked deterministically — the connection is opened on this thread and
@@ -158,7 +157,7 @@ def test_raw_connection_rejects_cross_thread_use_deterministically():
     the OS happens to recycle thread ids. This is the reason a bare
     ``TestClient`` could not be safe without ``aiosqlite``.
     """
-    path = tempfile.mktemp(suffix=".sqlite3")
+    path = str(tmp_path / "mn33-cross-thread.sqlite3")
     conn = sqlite3.connect(path)  # check_same_thread=True by default
     try:
         conn.execute("CREATE TABLE t (x INTEGER)")
