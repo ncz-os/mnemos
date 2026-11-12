@@ -3,10 +3,16 @@
 Each mapper must produce its documented frozen record with every documented field, use the
 documented default for an absent optional field, and leave the source row untouched.
 
-DIVERGENCE (brief premise vs code): ``description`` is only read when the row is a ``dict``,
-so the ``sqlite3.Row`` the repository queries actually return always maps ``description`` to
-``None`` even when the column is present. Invalid ``events`` JSON also degrades to an empty
-tuple instead of raising, so a malformed value is indistinguishable from "no events".
+DIVERGENCE (brief premise vs code, retained by design): invalid ``events`` JSON degrades to
+an empty tuple instead of raising, so a malformed value is indistinguishable from "no
+events". That is the shared JSON-degradation contract (see ``postgres._json_list`` and the
+other SQLite JSON-field helpers): malformed column data never aborts a webhook read, and
+raising only on SQLite would break cross-backend parity.
+
+Fixed (2026-11-11, refresh of ``hv/bk-mn-35-20261109-d2`` onto ``13a3fe4a``): ``description``
+is now mapped for both ``dict`` and ``sqlite3.Row`` inputs, matching postgres/mysql/oracle
+which read the column regardless of row type. A dict lacking the key still defaults to
+``None``; a Row lacking the column reads ``None`` via ``row["col"]``.
 """
 
 from __future__ import annotations
@@ -129,7 +135,7 @@ def test_subscription_row_without_description_key_is_not_given_one() -> None:
     assert "description" not in row
 
 
-def test_subscription_from_a_sqlite_row_drops_description() -> None:
+def test_subscription_from_a_sqlite_row_keeps_description() -> None:
     columns = list(_sub_row())
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -142,7 +148,7 @@ def test_subscription_from_a_sqlite_row_drops_description() -> None:
     record = _sqlite_webhook_subscription(row)
 
     assert row["description"] == "primary hook"
-    assert record.description is None  # DIVERGENCE: the dict-only guard drops it
+    assert record.description == "primary hook"  # parity with dict rows; no longer dropped
 
 
 def test_subscription_id_is_coerced_to_text() -> None:
