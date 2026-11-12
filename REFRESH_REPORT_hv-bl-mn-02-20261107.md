@@ -64,7 +64,7 @@ MN-02 change-set.
 
 ## Delivery
 
-- Branch `hv/bl-mn-02-20261107` pushed to ARGONAS (`origin`), upstream
+- Branch `hv/bl-mn-02-20261107` pushed to the private remote (`origin`), upstream
   tracking intact, remote SHA == local HEAD.
 
 ## Round 2 — review-defect fixes (2026-11-10)

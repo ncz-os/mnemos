@@ -51,7 +51,7 @@ Remaining failures are pre-existing environment issues on `master`.
 
 ## Delivery
 
-The same head branch was pushed to ARGONAS (the canonical private bare repo);
+The same head branch was pushed to the private remote (the canonical private bare repo);
 local HEAD, `origin` and `argonas` refs agree.
 
 ## Review follow-up (2026-11-09, post-merge re-review)
