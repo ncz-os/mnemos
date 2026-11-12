@@ -38,13 +38,43 @@ PROFILE_STORAGE = {
 # Postgres implementation selects exactly these three columns).
 _SESSION_ROW_KEYS = {"id", "created_at", "model"}
 
+# The lifecycle slots every provisioned store registers through.
+#: Snapshot captured by ``_register`` on first write; restored by ``_restore``.
+_REGISTER_SLOTS = ("_persistence_backend", "_pool", "_pool_manager")
+_register_saved: dict = {}
+
+
+def _register(backend) -> None:
+    """Register ``backend`` in the lifecycle module (manual path).
+
+    Unlike the monkeypatch path, this borrows no pytest teardown: the caller
+    must pair it with :func:`_restore` so the module never points at a closed
+    store. The slots are captured only on first write so that registering a
+    second store in sequence does not record the first store as "original".
+    """
+    for name in _REGISTER_SLOTS:
+        if name not in _register_saved:
+            _register_saved[name] = getattr(lifecycle, name)
+        setattr(lifecycle, name, backend if name == "_persistence_backend" else None)
+
+
+def _restore() -> None:
+    """Undo every manual registration, leaving the lifecycle untouched."""
+    for name, value in _register_saved.items():
+        setattr(lifecycle, name, value)
+    _register_saved.clear()
+
 
 def _user() -> UserContext:
     return UserContext(user_id="u", group_ids=[], role="root", namespace="default", authenticated=True)
 
 
 def _backend(monkeypatch, tmp_path, profile):
-    """Provision the SQLite backend for exactly ONE edge profile."""
+    """Provision the SQLite backend for exactly ONE edge profile.
+
+    Registration goes through monkeypatch so pytest restores the lifecycle
+    state automatically on teardown; the caller only closes the backend.
+    """
     backend = SqliteBackend(tmp_path / PROFILE_STORAGE[profile], SimpleNamespace())
     monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
     monkeypatch.setattr(lifecycle, "_pool", None)
@@ -176,15 +206,20 @@ def test_sessions_repository_create_session_on_raw_sqlite(monkeypatch, tmp_path)
     the two surfaces as a None/partial row here instead of as a 500 in the
     route.
     """
-    backend = _backend(monkeypatch, tmp_path, "raw-session-sqlite")
+    backend = SqliteBackend(tmp_path / PROFILE_STORAGE["raw-session-sqlite"], SimpleNamespace())
+    _register(backend)
     # The "no reuse across stores" check needs a second, equally provisioned
-    # store. Provision it through ``_backend`` too — same tmp dir, same
-    # lifecycle registration, same per-profile file invariant — then flip
-    # the lifecycle back to ``backend``. Both handles are closed below.
-    other_store = _backend(monkeypatch, tmp_path, "raw-session-sqlite-copy")
-    monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
-    monkeypatch.setattr(lifecycle, "_pool", None)
-    monkeypatch.setattr(lifecycle, "_pool_manager", None)
+    # store: same per-profile file, same tmp dir, same manual lifecycle
+    # registration. Registering it updates the module's slots for one instant,
+    # so flip them back to ``backend`` — never leave the module pointing at a
+    # store about to be closed.
+    other_store = SqliteBackend(tmp_path / PROFILE_STORAGE["raw-session-sqlite-copy"], SimpleNamespace())
+    _register(other_store)
+    # Flip the live slots back to ``backend``. ``_register_saved`` still holds
+    # the pre-test values, so ``_restore`` returns the module to exactly the
+    # state the test found it.
+    for name in _REGISTER_SLOTS:
+        setattr(lifecycle, name, backend if name == "_persistence_backend" else None)
 
     try:
         async def create(store):
@@ -216,7 +251,8 @@ def test_sessions_repository_create_session_on_raw_sqlite(monkeypatch, tmp_path)
         assert asyncio.run(read(backend, first["id"], namespace="elsewhere")) is None
         assert asyncio.run(read(other_store, first["id"])) is None
     finally:
-        # Release both file handles before the next profile provisions.
+        # Restore the lifecycle module state and release both file handles.
+        _restore()
         asyncio.run(backend.close())
         asyncio.run(other_store.close())
 
