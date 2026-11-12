@@ -13,6 +13,12 @@ Public surface:
 Both endpoints require authentication via the standard bearer-token
 dependency. The pubkey endpoint exposes only public-key material —
 no signing key leakage.
+
+The audit chain is keyed by memory id, not by tenant, so every endpoint
+that takes one has to apply the memories read predicate itself:
+``/proof`` resolves the memory under ``VisibilityFilter.for_read`` before
+touching the chain and 404s a memory the caller cannot see. Without that
+check the endpoint is a cross-tenant existence oracle (CF-22).
 """
 
 from __future__ import annotations
@@ -24,11 +30,16 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import AUDIT_CAPABILITY, backend_or_503 as _backend_or_503
-from mnemos.api.persistence_helpers import _capability_503
+from mnemos.api.persistence_helpers import (
+    AUDIT_CAPABILITY,
+    backend_or_503 as _backend_or_503,
+)
+from mnemos.api.persistence_helpers import _capability_503, maybe_set_pg_rls
 from mnemos.audit import derive_writer_keypair, load_root_keypair
 from mnemos.audit.crypto import merkle_leaf, merkle_proof, merkle_root
 from mnemos.audit.route_helper import memory_id_to_audit_bytes
+from mnemos.core.security import is_root
+from mnemos.persistence.visibility import VisibilityFilter
 from mnemos.workers.audit_sealer import audit_chain_enabled
 
 logger = logging.getLogger(__name__)
@@ -110,6 +121,34 @@ async def audit_proof_head(
     follow-up; this endpoint returns the chain head sufficient for
     replicas to look up the containing root in ``memory_audit_roots``
     and re-derive the inclusion path from their own copy of the chain.
+
+    CF-22 (2026-11-07 audit, F12): the chain head is only returned
+    when the memory itself is VISIBLE to the caller. The audit chain
+    is a forensic log of what exists, so answering it without the
+    visibility predicate would let any authenticated caller confirm
+    the existence (op, writer_id, signed_at, sealed state) of a
+    memory that ``GET /v1/memories/{id}`` would 404 for them — a
+    cross-tenant existence oracle, even after the memory row is
+    deleted. The route now resolves the memory through the caller's
+    read visibility first and answers 404 with the SAME body as a
+    missing id, so "invisible to me" and "does not exist" are
+    indistinguishable:
+
+    * root bypasses the predicate (``namespace=None``,
+      ``include_secrets=True`` — the same explicit-fetch contract as
+      GET-by-id, so root can fetch the proof of a vault-namespace
+      memory by exact id);
+    * non-root is pinned to their namespace with the vault
+      subtracted, so vault rows 404 for everyone but root;
+    * ``include_archived=True`` mirrors GET-by-id: archiving is
+      retention, not deletion, so an archived memory's proof stays
+      readable by its readers;
+    * a soft-deleted memory is invisible to EVERYONE (root included):
+      the memories read predicate already excludes
+      ``deleted_at IS NOT NULL`` rows, and making a dead row's
+      forensic head readable again would re-open the oracle through
+      the delete path. The proof of a deleted memory is an operator
+      job (direct store access), not an API surface.
     """
     if not audit_chain_enabled():
         raise HTTPException(
@@ -128,10 +167,43 @@ async def audit_proof_head(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    # CF-22: resolve the memory with the caller's visibility BEFORE
+    # touching the chain (see the contract in the docstring). The chain is
+    # keyed by memory id, not by tenant, so without this probe the endpoint
+    # is a cross-tenant existence oracle -- 200 + audit metadata for
+    # somebody else's memory, 404 otherwise -- and the 404 body has to be
+    # the one used for a missing id, not a distinct "not visible" body.
+    # Archived rows are included: an archive writes an audit entry that its
+    # owner must still be able to prove. Root keeps the GET-by-id
+    # explicit-fetch contract (include_secrets), which is what lets root
+    # prove a vault-namespace memory by exact id.
+    visibility = VisibilityFilter.for_read(
+        user,
+        namespace=None if is_root(user) else user.namespace,
+        include_secrets=is_root(user),
+    )
     async with backend.transactional() as tx:
+        # Postgres RLS GUCs before the first repository read, exactly as
+        # every other read endpoint that opens a transaction does.
+        await maybe_set_pg_rls(tx, user)
+        memory_row = await backend.memories.get_memory(
+            tx,
+            memory_id_str,
+            visibility=visibility,
+            include_archived=True,
+        )
+        if memory_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no audit entries for memory_id={memory_id_str}",
+            )
         row = await backend.audit_chain.get_latest_audit_entry(tx, memory_id_bytes)
 
     if row is None:
+        # Memory row is visible but has no chain entry (audit chain
+        # was off when it was written). Same body as above: this
+        # endpoint's only job is the chain head, and its absence must
+        # not leak anything the row-visibility check already gated.
         raise HTTPException(
             status_code=404,
             detail=f"no audit entries for memory_id={memory_id_str}",

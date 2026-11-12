@@ -7,11 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.api.memory_mutations import (
+    _assert_no_active_deletion,
     _insert_memory_with_created_webhook,
     _rls_context,
 )
+from mnemos.api.persistence_helpers import backend_or_503, require_postgres_pool_or_503
 from mnemos.api.read_policy import _validate_permission_mode
 from mnemos.core.ids import new_memory_id
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
@@ -46,6 +47,23 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
     """Ingest Claude Code session data into MNEMOS."""
     require_postgres_pool_or_503(route_label="POST /v1/ingest/session")
     permission_mode = _validate_permission_mode(request.permission_mode, default=600)
+    # CF-09 GDPR fence (MN-05): this route writes memory rows under the
+    # caller's own (user_id, namespace) scope, exactly like the single create
+    # that answers 409 while a deletion request is inside its grace window.
+    # Without the probe a session ingested mid-deletion lands rows the sweep
+    # cannot see (``deleted_at IS NULL``) that the hard delete then skips --
+    # ghost memories surviving a request recorded as ``hard_deleted``. Refuse
+    # before the first row, and OUTSIDE the try below: that block folds every
+    # exception into a 500, which would report a deletion refusal as a server
+    # error. Root keeps the documented tombstone-injection bypass. The probe
+    # takes the persistence BACKEND (the fence is backend-neutral), not the
+    # raw pool this route uses for the insert.
+    if user.role != "root":
+        await _assert_no_active_deletion(
+            backend_or_503(),
+            owner_id=user.user_id,
+            namespace=user.namespace,
+        )
     stored_ids = []
     try:
         data = request.raw_data

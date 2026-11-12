@@ -573,6 +573,26 @@ class _RateLimitSettings(BaseSettings):
         validation_alias=AliasChoices("RATE_LIMIT_STORAGE_URI", "RATE_LIMIT_STORAGE", "storage"),
     )
     trust_proxy: bool = Field(False, validation_alias="RATE_LIMIT_TRUST_PROXY")
+    #: How many proxies of OUR OWN append to ``X-Forwarded-For``. Only the
+    #: right-most entries of XFF were written by infrastructure; everything to
+    #: their left is client-supplied text. So this is the count of hops to walk
+    #: in from the right, not an allowlist of proxy addresses. Clamped to >= 1:
+    #: ``0`` would mean "trust nothing in the header", which is what
+    #: ``trust_proxy=False`` already says -- and a typo must not restore the
+    #: left-most read (CF-23), nor refuse to boot a server over a rate-limit
+    #: knob.
+    trusted_proxy_hops: int = Field(1, validation_alias="RATE_LIMIT_TRUSTED_PROXY_HOPS")
+
+    @field_validator("trusted_proxy_hops", mode="before")
+    @classmethod
+    def _clamp_hops(cls, value: object) -> int:
+        """Any unparsable or sub-1 value means "one proxy", never "trust the client"."""
+        try:
+            hops = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 1
+        return max(hops, 1)
+
     per_minute: int = Field(60, validation_alias=AliasChoices("MNEMOS_RATE_LIMIT_PER_MINUTE", "RATE_LIMIT_PER_MINUTE"))
     pantheon_gateway: str = Field(
         "60/minute",
