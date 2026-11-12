@@ -13,6 +13,12 @@ Public surface:
 Both endpoints require authentication via the standard bearer-token
 dependency. The pubkey endpoint exposes only public-key material —
 no signing key leakage.
+
+The audit chain is keyed by memory id, not by tenant, so every endpoint
+that takes one has to apply the memories read predicate itself:
+``/proof`` resolves the memory under ``VisibilityFilter.for_read`` before
+touching the chain and 404s a memory the caller cannot see. Without that
+check the endpoint is a cross-tenant existence oracle (CF-22).
 """
 
 from __future__ import annotations
@@ -162,13 +168,23 @@ async def audit_proof_head(
         raise HTTPException(status_code=400, detail=str(exc))
 
     # CF-22: resolve the memory with the caller's visibility BEFORE
-    # touching the chain (see the contract in the docstring).
+    # touching the chain (see the contract in the docstring). The chain is
+    # keyed by memory id, not by tenant, so without this probe the endpoint
+    # is a cross-tenant existence oracle -- 200 + audit metadata for
+    # somebody else's memory, 404 otherwise -- and the 404 body has to be
+    # the one used for a missing id, not a distinct "not visible" body.
+    # Archived rows are included: an archive writes an audit entry that its
+    # owner must still be able to prove. Root keeps the GET-by-id
+    # explicit-fetch contract (include_secrets), which is what lets root
+    # prove a vault-namespace memory by exact id.
     visibility = VisibilityFilter.for_read(
         user,
         namespace=None if is_root(user) else user.namespace,
         include_secrets=is_root(user),
     )
     async with backend.transactional() as tx:
+        # Postgres RLS GUCs before the first repository read, exactly as
+        # every other read endpoint that opens a transaction does.
         await maybe_set_pg_rls(tx, user)
         memory_row = await backend.memories.get_memory(
             tx,

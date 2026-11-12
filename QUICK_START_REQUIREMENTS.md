@@ -329,4 +329,4 @@ kill -9 <PID>
 
 ---
 
-**Version**: v7.0.5
+**Version**: v7.1.1
