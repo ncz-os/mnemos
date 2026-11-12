@@ -50,7 +50,7 @@ that belong to an extension.
 
 ```bash
 python3 scripts/oracle_to_postgres_copy.py --oracle 'user/password@host:1521/SERVICE' \
-    --pg 'postgresql://postgres:...@host:5432/mnemos' --target mnemos --dry-run    # column report, no writes
+    --pg 'postgresql://postgres:<password>@host:5432/mnemos' --target mnemos --dry-run    # column report, no writes
 python3 scripts/oracle_to_postgres_copy.py --oracle ... --pg ... --target mnemos \
     --drop-constraints hive_jobs.ck_hive_jobs_status,hive_agents.ck_hive_agents_status
 ```
@@ -94,7 +94,7 @@ Point an OpenAI-compatible embedding endpoint serving the same model as the depl
 1024-d for bge-m3) at the new database:
 
 ```bash
-MNEMOS_DATABASE_DSN='postgresql://mnemos_user:...@host:5432/mnemos' \
+MNEMOS_DATABASE_DSN='postgresql://mnemos_user:<password>@host:5432/mnemos' \
 MNEMOS_EMBED_HTTP_URL='http://embed-host:port/v1/embeddings' MNEMOS_EMBED_HTTP_MODEL=bge-m3 \
 python3 scripts/backfill_embeddings_http.py
 ```
@@ -107,7 +107,7 @@ build and quantisation) for query embeddings as for the backfill.
 
 ```
 MNEMOS_PERSISTENCE_BACKEND=postgres
-MNEMOS_DATABASE_DSN=postgresql://mnemos_user:...@127.0.0.1:5432/mnemos
+MNEMOS_DATABASE_DSN=postgresql://mnemos_user:<password>@127.0.0.1:5432/mnemos
 ```
 
 Restart, then check `/health` (`persistence_backend: PostgresBackend`, `database_connected: true`), `/stats`, a

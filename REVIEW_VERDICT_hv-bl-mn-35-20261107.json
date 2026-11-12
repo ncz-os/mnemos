@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "kind": "review",
+  "job_id": "01a1b7c4-f455-7f9c-997b-c908b70500a6",
+  "head_branch": "hv/bl-mn-35-20261107",
+  "base_branch": "master",
+  "base_sha": "026d9cec03f27a57723a95a468a3a5c4351bb452",
+  "head_sha": "a10c4800acb799756ea4860be9433a1c10181867",
+  "review_ref": "review/hv/bl-mn-35-20261107-01a1b7e2-a150-7e19-bdad-830576e1af07",
+  "verdict": "request-changes",
+  "final_verdict": "request-changes",
+  "re_review": true,
+  "reviewers": [
+    {
+      "model": "qwen38",
+      "agent": "coder",
+      "role": "reviewer",
+      "verdict": "request_changes",
+      "findings_count": 4
+    }
+  ],
+  "reason": "HEAD a10c4800 ('WIP: preserve uncommitted work from an unfinished run') adds one genuine new test suite — tests/test_federation_soft_deleted_replica_update.py — that characterises a real, currently-broken invariant: on the journaled receiver path, mnemos.domain.federation._store_memories calls federation_journal.accept_event BEFORE probing whether the local replica was soft-deleted (mnemos/domain/federation.py ~1371 vs ~1410), so a skipped event still advances the per-(peer, remote_id) last_sequence fence in federation_receive_state. I reproduced the defect locally: the new test suite FAILS at HEAD (2/2 tests, fence reads last_sequence=2 where the content is still at sequence 1), so it is a correct red characterization of the bug — but the fix it demands is not on the branch. No source file in mnemos/ was touched; the branch consists solely of the test file plus untracked .scratch/ working-tree artifacts (test-run logs, _files.txt, pair.py, repro scripts, a BASELINE_BEFORE_AFTER.txt) that were swept into the WIP commit. The baseline note itself is evidence of an unfinished run: it documents a suite (tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py) and an intermediate review-record commit (53c899b7) that belong to a different job (hv/ty-mnemos-domain-memory-categorization-entities-20261105) and does not describe anything on this branch. The committed baseline log also lists ~40 pre-existing unrelated ERRORs/FAILEDs (MCP/OAuth suites) that exist on the base as well. Reviewer timeout during the previous attempt (.review1.err) is why this is a retry. Requesting changes: land the actual fix — make the receiver's delete-skip decision happen before (or conditionally around) the fence write in _store_memories so a skipped event leaves the fence where the replica's applied content actually is, making the committed suite pass — and either drop the .scratch/ artifacts from the branch or move them out of git entirely.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "high",
+      "title": "MN-35 fix is missing: the committed suite fails at HEAD (2/2)",
+      "detail": "Both tests in tests/test_federation_soft_deleted_replica_update.py fail locally against HEAD (verified: 'a skipped event must not be recorded as applied ... got {last_sequence: 2}', and the batch variant's m2 fence stays at 6 instead of 2). The defect the suite characterises is real: in mnemos/domain/federation.py _store_memories, journal.accept_event (a fence-plus-write into federation_receive_state) runs at the top of the loop for every non-withdrawal event, and only afterwards does the F-2 soft-delete probe set skipped_deleted and continue. A skipped sequence is therefore durably recorded as applied, fencing the restored replica against its source until a full re-seed — exactly the regression the module docstring describes. The branch must implement the reordering (probe/skip before the fence, or roll back / not advance the fence when the event is skipped) and turn the suite green.",
+      "file": "mnemos/domain/federation.py",
+      "line": 1371
+    },
+    {
+      "id": "F2",
+      "severity": "medium",
+      "title": "Untracked .scratch/ working-tree artifacts committed into the branch",
+      "detail": "The WIP commit adds .scratch/_files.txt (423 lines of a test list), .scratch/_part1.txt, .scratch/_part2.txt, .scratch/base_done, .scratch/base_fail1.txt (truncated pytest output) and leaves more untracked residue (pair.py, repro_f2.py, repro_pair.py, baseline_full.txt, BASELINE_BEFORE_AFTER.txt) in the working tree. These are ephemeral debug/run artifacts, not deliverables, and should not be part of the MR diff. Remove them from the commit (and keep .scratch out of the branch; consider .gitignore) so the MR contains only the test suite and the fix.",
+      "file": ".scratch/_files.txt",
+      "line": 1
+    },
+    {
+      "id": "F3",
+      "severity": "low",
+      "title": "Baseline note describes a different job and is stale for this branch",
+      "detail": ".scratch/BASELINE_BEFORE_AFTER.txt documents before/after numbers for tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py (52 passed + 2 xfailed) and references an intermediate review-record commit 53c899b7 — neither of which is on this branch. If a baseline note is desired for MN-35, it should compare this branch's suite against base 026d9cec, not another job's characterisation suite.",
+      "file": ".scratch/BASELINE_BEFORE_AFTER.txt",
+      "line": 1
+    },
+    {
+      "id": "F4",
+      "severity": "low",
+      "title": "The committed test suite itself is sound — no test changes requested",
+      "detail": "tests/test_federation_soft_deleted_replica_update.py is well-constructed against real SQLite: it pins (a) a skipped sequence must not advance federation_receive_state.last_sequence, (b) the receiver never undeletes or writes into a locally soft-deleted replica, (c) after a local restore the same sequence is still deliverable and converges content, and (d) in a mixed batch the live id is fenced/applied while the deleted id's fence stays at its applied revision. It exercises the real _store_memories/journal path (no monkeypatched internals) and matches the documented F-2/F-3 semantics in mnemos/domain/federation.py. Keep it as the acceptance gate for the fix.",
+      "file": "tests/test_federation_soft_deleted_replica_update.py",
+      "line": 1
+    }
+  ]
+}

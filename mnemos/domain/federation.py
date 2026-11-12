@@ -1361,6 +1361,16 @@ async def _store_memories(
         if not remote_id or not isinstance(remote_id, str):
             continue
         if journal_enabled and mem.get("type") != "withdrawal":
+            # MN-35: read the replica's lifecycle BEFORE the fence. A
+            # replica this node soft-deleted locally is not applied — the
+            # row stays deleted and undeleting is a policy decision — so a
+            # skipped event must not be recorded as applied. Taking the
+            # probe here (read-only; F-2: it must also run before
+            # prepare_versioned_update, which clears deleted_at) is what
+            # keeps a later restore from being fenced against its pending
+            # revision.
+            pre_marker = await repo.fetch_federated_memory_marker(tx, f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}")
+            skipped = pre_marker is not None and pre_marker["deleted_at"] is not None
             if not await journal.accept_event(
                 tx,
                 peer_name,
@@ -1368,6 +1378,7 @@ async def _store_memories(
                 sequence=mem.get("federation_sequence"),
                 remote_updated=mem.get("updated") or mem.get("consolidated_at") or mem.get("created"),
                 withdrawn=False,
+                skipped=skipped,
             ):
                 # F-3: the sequence is already fenced. If a LOCAL sweep
                 # damaged the replica after we applied it (an older build
@@ -1411,6 +1422,10 @@ async def _store_memories(
         # first changes nothing else.
         existing = existing_markers.get(local_id)
         if journal_enabled:
+            # MN-35: a replica this node soft-deleted locally is skipped
+            # BEFORE the fence (up top), so this re-read only ever sees a
+            # live row. The probe stays as a belt-and-braces guard for the
+            # unsequenced fallback path.
             existing = await repo.fetch_federated_memory_marker(tx, local_id)
             if existing is not None and existing["deleted_at"] is not None:
                 # F-2: this node soft-deleted the replica locally. Every

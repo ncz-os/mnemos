@@ -801,6 +801,26 @@ def test_failed_start_leaves_no_active_tunnel(fake_bridge):
     assert tr._active_bridge is None
 
 
+def test_a_refused_second_start_mints_no_credential(monkeypatch):
+    """The 409 guard runs before the token is resolved.
+
+    A credential minted for a start that is then refused is a live secret
+    nobody asked for; it would also consume a one-shot ngrok/OAuth token
+    for a tunnel that never opens.
+    """
+    running = FakeBridge()
+    _run(running.start(target_port=5004))
+    tr._active_bridge = running
+
+    minted = []
+    monkeypatch.setattr(tr, "_issue_tunnel_token", lambda: minted.append(1) or ("t", "oauth", 1))
+
+    with pytest.raises(HTTPException) as ei:
+        _run(tr.start_tunnel(_request(), _root_user()))
+    assert ei.value.status_code == 409
+    assert minted == []
+
+
 def test_a_second_start_while_running_is_refused_before_the_bridge_is_entered(monkeypatch):
     """The 409 guard runs first: a live tunnel means the new bridge is
     never constructed, so a failing second bridge never even runs."""
