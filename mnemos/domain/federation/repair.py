@@ -174,20 +174,33 @@ async def repair_fenced_replicas(
                 repo = backend.federation
                 # Re-read the fence inside the mutation transaction: a
                 # withdrawal that landed after the dry run must not be
-                # resurrected by a stale candidate list.
-                fresh = await repo.fetch_fenced_damaged_replicas(tx, peer_name=name, after_id=None, limit=page_size)
+                # resurrected by a stale candidate list. Keyset-page to the
+                # candidate's id -- the first page alone is not enough when
+                # the population exceeds one page.
                 match = None
-                for row in fresh:
-                    try:
-                        rid = str(row["remote_id"])
-                        meta = row["metadata"]
-                        wdn = row["withdrawn"]
-                    except (KeyError, IndexError, TypeError):
-                        rid = str(getattr(row, "remote_id", ""))
-                        meta = getattr(row, "metadata", None)
-                        wdn = getattr(row, "withdrawn", None)
-                    if rid == remote_id:
-                        match = (wdn, meta)
+                cursor: str | None = None
+                while True:
+                    fresh = await repo.fetch_fenced_damaged_replicas(
+                        tx, peer_name=name, after_id=cursor, limit=page_size
+                    )
+                    if not fresh:
+                        break
+                    for row in fresh:
+                        try:
+                            rid = str(row["remote_id"])
+                            meta = row["metadata"]
+                            wdn = row["withdrawn"]
+                            lid = str(row["local_id"])
+                        except (KeyError, IndexError, TypeError):
+                            rid = str(getattr(row, "remote_id", ""))
+                            meta = getattr(row, "metadata", None)
+                            wdn = getattr(row, "withdrawn", None)
+                            lid = str(getattr(row, "local_id", ""))
+                        if rid == remote_id:
+                            match = (wdn, meta)
+                            break
+                        cursor = lid
+                    if match is not None or len(fresh) < page_size:
                         break
                 if match is None:
                     # Already gone (a concurrent repair or a re-pull fixed

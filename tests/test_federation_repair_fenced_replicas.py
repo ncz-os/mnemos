@@ -395,3 +395,30 @@ async def test_next_sync_repulls_repaired_rows(live_pair):
         ("fed:pythia:two", "second fact"),
     ]
     assert all(r["deleted_at"] is None and r["archived_at"] is None for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_apply_repairs_candidates_past_the_first_page(replica):
+    """The apply re-read pages to the candidate: >page_size damage all heals.
+
+    Withdrawn rows sort first and are never deleted, so a first-page-only
+    re-read would stall on them and silently skip every damaged row behind
+    them (no counter records it).
+    """
+    peer = await _peer(replica)
+    for i in range(3):
+        await _replica_row(replica, f"aaa-kept-{i}", deleted_at=NOW.isoformat())
+        await _fence(replica, f"aaa-kept-{i}", withdrawn=1)
+    for i in range(3):
+        await _replica_row(replica, f"zzz-lost-{i}", deleted_at=NOW.isoformat())
+        await _fence(replica, f"zzz-lost-{i}")
+
+    dry = await repair_fenced_replicas(replica, peer["id"], dry_run=True, page_size=2)
+    assert len(dry["candidates"]) == 6
+    applied = await repair_fenced_replicas(replica, peer["id"], dry_run=False, page_size=2)
+
+    assert applied["repaired"] == 3
+    assert applied["skipped_withdrawn"] == 3
+    assert applied["failed"] == []
+    remaining = await _all(replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")
+    assert sorted(r["id"] for r in remaining) == [f"fed:pythia:aaa-kept-{i}" for i in range(3)]
