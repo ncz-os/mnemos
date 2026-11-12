@@ -7,6 +7,7 @@ this tree; the journal join is also proven against a real SQLite database.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -104,11 +105,225 @@ async def test_oracle_dedup_aggregates_ids_without_the_4000_byte_listagg_cap():
 
     (sql,) = _sql_of(conn.calls)
     upper = " ".join(sql.upper().split())
-    # LISTAGG over VARCHAR2 ids dies with ORA-01489 at 4000 bytes; the CLOB
-    # form has no such cap and no silent truncation.
+    # LISTAGG over VARCHAR2 ids dies with ORA-01489 at 4000 bytes; the JSON
+    # aggregate has no such cap and no silent truncation. FB115: the id list
+    # is aggregated as a JSON ARRAY (JSON_ARRAYAGG), not as XML text.
     assert "LISTAGG" not in upper
-    assert "XMLAGG" in upper
-    assert "GETCLOBVAL" in upper
+    assert "JSON_ARRAYAGG" in upper
+    # RETURNING CLOB is load-bearing: without it JSON_ARRAYAGG returns
+    # VARCHAR2(4000) and a big group fails with ORA-40478 -- the very cap this
+    # change removes. The clause must be present, not merely tolerated.
+    assert "RETURNING CLOB" in upper
+
+
+@pytest.mark.asyncio
+async def test_oracle_dedup_id_list_has_no_4000_byte_cap():
+    """A group larger than 4000 bytes must survive the aggregate and the parse.
+
+    Oracle's JSON_ARRAYAGG defaults to VARCHAR2(4000) when the returning
+    clause is omitted, so the statement must ask for CLOB (a 100-id group of
+    40-char ids, JSON-quoted, is ~4.3 KB). The handler must then parse that
+    long JSON text into the full id list rather than truncating it.
+    """
+    from mnemos.persistence.oracle import OracleMemoryRepository
+
+    # Statement shape: the CLOB return type is what removes the cap.
+    conn = _Conn()
+    await OracleMemoryRepository().find_duplicate_content_groups(SimpleNamespace(conn=conn))
+    (sql,) = _sql_of(conn.calls)
+    upper = " ".join(sql.upper().split())
+    assert "RETURNING CLOB" in upper
+    assert "RETURNING VARCHAR2" not in upper
+
+    # Behaviour: 200 ids x 40 chars (~8.6 KB of JSON text) round-trip whole.
+    big_ids = [f"mem_{i:036d}" for i in range(200)]
+    row = {
+        "owner_id": "alice",
+        "namespace": "default",
+        "content_hash": "h_big",
+        "duplicate_count": len(big_ids),
+        "memory_ids": json.dumps(big_ids),
+        "keep_id": big_ids[0],
+        "canonical_id": big_ids[0],
+    }
+    assert len(row["memory_ids"]) > 4000
+    big_conn = _Conn(rows=[row])
+
+    out = await OracleMemoryRepository().find_duplicate_content_groups(SimpleNamespace(conn=big_conn))
+
+    assert len(out) == 1
+    got = out[0]["memory_ids"]
+    assert got == big_ids
+    assert len(got) == 200
+    assert out[0]["duplicate_count"] == 200
+
+
+# ---------------------------------------------------------------------------
+# FB115 · U+001F is not a legal XML character (XML 1.0, §2.2 Characters):
+# a delimiter fed through XMLELEMENT cannot be depended on to survive
+# getClobVal() verbatim, so the JSON array replaces the XML chain entirely.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_oracle_dedup_delimiter_is_not_an_xml_control_character():
+    from mnemos.persistence.oracle import OracleMemoryRepository
+
+    conn = _Conn()
+    await OracleMemoryRepository().find_duplicate_content_groups(SimpleNamespace(conn=conn))
+
+    (sql,) = _sql_of(conn.calls)
+    upper = " ".join(sql.upper().split())
+    assert "JSON_ARRAYAGG" in upper
+    # The whole XML chain goes: no XMLELEMENT wrapper, no EXTRACT/getClobVal,
+    # and no U+001F delimiter inside the aggregation. The CHR(13)/CHR(10)
+    # newline folding on normalized_content is untouched by this finding.
+    assert "XMLELEMENT" not in upper
+    assert "GETCLOBVAL" not in upper
+    assert "CHR(31)" not in upper
+
+
+@pytest.mark.asyncio
+async def test_oracle_dedup_result_parses_json_array_with_legacy_fallback():
+    from mnemos.persistence.oracle import OracleMemoryRepository
+
+    rows_in = [
+        {
+            "owner_id": "alice",
+            "namespace": "default",
+            "content_hash": "h1",
+            "duplicate_count": 2,
+            "memory_ids": '["mem_a", "mem_b"]',
+            "keep_id": "mem_a",
+            "canonical_id": "mem_a",
+        },
+        {
+            # A pre-FB115 deployment that stored the raw \x1f-delimited list
+            # (e.g. written by an older build mid-migration): still parses.
+            "owner_id": "bob",
+            "namespace": "default",
+            "content_hash": "h2",
+            "duplicate_count": 2,
+            "memory_ids": "mem_a\x1fmem_b",
+            "keep_id": "mem_a",
+            "canonical_id": "mem_a",
+        },
+    ]
+    conn = _Conn(rows=rows_in)
+    out = await OracleMemoryRepository().find_duplicate_content_groups(SimpleNamespace(conn=conn))
+
+    got = {r["content_hash"]: r["memory_ids"] for r in out}
+    assert got["h1"] == ["mem_a", "mem_b"]
+    assert got["h2"] == ["mem_a", "mem_b"]
+    assert all(isinstance(r["duplicate_count"], int) for r in out)
+
+
+@pytest.mark.asyncio
+async def test_oracle_dedup_result_parses_the_other_driver_shapes():
+    """The aggregate's raw value is not always a ``str``.
+
+    ``_materialize_value`` handles LOB objects, but a BLOB-style read yields
+    ``bytes`` and a driver may hand back a native sequence. The old handler's
+    ``json.dumps(raw or [])`` raised ``TypeError`` on ``bytes`` (killing the
+    whole sweep) and ``str()``-ed a native list into one junk id; both must
+    parse to the same id list as the JSON text, and a NULL aggregate (no rows
+    contributed) must be an empty list, never ``None``.
+    """
+    from mnemos.persistence.oracle import OracleMemoryRepository
+
+    rows_in = [
+        {
+            "owner_id": "alice",
+            "namespace": "default",
+            "content_hash": "h_bytes",
+            "duplicate_count": 2,
+            "memory_ids": b"mem_a\x1fmem_b",
+            "keep_id": "mem_a",
+            "canonical_id": "mem_a",
+        },
+        {
+            "owner_id": "alice",
+            "namespace": "default",
+            "content_hash": "h_list",
+            "duplicate_count": 2,
+            "memory_ids": ["mem_a", "mem_b"],
+            "keep_id": "mem_a",
+            "canonical_id": "mem_a",
+        },
+        {
+            "owner_id": "alice",
+            "namespace": "default",
+            "content_hash": "h_null",
+            "duplicate_count": 0,
+            "memory_ids": None,
+            "keep_id": "",
+            "canonical_id": "",
+        },
+    ]
+    conn = _Conn(rows=rows_in)
+    out = await OracleMemoryRepository().find_duplicate_content_groups(SimpleNamespace(conn=conn))
+
+    got = {r["content_hash"]: r["memory_ids"] for r in out}
+    assert got["h_bytes"] == ["mem_a", "mem_b"]
+    assert got["h_list"] == ["mem_a", "mem_b"]
+    assert got["h_null"] == []
+
+
+@pytest.mark.asyncio
+async def test_oracle_dedup_result_parses_json_bytes_and_empty_sequences():
+    """A JSON array read as bytes is parsed as JSON, and an empty native
+    sequence is an empty id list rather than the phantom id ``"[]"``."""
+    from mnemos.persistence.oracle import OracleMemoryRepository
+
+    base = {"owner_id": "alice", "namespace": "default", "keep_id": "", "canonical_id": ""}
+    rows_in = [
+        {**base, "content_hash": "h_json_bytes", "duplicate_count": 2, "memory_ids": b'["mem_a", "mem_b"]'},
+        {**base, "content_hash": "h_json_memoryview", "duplicate_count": 1, "memory_ids": memoryview(b'["mem_a"]')},
+        {**base, "content_hash": "h_empty_list", "duplicate_count": 0, "memory_ids": []},
+        {**base, "content_hash": "h_empty_tuple", "duplicate_count": 0, "memory_ids": ()},
+        {**base, "content_hash": "h_empty_json", "duplicate_count": 0, "memory_ids": "[]"},
+    ]
+    conn = _Conn(rows=rows_in)
+    out = await OracleMemoryRepository().find_duplicate_content_groups(SimpleNamespace(conn=conn))
+
+    got = {r["content_hash"]: r["memory_ids"] for r in out}
+    assert got["h_json_bytes"] == ["mem_a", "mem_b"]
+    assert got["h_json_memoryview"] == ["mem_a"]
+    assert got["h_empty_list"] == []
+    assert got["h_empty_tuple"] == []
+    assert got["h_empty_json"] == []
+
+
+def _balanced_expression(text: str) -> None:
+    """Fail on an unbalanced parenthesis -- the shape of a mangled function."""
+    assert text.count("(") == text.count(")"), text
+
+
+@pytest.mark.asyncio
+async def test_db2_dedup_statement_is_syntactically_closed():
+    from mnemos.persistence.db2 import Db2MemoryRepository
+
+    conn = _Conn()
+    await Db2MemoryRepository().find_duplicate_content_groups(SimpleNamespace(conn=conn))
+
+    (sql,) = _sql_of(conn.calls)
+    _balanced_expression(sql)
+    # The identity is content_hash and the sweep never digests a truncated CLOB,
+    # so no HASH(...) of any kind appears and the window closes cleanly.
+    assert "HASH(" not in sql
+    assert "PARTITION BY owner_id, namespace, content_hash ORDER BY created DESC" in sql
+    assert "GROUP BY owner_id, namespace, content_hash HAVING COUNT(*) > 1" in sql
+
+
+@pytest.mark.asyncio
+async def test_oracle_dedup_statement_is_syntactically_closed():
+    from mnemos.persistence.oracle import OracleMemoryRepository
+
+    conn = _Conn()
+    await OracleMemoryRepository().find_duplicate_content_groups(SimpleNamespace(conn=conn))
+
+    (sql,) = _sql_of(conn.calls)
+    _balanced_expression(sql)
 
 
 @pytest.mark.asyncio
@@ -127,6 +342,7 @@ async def test_db2_dedup_groups_by_a_digest_not_a_clob():
     # key never has to touch the CLOB at all.
     assert "CONTENT_HASH" in group_by
     assert "HASH_SHA256" not in group_by
+    # SQL0134N: a CLOB cannot be a grouping term -- only its digest may be.
     assert "REPLACE(" not in group_by
     assert "COALESCE(" not in group_by
 
@@ -224,39 +440,6 @@ def test_db2_journal_writes_changed_at_in_utc(name):
         assert marker and "CURRENT_TIMESTAMP," not in marker.replace(
             "CURRENT_TIMESTAMP - CURRENT_TIMEZONE", ""
         )
-
-
-def _balanced_expression(text: str) -> None:
-    """Fail on an unbalanced parenthesis -- the shape of a mangled function."""
-    assert text.count("(") == text.count(")"), text
-
-
-@pytest.mark.asyncio
-async def test_db2_dedup_statement_is_syntactically_closed():
-    from mnemos.persistence.db2 import Db2MemoryRepository
-
-    conn = _Conn()
-    await Db2MemoryRepository().find_duplicate_content_groups(SimpleNamespace(conn=conn))
-
-    (sql,) = _sql_of(conn.calls)
-    _balanced_expression(sql)
-    # The identity is content_hash and the sweep never digests a truncated CLOB,
-    # so no HASH(...) of any kind appears and the window closes cleanly.
-    assert "HASH(" not in sql
-    assert "PARTITION BY owner_id, namespace, content_hash ORDER BY created DESC" in sql
-    assert "GROUP BY owner_id, namespace, content_hash HAVING COUNT(*) > 1" in sql
-
-
-
-@pytest.mark.asyncio
-async def test_oracle_dedup_statement_is_syntactically_closed():
-    from mnemos.persistence.oracle import OracleMemoryRepository
-
-    conn = _Conn()
-    await OracleMemoryRepository().find_duplicate_content_groups(SimpleNamespace(conn=conn))
-
-    (sql,) = _sql_of(conn.calls)
-    _balanced_expression(sql)
 
 
 # ---------------------------------------------------------------------------
