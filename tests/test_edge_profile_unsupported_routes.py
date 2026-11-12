@@ -156,11 +156,11 @@ def test_edge_profile_documents_batch_import_no_longer_requires_postgres(edge_cl
 def test_edge_profiles_do_not_reuse_each_others_storage(monkeypatch, tmp_path):
     """Two edge profiles must not be able to reach each other's rows.
 
-    The fixture used to open one shared SQLite file for every test in this
-    module, so a row created by one test was visible to the next. Path
-    inequality alone does not prove that: this writes a session through one
-    profile's store and reads it back through the other's, the way the shared
-    fixture did.
+    Each profile provisions its own SQLite file via PROFILE_STORAGE, so
+    path inequality is enforced by construction. This test verifies the
+    isolation contract explicitly by writing through one profile's store and
+    reading through the other's, in both directions, plus each profile's own
+    round-trip.
 
     The write direction is an explicit argument (review finding F2, round 2):
     ``first -> second`` alone would only catch a leak that flowed one way.
