@@ -21,6 +21,7 @@ fails to recycle an id.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
 from types import SimpleNamespace
@@ -46,6 +47,37 @@ def _user() -> UserContext:
     return UserContext(user_id="u", group_ids=[], role="root", namespace="default", authenticated=True)
 
 
+def _close_on_owning_thread(backend: SqliteBackend) -> None:
+    """Close ``backend`` from the thread that owns its raw connection.
+
+    The raw ``sqlite3`` fallback binds the connection to the portal thread
+    that first opened it, so ``close()`` from any other thread raises
+    ``ProgrammingError`` — the same affinity MN-33 was about. Determine the
+    owner deterministically and run the close there if we are not already
+    on it.
+    """
+    if backend._conn is None or backend._closed:
+        return
+    owner = _owning_thread(backend._conn)
+    if owner == threading.get_ident():
+        asyncio.run(backend.close())
+        return
+
+    closed: list[BaseException | None] = []
+
+    def _close() -> None:
+        try:
+            asyncio.run(backend.close())
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            closed.append(exc)
+
+    worker = threading.Thread(target=_close, name="mn33-close-owning-thread")
+    worker.start()
+    worker.join(timeout=10)
+    assert not worker.is_alive(), "the close thread did not finish"
+    assert not closed, f"close on the owning thread failed: {closed!r}"
+
+
 @pytest.fixture
 def edge_backend(monkeypatch, tmp_path):
     """The edge fixture's backend wiring on the no-aiosqlite profile.
@@ -55,13 +87,22 @@ def edge_backend(monkeypatch, tmp_path):
     profile where the thread affinity actually bites. With aiosqlite installed
     the driver owns its own worker thread and the flake never appears, which is
     why this only ever failed in a minimal venv.
+
+    The backend is closed deterministically on teardown (round 1/2, F5 — the
+    same lifecycle-registration discipline applied to this fixture): every
+    provisioned resource is released, never left to GC. Because a bare
+    ``TestClient`` serves each request on a fresh portal thread, the owner
+    of the opened connection is not necessarily the fixture thread, so the
+    close runs on the owning thread via :func:`_close_on_owning_thread`.
     """
     monkeypatch.setattr(storage, "aiosqlite", None)
     backend = SqliteBackend(tmp_path / "edge.sqlite3", SimpleNamespace())
     monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
     monkeypatch.setattr(lifecycle, "_pool", None)
     monkeypatch.setattr(lifecycle, "_pool_manager", None)
-    return backend
+    yield backend
+    _close_on_owning_thread(backend)
+    assert backend._closed, "the fixture must release its connection on teardown"
 
 
 @pytest.fixture
@@ -120,12 +161,18 @@ def _owning_thread(conn: sqlite3.Connection) -> int:
     the owner) or raises with the owning id in the message.
     """
     try:
-        conn.execute("SELECT 1")
+        result = conn.execute("SELECT 1")
     except sqlite3.ProgrammingError as exc:
         message = str(exc)
         marker = "created in thread id "
         assert marker in message, f"unexpected sqlite3 error: {message}"
         return int(message.split(marker, 1)[1].split()[0])
+    # On the raw sqlite3 path ``execute`` returns a cursor synchronously;
+    # on an aiosqlite Connection it returns a coroutine — never let that
+    # leak (it would warn "coroutine was never awaited" and keep the
+    # driver's worker thread busy).
+    if asyncio.iscoroutine(result):
+        result.close()
     return threading.get_ident()
 
 
@@ -204,3 +251,7 @@ def test_aiosqlite_profile_serves_bare_requests(edge_app, edge_backend, monkeypa
     served = edge_app.state.served_threads
     assert len(served) >= 2, f"expected at least two served requests, saw {len(served)}"
     assert edge_backend._conn is not None, "the round trip never opened the connection"
+    # The driver owns the worker thread, not the request portals: every
+    # request may come from a different portal, but the connection itself is
+    # served from the driver's own thread and stays open for the client.
+    assert edge_backend._closed is False, "the driver must keep the connection open during the round trip"
