@@ -22,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import httpx
 import pytest_asyncio
 
 from mnemos.domain.federation.repair import repair_fenced_replicas
@@ -138,6 +139,10 @@ async def _fence(replica, remote_id: str, *, withdrawn: int = 0) -> None:
 
 async def _damage_three(replica) -> None:
     """One soft-deleted, one archived, one locally consolidated replica row."""
+    # The canonical the local consolidation points at must exist: the schema
+    # constrains ``consolidated_into REFERENCES memories(id)``.
+    await _replica_row(replica, "canon")
+    await _fence(replica, "canon")
     await _replica_row(replica, "gone", deleted_at=NOW.isoformat())
     await _fence(replica, "gone")
     archived = await _replica_row(replica, "old", archived_at=NOW.isoformat())
@@ -166,21 +171,19 @@ async def test_dry_run_lists_candidates_and_changes_nothing(replica):
 
     report = await repair_fenced_replicas(replica, peer["id"], dry_run=True)
 
-    assert sorted(report["candidates"]) == ["merged", "gone", "old"] or sorted(
-        c["remote_id"] if isinstance(c, dict) else c for c in report["candidates"]
-    ) == ["gone", "merged", "old"]
+    assert sorted(c["remote_id"] for c in report["candidates"]) == [
+        "gone",
+        "merged",
+        "old",
+    ], report["candidates"]
     assert report["repaired"] == 0
     assert report["skipped_withdrawn"] == 0
     assert report["skipped_consolidated"] == 0
     # Dry run touches nothing: rows, fence and archive blob all still there.
-    rows = await _all(
-        replica, "SELECT id FROM memories WHERE federation_source = 'pythia'"
-    )
-    assert len(rows) == 3
-    fences = await _all(
-        replica, "SELECT remote_id FROM federation_receive_state WHERE peer_name = 'pythia'"
-    )
-    assert len(fences) == 3
+    rows = await _all(replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")
+    assert len(rows) == 4
+    fences = await _all(replica, "SELECT remote_id FROM federation_receive_state WHERE peer_name = 'pythia'")
+    assert len(fences) == 4
     blob = await _one(replica, "SELECT id FROM memory_archive WHERE id = ?", "fed:pythia:old")
     assert blob is not None
 
@@ -191,8 +194,7 @@ async def test_apply_deletes_rows_blob_fence_and_cursors(replica):
     await _damage_three(replica)
     await _exec(
         replica,
-        "INSERT INTO federation_peer_cursors(peer_id, cursor_value, filter_signature) "
-        "VALUES (?, ?, ?)",
+        "INSERT INTO federation_peer_cursors(peer_id, cursor_value, filter_signature) VALUES (?, ?, ?)",
         peer["id"],
         "journal:9",
         "sig",
@@ -203,25 +205,24 @@ async def test_apply_deletes_rows_blob_fence_and_cursors(replica):
     assert report["repaired"] == 3
     assert report["skipped_withdrawn"] == 0
     assert report["skipped_consolidated"] == 0
-    rows = await _all(
-        replica, "SELECT id FROM memories WHERE federation_source = 'pythia'"
-    )
-    assert rows == []
+    rows = await _all(replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")
+    # The healthy canonical stays; every damaged row is gone.
+    assert [r["id"] for r in rows] == ["fed:pythia:canon"]
     blob = await _one(replica, "SELECT id FROM memory_archive WHERE id = ?", "fed:pythia:old")
     assert blob is None
-    fences = await _all(
-        replica, "SELECT remote_id FROM federation_receive_state WHERE peer_name = 'pythia'"
-    )
-    assert fences == []
-    cursors = await _all(
-        replica, "SELECT peer_id FROM federation_peer_cursors WHERE peer_id = ?", peer["id"]
-    )
+    fences = await _all(replica, "SELECT remote_id FROM federation_receive_state WHERE peer_name = 'pythia'")
+    # Only damaged rows lose their fence; the healthy canonical keeps its own.
+    assert [f["remote_id"] for f in fences] == ["canon"]
+    cursors = await _all(replica, "SELECT peer_id FROM federation_peer_cursors WHERE peer_id = ?", peer["id"])
     assert cursors == []
 
 
 @pytest.mark.asyncio
 async def test_apply_skips_withdrawn_and_peer_consolidated_rows(replica):
     peer = await _peer(replica)
+    # The canonical the peer-consolidated twin points at must exist.
+    await _replica_row(replica, "canon")
+    await _fence(replica, "canon")
     # Source withdrew this one: the fence says so, so it must never come back.
     await _replica_row(replica, "revoked", deleted_at=NOW.isoformat())
     await _fence(replica, "revoked", withdrawn=1)
@@ -230,9 +231,7 @@ async def test_apply_skips_withdrawn_and_peer_consolidated_rows(replica):
         replica,
         "twin",
         consolidated_into="fed:pythia:canon",
-        metadata=json.dumps(
-            {"federation_consolidation": {"remote_id": "twin", "peer": "pythia"}}
-        ),
+        metadata=json.dumps({"federation_consolidation": {"remote_id": "twin", "peer": "pythia"}}),
     )
     await _fence(replica, "twin")
     # Genuine local damage alongside, to prove the run still repairs the rest.
@@ -244,8 +243,155 @@ async def test_apply_skips_withdrawn_and_peer_consolidated_rows(replica):
     assert report["repaired"] == 1
     assert report["skipped_withdrawn"] == 1
     assert report["skipped_consolidated"] == 1
-    remaining = {
-        r["id"]
-        for r in await _all(replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")
-    }
-    assert remaining == {"fed:pythia:revoked", "fed:pythia:twin"}
+    remaining = {r["id"] for r in await _all(replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")}
+    assert remaining == {"fed:pythia:revoked", "fed:pythia:twin", "fed:pythia:canon"}
+
+
+# ── end-to-end: the next ordinary sync re-pulls what the repair cleared ──────
+
+
+class _SourceTransport(httpx.AsyncBaseTransport):
+    """Dispatch the replica's outbound HTTP into the source's real routes."""
+
+    def __init__(self, app, calls):
+        self._app = app
+        self.calls = calls
+
+    async def handle_async_request(self, request):
+        rewritten = httpx.Request(
+            method=request.method,
+            url=request.url.copy_with(scheme="http", host="pythia", port=None),
+            headers=request.headers,
+            content=request.content,
+            extensions=request.extensions,
+        )
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=self._app), base_url="http://pythia") as inner:
+            return await inner.send(rewritten)
+
+
+@pytest_asyncio.fixture
+async def live_pair(tmp_path: Path, monkeypatch):
+    """Two real SQLite backends: PYTHIA (source) and PROTEUS (replica)."""
+    import httpx
+    from fastapi import FastAPI
+
+    from mnemos.api import persistence_helpers
+    from mnemos.api.routes.federation import router as federation_router
+    from mnemos.api.dependencies import UserContext, get_current_user
+    from mnemos.domain import federation as fed
+
+    monkeypatch.setenv("MNEMOS_FEDERATION_FEED_INCLUDE_PRIVATE", "1")
+    monkeypatch.setenv("MNEMOS_EMBEDDING_DIM", str(EMBED_DIM))
+    monkeypatch.setenv("MNEMOS_EMBED_HTTP_MODEL", "bge-m3")
+    from mnemos.persistence.sqlite import SqliteBackend
+
+    source = SqliteBackend(tmp_path / "pythia.db", _Settings())
+    await source.open()
+    replica = SqliteBackend(tmp_path / "proteus.db", _Settings())
+    await replica.open()
+    from types import SimpleNamespace as _NS
+
+    async def _current_user():
+        return UserContext(
+            user_id="federation-bot",
+            group_ids=[],
+            role="root",
+            namespace=None,
+            authenticated=True,
+        )
+
+    app = FastAPI()
+    app.include_router(federation_router)
+    app.dependency_overrides[get_current_user] = _current_user
+    transport = _SourceTransport(app, [])
+
+    real_make_safe_client = fed.make_safe_client
+
+    async def _safe_client(url, *, timeout=None, allow_private=True, **kwargs):
+        client = httpx.AsyncClient(transport=transport, base_url="http://pythia")
+        return client, None
+
+    def _current_backend():
+        return source
+
+    monkeypatch.setattr(fed, "make_safe_client", _safe_client)
+    monkeypatch.setattr(persistence_helpers, "backend_or_503", _current_backend)
+
+    async def _schema_ok(*args, **kwargs):
+        return {
+            "ok": True,
+            "mnemos_version": "9.9.9",
+            "schema_signature": "9.9",
+            "migrations_fingerprint": None,
+        }
+
+    real_schema = fed._check_peer_schema
+    fed._check_peer_schema = _schema_ok
+    try:
+        yield _NS(source=source, replica=replica)
+    finally:
+        monkeypatch.setattr(fed, "make_safe_client", real_make_safe_client)
+        fed._check_peer_schema = real_schema
+        await replica.close()
+        await source.close()
+
+
+@pytest.mark.asyncio
+async def test_next_sync_repulls_repaired_rows(live_pair):
+    """Apply clears fence + cursors, so the next ordinary sync restores the rows."""
+    from mnemos.domain import federation as fed
+
+    source, replica = live_pair.source, live_pair.replica
+    async with source.transactional() as tx:
+        for rid, text in (("one", "first fact"), ("two", "second fact")):
+            await tx.conn.execute(
+                "INSERT INTO memories(id, content, category, owner_id, namespace, "
+                "permission_mode, created, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (rid, text, "facts", "alice", "default", 644, NOW.isoformat(), NOW.isoformat()),
+            )
+    async with replica.transactional() as tx:
+        peer = await replica.federation.create_peer(
+            tx,
+            name="pythia",
+            base_url="http://pythia",
+            auth_token="token",
+            namespace_filter=None,
+            category_filter=None,
+            enabled=True,
+            sync_interval_secs=300,
+            compat_mode="permissive",
+        )
+    await fed.sync_peer(replica, peer["id"])
+    got = await _all(replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")
+    assert {r["id"] for r in got} == {"fed:pythia:one", "fed:pythia:two"}
+
+    # Pre-fence damage, the way an old build left it: archived + soft-deleted.
+    await _exec(
+        replica,
+        "UPDATE memories SET archived_at = ?, content = ? WHERE id = ?",
+        NOW.isoformat(),
+        "ARCHIVED:fed:pythia:one",
+        "fed:pythia:one",
+    )
+    await _exec(
+        replica,
+        "UPDATE memories SET deleted_at = ? WHERE id = ?",
+        NOW.isoformat(),
+        "fed:pythia:two",
+    )
+    dry = await repair_fenced_replicas(replica, peer["id"], dry_run=True)
+    assert sorted(c["remote_id"] for c in dry["candidates"]) == ["one", "two"]
+    applied = await repair_fenced_replicas(replica, peer["id"], dry_run=False)
+    assert applied["repaired"] == 2
+    assert applied["failed"] == []
+
+    await fed.sync_peer(replica, peer["id"])
+    rows = await _all(
+        replica,
+        "SELECT id, content, deleted_at, archived_at FROM memories WHERE federation_source = 'pythia' ORDER BY id",
+    )
+    assert [(r["id"], r["content"]) for r in rows] == [
+        ("fed:pythia:one", "first fact"),
+        ("fed:pythia:two", "second fact"),
+    ]
+    assert all(r["deleted_at"] is None and r["archived_at"] is None for r in rows)

@@ -75,6 +75,40 @@ sequence already handed out; an event that reused a cursor position would be
 invisible to the replica. Reconcile never deletes or overwrites a replica
 row.
 
+### Repair rows fenced before the replica fence existed (`repair`, MN-24)
+
+A replica row damaged by a *local* lifecycle sweep (soft-delete, archival, a
+local consolidation) **before** the replica fence shipped can never heal: the
+receiver's durable sequence fence drops the source's replay before any write,
+so the row stays wrong forever and the only fallback is a full re-seed of the
+peer. `repair_fenced_replicas(backend, peer_id, dry_run=True)` is the one-off
+cleanup; `POST /v1/federation/peers/{id}/repair?dry_run=true`
+(`mnemos federation repair <peer> [--apply]`) exposes it. Dry run is the
+default and changes nothing: it lists each candidate's `remote_id` and what
+is wrong with it (`deleted` / `archived` / `consolidated`).
+
+With `dry_run=false`, per row: the archive blob is deleted first (the archive
+table references the row with `ON DELETE RESTRICT`), then the local copy,
+then the row's `federation_receive_state` fence; an audit `delete` entry is
+written when the audit chain is on. After all rows the peer's journal cursors
+are cleared, so the next ordinary sync replays from the source and re-pulls
+every repaired row as a fresh insert through the normal write path. Per-row
+failures are collected in `failed`, never raised: one bad id does not stop
+the run.
+
+Two populations are never touched. Rows the source withdrew (the fence says
+`withdrawn`) are counted in `skipped_withdrawn`: a revocation must never come
+back as live data. Rows whose `metadata` carries the
+`federation_consolidation` marker are counted in `skipped_consolidated`: that
+marker is what the peer-consolidation tombstone path writes, so it is the
+peer's own consolidation applied here, not damage a local sweep did. A dry run
+taken after an apply therefore shows an empty candidate list unless new damage
+appears.
+
+Test coverage: `tests/test_federation_repair_fenced_replicas.py` (real
+SQLite, including a full source→replica→damage→repair→re-sync round trip
+that asserts the rows come back with the source's content).
+
 ## Locally soft-deleted replicas (`skipped_deleted`, F-2)
 
 A replica an operator has soft-deleted on the receiving node is a lifecycle

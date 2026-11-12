@@ -1371,6 +1371,28 @@ def federation_reconcile(
     _echo_json_response(response)
 
 
+@federation_app.command("repair")
+def federation_repair(
+    peer_id: str = typer.Argument(..., help="Federation peer id"),
+    apply: bool = typer.Option(False, "--apply", help="Actually repair (default is a dry run)"),
+    page_size: int = typer.Option(500, "--page-size", min=1, max=5000),
+) -> None:
+    """Repair replica rows damaged before the replica fence. Dry run unless --apply."""
+    base, headers = _api_env(require_key=True)
+    params: dict[str, Any] = {"dry_run": not apply, "page_size": page_size}
+    try:
+        response = httpx.post(
+            f"{base}/v1/federation/peers/{peer_id}/repair",
+            headers=headers,
+            params=params,
+            timeout=600,
+        )
+    except httpx.RequestError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    _echo_json_response(response)
+
+
 app.add_typer(federation_app, name="federation")
 app.add_typer(serve_app, name="serve")
 app.add_typer(worker_app, name="worker")

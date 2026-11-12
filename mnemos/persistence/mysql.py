@@ -8135,6 +8135,87 @@ class MysqlFederationRepository(FederationRepository):
             )
             return int(cursor.rowcount or 0)
 
+    # ── MN-24: repair rows fenced before the replica fence existed ───────
+
+    async def fetch_fenced_damaged_replicas(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        params: list[Any] = [peer_name]
+        where = (
+            "WHERE m.federation_source = %s "
+            "AND (m.deleted_at IS NOT NULL "
+            "OR m.archived_at IS NOT NULL "
+            "OR m.consolidated_into IS NOT NULL)"
+        )
+        if after_id is not None:
+            where += " AND m.id > %s"
+            params.append(after_id)
+        params.append(max(1, int(limit)))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT m.id AS local_id,
+                       SUBSTRING(m.id, CHAR_LENGTH(m.federation_source) + 6) AS remote_id,
+                       m.deleted_at AS deleted_at, m.archived_at AS archived_at,
+                       m.consolidated_into AS consolidated_into, m.metadata AS metadata,
+                       frs.withdrawn AS withdrawn
+                  FROM memories m
+                  LEFT JOIN federation_receive_state frs
+                    ON frs.peer_name = m.federation_source
+                   AND frs.remote_id = SUBSTRING(m.id, CHAR_LENGTH(m.federation_source) + 6)
+                 {where}
+                 ORDER BY m.id ASC
+                 LIMIT %s
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def clear_federation_receive_fence(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        remote_id: str,
+    ) -> int:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM federation_receive_state WHERE peer_name = %s AND remote_id = %s",
+                (peer_name, remote_id),
+            )
+            return int(cursor.rowcount or 0)
+
+    async def clear_federation_peer_cursors(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+    ) -> int:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM federation_peer_cursors WHERE peer_id = %s",
+                (peer_id,),
+            )
+            return int(cursor.rowcount or 0)
+
+    async def delete_federated_archive_blob(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM memory_archive WHERE id = %s",
+                (local_id,),
+            )
+            return int(cursor.rowcount or 0)
+
     # ── F-15 parity / reconcile (read-only, keyset-paged) ────────────────
 
     async def fetch_parity_page(

@@ -1188,3 +1188,39 @@ async def federation_peer_reconcile(
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return FederationReconcileResponse(result=result)
+
+
+class FederationRepairResponse(BaseModel):
+    result: dict[str, Any]
+
+
+@router.post("/peers/{peer_id}/repair", response_model=FederationRepairResponse)
+async def federation_peer_repair(
+    peer_id: str,
+    _: UserContext = Depends(_require_federation_role),
+    dry_run: bool = Query(True, description="True (default) only lists what would be repaired"),
+    page_size: int = Query(500, ge=1, le=5000),
+):
+    """Repair replica rows damaged before the replica fence existed.
+
+    MN-24 / D-MN5. Dry run by default: lists the locally damaged replica
+    rows (soft-deleted, archived, locally consolidated) and changes nothing.
+    With ``dry_run=false`` deletes the damaged local copy plus its archive
+    blob, clears the row's receive-state fence and the peer's journal
+    cursors, so the next ordinary sync replays and re-pulls through the
+    normal write path. Rows the source withdrew and consolidations the peer
+    itself published are never touched.
+    """
+    from mnemos.domain.federation.repair import repair_fenced_replicas
+
+    backend = require_federation_backend()
+    try:
+        result = await repair_fenced_replicas(
+            backend,
+            peer_id if peer_id != "all" else None,
+            dry_run=dry_run,
+            page_size=page_size,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    return FederationRepairResponse(result=result)

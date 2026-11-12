@@ -7192,8 +7192,8 @@ class OracleFederationRepository(FederationRepository):
     ) -> list[Row]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
-        columns = (
-            "id, content, category, subcategory, metadata, owner_id, namespace, updated" + (", content_hash" if include_content_hash else "")
+        columns = "id, content, category, subcategory, metadata, owner_id, namespace, updated" + (
+            ", content_hash" if include_content_hash else ""
         )
         try:
             if updated_after is not None and id_after is not None:
@@ -8059,6 +8059,106 @@ class OracleFederationRepository(FederationRepository):
                    AND federation_source = :peer
                 """,
                 {"id": memory_id, "local_id": f"fed:{peer_name}:{memory_id}", "peer": peer_name},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    # ── MN-24: repair rows fenced before the replica fence existed ───────
+
+    async def fetch_fenced_damaged_replicas(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        where = (
+            "WHERE m.federation_source = :peer "
+            "AND (m.deleted_at IS NOT NULL "
+            "OR m.archived_at IS NOT NULL "
+            "OR m.consolidated_into IS NOT NULL)"
+        )
+        params: dict[str, Any] = {"peer": peer_name, "limit": max(1, int(limit))}
+        if after_id is not None:
+            where += " AND m.id > :after_id"
+            params["after_id"] = after_id
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id AS local_id,
+                       SUBSTR(m.id, LENGTH(m.federation_source) + 6) AS remote_id,
+                       m.deleted_at AS deleted_at, m.archived_at AS archived_at,
+                       m.consolidated_into AS consolidated_into, m.metadata AS metadata,
+                       frs.withdrawn AS withdrawn
+                  FROM memories m
+                  LEFT JOIN federation_receive_state frs
+                    ON frs.peer_name = m.federation_source
+                   AND frs.remote_id = SUBSTR(m.id, LENGTH(m.federation_source) + 6)
+                  {where}
+                 ORDER BY m.id ASC
+                 FETCH FIRST :limit ROWS ONLY
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def clear_federation_receive_fence(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        remote_id: str,
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM federation_receive_state WHERE peer_name = :peer AND remote_id = :rid",
+                {"peer": peer_name, "rid": remote_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def clear_federation_peer_cursors(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM federation_peer_cursors WHERE peer_id = :pid",
+                {"pid": peer_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def delete_federated_archive_blob(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM memory_archive WHERE id = :lid",
+                {"lid": local_id},
             )
             return int(getattr(cursor, "rowcount", 0) or 0)
         finally:
