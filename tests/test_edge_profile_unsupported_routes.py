@@ -301,15 +301,32 @@ def test_edge_profile_sessions_route_requires_the_sessions_capability(monkeypatc
     backend = _backend(monkeypatch, tmp_path, "raw-route-sqlite")
 
     class _StateOnlyBackend:
-        capabilities = {STATE_CAPABILITY}
+        """A real ``SqliteBackend`` facade with ONLY the state capability
+        advertised.
 
-        @asynccontextmanager
-        async def transactional(self):
-            async with backend.transactional() as tx:
-                yield tx
+        It shares the provisioned SQLite store (so ``transactional()`` is the
+        real backend context manager, not a hand-rolled double) but hides
+        every other feature-layer flag via a narrowed ``capabilities`` view.
+        Because the real backend still carries the ``sessions`` repository,
+        this isolates the capability-gate path in
+        ``require_sessions_backend``: with ``SESSIONS_CAPABILITY`` missing from
+        the advertised set, the route must answer 503 before it ever touches
+        the store — never falling through to read a row persisted by another
+        profile.
+        """
 
-    assert SESSIONS_CAPABILITY not in _StateOnlyBackend.capabilities
-    monkeypatch.setattr(lifecycle, "_persistence_backend", _StateOnlyBackend())
+        def __init__(self, real_backend):
+            self._real = real_backend
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        @property
+        def capabilities(self):
+            return {STATE_CAPABILITY}
+
+    assert SESSIONS_CAPABILITY not in _StateOnlyBackend(backend).capabilities
+    monkeypatch.setattr(lifecycle, "_persistence_backend", _StateOnlyBackend(backend))
 
     resp = _route_client().post("/v1/sessions", json={"model": "m"})
     assert resp.status_code == 503, resp.text
