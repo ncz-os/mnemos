@@ -52,3 +52,53 @@ def test_real_aws_shapes_are_still_caught(text):
 def test_a_wrapped_token_is_still_reassembled():
     text = "token: abcdefghijklmn\nopqrstuvwxyz0123456789"
     assert classify(text).cls != SecretClass.CLEAN
+
+
+# ── round 2 (2026-11-12): shapes the production-corpus comparison still redacted ──
+
+PATH40 = "/Datasets/ImageNetTrain/ValidSplit/Part1"
+
+
+def test_the_path_fixture_is_a_40_char_run():
+    assert len(PATH40.lstrip("/")) + 1 == 40 or len(PATH40) == 40
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ran test_doctor_core_characterisation_20261112 and it passed",
+        "all of test_review_queue_fixes_20261031 passed today",
+        "board Orin A9A-AA is ready for the bench",
+        "COMMIT a1b2c3d4 on the build host finished",
+        "PUSH 3c41c07..00a04e7 HEAD -> main from the worker",
+        "ARGONAS 20261112 DEPLOY 20261113 STATE recorded",
+        "the loader uses CixDrmPlatform2 with MediaPipeline for output",
+        f"dataset lives at {PATH40} on the bench",
+        "rk3588-v2 board and R1A-BB revision were tested",
+    ],
+)
+def test_identifiers_and_shorthand_stay_clean(text):
+    finding = classify(text)
+    assert finding.cls == SecretClass.CLEAN, (finding.cls, finding.reasons)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "API Key: sk_live_51H8AbCdEfGhIjKlMn OpQrStUvWxYz0123",
+        "Perplexity API key: pplx-AbC123xyzQ\nrStUvWxYz4567890aBcD",
+        "the access key is Zk3pQ8vLm2Xr7TnB4yHc9WdFg6JsUa1E oIq0AbCd9876",
+        "bearer eyJhbGciOiJIUzI1NiJ9 eyJzdWIiOiIxMjM0NTY3ODkwIn0 SflKxwRJSMeKKF2QT4fwpM",
+    ],
+)
+def test_anchored_wrapped_credentials_are_still_caught(text):
+    finding = classify(text)
+    assert finding.cls != SecretClass.CLEAN, text
+    assert finding.reasons
+
+
+def test_a_wrapped_key_does_not_swallow_the_next_words():
+    text = "API Key: abcdefghijkLMNO\nopqrstuvwxyz0123456789\nModels are listed below"
+    out = redact_content(text)
+    assert "opqrstuvwxyz0123456789" not in out
+    assert "Models are listed below" in out

@@ -121,19 +121,38 @@ def _aws_secret_shaped(candidate: str) -> bool:
     """True when a 40-char base64-alphabet run can plausibly be an AWS secret key.
 
     The pattern alone matches every 40-hex git SHA, every long identifier
-    and some paths. An issued key is random over 64 symbols, so it is not
-    all hex, it carries both an upper- and a lower-case letter, and it is
-    not a ``dir/dir/dir/file`` path (three or more slash-separated segments
-    that each start with a word of 3+ letters).
+    and many paths. An issued key is random over 64 symbols, so it is not
+    all hex, it carries both an upper- and a lower-case letter, it is not
+    a CamelCase identifier, and it is not a path: a random key holds three
+    or more slashes about 2% of the time, a path nearly always does, and a
+    leading ``/`` or ``~`` is a path whatever follows.
     """
     if _HEX_ONLY_RE.fullmatch(candidate):
         return False
     if not re.search(r"[A-Z]", candidate) or not re.search(r"[a-z]", candidate):
         return False
-    segments = candidate.split("/")
-    if len(segments) >= 4 and all(re.match(r"[A-Za-z]{3,}", seg) for seg in segments):
+    if candidate.count("/") >= 3 or candidate[:1] in "/~":
+        return False
+    segments = [seg for seg in candidate.split("/") if seg]
+    if candidate.count("/") >= 2 and segments and all(_path_segment_is_words(seg) for seg in segments):
+        return False
+    if _SPLIT_IDENT_RE.fullmatch(candidate):
         return False
     return True
+
+
+def _path_segment_is_words(segment: str) -> bool:
+    return all(_segment_is_word(part) for part in re.split(r"[._-]", segment) if part)
+
+
+def _segment_is_word(part: str) -> bool:
+    """A number, a (Camel)Case word, a 1-2 letter stub or a short capital code."""
+    return bool(
+        re.fullmatch(r"[0-9]+", part)
+        or _SPLIT_IDENT_RE.fullmatch(part)
+        or re.fullmatch(r"[a-z]{1,2}", part)
+        or re.fullmatch(r"[A-Z][0-9A-Z]{0,3}", part)
+    )
 
 
 # The AWS access-key id (aws_akia, above) is what the IAM console shows
@@ -184,7 +203,7 @@ _SPLIT_HEX_FRAGMENT_RE = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
 _SPLIT_WORD_FRAGMENT_RE = re.compile(r"\A[A-Z]?[a-z]{5,}\Z")
 
 
-def _iter_split_token_spans(text: str):
+def _iter_split_token_spans_unanchored(text: str):
     """Yield (start, end) spans of tokens split across whitespace.
 
     Adjacent fragments (separated only by a space or a single newline) are
@@ -208,7 +227,35 @@ def _iter_split_token_spans(text: str):
                 yield pieces[first].start(), end
 
 
-def _fragment_is_token_grade(frag: str) -> bool:
+# A wrapped credential is only reported when it is ANCHORED: it starts with a
+# known credential prefix, or a credential keyword sits just before it
+# ("API key: <part>\n<part>"). Unanchored, prose and identifiers produced
+# ~3,000 false redactions on the production corpus. A chain that ends in a
+# plain word ("... Models") stops before that word.
+_SPLIT_ANCHOR_PREFIX_RE = re.compile(
+    r"(?:[prs]k_(?:live|test)_|eyJ|gh[pousr]_|github_pat_|glpat-|xox[abprs]-|AKIA|ASIA|AIza|sk-)"
+)
+_SPLIT_ANCHOR_WORD_RE = re.compile(
+    r"(?i)\b(?:token|secret|password|passwd|api[_ -]?key|access[_ -]?key|bearer|credential|private[_ -]?key|"
+    r"client[_ -]?secret)s?\b[^\n]{0,12}\Z"
+)
+_SPLIT_LAST_PIECE_RE = re.compile(r"[0-9A-Za-z_-]+\Z")
+
+
+def _iter_split_token_spans(text: str):
+    """Yield (start, end) spans of anchored credentials split across whitespace."""
+    for start, end in _iter_split_token_spans_unanchored(text):
+        if not (
+            _SPLIT_ANCHOR_PREFIX_RE.match(text, start) or _SPLIT_ANCHOR_WORD_RE.search(text[max(0, start - 40) : start])
+        ):
+            continue
+        last = _SPLIT_LAST_PIECE_RE.search(text[start:end])
+        if last and _SPLIT_WORD_FRAGMENT_RE.match(last.group(0)):
+            continue
+        yield start, end
+
+
+def _fragment_is_token_grade_base(frag: str) -> bool:
     """True if one fragment alone is credential-shaped rather than a word."""
     if _SPLIT_DATE_FRAGMENT_RE.match(frag) or _SPLIT_HYPHENATED_PROSE_RE.match(frag):
         return False
@@ -229,6 +276,32 @@ def _fragment_is_token_grade(frag: str) -> bool:
     # "endpoint20261017").
     digits = re.search(r"[0-9]+\Z", frag)
     return bool(digits) and len(digits.group(0)) >= 10
+
+
+_SPLIT_ALLCAPS_RE = re.compile(r"\A[A-Z]{2,}[0-9]{0,4}\Z")
+# cixDrmPlatform2, HTTPServer, MyLongIdentifier: words run together, not a token.
+_SPLIT_IDENT_RE = re.compile(r"\A(?:[A-Z]?[a-z]{3,}|[A-Z]{2,})+[0-9]{0,4}\Z")
+# test_foo_bar_1, R1A-BB, rk3588-v2: segments that are each a word or a number.
+_SPLIT_SEGMENTED_RE = re.compile(r"\A[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+\Z")
+
+
+def _fragment_is_token_grade(frag: str) -> bool:
+    """True if one fragment alone is credential-shaped rather than prose or an identifier.
+
+    Measured on the production corpus: snake_case test names, ALLCAPS words,
+    CamelCase identifiers, kebab/snake segments that are all words, and
+    fragments under 8 chars without all of upper, lower and a digit are
+    ordinary text, never the tail of a wrapped credential.
+    """
+    if not _fragment_is_token_grade_base(frag):
+        return False
+    if _SPLIT_ALLCAPS_RE.match(frag) or _SPLIT_IDENT_RE.match(frag):
+        return False
+    if _SPLIT_SEGMENTED_RE.match(frag) and all(_segment_is_word(part) for part in re.split(r"[_-]", frag)):
+        return False
+    if len(frag) < 8 and not (re.search(r"[A-Z]", frag) and re.search(r"[a-z]", frag) and re.search(r"[0-9]", frag)):
+        return False
+    return True
 
 
 def _split_chain_is_token(run: list[str], text: str, pieces, first: int) -> bool:
