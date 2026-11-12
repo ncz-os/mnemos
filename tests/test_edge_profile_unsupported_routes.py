@@ -34,8 +34,14 @@ PROFILE_STORAGE = {
     "raw-state-sqlite": "raw-state.sqlite3",
     "raw-session-sqlite-copy": "raw-session-copy.sqlite3",
 }
-# What ``SessionsRepository.create_session`` returns on every backend (the
-# Postgres implementation selects exactly these three columns).
+# What the route must be able to read back from
+# ``SessionsRepository.create_session`` on every backend. The SQLite and
+# Postgres implementations both return at least ``id``, ``created_at`` and
+# ``model`` (Postgres selects exactly these three columns via
+# ``INSERT ... RETURNING id``); the ABC contract itself requires ``id``,
+# ``user_id``, ``namespace`` and ``model``. The repository test pins only the
+# contract subset (round 1/2, F3); ``created_at`` is pinned at the route
+# round-trip, where ``SessionResponse`` actually needs it.
 _SESSION_ROW_KEYS = {"id", "created_at", "model"}
 
 # The lifecycle slots every provisioned store registers through.
@@ -238,12 +244,16 @@ def test_sessions_repository_create_session_on_raw_sqlite(monkeypatch, tmp_path)
         assert first is not None and second is not None
         assert first["id"] and second["id"]
         assert first["id"] != second["id"], "two sessions must not share one id"
-        # Contract, not projection drift: every backend returns at least the
-        # session identity columns. The SQLite projection may not gain extra
-        # keys without a matching contract change, so hold the upper bound too
-        # — but the load-bearing check is that the contract columns are present.
+        # Contract, not projection drift (review round 1/2, finding F3): the
+        # load-bearing check is that the ABC contract columns are present.
+        # The previous ``set(first.keys()) == _SESSION_ROW_KEYS`` upper bound
+        # forced this SQLite projection to match exactly and failed on any
+        # legitimate addition — even though ``created_at`` is not part of the
+        # ``SessionsRepository.create_session`` contract (only ``id``,
+        # ``user_id``, ``namespace`` and ``model`` are required by the ABC).
+        # Keep the lower bound only; the route round-trip test pins the
+        # response fields separately, where they are actually required.
         assert _SESSION_ROW_KEYS <= set(first.keys())
-        assert set(first.keys()) == _SESSION_ROW_KEYS
 
         assert asyncio.run(read(backend, first["id"]))["id"] == first["id"]
 
@@ -268,7 +278,10 @@ def test_edge_profile_sessions_route_does_not_require_postgres(edge_client):
     session_id = body["session_id"]
     # The response model carries the row contract end-to-end, not just an id:
     # drift in the SQLite create_session projection must surface here, not be
-    # masked by a client that reads only the identifier.
+    # masked by a client that reads only the identifier. These pins cover the
+    # fields the repository row must provide (``model`` and ``created_at`` in
+    # the ``SessionResponse``) — the contract columns that are no longer
+    # pinned by the repository test's exact-key upper bound (round 1/2, F3).
     assert body["model"] == "m"
     assert body["created_at"], "the created_at field must be present and non-empty"
 
