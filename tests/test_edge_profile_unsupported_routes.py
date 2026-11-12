@@ -278,7 +278,6 @@ def test_edge_profile_sessions_route_requires_the_sessions_capability(monkeypatc
 
     class _StateOnlyBackend:
         capabilities = {STATE_CAPABILITY}
-        sessions = backend.sessions
 
         @asynccontextmanager
         async def transactional(self):
