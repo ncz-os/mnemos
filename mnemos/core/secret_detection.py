@@ -114,6 +114,28 @@ _HIGH_CONFIDENCE: list[tuple[str, re.Pattern]] = [
 # * _iter_split_token_spans — a run of 2-6 whitespace-separated fragments
 #   that together form one base64url/Stripe-shaped token.
 _AWS_SECRET_RE = re.compile(r"(?<![0-9A-Za-z/+=])[0-9A-Za-z/+=]{40}(?![0-9A-Za-z/+=])")
+_HEX_ONLY_RE = re.compile(r"[0-9a-fA-F]+")
+
+
+def _aws_secret_shaped(candidate: str) -> bool:
+    """True when a 40-char base64-alphabet run can plausibly be an AWS secret key.
+
+    The pattern alone matches every 40-hex git SHA, every long identifier
+    and some paths. An issued key is random over 64 symbols, so it is not
+    all hex, it carries both an upper- and a lower-case letter, and it is
+    not a ``dir/dir/dir/file`` path (three or more slash-separated segments
+    that each start with a word of 3+ letters).
+    """
+    if _HEX_ONLY_RE.fullmatch(candidate):
+        return False
+    if not re.search(r"[A-Z]", candidate) or not re.search(r"[a-z]", candidate):
+        return False
+    segments = candidate.split("/")
+    if len(segments) >= 4 and all(re.match(r"[A-Za-z]{3,}", seg) for seg in segments):
+        return False
+    return True
+
+
 # The AWS access-key id (aws_akia, above) is what the IAM console shows
 # next to this secret, so "AKIA... <secret>" vaults and masks both halves.
 
@@ -157,6 +179,9 @@ _SPLIT_DATE_FRAGMENT_RE = re.compile(r"\A(?:19|20)[0-9]{6}\Z")
 # Numbers and lowercase words joined by hyphens: a UUID chunk, a version, a
 # kebab-case phrase. A credential fragment joins with "_" or not at all.
 _SPLIT_HYPHENATED_PROSE_RE = re.compile(r"\A(?:[0-9]+|[a-z]+)(?:-(?:[0-9]+|[a-z]+))+\Z")
+_SPLIT_UUID_FRAGMENT_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+_SPLIT_HEX_FRAGMENT_RE = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
+_SPLIT_WORD_FRAGMENT_RE = re.compile(r"\A[A-Z]?[a-z]{5,}\Z")
 
 
 def _iter_split_token_spans(text: str):
@@ -186,6 +211,12 @@ def _iter_split_token_spans(text: str):
 def _fragment_is_token_grade(frag: str) -> bool:
     """True if one fragment alone is credential-shaped rather than a word."""
     if _SPLIT_DATE_FRAGMENT_RE.match(frag) or _SPLIT_HYPHENATED_PROSE_RE.match(frag):
+        return False
+    # A canonical UUID, a bare hex digest and an ordinary word (lower-case
+    # or Capitalised, "Category") are identifiers and prose, never the tail
+    # of a wrapped credential; without this "job <uuid>\nCategory ..." joined
+    # an id across the newline into the sentence that follows it.
+    if _SPLIT_UUID_FRAGMENT_RE.match(frag) or _SPLIT_HEX_FRAGMENT_RE.match(frag) or _SPLIT_WORD_FRAGMENT_RE.match(frag):
         return False
     # A lowercase word with a short trailing number ("build2026") is prose;
     # the same shape with a case shift is a token tail ("SflKxwRJSMeKK").
@@ -1096,6 +1127,13 @@ def classify(content: str | None) -> SecretFinding:
         # reference is prose, not a credential.
         window = text[max(0, mo.start() - 30) : mo.start()]
         if _SHA_CONTEXT_RE.search(window):
+            continue
+        # A 40-hex run is a SHA-1 wherever it sits ("main <sha> (approved)",
+        # "commits=[<sha>, <sha>]"): a secret access key is drawn from the
+        # 64-symbol base64 alphabet, so one that is all hex has odds of
+        # (16/64)^40. Likewise a key carries both cases, and a path-like
+        # run of words joined by "/" is a path.
+        if not _aws_secret_shaped(mo.group(0)):
             continue
         _escalate(finding, SecretClass.VAULT)
         finding.reasons.append("aws_secret")
