@@ -264,10 +264,21 @@ def test_edge_profile_sessions_route_does_not_require_postgres(edge_client):
     assert resp.status_code != 503, resp.text
     assert resp.status_code == 200, resp.text
 
-    session_id = resp.json()["session_id"]
+    body = resp.json()
+    session_id = body["session_id"]
+    # The response model carries the row contract end-to-end, not just an id:
+    # drift in the SQLite create_session projection must surface here, not be
+    # masked by a client that reads only the identifier.
+    assert body["model"] == "m"
+    assert body["created_at"], "the created_at field must be present and non-empty"
+
     fetched = edge_client.get(f"/v1/sessions/{session_id}")
     assert fetched.status_code == 200, fetched.text
-    assert fetched.json()["session_id"] == session_id
+    fetched_body = fetched.json()
+    assert fetched_body["session_id"] == session_id
+    # The round trip returns the context object, not a bare identifier: the
+    # session belongs to this namespace/user and carries the model we created it with.
+    assert fetched_body["model"] == "m"
 
 
 def test_edge_profile_sessions_route_requires_the_sessions_capability(monkeypatch, tmp_path):
