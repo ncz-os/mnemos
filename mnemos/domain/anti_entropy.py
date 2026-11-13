@@ -94,7 +94,7 @@ async def _fetch_peer_digest(
         # feed body. The digest fetch runs on the same worker tick against
         # the same peer, so it is the same unbounded-read exposure.
         try:
-            document, status_code, _resp = await _read_bounded_json(
+            document, status_code = await _read_bounded_json(
                 client,
                 url,
                 params=params,

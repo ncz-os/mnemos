@@ -418,6 +418,9 @@ async def test_pull_memory_by_id_uses_explicit_endpoint(monkeypatch):
 
     class _Response:
         status_code = 200
+        # NG2-MN-004: a declared length over the cap is refused before the
+        # body is read, so the stub answers with headers like a real one.
+        headers: dict[str, str] = {}
 
         def raise_for_status(self):
             pass

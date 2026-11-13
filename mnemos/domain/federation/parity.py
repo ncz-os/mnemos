@@ -32,6 +32,7 @@ caller's job: pass ``base_url``/``auth_token`` explicitly, as
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping
 from typing import Any
@@ -650,22 +651,30 @@ async def _redispatch_on_source(base_url: str, auth_token: str, memory_ids: list
         # NG2-MN-004: the answer is read under the same byte cap as every
         # other peer response. The body is a small count, so an over-cap
         # answer is a peer that is not behaving.
-        body, status_code, _resp = await _fed._post_bounded_json(
-            client,
-            url,
-            json_body={"memory_ids": memory_ids},
-            headers={"Authorization": f"Bearer {auth_token}"},
-        )
+        try:
+            body, status_code = await _fed._post_bounded_json(
+                client,
+                url,
+                json_body={"memory_ids": memory_ids},
+                headers={"Authorization": f"Bearer {auth_token}"},
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # A 2xx that is not JSON is a peer (or a proxy in front of it)
+            # that is not speaking this protocol. Nothing is reported as
+            # re-published, so reconcile counts every requested id as failed.
+            return 0
         if status_code in (404, 405):
             # A peer older than this release has no redispatch route. Nothing
             # was re-published, so reconcile reports every id as failed.
             return 0
         if status_code >= 400:
             raise RuntimeError(f"federation redispatch returned http {status_code}")
+        if not isinstance(body, dict):
+            # A 2xx that is not a JSON object is a peer that is not speaking
+            # this protocol; nothing was reported as re-published.
+            return 0
     except _fed.FederationPeerResponseTooLarge as e:
         raise RuntimeError(str(e)) from e
     finally:
         await client.aclose()
-    if not isinstance(body, dict):
-        return 0
     return int(body.get("redispatched") or 0)

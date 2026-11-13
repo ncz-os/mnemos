@@ -157,13 +157,15 @@ async def _read_bounded_json(
     params: Optional[Mapping[str, Any]] = None,
     headers: Optional[Mapping[str, str]] = None,
     max_bytes: Optional[int] = None,
-) -> Tuple[Any, int, Any]:
+) -> Tuple[Any, int]:
     """GET a peer URL and parse its JSON body under a hard byte cap.
 
     See :func:`_stream_bounded_json` for the bound itself. This is the
     GET-shaped wrapper.
 
-    Raises ``FederationPeerResponseTooLarge`` when the cap is exceeded.
+    Returns ``(parsed_body, status_code)``; ``parsed_body`` is ``None``
+    when the status is not a success. Raises
+    ``FederationPeerResponseTooLarge`` when the cap is exceeded.
     """
     return await _stream_bounded_json(
         client,
@@ -182,7 +184,8 @@ async def _post_bounded_json(
     json_body: Any = None,
     headers: Optional[Mapping[str, str]] = None,
     max_bytes: Optional[int] = None,
-) -> Tuple[Any, int, Any]:
+    read_error_body: bool = False,
+) -> Tuple[Any, int]:
     """POST to a peer URL and parse its JSON body under a hard byte cap.
 
     The POST counterpart of :func:`_read_bounded_json`; same streaming read
@@ -195,6 +198,7 @@ async def _post_bounded_json(
         json_body=json_body,
         headers=headers,
         max_bytes=max_bytes,
+        read_error_body=read_error_body,
     )
 
 
@@ -207,7 +211,8 @@ async def _stream_bounded_json(
     json_body: Any = None,
     headers: Optional[Mapping[str, str]] = None,
     max_bytes: Optional[int] = None,
-) -> Tuple[Any, int, Any]:
+    read_error_body: bool = False,
+) -> Tuple[Any, int]:
     """Call a peer URL and parse its JSON body under a hard byte cap.
 
     The peer response is read as a STREAM (``client.stream`` +
@@ -221,12 +226,23 @@ async def _stream_bounded_json(
     peer cannot smuggle a huge body past the cap with a small compressed
     one.
 
-    Returns ``(parsed_body, status_code, response)``. The status code is
-    returned rather than raised so each caller keeps its own status
-    semantics (the schema preflight distinguishes 5xx from 4xx; the pull
-    path maps 401 and 403 to their own errors). The response is returned
-    so a caller that wants the old ``raise_for_status()`` behaviour can
-    raise it — it still works after the stream is closed.
+    Returns ``(parsed_body, status_code)``. The status code is returned
+    rather than raised so each caller keeps its own status semantics (the
+    schema preflight distinguishes 5xx from 4xx; the pull path maps 401 and
+    403 to their own errors). The response OBJECT is deliberately not
+    returned: it is closed when the ``stream`` context exits, so it no
+    longer describes the request once the caller sees it, and acting on it
+    there is a bug waiting to be written. Callers turn a non-2xx status
+    into their own error (:func:`_raise_for_peer_status` gives the generic
+    pull paths the ``httpx.HTTPStatusError`` they used to get from
+    ``raise_for_status``).
+
+    An error body is not read at all (the caller only needs the status),
+    unless ``read_error_body`` asks for it — the fingerprint exchange reads
+    a 412's ``detail``. Either way it is bounded: a DECLARED length over the
+    cap is refused before a byte is read, an error body is exactly as
+    unbounded as a success one, and the declared length is the peer's own
+    promise about it.
 
     Raises ``FederationPeerResponseTooLarge`` when the cap is exceeded.
     """
@@ -238,17 +254,44 @@ async def _stream_bounded_json(
         request_kwargs["json"] = json_body
     async with client.stream(method, url, **request_kwargs) as response:
         status_code = response.status_code
-        if status_code >= 400:
-            # An error body is not read: the caller only needs the status,
-            # and an error body is exactly as unbounded as a success body.
-            return None, status_code, response
+        content_length = response.headers.get("content-length")
+        if content_length and content_length.isdigit() and int(content_length) > limit:
+            # A declared length over the cap needs no read at all; the
+            # stream is abandoned before a byte of the body is consumed.
+            raise FederationPeerResponseTooLarge(
+                f"peer response exceeds {limit} bytes (content-length {int(content_length)})"
+            )
+        if status_code >= 400 and not read_error_body:
+            return None, status_code
         async for chunk in response.aiter_bytes():
             received += len(chunk)
             if received > limit:
                 raise FederationPeerResponseTooLarge(f"peer response exceeds {limit} bytes (read {received})")
             chunks.append(chunk)
     raw = b"".join(chunks)
-    return json.loads(raw.decode("utf-8")), status_code, response
+    try:
+        return json.loads(raw.decode("utf-8")), status_code
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        if status_code >= 400:
+            # An unparseable error body says nothing the status does not.
+            return None, status_code
+        raise
+
+
+def _raise_for_peer_status(method: str, url: str, status_code: int) -> None:
+    """Raise ``httpx.HTTPStatusError`` for a non-2xx peer answer.
+
+    The bounded read no longer hands back a live response object, so the
+    pull paths rebuild the exception ``response.raise_for_status()`` used
+    to raise: same type, same status, same message shape, and the same
+    ``except httpx.HTTPError`` behaviour upstream already relies on.
+    """
+    if 200 <= status_code < 300:
+        return
+    response = httpx.Response(status_code)
+    request = httpx.Request(method, url)
+    response.request = request
+    response.raise_for_status()
 
 
 def eligible_for_federation(alias: str = "m") -> str:
@@ -515,33 +558,42 @@ async def post_peer_fingerprint(
             allow_private=_federation_allow_private(),
         )
     try:
-        resp = await client.post(url, json=dict(fingerprint), headers=headers)
+        # NG2-MN-004: the 412 body is the only one this call reads, and a
+        # peer is free to make it as large as it likes. Read it under the
+        # same cap as every other peer response instead of buffering it
+        # with ``resp.json()``; a body over the cap is unverifiable, the
+        # same as an unparseable one.
+        try:
+            body, status_code = await _post_bounded_json(
+                client,
+                url,
+                json_body=dict(fingerprint),
+                headers=headers,
+                read_error_body=True,
+            )
+        except FederationPeerResponseTooLarge as e:
+            logger.warning("federation: fingerprint exchange body too large: %s", e)
+            return {"ok": False, "supported": True, "status": None, "reason": str(e)}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body, status_code = {}, 200
     finally:
         if owns_client:
             await client.aclose()
-    if resp.status_code in (404, 405):
-        return {"ok": True, "supported": False, "status": resp.status_code}
-    if resp.status_code == 412:
+    if status_code in (404, 405):
+        return {"ok": True, "supported": False, "status": status_code}
+    if status_code == 412:
         reason = "fingerprint rejected by peer (412)"
-        try:
-            body = resp.json()
-        except Exception:
-            body = {}
         if isinstance(body, dict) and body.get("detail"):
             reason = str(body["detail"])
         return {"ok": False, "supported": True, "status": 412, "reason": reason}
-    if resp.status_code >= 400:
+    if status_code >= 400:
         return {
             "ok": False,
             "supported": True,
-            "status": resp.status_code,
-            "reason": f"fingerprint exchange failed: http {resp.status_code}",
+            "status": status_code,
+            "reason": f"fingerprint exchange failed: http {status_code}",
         }
-    try:
-        body = resp.json()
-    except Exception:
-        body = {}
-    return {"ok": True, "supported": True, "status": resp.status_code, "body": body}
+    return {"ok": True, "supported": True, "status": status_code, "body": body if isinstance(body, dict) else {}}
 
 
 async def _check_peer_schema(
@@ -594,7 +646,7 @@ async def _check_peer_schema(
             # shape it would have sent is unknown, so the sync must be
             # retried rather than burning the peer's whole sync interval.
             try:
-                data, status_code, _resp = await _read_bounded_json(
+                data, status_code = await _read_bounded_json(
                     client,
                     url,
                     headers={"Authorization": f"Bearer {auth_token}"},
@@ -1308,7 +1360,7 @@ async def _pull_batch(
         # NG2-MN-004: read the feed body as a STREAM under a byte cap. The
         # peer is not obliged to answer with the page size we asked for, and
         # ``r.json()`` would buffer the whole answer before parsing it.
-        body, status_code, response = await _read_bounded_json(
+        body, status_code = await _read_bounded_json(
             client,
             url,
             params=params,
@@ -1318,9 +1370,9 @@ async def _pull_batch(
             raise RuntimeError("federation auth token rejected (401)")
         if status_code == 403:
             raise RuntimeError("federation auth insufficient role (403)")
-        if status_code >= 400:
-            # Same exception the unbounded read raised for a non-2xx.
-            response.raise_for_status()
+        # Same exception the unbounded read raised for a non-2xx. This also
+        # guarantees ``body`` is parsed before the row parser sees it.
+        _raise_for_peer_status("GET", url, status_code)
         if not isinstance(body, dict):
             raise RuntimeError("federation peer feed response must be a JSON object")
     except FederationPeerResponseTooLarge as e:
@@ -1368,7 +1420,7 @@ async def pull_memory_by_id(
         # feed body. A peer that answers with a huge body for one memory is
         # bounded the same way a huge feed page is.
         try:
-            body, status_code, response = await _read_bounded_json(
+            body, status_code = await _read_bounded_json(
                 client,
                 url,
                 params=params,
@@ -1382,9 +1434,8 @@ async def pull_memory_by_id(
             raise RuntimeError("federation auth insufficient role (403)")
         if status_code == 404:
             return []
-        if status_code >= 400:
-            # Same exception the unbounded read raised for a non-2xx.
-            response.raise_for_status()
+        # Same exception the unbounded read raised for a non-2xx.
+        _raise_for_peer_status("GET", url, status_code)
     if isinstance(body, dict) and body.get("id") == memory_id:
         return [body]
     return []
