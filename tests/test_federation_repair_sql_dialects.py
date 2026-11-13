@@ -158,3 +158,33 @@ async def test_repair_writes_delete_fence_cursors_and_archive_blob(dialect):
     assert "old" in _bound(statements[0][1])
     assert "peer-id" in _bound(statements[1][1])
     assert "fed:pythia:old" in _bound(statements[2][1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dialect", ["postgres", "mysql", "oracle"])
+async def test_release_consolidation_targets_clears_the_pointer(dialect):
+    """The FK release uses each dialect's own placeholder style.
+
+    ``memories.consolidated_into`` references ``memories(id)``: a row that
+    still points at the target blocks the target's DELETE with a FOREIGN
+    KEY error. The repair releases the pointer first, so this statement
+    has to bind ``local_id`` in the dialect's own style ($1 / %s / :name)
+    and clear BOTH consolidation columns.
+    """
+    repo, tx = _repo_tx(dialect)
+    await repo.release_federation_consolidation_targets(tx, local_id="fed:pythia:old")
+    [(sql, params)] = _statements(dialect, tx)
+    assert sql.startswith("UPDATE memories SET consolidated_into = NULL")
+    assert "consolidated_at = NULL" in sql
+    assert "WHERE consolidated_into =" in sql
+
+    def _bound(params):
+        return list(params.values()) if isinstance(params, dict) else list(params)
+
+    assert "fed:pythia:old" in _bound(params)
+    if dialect == "postgres":
+        assert "= $1" in sql
+    elif dialect == "mysql":
+        assert "= %s" in sql
+    else:
+        assert "= :lid" in sql

@@ -422,3 +422,34 @@ async def test_apply_repairs_candidates_past_the_first_page(replica):
     assert applied["failed"] == []
     remaining = await _all(replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")
     assert sorted(r["id"] for r in remaining) == [f"fed:pythia:aaa-kept-{i}" for i in range(3)]
+
+
+@pytest.mark.asyncio
+async def test_apply_deletes_a_damaged_row_that_another_replica_points_at(replica):
+    """A damaged replica that is the TARGET of a consolidation pointer deletes.
+
+    ``memories.consolidated_into REFERENCES memories(id)`` (and SQLite runs
+    with ``PRAGMA foreign_keys=ON``), so deleting a row that another row
+    still points at fails with a FOREIGN KEY error. The repair collects
+    per-row errors instead of raising, so the failure was invisible: the
+    row stayed damaged and the run reported it in ``failed``.
+
+    The scenario: ``aaa-target`` is damaged (soft-deleted) and ``zzz-loser``
+    points at it. Candidates are repaired in ``remote_id`` order, so the
+    TARGET is deleted first and hits the FK -- exactly the order that
+    breaks. The repair must release the pointer first so the DELETE
+    succeeds and BOTH rows heal.
+    """
+    peer = await _peer(replica)
+    await _replica_row(replica, "aaa-target", deleted_at=NOW.isoformat())
+    await _fence(replica, "aaa-target")
+    await _replica_row(replica, "zzz-loser", consolidated_into="fed:pythia:aaa-target")
+    await _fence(replica, "zzz-loser")
+
+    report = await repair_fenced_replicas(replica, peer["id"], dry_run=False)
+
+    # The FK blocker must not turn into a swallowed failure.
+    assert report["failed"] == [], report["failed"]
+    assert report["repaired"] == 2, report
+    remaining = await _all(replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")
+    assert remaining == []

@@ -7405,6 +7405,19 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             (local_id,),
         )
 
+    async def release_federation_consolidation_targets(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        return await _execute_count(
+            self._conn(tx),
+            "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
+            "WHERE consolidated_into = ?",
+            (local_id,),
+        )
+
     # ── F-15 parity / reconcile ───────────────────────────────────────────
 
     async def fetch_parity_page(

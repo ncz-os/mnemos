@@ -78,6 +78,48 @@ def _damage_of(row: Any) -> list[str]:
     return damage
 
 
+def _repair_order(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Order the candidates so a referrer is deleted before its target.
+
+    ``memories.consolidated_into`` references ``memories(id)``. A damaged
+    replica can be the consolidation TARGET of another damaged replica.
+    Deleting the target while the referrer still points at it fails with a
+    FOREIGN KEY error, so the referrer has to go first.
+
+    The order is a topological sort over the "points at" relation, with
+    the stable ``(peer, remote_id)`` order as the tie-breaker so the run
+    stays deterministic. A cycle (two rows pointing at each other) cannot
+    be ordered by the relation alone -- those fall back to the stable
+    order and the FK release in the apply path breaks the cycle.
+    """
+    ordered: list[dict[str, Any]] = []
+    placed: set[str] = set()
+    by_local_id = {c["local_id"]: c for c in candidates}
+    # ``blocks[c]`` = the candidate ids that must be deleted BEFORE c,
+    # because they point at c and would block c's own DELETE.
+    blocks: dict[str, set[str]] = {c["local_id"]: set() for c in candidates}
+    for cand in candidates:
+        target = cand.get("consolidated_into")
+        if target and target in by_local_id:
+            # cand points at target -> cand must be deleted before target.
+            blocks[target].add(cand["local_id"])
+
+    def _ready(cand: dict[str, Any]) -> bool:
+        return all(dep in placed for dep in blocks.get(cand["local_id"], ()))
+
+    pending = sorted(candidates, key=lambda c: (c["peer"], c["remote_id"]))
+    while pending:
+        # Prefer a candidate whose referrers are all deleted. If none is
+        # ready the relation has a cycle: take the stable-order head so the
+        # run still makes progress (the FK release breaks the cycle).
+        ready = [c for c in pending if _ready(c)]
+        chosen = ready[0] if ready else pending[0]
+        ordered.append(chosen)
+        placed.add(chosen["local_id"])
+        pending.remove(chosen)
+    return ordered
+
+
 async def _damaged_for_peer(backend, peer_name: str, *, page_size: int) -> list[dict[str, Any]]:
     """Every locally damaged replica row for one peer, keyset-paged."""
     found: list[dict[str, Any]] = []
@@ -103,6 +145,10 @@ async def _damaged_for_peer(backend, peer_name: str, *, page_size: int) -> list[
                 metadata = row["metadata"]
             except (KeyError, IndexError, TypeError):
                 metadata = getattr(row, "metadata", None)
+            try:
+                consolidated_into = row["consolidated_into"]
+            except (KeyError, IndexError, TypeError):
+                consolidated_into = getattr(row, "consolidated_into", None)
             found.append(
                 {
                     "local_id": local_id,
@@ -110,6 +156,9 @@ async def _damaged_for_peer(backend, peer_name: str, *, page_size: int) -> list[
                     "damage": _damage_of(row),
                     "withdrawn": bool(int(withdrawn)) if withdrawn is not None else False,
                     "peer_consolidated": _is_peer_consolidated(metadata),
+                    "consolidated_into": (
+                        str(consolidated_into) if consolidated_into else None
+                    ),
                 }
             )
             after_id = local_id
@@ -165,7 +214,7 @@ async def repair_fenced_replicas(
 
     from mnemos.workers.audit_sealer import audit_chain_enabled
 
-    for cand in result["candidates"]:
+    for cand in _repair_order(result["candidates"]):
         name = cand["peer"]
         remote_id = cand["remote_id"]
         local_id = cand["local_id"]
@@ -220,6 +269,17 @@ async def repair_fenced_replicas(
                     )
 
                     snapshot = await fetch_audit_snapshot(tx, local_id)
+                # Release any consolidation pointer that targets THIS row
+                # before deleting it: ``memories.consolidated_into``
+                # references ``memories(id)``, so a row still pointing at
+                # this one makes the DELETE fail with a FOREIGN KEY error.
+                # Without this the repair of a damaged canonical silently
+                # fails (the error is collected, not raised) and the row
+                # stays damaged for good. The pointer belongs to a row that
+                # is itself being repaired (or that the source re-pulls
+                # anyway), so detaching it loses nothing: the next sync
+                # restores both rows through the normal write path.
+                await repo.release_federation_consolidation_targets(tx, local_id=local_id)
                 await repo.delete_federated_archive_blob(tx, local_id=local_id)
                 await repo.delete_federated_memory(tx, name, remote_id)
                 await repo.clear_federation_receive_fence(tx, peer_name=name, remote_id=remote_id)

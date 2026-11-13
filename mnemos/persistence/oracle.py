@@ -8209,6 +8209,25 @@ class OracleFederationRepository(FederationRepository):
         finally:
             await _call(cursor.close)
 
+    async def release_federation_consolidation_targets(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
+                "WHERE consolidated_into = :lid",
+                {"lid": local_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
     async def feed_query(self, tx, **kwargs):
         from mnemos.persistence.federation_journal import feed_query
 

@@ -8216,6 +8216,20 @@ class MysqlFederationRepository(FederationRepository):
             )
             return int(cursor.rowcount or 0)
 
+    async def release_federation_consolidation_targets(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
+                "WHERE consolidated_into = %s",
+                (local_id,),
+            )
+            return int(cursor.rowcount or 0)
+
     # ── F-15 parity / reconcile (read-only, keyset-paged) ────────────────
 
     async def fetch_parity_page(

@@ -6476,6 +6476,19 @@ class PostgresFederationRepository(FederationRepository):
         )
         return _pg_result_count(result)
 
+    async def release_federation_consolidation_targets(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        result = await _postgres_tx(tx).conn.execute(
+            "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
+            "WHERE consolidated_into = $1",
+            local_id,
+        )
+        return _pg_result_count(result)
+
     # ── F-15 parity / reconcile (read-only, keyset-paged) ────────────────
 
     async def fetch_parity_page(

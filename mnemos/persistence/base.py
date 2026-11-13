@@ -2535,6 +2535,33 @@ class FederationRepository(ABC):
         """
         return 0
 
+    async def release_federation_consolidation_targets(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        """Detach every row that points at ``local_id`` via ``consolidated_into``.
+
+        ``memories.consolidated_into`` references ``memories(id)``, so a row
+        that is still referenced blocks the DELETE of its target with a
+        FOREIGN KEY error. The repair deletes damaged replicas, and a
+        damaged replica can be the target of another damaged replica's
+        consolidation pointer -- deleting the target first then fails, and
+        the per-row failure leaves the target behind for good.
+
+        Releasing the pointer first is the only safe order: the row that
+        pointed at the target simply loses its (already broken) redirect,
+        which is the same state the receiver's own write path produces
+        (``prepare_versioned_update`` clears ``consolidated_into`` on a
+        re-pull), and the next sync re-pulls both rows anyway.
+
+        The scope is the WHOLE ``memories`` table, not just one peer: the
+        referencing row may be a local row or a replica of another peer.
+        Returns the number of rows detached.
+        """
+        return 0
+
     @abstractmethod
     async def fetch_memory_page(
         self,
