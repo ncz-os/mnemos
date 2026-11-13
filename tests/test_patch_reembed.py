@@ -20,10 +20,8 @@ Acceptance (from the task):
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -93,9 +91,7 @@ def _route_no_embed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_patch_content_reembeds_stored_vector(
-    sqlite_backend, tmp_path, monkeypatch, _route_no_embed
-):
+async def test_patch_content_reembeds_stored_vector(sqlite_backend, tmp_path, monkeypatch, _route_no_embed):
     """PATCH content -> stored vector equals embed(new content)."""
     from fastapi import Response
 
@@ -107,9 +103,7 @@ async def test_patch_content_reembeds_stored_vector(
     )
     # Create stores the vector inline (dim guard off on sqlite -> raw 8-dim OK).
     vec_before = await _stored_vector(sqlite_backend, created.id)
-    assert vec_before == _embed("the quick brown fox"), (
-        f"setup: create must store embed(content); got {vec_before!r}"
-    )
+    assert vec_before == _embed("the quick brown fox"), f"setup: create must store embed(content); got {vec_before!r}"
 
     # Track whether the re-embed happens inside the transaction.
     state = {"in_tx": False, "embed_inside_tx": 0, "embed_calls": 0}
@@ -143,20 +137,15 @@ async def test_patch_content_reembeds_stored_vector(
     )
     vec_after = await _stored_vector(sqlite_backend, created.id)
     assert vec_after == _embed("completely different zebra text"), (
-        "NG-MN-13 regression: PATCH kept the old embedding "
-        f"(before={vec_before!r} after={vec_after!r})"
+        f"NG-MN-13 regression: PATCH kept the old embedding (before={vec_before!r} after={vec_after!r})"
     )
     assert vec_after != vec_before
     assert state["embed_calls"] >= 1, "PATCH content must call the embedder"
-    assert state["embed_inside_tx"] == 0, (
-        "re-embed must run AFTER the update commits (outside the transaction)"
-    )
+    assert state["embed_inside_tx"] == 0, "re-embed must run AFTER the update commits (outside the transaction)"
 
 
 @pytest.mark.asyncio
-async def test_patch_metadata_only_does_not_reembed(
-    sqlite_backend, tmp_path, monkeypatch, _route_no_embed
-):
+async def test_patch_metadata_only_does_not_reembed(sqlite_backend, tmp_path, monkeypatch, _route_no_embed):
     """Metadata-only PATCH must not touch the stored vector."""
     from fastapi import Response
 
@@ -187,9 +176,7 @@ async def test_patch_metadata_only_does_not_reembed(
 
 
 @pytest.mark.asyncio
-async def test_patch_embed_failure_clears_stale_vector(
-    sqlite_backend, tmp_path, monkeypatch, _route_no_embed, caplog
-):
+async def test_patch_embed_failure_clears_stale_vector(sqlite_backend, tmp_path, monkeypatch, _route_no_embed, caplog):
     """On embedder failure the stale vector is cleared (NULL) + WARNING logged."""
     from fastapi import Response
 
@@ -220,9 +207,6 @@ async def test_patch_embed_failure_clears_stale_vector(
 
     vec_after = await _stored_vector(sqlite_backend, created.id)
     assert vec_after is None, (
-        "embedder failure must clear the stale vector (NULL) so the "
-        f"backfill picks the row up; got {vec_after!r}"
+        f"embedder failure must clear the stale vector (NULL) so the backfill picks the row up; got {vec_after!r}"
     )
-    assert any(r.levelno >= logging.WARNING for r in caplog.records), (
-        "embedder failure on PATCH must log a WARNING"
-    )
+    assert any(r.levelno >= logging.WARNING for r in caplog.records), "embedder failure on PATCH must log a WARNING"

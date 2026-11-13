@@ -1095,6 +1095,17 @@ class PostgresMemoryRepository(MemoryRepository):
             memory_id,
         )
 
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13).
+
+        Sets ``memories.embedding`` NULL so the embedding backfill
+        (which selects ``embedding IS NULL`` rows) picks the row up.
+        """
+        await _postgres_tx(tx).conn.execute(
+            "UPDATE memories SET embedding = NULL WHERE id = $1",
+            memory_id,
+        )
+
     async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None:
         conn = _postgres_tx(tx).conn
         return await conn.fetchrow(
