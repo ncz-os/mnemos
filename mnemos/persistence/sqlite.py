@@ -188,6 +188,10 @@ SQLITE_MIGRATION_FILES = [
     # M12 items 1/2: federation_peers lag/health columns + peer fingerprint
     # (SQLite mirror of 0071_federation_replica_health).
     "migrations_v7_4_federation_replica_health_sqlite.sql",
+    # Recall bookkeeping (recall_count/last_recalled_at) stops appending
+    # journal events: it cannot change federated content (SQLite mirror of
+    # 0072_federation_journal_metadata_only).
+    "migrations_v7_5_federation_journal_metadata_only_sqlite.sql",
 ]
 
 
@@ -1458,6 +1462,42 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             self._vec_index_complete = False
             logger.debug(
                 "sqlite-vec sync skipped on upsert_memory_embedding memory_id=%s: %s",
+                memory_id,
+                exc,
+            )
+
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13).
+
+        NULLs both the inline ``memories.embedding`` mirror and the
+        ``memory_embeddings`` join row (the table semantic_search reads
+        first), and drops the vec0 KNN entry so the candidate path
+        stops returning the stale vector. The backfill (which selects
+        ``embedding IS NULL`` rows) picks the row up on its next pass.
+        """
+        conn = self._conn(tx)
+        await _execute(conn, "UPDATE memories SET embedding = NULL WHERE id = ?", (memory_id,))
+        try:
+            await _execute(
+                conn,
+                "UPDATE memory_embeddings SET embedding = NULL WHERE memory_id = ?",
+                (memory_id,),
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug(
+                "memory_embeddings clear skipped for memory_id=%s: %s",
+                memory_id,
+                exc,
+            )
+        try:
+            await _execute(
+                conn,
+                "DELETE FROM memory_embedding_vec WHERE memory_id = ?",
+                (memory_id,),
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug(
+                "sqlite-vec clear skipped on clear_memory_embedding memory_id=%s: %s",
                 memory_id,
                 exc,
             )
@@ -4815,7 +4855,14 @@ def _sqlite_webhook_subscription(row: Any) -> WebhookSubscriptionRecord:
         id=str(row["id"]),
         url=row["url"],
         events=tuple(str(event) for event in events),
-        description=row.get("description") if isinstance(row, dict) else None,
+        # FB1008: ``description`` must map for every row type the mapper
+        # receives — live SQLite queries return ``dict`` rows, but
+        # ``sqlite3.Row`` objects support ``row["col"]`` access just the
+        # same (a genuinely absent column yields ``None``). The old
+        # ``isinstance(row, dict)`` guard dropped the value for Row inputs,
+        # breaking parity with postgres/mysql/oracle, which read the column
+        # regardless of row type.
+        description=(row.get("description") if isinstance(row, dict) else row["description"]),
         owner_id=row["owner_id"],
         namespace=row["namespace"],
         created=_sqlite_webhook_datetime(row["created"]),

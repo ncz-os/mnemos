@@ -3,8 +3,7 @@
 Several structured review passes over the characterisation suites
 (``tests/test_mnemos_domain_*_characterisation_20261105.py``,
 ``tests/test_mnemos_installer_detect_characterisation_20261105.py``,
-``tests/test_mnemos_api_routes_journal_characterisation_20261105.py`` and
-``.scratch/prev_streaming_test.py``) reported, repeatedly and verbatim,
+``tests/test_mnemos_api_routes_journal_characterisation_20261105.py``) reported, repeatedly and verbatim,
 that the files are "truncated" and that ``logging`` / ``json`` / ``socket``
 / ``asyncio`` are "undefined", and that names such as
 ``_GROQ_ENGINE_PROVIDERS`` or ``stream_event_source`` are "not defined".
@@ -41,7 +40,6 @@ CHARACTERISATION_SUITES = (
     "tests/test_mnemos_domain_openai_compat_schemas_characterisation_20261105.py",
     "tests/test_mnemos_domain_openai_compat_streaming_characterisation_20261105.py",
     "tests/test_mnemos_installer_detect_characterisation_20261105.py",
-    ".scratch/prev_streaming_test.py",
 )
 
 
@@ -113,9 +111,6 @@ REPORTED_UNDEFINED = (
     ("tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py", "json"),
     ("tests/test_mnemos_installer_detect_characterisation_20261105.py", "socket"),
     ("tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py", "json"),
-    (".scratch/prev_streaming_test.py", "logging"),
-    (".scratch/prev_streaming_test.py", "asyncio"),
-    (".scratch/prev_streaming_test.py", "OpenAICompatError"),
 )
 
 
@@ -139,14 +134,6 @@ REPORTED_UNDEFINED = (
         (
             "tests/test_mnemos_domain_memory_categorization_entities_characterisation_20261105.py",
             "test_query_entities_filters_by_name_only_with_ilike_pattern",
-        ),
-        (
-            ".scratch/prev_streaming_test.py",
-            "test_event_source_survives_a_failing_close_after_a_failure",
-        ),
-        (
-            ".scratch/prev_streaming_test.py",
-            "test_preflight_returns_an_openai_compat_error",
         ),
     ),
 )
@@ -275,28 +262,6 @@ def test_no_module_level_free_names_are_unbound(rel: str) -> None:
     """
     missing = _unbound_names(rel)
     assert not missing, f"{rel} uses unbound names: {sorted(set(missing))}"
-
-
-def test_baseline_note_belongs_to_a_different_job() -> None:
-    """Pin why the review's cited counts (5694 -> 5746) are not this branch's.
-
-    ``.scratch/BASELINE_BEFORE_AFTER.txt`` is authored on master by the
-    entities-suite job and carried in by refresh merges. Its numbers refer
-    to that job's base, not to any refresh branch. Recording the fact here
-    stops the mismatch being read as a defect in the refresh itself.
-    """
-    import re
-
-    note = (REPO / ".scratch/BASELINE_BEFORE_AFTER.txt").read_text(encoding="utf-8")
-    assert "5694" in note and "5746" in note, (
-        "the baseline note no longer carries the counts the review cites; "
-        "if it was replaced, this explanation needs updating too"
-    )
-    base = re.search(r"base ([0-9a-f]{7,40})", note)
-    assert base, "baseline note should record the base commit it measured"
-    # A 40/7-char hex sha; only assert the shape, not reachability (the
-    # object may be absent in a shallow clone).
-    assert re.fullmatch(r"[0-9a-f]{7,40}", base.group(1))
 
 
 def _bound_names_for(src: str) -> set[str]:

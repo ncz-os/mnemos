@@ -1,6 +1,6 @@
 # MNEMOS Specification
 
-**Version**: v7.1.0 current (major release; continues the v6.0.0
+**Version**: v7.2.0 current (major release; continues the v6.0.0
 split-distribution line and supersedes the v5.0.1 / v5.0.0 GA line from
 2026-05-02). Oracle AI Database 26ai, IBM Db2 12.1.5, MySQL and MariaDB
 backends sit behind the EPIMONE `PersistenceBackend` ABC alongside PostgreSQL and SQLite.
@@ -679,6 +679,7 @@ timestamp)`. Chain-verify endpoint: `GET /v1/consultations/audit/verify`
 | Body too large | `413 Payload Too Large` | Pure-ASGI streaming limiter handles chunked uploads (no in-memory buffering) |
 | OAuth state cookie absent | `400 invalid_request` | Typically caused by `MNEMOS_SESSION_SECRET` rotation mid-flight |
 | Federation peer lies | Size caps (1 MB/memory, 64 KB metadata) | Bounded blast radius; cap tripped logs peer identity |
+| Federation peer sends a huge response | Outbound response cap (`FEDERATION_MAX_RESPONSE_BYTES`, default 64 MiB) | The peer body is read as a stream and abandoned at the cap; the sync fails transiently, nothing is applied, the byte count is in the peer's `last_error` |
 | Webhook URL resolves to private IP | Delivery blocked | URL is validated at subscribe and delivery time, including DNS resolution |
 | Memory branch state corrupt | `409 Conflict` | Trigger raises `MN001`; API returns branch reconciliation guidance |
 | MCP tool call errors out | Structured error response | MCP contract preserved; client sees `is_error=True` + message |
@@ -964,6 +965,10 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
 - FTS via `plainto_tsquery` (not `to_tsquery`) — operator metacharacters
   treated as literals.
 - Federation size caps (1 MB/memory, 64 KB/metadata, 256 chars/name).
+- Outbound federation response cap (`FEDERATION_MAX_RESPONSE_BYTES`,
+  default 64 MiB): a peer response is read as a stream and abandoned at
+  the cap, so a peer cannot answer a pull with an unbounded body. This is
+  the outbound counterpart of the inbound body streaming limiter.
 - Body streaming limiter (chunked-transfer aware).
 - Audit endpoint rate limits (5/min chain-verify, 30/min list).
 - SSRF validation on webhook URLs at subscription and delivery time,
@@ -976,7 +981,7 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
   application visibility after
   `mnemos/db_migrations/migrations_v3_5_rls_group_select_unix_bits.sql`.
 
-### 10.4 Known gaps (as of v7.1.0)
+### 10.4 Known gaps (as of v7.2.0)
 
 - GDPR deletion requests can still hit the documented final-verify race or
   sweep-verifying exhaustion under sustained target writes; see

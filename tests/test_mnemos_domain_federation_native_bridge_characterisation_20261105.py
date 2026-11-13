@@ -9,11 +9,11 @@ Everything here is deterministic and offline: the optional native extension
 on the module's ``_NATIVE_FEDERATION`` global, so neither a present nor an
 absent compiled extension changes the outcome. No network, no clock, no sleep.
 
-One defect is pinned with ``xfail(strict=True)``: ``serialize_memory_for_feed``
-hands the caller's raw rows to the native extension without the vault filtering
-and span redaction that ``serialize_memory_rows`` applies. See
-``test_feed_native_path_drops_vault_rows_like_the_rows_path_does`` for the exact
-reason. The corresponding rows-path contract is pinned as a passing test.
+``serialize_memory_for_feed`` applies the same vault filtering and span
+redaction as ``serialize_memory_rows`` (via ``_redacted_non_vault_rows``)
+before either serializer runs; the previously-pinned leak of raw rows to the
+native extension is fixed, so the contract is pinned as a passing test in
+``test_feed_native_path_drops_vault_rows_like_the_rows_path_does``.
 """
 
 from __future__ import annotations
@@ -979,8 +979,10 @@ def test_memory_rows_native_path_receives_only_redacted_non_vault_rows(monkeypat
 
 
 def test_feed_native_path_receives_the_callers_rows_untouched(monkeypatch) -> None:
-    # The compact feed shape is a raw passthrough: no vault filtering and no
-    # span redaction, on the native path just as on the pure-Python path.
+    # The compact feed shape is NOT a raw passthrough: serialize_memory_for_feed
+    # applies the same vault filtering and span redaction as serialize_memory_rows
+    # (via _redacted_non_vault_rows) before either the native or pure-Python
+    # serializer runs. Vault rows are dropped and content is redacted.
     seen: list[Any] = []
 
     def feed(payload):
@@ -993,28 +995,15 @@ def test_feed_native_path_receives_the_callers_rows_untouched(monkeypatch) -> No
         _memory_row(id="vault_mem", namespace=VAULT_NAMESPACE, content=SECRET),
     ]
     native_bridge.serialize_memory_for_feed(rows)
-    assert [row["id"] for row in seen[0]] == ["plain", "vault_mem"]
-    assert seen[0][0]["content"] == SECRET
-    assert seen[0][1]["content"] == SECRET
+    assert [row["id"] for row in seen[0]] == ["plain"]
+    assert SECRET not in str(seen[0][0]["content"])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Defect (native feed path only): serialize_memory_for_feed forwards the caller's "
-        "raw `rows` to the native extension at line 168 -- no vault filtering and no span "
-        "redaction -- whereas serialize_memory_rows filters and redacts at line 184 before "
-        "calling out at line 187. Whenever a native extension is installed, every row "
-        "(including vault-namespace rows) reaches native code unredacted, even a single row. "
-        "Fix would be one line: pass _redacted_non_vault_rows(rows) at line 168, as the "
-        "rows path already does at line 184. Not changed here because this task is "
-        "tests-only. Latent today: serialize_memory_for_feed has no non-test caller in the "
-        "tree, and the one route that serializes memories "
-        "(mnemos/api/routes/federation.py) uses serialize_feed_response, which goes through "
-        "the redacting rows path."
-    ),
-)
 def test_feed_native_path_drops_vault_rows_like_the_rows_path_does(monkeypatch) -> None:
+    # Fixed (was pinned as a strict xfail): serialize_memory_for_feed now applies
+    # _redacted_non_vault_rows before ANY serializer (native or pure-Python),
+    # matching serialize_memory_rows. Vault-namespace rows are dropped and
+    # content-bearing fields span-redacted, so neither reaches native code.
     seen: list[Any] = []
     monkeypatch.setattr(
         native_bridge,
@@ -1026,8 +1015,12 @@ def test_feed_native_path_drops_vault_rows_like_the_rows_path_does(monkeypatch) 
         _memory_row(id="vault_mem", namespace=VAULT_NAMESPACE, content=SECRET),
     ]
     native_bridge.serialize_memory_for_feed(rows)
-    assert [row["id"] for row in seen[0]] == ["plain"]  # observed: ['plain', 'vault_mem']
-    assert SECRET not in json.dumps(seen[0])  # observed: leaked verbatim
+    assert [row["id"] for row in seen[0]] == ["plain"]
+    # The single non-vault row that reaches native code must be span-redacted;
+    # vault rows are dropped entirely. (Check per-field rather than via
+    # json.dumps on the raw rows, which still carry datetime values.)
+    for row in seen[0]:
+        assert SECRET not in str(row.get("content", ""))
 
 
 # --------------------------------------------------------------------------

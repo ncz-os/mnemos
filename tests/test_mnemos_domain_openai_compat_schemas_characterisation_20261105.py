@@ -33,6 +33,7 @@ Notable behaviour pinned as-is (see the test names for detail):
 
 from __future__ import annotations
 
+import typing
 from typing import Dict, List
 
 import pytest
@@ -343,12 +344,20 @@ def test_chat_message_content_requires_an_str_or_block_list():
     errors = _validate_errors(exc_info)
     assert errors[0]["loc"] == ("content", "str")
     assert errors[0]["type"] == "string_type"
-    # The list member of the union is named after the ContentBlock schema
-    # once its after-validator is attached; pin the shape, not the label.
+    # Second union member: the ContentBlock list. Assert the SHAPE and the
+    # declared type, not Pydantic's generated schema label. The label embeds
+    # the wrapped validator's function name ("list[function-after[
+    # validate_payload(), ContentBlock]]") and changes whenever Pydantic
+    # renames that repr or validate_payload is renamed — neither of which is
+    # a behaviour change here. get_args(ChatContent) is the declaration in
+    # schemas.py, so this stays true as long as the union is really
+    # Union[str, List[ContentBlock]].
     assert errors[1]["loc"][0] == "content"
-    assert errors[1]["loc"][1].startswith("list[function-after[validate_payload(), ")
-    assert errors[1]["loc"][1].endswith("ContentBlock]]")
+    assert errors[1]["loc"][1].startswith("list[")
     assert errors[1]["type"] == "list_type"
+    str_member, list_member = typing.get_args(ChatContent)
+    assert str_member is str
+    assert typing.get_args(list_member) == (ContentBlock,)
 
 
 def test_chat_message_invalid_block_in_list_surfaces_the_value_error():

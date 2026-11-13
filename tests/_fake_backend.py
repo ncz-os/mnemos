@@ -322,6 +322,17 @@ class _FakeMemoryRepo:
         )
         return self._resolve("upsert_memory_embedding", None)
 
+    async def clear_memory_embedding(self, tx, memory_id):
+        self.calls.append(
+            (
+                "clear_memory_embedding",
+                {
+                    "memory_id": memory_id,
+                },
+            )
+        )
+        return self._resolve("clear_memory_embedding", None)
+
     async def gather_stats(self, tx):
         from mnemos.persistence.base import MemoryStatsRow
 
@@ -1134,9 +1145,7 @@ class FakePostgresConnection:
         rows = [row for row in self.registry_rows if self._available(row)]
         normalized = " ".join(sql.split()).lower()
         if "from model_registry" not in normalized:
-            raise AssertionError(
-                f"unrecognised statement for FakePostgresConnection: {' '.join(sql.split())[:120]!r}"
-            )
+            raise AssertionError(f"unrecognised statement for FakePostgresConnection: {' '.join(sql.split())[:120]!r}")
 
         filters_provider = _filters_on(normalized, "provider")
         filters_model = _filters_on(normalized, "model_id")
@@ -1155,9 +1164,7 @@ class FakePostgresConnection:
         if "order by" in normalized:
             # Discovery: the only unfiltered shape the repository emits.
             return _order_by_graeae_weight_sql_order(rows)
-        raise AssertionError(
-            f"unrecognised model_registry statement: {' '.join(sql.split())[:120]!r}"
-        )
+        raise AssertionError(f"unrecognised model_registry statement: {' '.join(sql.split())[:120]!r}")
 
     async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
         self.fetch_calls.append((sql, args))
