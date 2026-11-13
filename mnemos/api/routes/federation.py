@@ -1209,7 +1209,10 @@ async def federation_peer_repair(
     blob, clears the row's receive-state fence and the peer's journal
     cursors, so the next ordinary sync replays and re-pulls through the
     normal write path. Rows the source withdrew and consolidations the peer
-    itself published are never touched.
+    itself published are never touched. Before each DELETE, same-peer
+    consolidation pointers targeting the row are detached (counted in
+    ``detached_pointers``); a LOCAL row's pointer is never touched -- if
+    it still blocks the DELETE the row is reported in ``failed``.
     """
     from mnemos.domain.federation.repair import repair_fenced_replicas
 

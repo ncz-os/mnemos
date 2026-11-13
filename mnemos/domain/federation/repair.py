@@ -254,6 +254,7 @@ async def repair_fenced_replicas(
         "skipped_withdrawn": 0,
         "skipped_consolidated": 0,
         "failed": [],
+        "detached_pointers": 0,
     }
     if dry_run:
         return result
@@ -315,17 +316,25 @@ async def repair_fenced_replicas(
                     )
 
                     snapshot = await fetch_audit_snapshot(tx, local_id)
-                # Release any consolidation pointer that targets THIS row
-                # before deleting it: ``memories.consolidated_into``
+                # Release any SAME-PEER consolidation pointer that targets
+                # THIS row before deleting it: ``memories.consolidated_into``
                 # references ``memories(id)``, so a row still pointing at
                 # this one makes the DELETE fail with a FOREIGN KEY error.
                 # Without this the repair of a damaged canonical silently
                 # fails (the error is collected, not raised) and the row
-                # stays damaged for good. The pointer belongs to a row that
-                # is itself being repaired (or that the source re-pulls
-                # anyway), so detaching it loses nothing: the next sync
-                # restores both rows through the normal write path.
-                await repo.release_federation_consolidation_targets(tx, local_id=local_id)
+                # stays damaged for good. Only replicas of the same peer
+                # are detached -- a LOCAL row (or another peer's replica)
+                # that points at the target keeps its pointer, and if that
+                # still blocks the DELETE the row fails loudly in
+                # ``failed`` instead of being silently detached. The
+                # detached count is surfaced so the operator sees the blast
+                # radius in both the dry run report shape and the apply
+                # result. The next sync re-pulls detached replicas anyway
+                # through the normal write path.
+                detached = await repo.release_federation_consolidation_targets(
+                    tx, local_id=local_id, peer_name=name
+                )
+                result["detached_pointers"] += int(detached or 0)
                 await repo.delete_federated_archive_blob(tx, local_id=local_id)
                 await repo.delete_federated_memory(tx, name, remote_id)
                 await repo.clear_federation_receive_fence(tx, peer_name=name, remote_id=remote_id)
@@ -351,11 +360,17 @@ async def repair_fenced_replicas(
 
     # The next sync must replay from the source: without a journal cursor for
     # any filter scope it does, and every cleared fence re-pulls as a fresh
-    # insert through the normal write path.
-    async with backend.transactional() as tx:
-        for row in await backend.federation.list_peers(tx):
-            if str(row["name"]) in peers:
-                await backend.federation.clear_federation_peer_cursors(tx, peer_id=str(row["id"]))
+    # insert through the normal write path. A cursor-clear failure must not
+    # turn a completed apply into an unhandled 500 after rows were already
+    # deleted: record it in ``failed`` and still return the summary.
+    try:
+        async with backend.transactional() as tx:
+            for row in await backend.federation.list_peers(tx):
+                if str(row["name"]) in peers:
+                    await backend.federation.clear_federation_peer_cursors(tx, peer_id=str(row["id"]))
+    except Exception as exc:  # noqa: BLE001 -- collected, never raised
+        logger.warning("[federation/repair] cursor clear failed: %s", exc)
+        result["failed"].append({"peer": "*", "id": "__cursors__", "error": str(exc)})
     return result
 
 

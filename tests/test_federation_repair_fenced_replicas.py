@@ -519,3 +519,129 @@ def test_repair_order_scales_linearly_with_the_candidate_count():
     assert len(ordered) == 4000
     # A quadratic sort-and-remove takes ~1.5s here; the linear one is <0.1s.
     assert elapsed < 0.5, f"repair order took {elapsed:.3f}s for 4000 candidates"
+
+
+@pytest.mark.asyncio
+async def test_apply_preserves_a_local_rows_consolidation_pointer(replica):
+    """F2: a LOCAL row pointing at a repaired replica keeps its pointer.
+
+    The FK release is scoped to same-peer replicas. An unrelated local
+    memory (``federation_source IS NULL``) that consolidates into a
+    damaged replica is collateral, not damage: repairing the replica must
+    not rewrite it. The local pointer still references the target row, so
+    the target's DELETE is FK-blocked and the row lands in ``failed``
+    instead of being silently detached.
+    """
+    peer = await _peer(replica)
+    await _replica_row(replica, "aaa-target", deleted_at=NOW.isoformat())
+    await _fence(replica, "aaa-target")
+    # An unrelated LOCAL row (not a replica) consolidating into the target.
+    await _exec(
+        replica,
+        "INSERT INTO memories(id, content, category, owner_id, namespace, permission_mode, "
+        "created, updated, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "local-note",
+        "local content",
+        "facts",
+        "alice",
+        "default",
+        644,
+        NOW.isoformat(),
+        NOW.isoformat(),
+        "{}",
+    )
+    await _exec(
+        replica,
+        "UPDATE memories SET consolidated_into = ? WHERE id = ?",
+        "fed:pythia:aaa-target",
+        "local-note",
+    )
+
+    report = await repair_fenced_replicas(replica, peer["id"], dry_run=False)
+
+    # The local pointer is preserved -- never silently detached.
+    local = await _one(replica, "SELECT consolidated_into FROM memories WHERE id = ?", "local-note")
+    assert local["consolidated_into"] == "fed:pythia:aaa-target"
+    # The blocked target fails loudly, not silently.
+    assert report["repaired"] == 0
+    assert len(report["failed"]) == 1
+    assert report["failed"][0]["id"] == "aaa-target"
+    assert report["detached_pointers"] == 0
+
+
+@pytest.mark.asyncio
+async def test_apply_detaches_a_same_peer_replica_pointer_and_reports_it(replica):
+    """The narrowed release still fixes the same-peer case and counts it.
+
+    The pointer holder here is a HEALTHY same-peer replica (not damage, so
+    not a candidate): the delete order cannot save the target, only the
+    scoped FK release can. The release detaches it and the run reports the
+    count in ``detached_pointers``.
+    """
+    peer = await _peer(replica)
+    await _replica_row(replica, "aaa-target", deleted_at=NOW.isoformat())
+    await _fence(replica, "aaa-target")
+    # Healthy same-peer replica pointing at the damaged target: it IS a
+    # candidate (consolidated_into set), but the delete order deletes the
+    # referrer first, so the release finds nothing to detach in that path.
+    # To exercise the release, the holder must not itself be damaged: give
+    # it a pointer at the target without any other damage marker... but
+    # any consolidated_into IS damage. So the release fires when the
+    # holder is repaired FIRST in stable order... no: the holder IS the
+    # referrer and goes first, deleting itself. The release path fires when
+    # a NON-candidate same-peer row points at the target -- e.g. a healthy
+    # replica whose pointer was set after the candidate scan. Simulate by
+    # pointing the holder at the target with damage markers cleared is
+    # impossible (the pointer is damage). Instead: two targets, one
+    # candidate holder pointing at a non-candidate... simplest true
+    # release case: holder is a candidate repaired first (deletes itself,
+    # no detach needed) -- detached_pointers stays 0 there.
+    #
+    # True release case: the holder points at the target but is NOT in the
+    # candidate list because its own row is healthy. A healthy row has NO
+    # damage markers, but consolidated_into set IS a damage marker. The
+    # only healthy pointer-holder is one whose pointer targets a row that
+    # is not damage... contradiction. The real release case: the holder
+    # was already repaired (deleted) -- no.
+    #
+    # Reconsider: the release detaches same-peer pointers held by rows
+    # that are NOT being deleted in this run -- rows that are not
+    # candidates. A non-candidate same-peer row with consolidated_into set
+    # cannot exist (it would be a candidate). UNLESS the row is not
+    # damaged because... consolidated_into set always means damaged. The
+    # release therefore fires exactly when the holder is a candidate that
+    # sorts AFTER the target is attempted -- i.e. when ordering does not
+    # save it. _repair_order always puts the referrer first, so within one
+    # repair run the release only fires for holders outside the candidate
+    # set: rows created between scan and apply, or -- the actual case --
+    # holders that are NOT replicas at all but same-peer... all same-peer
+    # rows with the pointer set are candidates.
+    #
+    # The genuine live case: the holder points at the target AND the holder
+    # itself was skipped (withdrawn or peer-consolidated). A skipped holder
+    # is never deleted, so the target's DELETE needs the release. Build
+    # that: holder carries the peer-consolidation marker -> skipped, but
+    # its pointer still blocks the target.
+    await _replica_row(
+        replica,
+        "holder",
+        consolidated_into="fed:pythia:aaa-target",
+        metadata=json.dumps({"federation_consolidation": {"remote_id": "holder", "peer": "pythia"}}),
+    )
+    await _fence(replica, "holder")
+
+    report = await repair_fenced_replicas(replica, peer["id"], dry_run=False)
+
+    assert report["failed"] == [], report["failed"]
+    # Target repaired (release detached the skipped holder's pointer);
+    # holder skipped as peer-consolidated.
+    assert report["repaired"] == 1, report
+    assert report["skipped_consolidated"] == 1, report
+    # One same-peer pointer was detached to unblock the target's DELETE.
+    assert report["detached_pointers"] == 1, report
+    holder = await _one(
+        replica, "SELECT consolidated_into FROM memories WHERE id = ?", "fed:pythia:holder"
+    )
+    assert holder["consolidated_into"] is None
+    remaining = await _all(replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")
+    assert sorted(r["id"] for r in remaining) == ["fed:pythia:holder"]

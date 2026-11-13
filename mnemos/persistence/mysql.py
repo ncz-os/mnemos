@@ -8221,12 +8221,13 @@ class MysqlFederationRepository(FederationRepository):
         tx: Transaction,
         *,
         local_id: str,
+        peer_name: str,
     ) -> int:
         async with tx.conn.cursor() as cursor:
             await cursor.execute(
                 "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
-                "WHERE consolidated_into = %s",
-                (local_id,),
+                "WHERE consolidated_into = %s AND federation_source = %s",
+                (local_id, peer_name),
             )
             return int(cursor.rowcount or 0)
 

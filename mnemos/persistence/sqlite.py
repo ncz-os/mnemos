@@ -7410,12 +7410,13 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
         tx: Transaction,
         *,
         local_id: str,
+        peer_name: str,
     ) -> int:
         return await _execute_count(
             self._conn(tx),
             "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
-            "WHERE consolidated_into = ?",
-            (local_id,),
+            "WHERE consolidated_into = ? AND federation_source = ?",
+            (local_id, peer_name),
         )
 
     # ── F-15 parity / reconcile ───────────────────────────────────────────

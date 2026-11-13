@@ -158,6 +158,22 @@ async def test_repair_writes_delete_fence_cursors_and_archive_blob(dialect):
     assert "old" in _bound(statements[0][1])
     assert "peer-id" in _bound(statements[1][1])
     assert "fed:pythia:old" in _bound(statements[2][1])
+    if dialect == "postgres":
+        # F1: federation_peer_cursors.peer_id is TEXT, not UUID -- the
+        # placeholder must carry no ::uuid cast.
+        assert "::uuid" not in statements[1][0]
+        assert "= $1" in statements[1][0]
+
+
+@pytest.mark.asyncio
+async def test_postgres_peer_cursor_delete_carries_no_uuid_cast():
+    """Pin F1: the peer-cursor delete binds a TEXT column, not a UUID."""
+    repo = PostgresFederationRepository()
+    tx = _pg_tx()
+    await repo.clear_federation_peer_cursors(tx, peer_id="abc")
+    [(sql, params)] = tx._conn.statements
+    assert sql == "DELETE FROM federation_peer_cursors WHERE peer_id = $1"
+    assert tuple(params) == ("abc",)
 
 
 @pytest.mark.asyncio
@@ -172,19 +188,25 @@ async def test_release_consolidation_targets_clears_the_pointer(dialect):
     and clear BOTH consolidation columns.
     """
     repo, tx = _repo_tx(dialect)
-    await repo.release_federation_consolidation_targets(tx, local_id="fed:pythia:old")
+    await repo.release_federation_consolidation_targets(tx, local_id="fed:pythia:old", peer_name="pythia")
     [(sql, params)] = _statements(dialect, tx)
     assert sql.startswith("UPDATE memories SET consolidated_into = NULL")
     assert "consolidated_at = NULL" in sql
     assert "WHERE consolidated_into =" in sql
+    # F2: the detach is scoped to same-peer replicas -- a local row's
+    # pointer must never be touched.
+    assert "federation_source" in sql
 
     def _bound(params):
         return list(params.values()) if isinstance(params, dict) else list(params)
 
     assert "fed:pythia:old" in _bound(params)
+    assert "pythia" in _bound(params)
     if dialect == "postgres":
         assert "= $1" in sql
+        assert "= $2" in sql
     elif dialect == "mysql":
-        assert "= %s" in sql
+        assert sql.count("= %s") == 2
     else:
         assert "= :lid" in sql
+        assert "= :peer" in sql

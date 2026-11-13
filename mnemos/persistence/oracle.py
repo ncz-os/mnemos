@@ -8214,6 +8214,7 @@ class OracleFederationRepository(FederationRepository):
         tx: Transaction,
         *,
         local_id: str,
+        peer_name: str,
     ) -> int:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
@@ -8221,8 +8222,8 @@ class OracleFederationRepository(FederationRepository):
             await _call(
                 cursor.execute,
                 "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
-                "WHERE consolidated_into = :lid",
-                {"lid": local_id},
+                "WHERE consolidated_into = :lid AND federation_source = :peer",
+                {"lid": local_id, "peer": peer_name},
             )
             return int(getattr(cursor, "rowcount", 0) or 0)
         finally:

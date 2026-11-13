@@ -2540,24 +2540,27 @@ class FederationRepository(ABC):
         tx: Transaction,
         *,
         local_id: str,
+        peer_name: str,
     ) -> int:
-        """Detach every row that points at ``local_id`` via ``consolidated_into``.
+        """Detach same-peer replica rows that point at ``local_id``.
 
         ``memories.consolidated_into`` references ``memories(id)``, so a row
         that is still referenced blocks the DELETE of its target with a
         FOREIGN KEY error. The repair deletes damaged replicas, and a
-        damaged replica can be the target of another damaged replica's
+        damaged replica can be the target of another replica's
         consolidation pointer -- deleting the target first then fails, and
         the per-row failure leaves the target behind for good.
 
-        Releasing the pointer first is the only safe order: the row that
-        pointed at the target simply loses its (already broken) redirect,
-        which is the same state the receiver's own write path produces
-        (``prepare_versioned_update`` clears ``consolidated_into`` on a
-        re-pull), and the next sync re-pulls both rows anyway.
+        The detach is scoped to replicas of the SAME peer
+        (``federation_source = peer_name``): only rows the next sync
+        re-pulls through the normal write path may be touched. A LOCAL row
+        (``federation_source IS NULL``) or another peer's replica that
+        points at the target keeps its pointer; if that pointer still
+        blocks the DELETE, the row fails the repair loudly (collected in
+        ``failed``) instead of being silently detached table-wide. This
+        mirrors the scoped shape of ``prepare_versioned_update``
+        (``WHERE id = ? AND federation_source = ?``).
 
-        The scope is the WHOLE ``memories`` table, not just one peer: the
-        referencing row may be a local row or a replica of another peer.
         Returns the number of rows detached.
         """
         return 0

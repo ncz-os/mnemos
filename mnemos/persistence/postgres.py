@@ -6459,7 +6459,7 @@ class PostgresFederationRepository(FederationRepository):
         peer_id: str,
     ) -> int:
         result = await _postgres_tx(tx).conn.execute(
-            "DELETE FROM federation_peer_cursors WHERE peer_id = $1::uuid",
+            "DELETE FROM federation_peer_cursors WHERE peer_id = $1",
             peer_id,
         )
         return _pg_result_count(result)
@@ -6481,11 +6481,13 @@ class PostgresFederationRepository(FederationRepository):
         tx: Transaction,
         *,
         local_id: str,
+        peer_name: str,
     ) -> int:
         result = await _postgres_tx(tx).conn.execute(
             "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
-            "WHERE consolidated_into = $1",
+            "WHERE consolidated_into = $1 AND federation_source = $2",
             local_id,
+            peer_name,
         )
         return _pg_result_count(result)
 

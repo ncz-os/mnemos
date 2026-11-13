@@ -87,14 +87,20 @@ cleanup; `POST /v1/federation/peers/{id}/repair?dry_run=true`
 default and changes nothing: it lists each candidate's `remote_id` and what
 is wrong with it (`deleted` / `archived` / `consolidated`).
 
-With `dry_run=false`, per row: the archive blob is deleted first (the archive
-table references the row with `ON DELETE RESTRICT`), then the local copy,
-then the row's `federation_receive_state` fence; an audit `delete` entry is
-written when the audit chain is on. After all rows the peer's journal cursors
-are cleared, so the next ordinary sync replays from the source and re-pulls
-every repaired row as a fresh insert through the normal write path. Per-row
-failures are collected in `failed`, never raised: one bad id does not stop
-the run.
+With `dry_run=false`, per row: same-peer consolidation pointers targeting
+the row are detached first (counted in `detached_pointers`, so the blast
+radius is visible in the result), then the archive blob is deleted first
+(the archive table references the row with `ON DELETE RESTRICT`), then the
+local copy, then the row's `federation_receive_state` fence; an audit
+`delete` entry is written when the audit chain is on. The detach is scoped
+to replicas of the same peer (`federation_source = <peer>`): a LOCAL row
+(`federation_source IS NULL`) or another peer's replica that points at the
+target keeps its pointer, and if that still blocks the DELETE the row is
+reported in `failed` rather than silently detached. After all rows the
+peer's journal cursors are cleared, so the next ordinary sync replays from
+the source and re-pulls every repaired row as a fresh insert through the
+normal write path. Per-row failures are collected in `failed`, never
+raised: one bad id does not stop the run.
 
 Two populations are never touched. Rows the source withdrew (the fence says
 `withdrawn`) are counted in `skipped_withdrawn`: a revocation must never come
