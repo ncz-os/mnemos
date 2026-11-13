@@ -21,7 +21,6 @@ fails to recycle an id.
 
 from __future__ import annotations
 
-import asyncio
 import sqlite3
 import threading
 from types import SimpleNamespace
@@ -47,35 +46,36 @@ def _user() -> UserContext:
     return UserContext(user_id="u", group_ids=[], role="root", namespace="default", authenticated=True)
 
 
-def _close_on_owning_thread(backend: SqliteBackend) -> None:
-    """Close ``backend`` from the thread that owns its raw connection.
+def _owning_thread(conn: sqlite3.Connection) -> int:
+    """The thread id the raw ``sqlite3`` connection is bound to.
 
-    The raw ``sqlite3`` fallback binds the connection to the portal thread
-    that first opened it, so ``close()`` from any other thread raises
-    ``ProgrammingError`` — the same affinity MN-33 was about. Determine the
-    owner deterministically and run the close there if we are not already
-    on it.
+    A probe ``execute`` from the current thread either succeeds (the caller IS
+    the owner) or raises with the owning id in the message.
+
+    This helper only ever runs against the raw ``sqlite3`` fallback in these
+    tests (the fixture forces ``storage.aiosqlite`` to ``None``, so
+    ``SqliteBackend.open`` builds a ``sqlite3`` connection whose ``execute``
+    returns a cursor synchronously). The coroutine branch below is purely
+    defensive: on the aiosqlite path ``execute`` returns a never-started
+    coroutine, and calling ``.close()`` on a never-started coroutine is the
+    documented way to dispose of it without running it — it marks the
+    coroutine closed so the event loop never reports "coroutine was never
+    awaited" and no driver worker stays busy. The helper then reports the
+    current thread, which is correct for the multiplexed driver (any thread
+    may submit through it).
     """
-    if backend._conn is None or backend._closed:
-        return
-    owner = _owning_thread(backend._conn)
-    if owner == threading.get_ident():
-        asyncio.run(backend.close())
-        return
+    import asyncio
 
-    closed: list[BaseException | None] = []
-
-    def _close() -> None:
-        try:
-            asyncio.run(backend.close())
-        except BaseException as exc:  # noqa: BLE001 - reported below
-            closed.append(exc)
-
-    worker = threading.Thread(target=_close, name="mn33-close-owning-thread")
-    worker.start()
-    worker.join(timeout=10)
-    assert not worker.is_alive(), "the close thread did not finish"
-    assert not closed, f"close on the owning thread failed: {closed!r}"
+    try:
+        result = conn.execute("SELECT 1")
+    except sqlite3.ProgrammingError as exc:
+        message = str(exc)
+        marker = "created in thread id "
+        assert marker in message, f"unexpected sqlite3 error: {message}"
+        return int(message.split(marker, 1)[1].split()[0])
+    if asyncio.iscoroutine(result):
+        result.close()
+    return threading.get_ident()
 
 
 @pytest.fixture
@@ -88,12 +88,15 @@ def edge_backend(monkeypatch, tmp_path):
     the driver owns its own worker thread and the flake never appears, which is
     why this only ever failed in a minimal venv.
 
-    The backend is closed deterministically on teardown (round 1/2, F5 — the
-    same lifecycle-registration discipline applied to this fixture): every
-    provisioned resource is released, never left to GC. Because a bare
-    ``TestClient`` serves each request on a fresh portal thread, the owner
-    of the opened connection is not necessarily the fixture thread, so the
-    close runs on the owning thread via :func:`_close_on_owning_thread`.
+    Teardown closes the backend only when it is still open AND owned by the
+    current (fixture) thread; the portal-thread tests below close on the
+    portal thread *before* the portal shuts down, so this is a no-op for
+    them. An un-closed connection owned by a dead portal thread cannot be
+    released from here at all (``sqlite3.Connection.close`` is itself
+    thread-affined), so teardown reports the leak with ``pytest.fail``
+    instead of spawning a fresh thread and gambling on thread-id recycling.
+    Tests that never open the connection (or run the aiosqlite profile) close
+    directly here, exactly as before.
     """
     monkeypatch.setattr(storage, "aiosqlite", None)
     backend = SqliteBackend(tmp_path / "edge.sqlite3", SimpleNamespace())
@@ -101,8 +104,19 @@ def edge_backend(monkeypatch, tmp_path):
     monkeypatch.setattr(lifecycle, "_pool", None)
     monkeypatch.setattr(lifecycle, "_pool_manager", None)
     yield backend
-    _close_on_owning_thread(backend)
-    assert backend._closed, "the fixture must release its connection on teardown"
+    if backend._conn is not None and not backend._closed:
+        if _owning_thread(backend._conn) == threading.get_ident():
+            import asyncio as _asyncio
+
+            _asyncio.run(backend.close())
+        else:
+            backend._conn = None
+            pytest.fail(
+                "backend connection still open and owned by another (portal) thread; "
+                "close it on the owning thread via client.portal.call(backend.close) "
+                "inside the `with TestClient(...)` block"
+            )
+        assert backend._closed, "the fixture must release its connection on teardown"
 
 
 @pytest.fixture
@@ -144,56 +158,58 @@ def test_context_managed_client_serves_every_request_on_one_thread(edge_app, edg
     on the same thread for the client's whole lifetime, so the raw ``sqlite3``
     connection is always used from its owning thread. Deterministic: it asserts
     sameness of observed thread ids, which holds regardless of OS id recycling.
+
+    All backend state is asserted while the portal is still alive, inside the
+    ``with`` block; the close runs on the owning portal thread there too, so
+    fixture teardown finds an already-released backend.
     """
     with TestClient(edge_app) as client:
         _state_roundtrip(client)
-
-    served = edge_app.state.served_threads
-    assert len(served) >= 2, f"expected at least two served requests, saw {len(served)}"
-    assert len(set(served)) == 1, f"requests ran on several threads: {sorted(set(served))}"
-    assert edge_backend._conn is not None, "the round trip never opened the connection"
-
-
-def _owning_thread(conn: sqlite3.Connection) -> int:
-    """The thread id the raw ``sqlite3`` connection is bound to.
-
-    A probe ``execute`` from the current thread either succeeds (the caller IS
-    the owner) or raises with the owning id in the message.
-    """
-    try:
-        result = conn.execute("SELECT 1")
-    except sqlite3.ProgrammingError as exc:
-        message = str(exc)
-        marker = "created in thread id "
-        assert marker in message, f"unexpected sqlite3 error: {message}"
-        return int(message.split(marker, 1)[1].split()[0])
-    # On the raw sqlite3 path ``execute`` returns a cursor synchronously;
-    # on an aiosqlite Connection it returns a coroutine — never let that
-    # leak (it would warn "coroutine was never awaited" and keep the
-    # driver's worker thread busy).
-    if asyncio.iscoroutine(result):
-        result.close()
-    return threading.get_ident()
+        assert edge_backend._conn is not None, "the round trip never opened the connection"
+        served = list(edge_app.state.served_threads)
+        assert len(served) >= 2, f"expected at least two served requests, saw {len(served)}"
+        assert len(set(served)) == 1, f"requests ran on several threads: {sorted(set(served))}"
+        # Single probe on the portal thread: a clean return (no
+        # ProgrammingError) proves this thread owns the raw connection.
+        assert client.portal.call(_owning_thread, edge_backend._conn) == client.portal.call(
+            threading.get_ident
+        )
+        client.portal.call(edge_backend.close)
+        assert edge_backend._closed, "the round trip must close on the owning portal thread"
+        assert edge_backend._conn is None, "the backend must release its connection on close"
 
 
 def test_context_managed_client_matches_connection_owning_thread(edge_app, edge_backend):
     """The client's single thread is the thread that owns the raw connection.
 
-    ``sqlite3`` reports the owner verbatim in its cross-thread error, so a
-    probe ``execute`` pins the owner without assuming where ``open()`` ran.
-    This is the property that makes the round trip safe rather than lucky.
+    The round trip opens and uses the raw connection on the TestClient
+    portal thread, and the close runs on that same thread
+    (``client.portal.call(backend.close)``) before the portal shuts down —
+    no cross-thread close, no thread-id coincidence. ``portal.call`` executes
+    on the portal thread itself, so the recorded serving thread must equal
+    the portal's own ident, and the backend must be fully released after.
+
+    Everything is asserted while the portal is still alive, inside the
+    ``with`` block: after ``close()`` the helper is never called on the
+    dead connection, and no backend attribute is read past teardown.
     """
     with TestClient(edge_app) as client:
         _state_roundtrip(client)
-
-    conn = edge_backend._conn
-    assert conn is not None, "the round trip never opened the connection"
-    served = set(edge_app.state.served_threads)
-    assert len(served) == 1, f"requests ran on several threads: {sorted(served)}"
-    assert served == {_owning_thread(conn)}, (
-        f"client thread {sorted(served)} is not the connection's owning thread "
-        f"{_owning_thread(conn)}"
-    )
+        assert edge_backend._conn is not None, "the round trip never opened the connection"
+        portal_ident = client.portal.call(threading.get_ident)
+        # One probe, on the portal thread, before the close: a clean return
+        # proves the portal thread owns the raw connection.
+        assert client.portal.call(_owning_thread, edge_backend._conn) == portal_ident
+        served = set(edge_app.state.served_threads)
+        assert len(served) == 1, f"requests ran on several threads: {sorted(served)}"
+        assert served == {portal_ident}, (
+            f"client thread {sorted(served)} is not the portal thread {portal_ident}"
+        )
+        client.portal.call(edge_backend.close)
+        assert edge_backend._closed, "the backend must be closed on the owning thread"
+        assert edge_backend._conn is None, (
+            "the backend must release its connection on the owning thread"
+        )
 
 
 def test_raw_connection_rejects_cross_thread_use_deterministically(tmp_path):

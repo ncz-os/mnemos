@@ -102,7 +102,8 @@ def _route_client():
 @pytest.fixture
 def edge_client(monkeypatch, tmp_path):
     backend = _backend(monkeypatch, tmp_path, "raw-route-sqlite")
-    yield _route_client()
+    with _route_client() as client:
+        yield client
     # Release the provisioned file handle before the next profile opens.
     asyncio.run(backend.close())
 
@@ -332,6 +333,8 @@ def test_edge_profile_sessions_route_requires_the_sessions_capability(monkeypatc
     assert SESSIONS_CAPABILITY not in _StateOnlyBackend(backend).capabilities
     monkeypatch.setattr(lifecycle, "_persistence_backend", _StateOnlyBackend(backend))
 
-    resp = _route_client().post("/v1/sessions", json={"model": "m"})
+    resp = None
+    with _route_client() as _client:
+        resp = _client.post("/v1/sessions", json={"model": "m"})
     assert resp.status_code == 503, resp.text
     assert "sessions" in resp.text.lower()
