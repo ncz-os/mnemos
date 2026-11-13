@@ -2,6 +2,10 @@
 
 All notable changes to MNEMOS are documented here.
 
+## Unreleased
+
+- **Federation (security)** — an outbound peer response is now read as a STREAM under a byte cap (`FEDERATION_MAX_RESPONSE_BYTES`, default 64 MiB) instead of being buffered whole by `r.json()`. The cap applies to the feed pull, the by-id pull, the schema preflight, the anti-entropy digest and the parity redispatch. A peer that answers with more than the cap is a transient sync failure: nothing is applied, the peer's `last_error` names the peer and the byte count, and the pull retries on the next tick. The inbound side already had a bound (`MAX_BODY_BYTES`, a chunked-aware ASGI limiter); this is its outbound counterpart. Without it a registered peer (or anything that could answer on its URL after the DNS pin) could return a multi-GB body and take the worker — which also serves the API in the default profile — down.
+
 ## 7.2.0 — 2026-11-12
 
 A minor release on the 7.x line: one additive database migration (0072, applied automatically at startup, nothing

@@ -1095,6 +1095,23 @@ class _FederationSettings(BaseSettings):
         ge=0,
         validation_alias="MNEMOS_FEDERATION_ANTI_ENTROPY_INTERVAL_SECS",
     )
+    # NG2-MN-004: the outbound byte cap for a peer response. The pull path
+    # reads a peer answer as a STREAM and stops at this many bytes; a peer
+    # that sends more is a transient sync failure, never a buffer. The
+    # inbound side has had a bound since SEC-04 (_BodySizeLimitASGI in
+    # mnemos/api/main.py); without this one a registered peer could answer
+    # a feed pull with a multi-GB JSON body and take the worker (which
+    # also serves the API in the default profile) down.
+    #
+    # The default (64 MiB) is comfortably above the worst legitimate page:
+    # FEDERATION_BATCH_LIMIT (100) rows x the 1 MB per-content cap, plus
+    # the base64 embedding a copy_embeddings peer adds. Lower it to tighten
+    # the bound; raise it only if a peer legitimately ships bigger pages.
+    max_response_bytes: int = Field(
+        64 * 1024 * 1024,
+        ge=1024,
+        validation_alias="FEDERATION_MAX_RESPONSE_BYTES",
+    )
 
 
 class _OAuthSettings(BaseSettings):

@@ -647,17 +647,25 @@ async def _redispatch_on_source(base_url: str, auth_token: str, memory_ids: list
         allow_private=_fed._federation_allow_private(),
     )
     try:
-        response = await client.post(
+        # NG2-MN-004: the answer is read under the same byte cap as every
+        # other peer response. The body is a small count, so an over-cap
+        # answer is a peer that is not behaving.
+        body, status_code, _resp = await _fed._post_bounded_json(
+            client,
             url,
-            json={"memory_ids": memory_ids},
+            json_body={"memory_ids": memory_ids},
             headers={"Authorization": f"Bearer {auth_token}"},
         )
-        if response.status_code in (404, 405):
+        if status_code in (404, 405):
             # A peer older than this release has no redispatch route. Nothing
             # was re-published, so reconcile reports every id as failed.
             return 0
-        response.raise_for_status()
-        body = response.json()
+        if status_code >= 400:
+            raise RuntimeError(f"federation redispatch returned http {status_code}")
+    except _fed.FederationPeerResponseTooLarge as e:
+        raise RuntimeError(str(e)) from e
     finally:
         await client.aclose()
+    if not isinstance(body, dict):
+        return 0
     return int(body.get("redispatched") or 0)

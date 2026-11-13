@@ -24,6 +24,7 @@ real event between.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional
@@ -34,7 +35,9 @@ from mnemos.core.safe_http import make_safe_client
 from mnemos.domain.federation import (
     FEDERATION_HTTP_TIMEOUT,
     FederationBackend,
+    FederationPeerResponseTooLarge,
     _federation_allow_private,
+    _read_bounded_json,
     _store_memories,
     pull_memory_by_id,
 )
@@ -87,15 +90,28 @@ async def _fetch_peer_digest(
         except Exception as e:
             raise AntiEntropyError(f"federation URL rejected (SSRF/DNS): {type(e).__name__}: {e}") from e
     try:
-        resp = await client.get(url, params=params, headers=headers)
-        if resp.status_code == 404:
+        # NG2-MN-004: the digest body is read under the same byte cap as the
+        # feed body. The digest fetch runs on the same worker tick against
+        # the same peer, so it is the same unbounded-read exposure.
+        try:
+            document, status_code, _resp = await _read_bounded_json(
+                client,
+                url,
+                params=params,
+                headers=headers,
+            )
+        except FederationPeerResponseTooLarge as e:
+            raise AntiEntropyError(str(e)) from e
+        except (json.JSONDecodeError, UnicodeDecodeError) as parse_err:
+            raise AntiEntropyError(f"peer digest response is not valid JSON: {parse_err}") from parse_err
+        if status_code == 404:
             raise AntiEntropyError("peer does not expose /v1/federation/digest (pre-M12 build)")
-        if resp.status_code == 401:
+        if status_code == 401:
             raise AntiEntropyError("federation auth token rejected (401)")
-        if resp.status_code == 403:
+        if status_code == 403:
             raise AntiEntropyError("federation auth insufficient role (403)")
-        resp.raise_for_status()
-        document = resp.json()
+        if status_code >= 400:
+            raise AntiEntropyError(f"peer digest returned http {status_code}")
     finally:
         if owns_client:
             await client.aclose()
