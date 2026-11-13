@@ -34,6 +34,7 @@ existing ``delete_federated_memory``) -- never raw ``_lc._pool`` access.
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 from typing import Any
@@ -91,32 +92,77 @@ def _repair_order(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     stays deterministic. A cycle (two rows pointing at each other) cannot
     be ordered by the relation alone -- those fall back to the stable
     order and the FK release in the apply path breaks the cycle.
+
+    Kahn's algorithm with a ready-set: a candidate becomes ready when
+    every referrer that must go first is already placed. The ready set
+    is kept sorted by the stable key, so the result is identical to
+    repeatedly taking the first ready candidate of a stable-ordered
+    pending list -- but without that list's O(N) scan-and-remove per
+    step, which was quadratic in the candidate count (the CLI allows a
+    page size of 5000 per peer).
     """
+    if not candidates:
+        return []
     ordered: list[dict[str, Any]] = []
     placed: set[str] = set()
     by_local_id = {c["local_id"]: c for c in candidates}
-    # ``blocks[c]`` = the candidate ids that must be deleted BEFORE c,
+    # ``blockers[c]`` = the candidate ids that must be deleted BEFORE c,
     # because they point at c and would block c's own DELETE.
-    blocks: dict[str, set[str]] = {c["local_id"]: set() for c in candidates}
+    blockers: dict[str, set[str]] = {c["local_id"]: set() for c in candidates}
     for cand in candidates:
         target = cand.get("consolidated_into")
         if target and target in by_local_id:
             # cand points at target -> cand must be deleted before target.
-            blocks[target].add(cand["local_id"])
+            blockers[target].add(cand["local_id"])
 
-    def _ready(cand: dict[str, Any]) -> bool:
-        return all(dep in placed for dep in blocks.get(cand["local_id"], ()))
-
+    # Stable order: the tie-breaker for every choice below.
     pending = sorted(candidates, key=lambda c: (c["peer"], c["remote_id"]))
-    while pending:
-        # Prefer a candidate whose referrers are all deleted. If none is
-        # ready the relation has a cycle: take the stable-order head so the
-        # run still makes progress (the FK release breaks the cycle).
-        ready = [c for c in pending if _ready(c)]
-        chosen = ready[0] if ready else pending[0]
+    # ``ready`` holds candidates whose blockers are all placed. It is
+    # drained by the stable key, so the output stays deterministic.
+    ready: list[tuple[tuple[str, str], dict[str, Any]]] = []
+    remaining: dict[str, int] = {}
+    for cand in pending:
+        deps = blockers.get(cand["local_id"], ())
+        remaining[cand["local_id"]] = len(deps)
+        if not deps:
+            heapq.heappush(ready, ((cand["peer"], cand["remote_id"]), cand))
+
+    # ``dependents`` maps a candidate to the candidates it unblocks.
+    dependents: dict[str, list[str]] = {}
+    for target, deps in blockers.items():
+        for dep in deps:
+            dependents.setdefault(dep, []).append(target)
+
+    while len(ordered) < len(candidates):
+        if ready:
+            # Take the ready candidate with the lowest stable key.
+            chosen = heapq.heappop(ready)[1]
+        elif remaining:
+            # A cycle (or a self-reference): no candidate is ready. Take
+            # the stable-order head so the run still makes progress --
+            # the FK release in the apply path breaks the cycle.
+            for cand in pending:
+                if cand["local_id"] not in placed and cand["local_id"] in remaining:
+                    chosen = cand
+                    break
+            else:  # pragma: no cover -- unreachable while ordered < candidates
+                chosen = pending[len(ordered)]
+        else:  # pragma: no cover -- defensive
+            break
+        lid = chosen["local_id"]
         ordered.append(chosen)
-        placed.add(chosen["local_id"])
-        pending.remove(chosen)
+        placed.add(lid)
+        remaining.pop(lid, None)
+        # Anything that was waiting on this candidate may now be ready.
+        for target in dependents.get(lid, ()):
+            if target not in remaining:
+                continue
+            remaining[target] -= 1
+            if remaining[target] == 0:
+                target_cand = by_local_id[target]
+                heapq.heappush(
+                    ready, ((target_cand["peer"], target_cand["remote_id"]), target_cand)
+                )
     return ordered
 
 

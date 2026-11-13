@@ -25,7 +25,7 @@ import pytest
 import httpx
 import pytest_asyncio
 
-from mnemos.domain.federation.repair import repair_fenced_replicas
+from mnemos.domain.federation.repair import _repair_order, repair_fenced_replicas
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 EMBED_DIM = 3
@@ -453,3 +453,69 @@ async def test_apply_deletes_a_damaged_row_that_another_replica_points_at(replic
     assert report["repaired"] == 2, report
     remaining = await _all(replica, "SELECT id FROM memories WHERE federation_source = 'pythia'")
     assert remaining == []
+
+
+# ── the delete order itself ─────────────────────────────────────────────────
+
+
+def _cand(remote_id: str, *, points_at: str | None = None, peer: str = "pythia") -> dict:
+    return {
+        "peer": peer,
+        "remote_id": remote_id,
+        "local_id": f"fed:{peer}:{remote_id}",
+        "consolidated_into": f"fed:{peer}:{points_at}" if points_at else None,
+    }
+
+
+def test_repair_order_deletes_a_referrer_before_its_target():
+    """The referrer goes first: the target's DELETE is not FK-blocked."""
+    ordered = _repair_order([_cand("aaa-target"), _cand("zzz-loser", points_at="aaa-target")])
+    assert [c["remote_id"] for c in ordered] == ["zzz-loser", "aaa-target"]
+
+
+def test_repair_order_deletes_a_referrer_first_even_when_it_sorts_later():
+    """The dependency wins over the stable order."""
+    ordered = _repair_order([_cand("aaa-target"), _cand("zzz-loser", points_at="aaa-target")])
+    pos = {c["remote_id"]: i for i, c in enumerate(ordered)}
+    assert pos["zzz-loser"] < pos["aaa-target"]
+
+
+def test_repair_order_keeps_the_stable_order_without_dependencies():
+    """No dependency -> the stable (peer, remote_id) order is kept."""
+    ordered = _repair_order([_cand("b"), _cand("a"), _cand("c")])
+    assert [c["remote_id"] for c in ordered] == ["a", "b", "c"]
+
+
+def test_repair_order_orders_a_chain_of_three():
+    """c -> b -> a: the order must be c, b, a."""
+    ordered = _repair_order(
+        [_cand("a"), _cand("b", points_at="a"), _cand("c", points_at="b")]
+    )
+    assert [c["remote_id"] for c in ordered] == ["c", "b", "a"]
+
+
+def test_repair_order_breaks_a_cycle_instead_of_hanging():
+    """Two rows pointing at each other: no valid order exists, but the
+    repair must still finish (the FK release breaks the cycle)."""
+    ordered = _repair_order([_cand("a", points_at="b"), _cand("b", points_at="a")])
+    assert sorted(c["remote_id"] for c in ordered) == ["a", "b"]
+
+
+def test_repair_order_ignores_a_pointer_to_a_row_outside_the_candidates():
+    """A pointer at a row that is not a candidate (a LOCAL row, say)
+    cannot be ordered -- it is handled by the FK release instead."""
+    ordered = _repair_order([_cand("a"), _cand("b", points_at="not-a-candidate")])
+    assert [c["remote_id"] for c in ordered] == ["a", "b"]
+
+
+def test_repair_order_scales_linearly_with_the_candidate_count():
+    """The order must not be quadratic: the CLI allows 5000 per page."""
+    import time
+
+    candidates = [_cand(f"r{i:06d}") for i in range(4000)]
+    start = time.perf_counter()
+    ordered = _repair_order(candidates)
+    elapsed = time.perf_counter() - start
+    assert len(ordered) == 4000
+    # A quadratic sort-and-remove takes ~1.5s here; the linear one is <0.1s.
+    assert elapsed < 0.5, f"repair order took {elapsed:.3f}s for 4000 candidates"
