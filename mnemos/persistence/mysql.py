@@ -2087,6 +2087,15 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
                 (vec_literal, memory_id),
             )
 
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13)."""
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE memories SET embedding = NULL WHERE id = %s",
+                (memory_id,),
+            )
+
     async def list_memories(
         self,
         tx: Transaction,

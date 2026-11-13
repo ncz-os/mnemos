@@ -1486,6 +1486,19 @@ class OracleMemoryRepository(MemoryRepository):
         finally:
             await _call(cursor.close)
 
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13)."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET embedding = NULL WHERE id = :id",
+                {"id": memory_id},
+            )
+        finally:
+            await _call(cursor.close)
+
     async def set_suppress_version_snapshot(self, tx: Transaction) -> None:
         # No-op for Oracle — Postgres uses a session GUC to bypass the
         # version-snapshot trigger; the Oracle schema has no equivalent
