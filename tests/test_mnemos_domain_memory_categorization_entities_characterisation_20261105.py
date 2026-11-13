@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import pytest
@@ -160,6 +161,21 @@ def _manager(conn: Optional[_Conn] = None) -> tuple[EntityManager, Optional[_Con
 def _statements(conn: _Conn, method: str) -> List[tuple]:
     """(sql, args) pairs recorded for one connection method."""
     return [(sql, args) for m, sql, args in conn.calls if m == method]
+
+
+def _bindings(sql: str) -> Dict[int, str]:
+    """Map each positional placeholder ``$N`` to the column it is bound to.
+
+    Characterisation tests elsewhere assert the SQL text and the argument
+    tuple independently, which cannot tell ``$2`` naming ``id`` from ``$2``
+    naming ``owner_id``: both are the same string shape, and a swap would
+    still satisfy a tuple-equality check written from the same misreading.
+    This reads the ``column = $N`` bindings out of the statement itself, so
+    the parameter ORDER is asserted against the SQL that will actually run --
+    the thing a human (or an LLM) reviewing a diff cannot see when the
+    function body falls outside the hunk.
+    """
+    return {int(index): column for column, index in re.findall(r"(\w+)\s*=\s*\$(\d+)", sql)}
 
 
 # ── constructor and _scope ───────────────────────────────────────────────
@@ -551,6 +567,8 @@ async def test_update_entity_writes_both_description_and_metadata():
     sql, args = _statements(conn, "execute")[0]
     assert "SET description = $1, metadata = $2::jsonb" in sql
     assert args == ("d", json.dumps({"k": "v"}), "1", "u1", "ns1")
+    # Parameter ORDER asserted against the placeholders in the statement.
+    assert _bindings(sql) == {1: "description", 2: "metadata", 3: "id", 4: "owner_id", 5: "namespace"}
 
 
 async def test_update_entity_description_only_branch():
@@ -562,6 +580,10 @@ async def test_update_entity_description_only_branch():
     assert "SET description = $1, updated = NOW()" in sql
     assert "metadata" not in sql
     assert args == ("d", "1", "u1", "ns1")
+    # metadata is absent, so the statement RENUMBERS the WHERE placeholders:
+    # $2 is the id and $3 the owner — this is the branch that looked "shifted"
+    # next to the both-fields case. Nothing is swapped: `id = $2` states it.
+    assert _bindings(sql) == {1: "description", 2: "id", 3: "owner_id", 4: "namespace"}
 
 
 async def test_update_entity_metadata_only_branch():
@@ -572,6 +594,7 @@ async def test_update_entity_metadata_only_branch():
     sql, args = _statements(conn, "execute")[0]
     assert "SET metadata = $1::jsonb, updated = NOW()" in sql
     assert args == (json.dumps({"k": 1}), "1", "u1", "ns1")
+    assert _bindings(sql) == {1: "metadata", 2: "id", 3: "owner_id", 4: "namespace"}
 
 
 @pytest.mark.xfail(
@@ -743,6 +766,21 @@ async def test_get_statistics_partial_failure_after_total_keeps_total(caplog):
 
     assert stats == {"total_entities": 7, "by_type": {}}
     assert "Error getting entity stats" in caplog.text
+
+
+async def test_get_statistics_total_is_fetched_before_the_grouped_rows():
+    # WHY the two error tests above differ (0 vs 7) — and why that is not a
+    # contradiction: get_statistics assigns `total_entities` from a fetchval
+    # BEFORE it runs the grouped fetch, inside ONE try block. A failure of the
+    # first query therefore leaves the seeded 0; a failure of the second
+    # leaves the already-assigned total. Pinning the call ORDER is what makes
+    # both outcomes explicable rather than incidental, so a future reordering
+    # of these two queries is a deliberate decision, not a silent one.
+    manager, conn = _manager(_Conn(val=7, rows=[]))
+
+    await manager.get_statistics(user=_user())
+
+    assert [method for method, _, _ in conn.calls] == ["fetchval", "fetch"]
 
 
 # ── module surface ───────────────────────────────────────────────────────

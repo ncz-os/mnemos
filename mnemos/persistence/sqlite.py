@@ -4819,7 +4819,14 @@ def _sqlite_webhook_subscription(row: Any) -> WebhookSubscriptionRecord:
         id=str(row["id"]),
         url=row["url"],
         events=tuple(str(event) for event in events),
-        description=row.get("description") if isinstance(row, dict) else None,
+        # FB1008: ``description`` must map for every row type the mapper
+        # receives — live SQLite queries return ``dict`` rows, but
+        # ``sqlite3.Row`` objects support ``row["col"]`` access just the
+        # same (a genuinely absent column yields ``None``). The old
+        # ``isinstance(row, dict)`` guard dropped the value for Row inputs,
+        # breaking parity with postgres/mysql/oracle, which read the column
+        # regardless of row type.
+        description=(row.get("description") if isinstance(row, dict) else row["description"]),
         owner_id=row["owner_id"],
         namespace=row["namespace"],
         created=_sqlite_webhook_datetime(row["created"]),

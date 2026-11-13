@@ -999,6 +999,11 @@ async def merge_branch(
                     delivery_ids = []
 
         if live_tracks_target:
+            # Invalidate the stats cache and bump the visibility epoch. The
+            # ``mnemos:search:*`` sweep that used to run here is gone: it
+            # scanned ``_lc._cache``, which the lifecycle hard-wires to
+            # ``None`` and which holds no search keys since the per-user
+            # search cache was removed (MN-31).
             if _lc._cache:
                 try:
                     await _lc._cache.delete("stats:global")

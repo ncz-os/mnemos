@@ -1,0 +1,191 @@
+diff --git a/tests/test_cpu_characterisation_20261107.py b/tests/test_cpu_characterisation_20261107.py
+new file mode 100644
+index 00000000..201de010
+--- /dev/null
++++ b/tests/test_cpu_characterisation_20261107.py
+@@ -0,0 +1,185 @@
++"""Characterisation of ``mnemos/domain/kronos/backends/cpu.py`` (FB1124).
++
++Pins the CPU EWMA exactly as it behaves: its recursion, the alpha window, the
++early return for an empty input, and the shapes it silently refuses. Behaviour
++that looks wrong is pinned and named as a divergence in the summary.
++"""
++
++from __future__ import annotations
++
++import inspect
++
++import numpy as np
++import pytest
++
++from mnemos.domain.kronos.backends import cpu
++
++
++def _reference(values, alpha):
++    """The documented recursion, written out independently of the module."""
++    out = [float(values[0])]
++    for value in values[1:]:
++        out.append(alpha * float(value) + (1.0 - alpha) * out[-1])
++    return np.asarray(out, dtype=float)
++
++
++def test_the_backend_names_itself_cpu() -> None:
++    assert cpu.BACKEND_NAME == "cpu"
++
++
++def test_the_default_alpha_is_three_tenths() -> None:
++    parameter = inspect.signature(cpu.ewma).parameters["alpha"]
++
++    assert parameter.default == 0.3
++
++
++def test_known_input_with_half_alpha() -> None:
++    result = cpu.ewma(np.asarray([10.0, 20.0, 30.0]), alpha=0.5)
++
++    np.testing.assert_allclose(result, np.asarray([10.0, 15.0, 22.5]))
++
++
++def test_the_series_starts_unsmoothed_at_the_first_sample() -> None:
++    result = cpu.ewma(np.asarray([7.0, 1.0, 1.0]), alpha=0.9)
++
++    assert result[0] == 7.0
++
++
++def test_alpha_one_is_the_input_unchanged() -> None:
++    values = np.asarray([1.5, -2.0, 9.0])
++
++    np.testing.assert_array_equal(cpu.ewma(values, alpha=1.0), values)
++
++
++def test_a_single_sample_comes_back_as_itself() -> None:
++    result = cpu.ewma(np.asarray([4.25]))
++
++    np.testing.assert_array_equal(result, np.asarray([4.25]))
++
++
++def test_the_default_alpha_path_matches_the_recursion() -> None:
++    values = np.asarray([5.0, 4.0, 6.0, 2.0, 8.0])
++
++    np.testing.assert_allclose(cpu.ewma(values), _reference(values, 0.3))
++
++
++@pytest.mark.parametrize("alpha", [0.0001, 0.25, 0.5, 0.9999])
++def test_every_valid_alpha_runs_the_same_recursion(alpha: float) -> None:
++    values = np.asarray([3.0, -1.0, 4.0, 1.0])
++
++    np.testing.assert_allclose(cpu.ewma(values, alpha=alpha), _reference(values, alpha))
++
++
++@pytest.mark.parametrize("alpha", [0, 0.0, -0.1, 1.0000001, 2.0])
++def test_alpha_outside_the_half_open_unit_interval_is_a_value_error(alpha: float) -> None:
++    with pytest.raises(ValueError) as info:
++        cpu.ewma(np.asarray([1.0, 2.0]), alpha=alpha)
++
++    assert str(info.value) == "alpha must be in the range (0, 1]"
++
++
++def test_alpha_is_checked_before_the_values_are_converted() -> None:
++    # The guard runs first, so unusable values never reach numpy when alpha is
++    # bad. Pinned because it decides which error a caller sees.
++    with pytest.raises(ValueError, match="alpha must be in the range"):
++        cpu.ewma(["not", "numbers"], alpha=0)
++
++
++def test_alpha_may_be_a_numpy_scalar() -> None:
++    result = cpu.ewma(np.asarray([2.0, 4.0]), alpha=np.float64(0.5))
++
++    np.testing.assert_allclose(result, np.asarray([2.0, 3.0]))
++
++
++def test_a_string_alpha_is_a_type_error_from_the_comparison() -> None:
++    with pytest.raises(TypeError):
++        cpu.ewma(np.asarray([1.0]), alpha="0.5")  # type: ignore[arg-type]
++
++
++def test_alpha_may_be_passed_positionally() -> None:
++    np.testing.assert_allclose(cpu.ewma(np.asarray([2.0, 4.0]), 0.5), np.asarray([2.0, 3.0]))
++
++
++def test_an_empty_array_returns_an_empty_float_array() -> None:
++    values = np.asarray([])
++
++    result = cpu.ewma(values)
++
++    assert result.shape == (0,)
++    assert result.dtype == np.dtype(float)
++    assert result is not values
++
++
++def test_an_empty_list_is_accepted_and_returns_an_empty_array() -> None:
++    result = cpu.ewma([])
++
++    assert isinstance(result, np.ndarray)
++    assert result.size == 0
++    assert result.dtype == np.dtype(float)
++
++
++def test_an_invalid_alpha_still_fails_on_an_empty_input() -> None:
++    with pytest.raises(ValueError):
++        cpu.ewma(np.asarray([]), alpha=0)
++
++
++def test_integer_input_comes_back_as_float64() -> None:
++    result = cpu.ewma(np.asarray([10, 20, 30], dtype=np.int64), alpha=0.5)
++
++    assert result.dtype == np.dtype("float64")
++
++
++def test_float32_input_is_widened_to_float64() -> None:
++    result = cpu.ewma(np.asarray([1.0, 2.0], dtype=np.float32), alpha=0.5)
++
++    assert result.dtype == np.dtype("float64")
++
++
++def test_a_plain_list_is_accepted() -> None:
++    np.testing.assert_allclose(cpu.ewma([2.0, 6.0], alpha=0.5), np.asarray([2.0, 4.0]))
++
++
++def test_non_numeric_values_fail_numpy_conversion() -> None:
++    with pytest.raises(ValueError):
++        cpu.ewma(["a", "b"])
++
++
++def test_a_nan_poisons_the_output_from_its_own_position_onward() -> None:
++    result = cpu.ewma(np.asarray([1.0, np.nan, 3.0]), alpha=0.5)
++
++    assert result[0] == 1.0
++    assert np.isnan(result[1])
++    assert np.isnan(result[2])
++
++
++def test_an_infinity_stays_infinite() -> None:
++    result = cpu.ewma(np.asarray([np.inf, 1.0]), alpha=0.5)
++
++    assert np.isinf(result[0])
++    assert np.isinf(result[1])
++
++
++def test_the_result_does_not_alias_the_input() -> None:
++    values = np.asarray([3.0, 3.0, 3.0])
++
++    result = cpu.ewma(values, alpha=0.5)
++    values[0] = 100.0
++
++    np.testing.assert_allclose(result, np.asarray([3.0, 3.0, 3.0]))
++
++
++def test_a_two_dimensional_input_raises_index_error() -> None:
++    # ``np.asarray`` accepts it and ``size`` counts elements, but the loop
++    # indexes rows, so anything taller than its own width walks off the end.
++    # Pinned as observed: the function is 1-D only and says so nowhere.
++    with pytest.raises(IndexError):
++        cpu.ewma(np.zeros((2, 3)), alpha=0.5)
++
++
++def test_the_function_is_deterministic() -> None:
++    values = np.asarray([1.0, 5.0, 2.0, 8.0, 3.0])
++
++    first = cpu.ewma(values, alpha=0.4)
++    second = cpu.ewma(values, alpha=0.4)
++
++    np.testing.assert_array_equal(first, second)
