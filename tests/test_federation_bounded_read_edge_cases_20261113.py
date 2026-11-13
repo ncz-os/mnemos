@@ -276,3 +276,74 @@ async def test_fingerprint_exchange_keeps_its_status_meanings(monkeypatch):
     assert verdict["ok"] is True
     assert verdict["supported"] is True
     assert verdict["body"] == {"accepted": True}
+
+
+async def test_a_redirect_is_a_failure_not_an_empty_page(monkeypatch):
+    """3xx is an error here, because the safe client never follows redirects.
+
+    ``make_safe_client`` sets ``follow_redirects=False`` (the DNS pin must
+    not be bypassed by a redirect), so before the cap a 3xx reached
+    ``raise_for_status()`` and raised. The bounded read must keep that: a
+    redirect reported as "no rows" would stop a pull silently, and the
+    by-id path's empty list means "withdrawn", which anti-entropy never
+    retries.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(307, headers={"location": "https://elsewhere.example/feed"})
+
+    _install(monkeypatch, handler)
+
+    with pytest.raises(httpx.HTTPStatusError) as exc:
+        await federation._pull_batch(
+            base_url="https://peer.example",
+            auth_token="sek",
+            since=None,
+            namespace_filter=None,
+            category_filter=None,
+        )
+    assert exc.value.response.status_code == 307
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await federation.pull_memory_by_id(
+            base_url="https://peer.example",
+            auth_token="sek",
+            memory_id="mem-1",
+            namespace_filter=None,
+            category_filter=None,
+        )
+
+
+async def test_a_redirect_is_transient_in_the_schema_preflight(monkeypatch):
+    """A 3xx /schema answer is retried, not recorded as a durable mismatch."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(307, headers={"location": "https://elsewhere.example/schema"})
+
+    _install(monkeypatch, handler)
+
+    result = await federation._check_peer_schema(
+        base_url="https://peer.example",
+        auth_token="sek",
+        name="peer-a",
+    )
+
+    assert result["ok"] is False
+    assert result["transient"] is True
+    assert "307" in result["reason"]
+
+
+async def test_a_broken_2xx_fingerprint_body_is_not_an_acceptance(monkeypatch):
+    """A 2xx with an unparseable body accepts nothing and says so."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<html>captive portal</html>")
+
+    _install(monkeypatch, handler)
+
+    verdict = await federation.post_peer_fingerprint("https://peer.example", "sek", {})
+
+    assert verdict["ok"] is False
+    assert verdict["supported"] is True
+    assert verdict["status"] == 200
+    assert "not valid JSON" in verdict["reason"]

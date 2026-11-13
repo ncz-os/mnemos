@@ -229,7 +229,9 @@ async def _stream_bounded_json(
     Returns ``(parsed_body, status_code)``. The status code is returned
     rather than raised so each caller keeps its own status semantics (the
     schema preflight distinguishes 5xx from 4xx; the pull path maps 401 and
-    403 to their own errors). The response OBJECT is deliberately not
+    403 to their own errors). Every non-2xx — 3xx included, because the
+    safe client never follows a redirect — comes back with ``None`` for
+    the body. The response OBJECT is deliberately not
     returned: it is closed when the ``stream`` context exits, so it no
     longer describes the request once the caller sees it, and acting on it
     there is a bug waiting to be written. Callers turn a non-2xx status
@@ -261,7 +263,9 @@ async def _stream_bounded_json(
             raise FederationPeerResponseTooLarge(
                 f"peer response exceeds {limit} bytes (content-length {int(content_length)})"
             )
-        if status_code >= 400 and not read_error_body:
+        if status_code >= 300 and not read_error_body:
+            # 3xx included: the safe client never follows a redirect, so a
+            # redirect is a failure and its body is not ours to parse.
             return None, status_code
         async for chunk in response.aiter_bytes():
             received += len(chunk)
@@ -272,8 +276,8 @@ async def _stream_bounded_json(
     try:
         return json.loads(raw.decode("utf-8")), status_code
     except (json.JSONDecodeError, UnicodeDecodeError):
-        if status_code >= 400:
-            # An unparseable error body says nothing the status does not.
+        if status_code >= 300:
+            # An unparseable non-2xx body says nothing the status does not.
             return None, status_code
         raise
 
@@ -285,6 +289,11 @@ def _raise_for_peer_status(method: str, url: str, status_code: int) -> None:
     pull paths rebuild the exception ``response.raise_for_status()`` used
     to raise: same type, same status, same message shape, and the same
     ``except httpx.HTTPError`` behaviour upstream already relies on.
+
+    A redirect counts as a failure, exactly as it did before the cap: the
+    safe client never follows one (the DNS pin must not be bypassed), so a
+    3xx here means the peer URL is wrong. Reporting it as an empty page
+    would stop a pull silently.
     """
     if 200 <= status_code < 300:
         return
@@ -574,8 +583,14 @@ async def post_peer_fingerprint(
         except FederationPeerResponseTooLarge as e:
             logger.warning("federation: fingerprint exchange body too large: %s", e)
             return {"ok": False, "supported": True, "status": None, "reason": str(e)}
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            body, status_code = {}, 200
+        except (json.JSONDecodeError, UnicodeDecodeError) as parse_err:
+            # A 2xx whose body is not JSON accepted nothing.
+            return {
+                "ok": False,
+                "supported": True,
+                "status": 200,
+                "reason": f"fingerprint exchange response is not valid JSON: {parse_err}",
+            }
     finally:
         if owns_client:
             await client.aclose()
@@ -681,7 +696,21 @@ async def _check_peer_schema(
                     "transient": True,
                     "reason": f"http {status_code}",
                 }
-            if status_code != 200:
+            if status_code >= 300:
+                # A redirect is never followed (the DNS pin must not be
+                # bypassed), so it is a peer-URL problem to retry, not a
+                # verdict on the peer's schema.
+                if status_code < 400:
+                    logger.warning(
+                        "federation: peer %s /schema returned %d without following it (transient)",
+                        name,
+                        status_code,
+                    )
+                    return {
+                        "ok": False,
+                        "transient": True,
+                        "reason": f"http {status_code}",
+                    }
                 # 4xx — durable: peer doesn't speak the protocol or
                 # rejected the auth. Pre-v3.4 peers land here too.
                 logger.info(
