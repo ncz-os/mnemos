@@ -1063,6 +1063,29 @@ class MemoryRepository(ABC):
         """
         ...
 
+    async def upsert_memory_embedding(
+        self, tx: Transaction, memory_id: str, embedding: Sequence[float]
+    ) -> None:
+        """Write a precomputed embedding vector for ``memory_id``.
+
+        Idempotent; a no-op when the embedding is empty. Every backend
+        implements this (inline ``memories.embedding`` column on
+        Postgres/Oracle/Db2/MySQL, the ``memory_embeddings`` join table
+        plus ``memories.embedding`` mirror on SQLite, the
+        ``memory_embeddings`` join table on MariaDB).
+        """
+        ...
+
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (set it NULL).
+
+        NG-MN-13: when a content PATCH re-embed fails, the old vector
+        must not survive — semantic search would keep matching the
+        previous text. Clearing marks the row for the embedding
+        backfill (which selects ``embedding IS NULL`` rows).
+        """
+        ...
+
 
 class KGRepository(ABC):
     """Knowledge graph triple persistence."""

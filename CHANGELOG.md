@@ -2,15 +2,33 @@
 
 All notable changes to MNEMOS are documented here.
 
-## Unreleased
+## 7.2.0 — 2026-11-12
 
-- **Federation** — MN-25: the concurrent-sync trigger contract is pinned. `POST /v1/federation/peers/{id}/sync` blocks on the per-peer sync lock when another pass for the peer is in flight and returns the result of its own pass — it is never a 409 (`FederationSyncInProgress` is not part of the contract; the only 409s from the trigger route remain schema-compatibility and unverifiable-schema aborts). Regression test: `tests/test_federation_sync_trigger_blocks_20261110.py`.
+A minor release on the 7.x line: one additive database migration (0072, applied automatically at startup, nothing
+dropped or rewritten), security fixes, and stricter secret detection. Peers on 7.1 keep federating with 7.2 nodes:
+same-major peers sync without the same-minor migrations-fingerprint check.
+
+- **Federation journal** — migration 0072 adds `event_kind` to journal rows (one nullable column with a default, one index, replaced trigger functions, additive on all five dialect families) and makes a content change absorb any pending metadata-only rows for its memory. *Correction after release:* the first version of this entry said 0072 stopped recall bookkeeping (`recall_count`, `last_recalled_at`) from appending journal events and quoted about 75 events per live memory. That was already true from migration 0068 (7.1.0): on a copy of the production database a recall bump adds no journal row under either 0068 or 0072, and a content edit adds the same rows under both. The 75-events figure was measured before 0068.
+- **Federation** — a replica this node soft-deleted locally is skipped without advancing the receive fence, so a later restore replays normally (MN-35). The native feed serializer applies the same vault filtering and redaction as the row path. MN-25: the concurrent-sync trigger contract is pinned. `POST /v1/federation/peers/{id}/sync` blocks on the per-peer sync lock when another pass for the peer is in flight and returns the result of its own pass — it is never a 409 (`FederationSyncInProgress` is not part of the contract; the only 409s from the trigger route remain schema-compatibility and unverifiable-schema aborts). Regression test: `tests/test_federation_sync_trigger_blocks_20261110.py`.
+- **Audit** — `/v1/audit/proof` is gated on read visibility of the memory, closing a cross-tenant existence oracle (CF-22).
+- **Deletion fence** — the CF-09 deletion fence runs on every bulk, ingest and portability import write path, so a deleted memory cannot come back through an import (MN-05).
+- **Document import** — the `memory.created` webhook redacts vaulted chunk content (MN-02), and an import fails closed when the post-classification namespace is missing instead of falling back to the caller's namespace.
+- **Secret detection** — new detectors for Stripe keys, bearer JWTs, AWS access-key pairs and AWS secret keys, and credentials wrapped across a space or line break. A wrapped token is only reported when a credential prefix or keyword anchors it; 40-hex git SHAs, UUIDs, paths, identifiers and ordinary words are not treated as secrets.
+- **Rate limiting** — with `RATE_LIMIT_TRUST_PROXY=true` the client is the right-most `X-Forwarded-For` entry written by our own proxies (`RATE_LIMIT_TRUSTED_PROXY_HOPS`, default 1), not the client-chosen left-most entry (CF-23). The default `RATE_LIMIT_TRUST_PROXY=false` is unaffected.
+- **NATS** — namespace subject tokens are collision-free (MN-17): `.` still renders as `_`, and every other character outside `[A-Za-z0-9-]`, including `_` itself, is percent-encoded (`a_b` becomes `a%5Fb`).
+- **Webhooks** — delivery dedup correlates on `delivery_id`; raw-string and falsy memory ids are handled.
+- **Tunnels** — a start request that would conflict returns 409 before a tunnel credential is minted.
+- **Oracle and SQLite** — Oracle duplicate-id aggregation uses `JSON_ARRAYAGG ... RETURNING CLOB`; SQLite maps the webhook subscription description.
+- **Search cache cleanup** — the dead `SCAN MATCH "mnemos:search:*"` invalidation sweeps and the `_get_cache_key` / `_vis_epoch_current` helpers they existed to serve are removed. The per-user search cache never existed in the runtime (`_lc._cache` is hard-wired to `None` with no Redis, and the search handler stopped reading a cache), so every sweep matched keys of a cache that was never written. The four remaining routes keep their `/stats`-entry invalidation, and the ACL grant/revoke path keeps its visibility-epoch bump — which the MCP principal-context cache (role/namespace authorization inputs) subscribes to — and now always runs it instead of early-returning when no cache is configured. The "Cache coherency" section of `docs/MULTIUSER_ACL_DESIGN.md` is updated to match.
+- **Tools** — an Oracle to PostgreSQL copy tool and runbook (`scripts/oracle_to_postgres_copy.py`, `docs/MIGRATING-ORACLE-TO-POSTGRES.md`), an ownership-reassignment script, and a hardened `scripts/backfill_embeddings_http.py`. The installer falls back to `lsb_release` for an unmapped distro, and the compose postgres-upgrade list includes every mounted migration.
+- **Docs** — operator version pins and container-image tags track 7.2.0.
+
+Upgrade note: take a database backup first. Each node replays its own migration set on start, so a node still running 7.1 restores its pre-0072 journal triggers when it restarts: roll every node that shares a database together. Rolling back to 7.1.1 is supported; it runs on the migrated schema and restores its own triggers. NATS subscribers that match an exact namespace token containing `_` or other characters outside `[A-Za-z0-9-]` must use the encoded form.
 
 ## 7.1.1 — 2026-11-08
 
 - **Oracle** — the federation replica-health write (`record_sync_lag`) bound a variable named `:rows`, a reserved word, so every peer pull on an Oracle primary failed with ORA-01745 after the sync (HTTP 500 on `/v1/federation/peers/<id>/sync`, peer status never refreshed). The bind names are renamed (`:rows_n`, `:lag_s`, `:emb_status`, and `:owner_uid` in the scoped audit-log read) and a test now rejects any reserved-word bind name in the Oracle backend.
-- **Docs** — the operator-facing version pins and container-image tags are re-pinned from 7.1.0 to 7.1.1, so `tests/test_doc_version_pins_match_code.py` no longer reports a stale current-version claim.
-- **Search cache cleanup** — the dead `SCAN MATCH "mnemos:search:*"` invalidation sweeps and the `_get_cache_key` / `_vis_epoch_current` helpers they existed to serve are removed. The per-user search cache never existed in the runtime (`_lc._cache` is hard-wired to `None` with no Redis, and the search handler stopped reading a cache), so every sweep matched keys of a cache that was never written. The four remaining routes keep their `/stats`-entry invalidation, and the ACL grant/revoke path keeps its visibility-epoch bump — which the MCP principal-context cache (role/namespace authorization inputs) subscribes to — and now always runs it instead of early-returning when no cache is configured. The "Cache coherency" section of `docs/MULTIUSER_ACL_DESIGN.md` is updated to match.
+- **Docs** — the operator-facing version pins and container-image tags were re-pinned from 7.1.0 to 7.1.1 after the tag (documentation only).
 
 ## 7.1.0 — 2026-11-08
 

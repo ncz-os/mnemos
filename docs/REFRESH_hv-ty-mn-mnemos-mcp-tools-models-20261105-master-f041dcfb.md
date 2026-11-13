@@ -14,7 +14,7 @@ during that merge were resolved in favour of the branch's work.
 |----------------------------|----------------------------------|
 | Delivery head              | `493d9bbc`                       |
 | `origin/master` (target)   | `f041dcfb` (already integrated)  |
-| `origin/ARGONAS`           | `493d9bbc`                       |
+| `origin/private-remote`           | `493d9bbc`                       |
 | `origin/hv/ty-mn-...`      | `493d9bbc`                       |
 
 ## Conflict resolution summary
@@ -52,4 +52,4 @@ deterministic way.
 ## Delivery
 
 The branch was pushed with upstream tracking (`origin/hv/...`) and its head was
-pushed to `origin/ARGONAS`; both remote refs match the local delivery head.
+pushed to `origin/private-remote`; both remote refs match the local delivery head.

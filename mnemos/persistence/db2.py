@@ -1257,6 +1257,31 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
 
         await asyncio.to_thread(_go)
 
+    async def clear_memory_embedding(self, tx: Any, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13).
+
+        Db2 override: positional bind (?) vs Oracle :name.
+        """
+        conn = _conn_from_tx(tx)
+        sync_conn = getattr(conn, "_conn", None)
+        sql = "UPDATE memories SET embedding = NULL WHERE id = ?"
+        if sync_conn is None:
+            cursor = await _call(conn.cursor)
+            try:
+                await _call(cursor.execute, sql, (memory_id,))
+            finally:
+                await _call(cursor.close)
+            return
+
+        def _go_clear() -> None:
+            cur = sync_conn.cursor()
+            try:
+                cur.execute(sql, (memory_id,))
+            finally:
+                cur.close()
+
+        await asyncio.to_thread(_go_clear)
+
     async def update_memory(
         self,
         tx: Any,

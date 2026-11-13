@@ -1466,6 +1466,42 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 exc,
             )
 
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13).
+
+        NULLs both the inline ``memories.embedding`` mirror and the
+        ``memory_embeddings`` join row (the table semantic_search reads
+        first), and drops the vec0 KNN entry so the candidate path
+        stops returning the stale vector. The backfill (which selects
+        ``embedding IS NULL`` rows) picks the row up on its next pass.
+        """
+        conn = self._conn(tx)
+        await _execute(conn, "UPDATE memories SET embedding = NULL WHERE id = ?", (memory_id,))
+        try:
+            await _execute(
+                conn,
+                "UPDATE memory_embeddings SET embedding = NULL WHERE memory_id = ?",
+                (memory_id,),
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug(
+                "memory_embeddings clear skipped for memory_id=%s: %s",
+                memory_id,
+                exc,
+            )
+        try:
+            await _execute(
+                conn,
+                "DELETE FROM memory_embedding_vec WHERE memory_id = ?",
+                (memory_id,),
+            )
+        except sqlite3.OperationalError as exc:
+            logger.debug(
+                "sqlite-vec clear skipped on clear_memory_embedding memory_id=%s: %s",
+                memory_id,
+                exc,
+            )
+
     async def _sqlite_vec_candidate_ids(
         self,
         conn: Any,
