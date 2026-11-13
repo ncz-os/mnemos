@@ -1572,3 +1572,89 @@ def test_helpers_never_touch_the_pool_directly():
     source = Path(chain.__file__).read_text()
     assert "_lc._pool" not in source
     assert Path(chain.__file__).name == "chain.py"
+
+
+# ---------------------------------------------------------------------------
+# __all__ completeness: every public symbol is present and callable
+# ---------------------------------------------------------------------------
+
+
+def test_dunder_all_is_complete_and_every_name_resolves():
+    """Every name in ``__all__`` exists as a module attribute.
+
+    A missing symbol (renamed, removed, or misspelled in the tuple) breaks
+    ``from mnemos.webhooks.chain import *``; this pins the contract.
+    """
+    for name in chain.__all__:
+        assert hasattr(chain, name), f"__all__ lists {name!r} but it is missing from the module"
+        assert callable(getattr(chain, name)), f"__all__ lists {name!r} but it is not callable"
+
+
+def test_dunder_all_covers_every_exported_helper_exactly():
+    """The tuple lists exactly the 14 documented helpers — no more, no less."""
+    assert len(chain.__all__) == 14
+    expected = {
+        "_load_delivery_for_claim",
+        "_insert_successor_delivery",
+        "_record_value",
+        "_is_sqlite_connection",
+        "_lock_delivery_chain",
+        "_delivery_chain_lock_key",
+        "_has_successor_attempt",
+        "_has_live_successor_attempt",
+        "_has_succeeded_chain_attempt",
+        "_abandon_owned_attempt_after_live_successor",
+        "_abandon_current_attempt_after_succeeded_chain_peer",
+        "_abandon_owned_attempt_after_succeeded_chain_peer",
+        "_find_live_unleased_successor_attempts",
+        "_abandon_live_successor_attempt",
+    }
+    assert set(chain.__all__) == expected
+
+
+def test_lock_delivery_chain_uses_asyncpg_connection_type_not_instance_module():
+    """``_is_sqlite_connection`` inspects ``type(conn).__module__``.
+
+    Even if an instance carries a rogue ``__module__`` attribute, the check
+    must read the class — so an asyncpg-shaped instance cannot opt out of
+    the lock by mutating its own instance namespace.
+    """
+    conn = _AsyncpgConn()
+    conn.__module__ = "sqlite3"  # type: ignore[attr-defined]
+
+    _run(chain._lock_delivery_chain(conn, _DELIVERY))
+
+    assert len(conn.calls) == 1
+    assert conn.calls[0][1] == "SELECT pg_advisory_xact_lock($1)"
+
+
+def test_record_value_prefers_getitem_over_attribute_when_both_exist():
+    """A record with both ``__getitem__`` and an attribute takes the mapping arm.
+
+    ``hasattr(record, '__getitem__')`` is checked first, so the mapping value
+    wins; the attribute is never consulted.
+    """
+
+    class _Both:
+        url = "https://example.test/attribute"
+
+        def __getitem__(self, key):
+            return "https://example.test/mapping"
+
+    assert chain._record_value(_Both(), "url") == "https://example.test/mapping"
+
+
+def test_insert_successor_does_not_swallow_publish_errors_and_stops_after_first_failure(publishers):
+    """Only the first publisher failure is observed.
+
+    ``publish_delivery_queued`` is awaited before ``publish_webhook_outbox_insert``,
+    so a failure in the first one propagates immediately and the second is
+    never called — there is no internal try/except that hides the error.
+    """
+    publishers.fail_with = RuntimeError("first publisher down")
+    conn = _FakeConn(row_results=[{"id": _SUCCESSOR_ID}])
+
+    with pytest.raises(RuntimeError, match="first publisher down"):
+        _run(chain._insert_successor_delivery(conn, _SUCCESSOR_SOURCE, 2, "t"))
+    assert len(publishers.queued) == 0
+    assert len(publishers.outbox) == 0
