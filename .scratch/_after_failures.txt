@@ -48,22 +48,10 @@ FAILED tests/test_connector_smoke.py::test_documented_stdio_connector_smoke[code
 FAILED tests/test_connector_smoke.py::test_documented_stdio_connector_smoke[continue-dev]
 FAILED tests/test_connector_smoke.py::test_documented_stdio_connector_smoke[cursor]
 FAILED tests/test_connector_smoke.py::test_streamable_http_mcp_smoke - Assert...
-FAILED tests/test_doc_version_pins_match_code.py::test_current_version_claim_in_doc[API_DOCUMENTATION.md-v{V} current]
-FAILED tests/test_doc_version_pins_match_code.py::test_current_version_claim_in_doc[DEPLOYMENT.md-v{V} current]
-FAILED tests/test_doc_version_pins_match_code.py::test_current_version_claim_in_doc[docs/GRAEAE_FEATURES.md-current v{V} documentation]
-FAILED tests/test_doc_version_pins_match_code.py::test_current_version_claim_in_doc[docs/OPERATIONS.md-v{V} production line]
-FAILED tests/test_doc_version_pins_match_code.py::test_current_version_claim_in_doc[docs/SPECIFICATION.md-v{V} current]
-FAILED tests/test_doc_version_pins_match_code.py::test_current_version_claim_in_doc[EVOLUTION.md-current v{V} release line]
-FAILED tests/test_doc_version_pins_match_code.py::test_current_version_claim_in_doc[QUICK_START_REQUIREMENTS.md-current v{V} release line]
-FAILED tests/test_doc_version_pins_match_code.py::test_current_version_claim_in_doc[README.md-MNEMOS v{V} is]
-FAILED tests/test_doc_version_pins_match_code.py::test_current_version_claim_in_doc[ROADMAP.md-Current status \u2014 v{V}]
-FAILED tests/test_doc_version_pins_match_code.py::test_current_version_claim_in_doc[SYSTEM_REQUIREMENTS.md-current v{V} release line]
-FAILED tests/test_doc_version_pins_match_code.py::test_no_active_doc_claims_a_superseded_version_is_current
-FAILED tests/test_doc_version_pins_match_code.py::test_no_stale_as_of_version_anywhere
-FAILED tests/test_doc_version_pins_match_code.py::test_no_stale_docker_image_tag
-FAILED tests/test_doc_version_pins_match_code.py::test_no_stale_health_json_version
-FAILED tests/test_doc_version_pins_match_code.py::test_no_stale_pin_advice_in_prose
-FAILED tests/test_doc_version_pins_match_code.py::test_no_stale_tracks_mnemos_server_marker
+FAILED tests/test_embedding_contract_f06.py::test_backend_embedding_column_dim_reports_the_live_width
+FAILED tests/test_embedding_contract_f06.py::test_contract_reads_the_live_sqlite_column
+FAILED tests/test_embedding_contract_f06_review.py::test_contract_reads_the_column_width_through_the_repository_abc
+FAILED tests/test_embedding_contract_f06_review.py::test_contract_reads_the_column_width_through_the_repository_abc_without_a_tx
 FAILED tests/test_mcp_audit_log.py::test_stdio_transport_drains_audit_on_shutdown
 FAILED tests/test_mcp_audit_log.py::test_stdio_transport_logs_drained_count
 FAILED tests/test_mcp_http_auth_toggle.py::test_disabled_by_profile_default_starts_without_token_and_warns_once[dev]

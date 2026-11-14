@@ -481,14 +481,23 @@ async def test_import_uses_canonical_id_from_returning_clause(
     auth_headers,
     monkeypatch,
 ):
-    """The route surfaces the canonical id returned by DocumentRepository."""
+    """The route surfaces the canonical id returned by DocumentRepository.
+
+    The stub must honour the same contract as the real repository: on the
+    emit path ``ImportedDocumentChunk`` carries the POST-classification
+    namespace, because the route refuses to emit a ``memory.created`` webhook
+    describing a row it cannot attribute (F2). A stub that omits it is not a
+    scenario the production code can reach.
+    """
     install_fake_backend(monkeypatch)
     _stub_importer_with_chunks(mock_importer_class, n=1)
     canonical_id = "mem_canonical_from_existing_row"
 
     async def _return_canonical(_backend, _tx, kwargs):
         assert kwargs["memory_id"] != canonical_id
-        return ImportedDocumentChunk(memory_id=canonical_id)
+        return ImportedDocumentChunk(
+            memory_id=canonical_id, namespace=kwargs["namespace"]
+        )
 
     repo = _install_recording_repo(monkeypatch, _return_canonical)
 
@@ -731,14 +740,21 @@ async def test_legacy_update_falls_through_to_on_conflict_on_unique_violation(
     auth_headers,
     monkeypatch,
 ):
-    """When legacy resolution falls through, the repository's canonical id is surfaced."""
+    """When legacy resolution falls through, the repository's canonical id is surfaced.
+
+    As in the returning-clause case, the stub returns the POST-classification
+    namespace the real ``import_chunk`` reports on the emit path; the route
+    fails closed on a row it cannot attribute (F2).
+    """
     install_fake_backend(monkeypatch)
     _stub_importer_with_chunks(mock_importer_class, n=1)
     insert_canonical_id = "mem_canonical_from_on_conflict_path"
 
     async def _return_on_conflict_canonical(_backend, _tx, kwargs):
         assert kwargs["legacy_chunk_key"] != kwargs["chunk_key"]
-        return ImportedDocumentChunk(memory_id=insert_canonical_id)
+        return ImportedDocumentChunk(
+            memory_id=insert_canonical_id, namespace=kwargs["namespace"]
+        )
 
     repo = _install_recording_repo(monkeypatch, _return_on_conflict_canonical)
 

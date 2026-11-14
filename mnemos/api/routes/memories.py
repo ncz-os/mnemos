@@ -35,6 +35,7 @@ from mnemos.api.memory_mutations import (
     _metadata_for_audit,
     _publish_bulk_created_events,
     _publish_nats_with_timeout,
+    _reembed_memory_after_patch,
     _rls_context,
     _schedule_outbox_deliveries,
     _write_memory_mutation_audit_entry,
@@ -1951,6 +1952,25 @@ async def update_memory(
     except HTTPException:
         raise
     _schedule_outbox_deliveries(delivery_ids)
+    # NG-MN-13: a content PATCH must refresh the stored vector. The
+    # embedding is computed AFTER the update commits (outside the
+    # transaction, like create) so the model round trip holds no pool
+    # connection and no SQLite global lock. Metadata/tags-only PATCHes
+    # skip this entirely. On embedder failure the helper clears the
+    # stale vector (NULL) with a WARNING so the backfill re-embeds.
+    reembed_text: str | None = None
+    if updates and request.content is not None:
+        reembed_text = row["content"]
+    if reembed_text is not None:
+        # F2 (adversarial review 2026-06-28): embed the span-redacted
+        # content, not raw, so secret text never enters the vector index.
+        # ``_classified`` only exists when content/verbatim was patched;
+        # reembed_text is only set in that same case, so it is bound here.
+        await _reembed_memory_after_patch(
+            backend,
+            memory_id,
+            embed_text=_content_redacted_for_embedding(reembed_text, _classified),
+        )
     try:
         updated_at = row["updated"]
     except (KeyError, TypeError):
