@@ -296,14 +296,6 @@ class TestValidateModelOrAlias:
     def test_valid_values_strip_and_return(self, value):
         assert mcp_models._validate_model_or_alias(value) == value
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "DEFECT: the regex matches this value, but the later strip() gate rejects "
-            "whitespace-padded aliases, so the advertised strip-then-normalise contract "
-            "cannot be reached for strings that need trimming."
-        ),
-    )
     def test_surrounding_whitespace_is_stripped(self):
         assert mcp_models._validate_model_or_alias("  auto:reasoning \n") == "auto:reasoning"
 
