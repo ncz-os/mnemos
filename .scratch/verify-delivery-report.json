@@ -1,0 +1,25 @@
+{
+  "head_sha": "de6c8c741401f9b724a13fb444b8fcb6d0f347c3",
+  "tests_base": 23,
+  "tests_head": 23,
+  "command": "python3 -m pytest tests/ -q --ignore=tests/test_live_e2e.py",
+  "base": {
+    "sha": "782ed312fa549f4fd84a00c9c264480e3e0a5d41",
+    "passed": 5767,
+    "failed": 23,
+    "skipped": 593,
+    "xfailed": 2,
+    "xpassed": 3,
+    "duration_s": 186.53
+  },
+  "head": {
+    "sha": "de6c8c741401f9b724a13fb444b8fcb6d0f347c3",
+    "passed": 5865,
+    "failed": 23,
+    "skipped": 593,
+    "xfailed": 2,
+    "xpassed": 3,
+    "duration_s": 209.16
+  },
+  "notes": "Read-only verification; no files, branches, or commits modified. Failure sets are IDENTICAL on base (master 782ed312) and head (de6c8c74): all 23 failures are pre-existing environment issues present on both trees (missing sqlite-vec module for the embedding-contract column-width tests; router/wiring assertion failures). The head adds tests/test_mnemos_installer_agent_characterisation_20261105.py (231 tests, all passing in isolation) and introduces no new failures."
+}
