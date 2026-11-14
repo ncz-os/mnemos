@@ -1952,7 +1952,9 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         if vis_clause:
             where_parts.append(vis_clause)
         where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
-        select_sql = f"SELECT {_sqlite_memory_cols()} FROM memories{where_sql} ORDER BY created DESC, id ASC LIMIT ? OFFSET ?"
+        select_sql = (
+            f"SELECT {_sqlite_memory_cols()} FROM memories{where_sql} ORDER BY created DESC, id ASC LIMIT ? OFFSET ?"
+        )
         # COUNT(*) first (without limit/offset params), then paged
         # SELECT with the same predicate params plus limit/offset.
         count_sql = f"SELECT COUNT(*) FROM memories{where_sql}"
@@ -2316,8 +2318,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         )
         cat_rows = await _fetch_all(
             conn,
-            "SELECT category, COUNT(*) AS cnt FROM memories "
-            "WHERE deleted_at IS NULL GROUP BY category",
+            "SELECT category, COUNT(*) AS cnt FROM memories WHERE deleted_at IS NULL GROUP BY category",
         )
         sub_rows = await _fetch_all(
             conn,
@@ -2327,8 +2328,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         )
         avg_quality = await _fetch_val(
             conn,
-            "SELECT AVG(quality_rating) FROM memories "
-            "WHERE deleted_at IS NULL AND quality_rating IS NOT NULL",
+            "SELECT AVG(quality_rating) FROM memories WHERE deleted_at IS NULL AND quality_rating IS NOT NULL",
         )
         memories_by_subcategory: dict[str, dict[str, int]] = {}
         for r in sub_rows:
@@ -7365,6 +7365,93 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             WHERE id = ?
               AND federation_source = ?
             """,
+            (local_id, peer_name),
+        )
+
+    # ── MN-24: repair rows fenced before the replica fence existed ───────
+
+    async def fetch_fenced_damaged_replicas(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        params: list[Any] = [peer_name]
+        where = (
+            "WHERE m.federation_source = ? "
+            "AND (m.deleted_at IS NOT NULL "
+            "OR m.archived_at IS NOT NULL "
+            "OR m.consolidated_into IS NOT NULL)"
+        )
+        if after_id is not None:
+            where += " AND m.id > ?"
+            params.append(after_id)
+        params.append(max(1, int(limit)))
+        return await _fetch_all(
+            self._conn(tx),
+            "SELECT m.id AS local_id, "
+            "substr(m.id, length(m.federation_source) + 6) AS remote_id, "
+            "m.deleted_at AS deleted_at, m.archived_at AS archived_at, "
+            "m.consolidated_into AS consolidated_into, m.metadata AS metadata, "
+            "frs.withdrawn AS withdrawn "
+            "FROM memories m "
+            "LEFT JOIN federation_receive_state frs "
+            "ON frs.peer_name = m.federation_source "
+            "AND frs.remote_id = substr(m.id, length(m.federation_source) + 6) "
+            f"{where} ORDER BY m.id ASC LIMIT ?",
+            params,
+        )
+
+    async def clear_federation_receive_fence(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        remote_id: str,
+    ) -> int:
+        return await _execute_count(
+            self._conn(tx),
+            "DELETE FROM federation_receive_state WHERE peer_name = ? AND remote_id = ?",
+            (peer_name, remote_id),
+        )
+
+    async def clear_federation_peer_cursors(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+    ) -> int:
+        return await _execute_count(
+            self._conn(tx),
+            "DELETE FROM federation_peer_cursors WHERE peer_id = ?",
+            (peer_id,),
+        )
+
+    async def delete_federated_archive_blob(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        return await _execute_count(
+            self._conn(tx),
+            "DELETE FROM memory_archive WHERE id = ?",
+            (local_id,),
+        )
+
+    async def release_federation_consolidation_targets(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        peer_name: str,
+    ) -> int:
+        return await _execute_count(
+            self._conn(tx),
+            "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
+            "WHERE consolidated_into = ? AND federation_source = ?",
             (local_id, peer_name),
         )
 
