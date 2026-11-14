@@ -801,6 +801,26 @@ def test_failed_start_leaves_no_active_tunnel(fake_bridge):
     assert tr._active_bridge is None
 
 
+def test_a_refused_second_start_mints_no_credential(monkeypatch):
+    """The 409 guard runs before the token is resolved.
+
+    A credential minted for a start that is then refused is a live secret
+    nobody asked for; it would also consume a one-shot ngrok/OAuth token
+    for a tunnel that never opens.
+    """
+    running = FakeBridge()
+    _run(running.start(target_port=5004))
+    tr._active_bridge = running
+
+    minted = []
+    monkeypatch.setattr(tr, "_issue_tunnel_token", lambda: minted.append(1) or ("t", "oauth", 1))
+
+    with pytest.raises(HTTPException) as ei:
+        _run(tr.start_tunnel(_request(), _root_user()))
+    assert ei.value.status_code == 409
+    assert minted == []
+
+
 def test_a_second_start_while_running_is_refused_before_the_bridge_is_entered(monkeypatch):
     """The 409 guard runs first: a live tunnel means the new bridge is
     never constructed, so a failing second bridge never even runs."""
@@ -853,6 +873,51 @@ def test_409_does_not_spawn_a_second_bridge(fake_bridge):
     with pytest.raises(HTTPException):
         _run(tr.start_tunnel(_request(), _root_user()))
     assert len(fake_bridge.start_calls) == before
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "TUNNELS-FINDING-1: start_tunnel mints the connector credential before "
+        "the single-tunnel 409 guard, so a refused POST /start leaves a live "
+        "OAuth token behind that nobody asked for."
+    ),
+)
+def test_a_second_start_mints_no_token_for_a_request_that_409s(monkeypatch):
+    """DEFECT pinned as xfail(strict=True): ``start_tunnel`` issues the
+    connector credential *before* it takes the lock and checks the
+    single-tunnel guard, so a second ``POST /start`` against a running
+    tunnel mints a fresh OAuth access token and then throws it away with
+    the 409.
+
+    The module docstring is explicit about the intended order: "a token
+    issued for a request that then 422s is a live credential nobody asked
+    for". The unknown-backend branch (422) is ordered correctly — backend
+    is resolved first — but the 409 guard runs inside the lock, after
+    ``_issue_tunnel_token()`` already returned. The minted token is a real
+    bearer the MCP edge will honour (same ``OAuthService`` the SSE
+    handshake validates), so every refused ``/start`` leaves an unused
+    live credential behind.
+
+    Fix would move the 409 check above token issuance (or inside the lock
+    before minting). When that lands, this assertion starts passing and
+    strict mode fails loudly — the signal to flip it to a real test.
+    """
+    minted: list[str] = []
+
+    class _Service:
+        def issue_access_token(self, *, client_id, provider, lifetime):
+            minted.append(client_id)
+            return f"live-jwt-{len(minted)}"
+
+    monkeypatch.setattr(tr, "_oauth_service", lambda: _Service())
+    _run(tr.start_tunnel(_request(), _root_user()))  # first tunnel: 1 token used
+    minted.clear()
+    with pytest.raises(HTTPException) as ei:
+        _run(tr.start_tunnel(_request(), _root_user()))
+    assert ei.value.status_code == 409
+    # Today: the 409 attempt still mints 1 token that nobody can ever use.
+    assert minted == [], f"a refused /start must not mint a credential, minted {minted}"
 
 
 def test_a_dead_existing_bridge_does_not_block_a_new_start(monkeypatch):

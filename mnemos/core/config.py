@@ -573,6 +573,26 @@ class _RateLimitSettings(BaseSettings):
         validation_alias=AliasChoices("RATE_LIMIT_STORAGE_URI", "RATE_LIMIT_STORAGE", "storage"),
     )
     trust_proxy: bool = Field(False, validation_alias="RATE_LIMIT_TRUST_PROXY")
+    #: How many proxies of OUR OWN append to ``X-Forwarded-For``. Only the
+    #: right-most entries of XFF were written by infrastructure; everything to
+    #: their left is client-supplied text. So this is the count of hops to walk
+    #: in from the right, not an allowlist of proxy addresses. Clamped to >= 1:
+    #: ``0`` would mean "trust nothing in the header", which is what
+    #: ``trust_proxy=False`` already says -- and a typo must not restore the
+    #: left-most read (CF-23), nor refuse to boot a server over a rate-limit
+    #: knob.
+    trusted_proxy_hops: int = Field(1, validation_alias="RATE_LIMIT_TRUSTED_PROXY_HOPS")
+
+    @field_validator("trusted_proxy_hops", mode="before")
+    @classmethod
+    def _clamp_hops(cls, value: object) -> int:
+        """Any unparsable or sub-1 value means "one proxy", never "trust the client"."""
+        try:
+            hops = int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 1
+        return max(hops, 1)
+
     per_minute: int = Field(60, validation_alias=AliasChoices("MNEMOS_RATE_LIMIT_PER_MINUTE", "RATE_LIMIT_PER_MINUTE"))
     pantheon_gateway: str = Field(
         "60/minute",
@@ -1074,6 +1094,23 @@ class _FederationSettings(BaseSettings):
         3600,
         ge=0,
         validation_alias="MNEMOS_FEDERATION_ANTI_ENTROPY_INTERVAL_SECS",
+    )
+    # NG2-MN-004: the outbound byte cap for a peer response. The pull path
+    # reads a peer answer as a STREAM and stops at this many bytes; a peer
+    # that sends more is a transient sync failure, never a buffer. The
+    # inbound side has had a bound since SEC-04 (_BodySizeLimitASGI in
+    # mnemos/api/main.py); without this one a registered peer could answer
+    # a feed pull with a multi-GB JSON body and take the worker (which
+    # also serves the API in the default profile) down.
+    #
+    # The default (64 MiB) is comfortably above the worst legitimate page:
+    # FEDERATION_BATCH_LIMIT (100) rows x the 1 MB per-content cap, plus
+    # the base64 embedding a copy_embeddings peer adds. Lower it to tighten
+    # the bound; raise it only if a peer legitimately ships bigger pages.
+    max_response_bytes: int = Field(
+        64 * 1024 * 1024,
+        ge=1024,
+        validation_alias="FEDERATION_MAX_RESPONSE_BYTES",
     )
 
 

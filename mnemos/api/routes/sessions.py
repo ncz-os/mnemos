@@ -200,8 +200,12 @@ async def add_session_message(
     if mnemos_context:
         system_prompt = f"[MNEMOS Context - {memories_injected} memories]\n{mnemos_context}"
         if has_system:
-            # Append to existing system prompt
-            messages[0]["content"] += f"\n\n{system_prompt}"
+            # Append to existing system prompt (the actual system row,
+            # which may not be first in the history ordering).
+            for m in messages:
+                if m["role"] == "system":
+                    m["content"] += f"\n\n{system_prompt}"
+                    break
         else:
             messages.insert(0, {"role": "system", "content": system_prompt})
 

@@ -2087,6 +2087,15 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
                 (vec_literal, memory_id),
             )
 
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13)."""
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE memories SET embedding = NULL WHERE id = %s",
+                (memory_id,),
+            )
+
     async def list_memories(
         self,
         tx: Transaction,
@@ -8132,6 +8141,102 @@ class MysqlFederationRepository(FederationRepository):
                    AND federation_source = %s
                 """,
                 (memory_id, local_id, peer_name),
+            )
+            return int(cursor.rowcount or 0)
+
+    # ── MN-24: repair rows fenced before the replica fence existed ───────
+
+    async def fetch_fenced_damaged_replicas(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        params: list[Any] = [peer_name]
+        where = (
+            "WHERE m.federation_source = %s "
+            "AND (m.deleted_at IS NOT NULL "
+            "OR m.archived_at IS NOT NULL "
+            "OR m.consolidated_into IS NOT NULL)"
+        )
+        if after_id is not None:
+            where += " AND m.id > %s"
+            params.append(after_id)
+        params.append(max(1, int(limit)))
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                f"""
+                SELECT m.id AS local_id,
+                       SUBSTRING(m.id, CHAR_LENGTH(m.federation_source) + 6) AS remote_id,
+                       m.deleted_at AS deleted_at, m.archived_at AS archived_at,
+                       m.consolidated_into AS consolidated_into, m.metadata AS metadata,
+                       frs.withdrawn AS withdrawn
+                  FROM memories m
+                  LEFT JOIN federation_receive_state frs
+                    ON frs.peer_name = m.federation_source
+                   AND frs.remote_id = SUBSTRING(m.id, CHAR_LENGTH(m.federation_source) + 6)
+                 {where}
+                 ORDER BY m.id ASC
+                 LIMIT %s
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def clear_federation_receive_fence(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        remote_id: str,
+    ) -> int:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM federation_receive_state WHERE peer_name = %s AND remote_id = %s",
+                (peer_name, remote_id),
+            )
+            return int(cursor.rowcount or 0)
+
+    async def clear_federation_peer_cursors(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+    ) -> int:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM federation_peer_cursors WHERE peer_id = %s",
+                (peer_id,),
+            )
+            return int(cursor.rowcount or 0)
+
+    async def delete_federated_archive_blob(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "DELETE FROM memory_archive WHERE id = %s",
+                (local_id,),
+            )
+            return int(cursor.rowcount or 0)
+
+    async def release_federation_consolidation_targets(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        peer_name: str,
+    ) -> int:
+        async with tx.conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
+                "WHERE consolidated_into = %s AND federation_source = %s",
+                (local_id, peer_name),
             )
             return int(cursor.rowcount or 0)
 

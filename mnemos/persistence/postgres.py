@@ -871,9 +871,7 @@ class PostgresMemoryRepository(MemoryRepository):
         if not include_secrets:
             params.append(VAULT_NAMESPACE)
             conditions.append(f"(namespace IS NULL OR namespace <> ${len(params)})")
-        rows = await conn.fetch(
-            "SELECT id FROM memories WHERE " + " AND ".join(conditions), *params
-        )
+        rows = await conn.fetch("SELECT id FROM memories WHERE " + " AND ".join(conditions), *params)
         return {row["id"] for row in rows}
 
     async def fetch_deletion_log_for_export(
@@ -1095,6 +1093,17 @@ class PostgresMemoryRepository(MemoryRepository):
             memory_id,
         )
 
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13).
+
+        Sets ``memories.embedding`` NULL so the embedding backfill
+        (which selects ``embedding IS NULL`` rows) picks the row up.
+        """
+        await _postgres_tx(tx).conn.execute(
+            "UPDATE memories SET embedding = NULL WHERE id = $1",
+            memory_id,
+        )
+
     async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None:
         conn = _postgres_tx(tx).conn
         return await conn.fetchrow(
@@ -1159,16 +1168,12 @@ class PostgresMemoryRepository(MemoryRepository):
             # the vault rows are still subtracted because ``for_read`` sets
             # ``exclude_namespaces`` for root too.
             visibility = VisibilityFilter.for_caller(user)
-            vis_clause, vis_params, next_idx = _render_postgres_visibility(
-                visibility, start_idx=1, table_alias="m"
-            )
+            vis_clause, vis_params, next_idx = _render_postgres_visibility(visibility, start_idx=1, table_alias="m")
             q_ph = f"${next_idx}"
             lim_ph = f"${next_idx + 1}"
             where = (
                 "m.deleted_at IS NULL "
-                "AND m.archived_at IS NULL "
-                + (f"AND {vis_clause} " if vis_clause else "")
-                + f"AND ("
+                "AND m.archived_at IS NULL " + (f"AND {vis_clause} " if vis_clause else "") + f"AND ("
                 f"to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})"
                 " OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')"
                 ")"
@@ -2807,9 +2812,7 @@ class PostgresCompressionQueueRepository(CompressionQueueRepository):
         infrastructure failure.
         """
         try:
-            count = await conn.fetchval(
-                "SELECT COUNT(*) FROM memory_compressed_variants"
-            )
+            count = await conn.fetchval("SELECT COUNT(*) FROM memory_compressed_variants")
         except asyncpg.UndefinedTableError:
             return -1
         return int(count or 0)
@@ -4463,10 +4466,7 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
         )
         if exists is None:
             return None
-        sql = (
-            "SELECT field, value FROM model_registry_field_obs "
-            "WHERE provider = $1 AND model_id = $2"
-        )
+        sql = "SELECT field, value FROM model_registry_field_obs WHERE provider = $1 AND model_id = $2"
         params: list[Any] = [provider, model_id]
         if authoritative_source is not None:
             params.append(authoritative_source)
@@ -4635,12 +4635,8 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
                     }
                 )
 
-        canonical_prices.sort(
-            key=lambda pr: (pr["provider"], pr["model_id"], pr["pricing_model"], pr["band"])
-        )
-        canonical_benchmarks.sort(
-            key=lambda b: (b["provider"], b["model_id"], b["benchmark"])
-        )
+        canonical_prices.sort(key=lambda pr: (pr["provider"], pr["model_id"], pr["pricing_model"], pr["band"]))
+        canonical_benchmarks.sort(key=lambda b: (b["provider"], b["model_id"], b["benchmark"]))
 
         return {
             "models": canonical_models,
@@ -6408,6 +6404,99 @@ class PostgresFederationRepository(FederationRepository):
             WHERE id = $1
               AND federation_source = $2
             """,
+            local_id,
+            peer_name,
+        )
+        return _pg_result_count(result)
+
+    # ── MN-24: repair rows fenced before the replica fence existed ───────
+
+    async def fetch_fenced_damaged_replicas(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        args: list[Any] = [peer_name]
+        where = (
+            "WHERE m.federation_source = $1 "
+            "AND (m.deleted_at IS NOT NULL "
+            "OR m.archived_at IS NOT NULL "
+            "OR m.consolidated_into IS NOT NULL)"
+        )
+        if after_id is not None:
+            args.append(after_id)
+            where += f" AND m.id > ${len(args)}"
+        args.append(max(1, int(limit)))
+        n = len(args)
+        return await _postgres_tx(tx).conn.fetch(
+            f"""
+            SELECT m.id AS local_id,
+                   substr(m.id, length(m.federation_source) + 6) AS remote_id,
+                   m.deleted_at AS deleted_at, m.archived_at AS archived_at,
+                   m.consolidated_into AS consolidated_into, m.metadata AS metadata,
+                   frs.withdrawn AS withdrawn
+            FROM memories m
+            LEFT JOIN federation_receive_state frs
+              ON frs.peer_name = m.federation_source
+             AND frs.remote_id = substr(m.id, length(m.federation_source) + 6)
+            {where}
+            ORDER BY m.id ASC
+            LIMIT ${n}
+            """,
+            *args,
+        )
+
+    async def clear_federation_receive_fence(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        remote_id: str,
+    ) -> int:
+        result = await _postgres_tx(tx).conn.execute(
+            "DELETE FROM federation_receive_state WHERE peer_name = $1 AND remote_id = $2",
+            peer_name,
+            remote_id,
+        )
+        return _pg_result_count(result)
+
+    async def clear_federation_peer_cursors(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+    ) -> int:
+        result = await _postgres_tx(tx).conn.execute(
+            "DELETE FROM federation_peer_cursors WHERE peer_id = $1",
+            peer_id,
+        )
+        return _pg_result_count(result)
+
+    async def delete_federated_archive_blob(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        result = await _postgres_tx(tx).conn.execute(
+            "DELETE FROM memory_archive WHERE id = $1",
+            local_id,
+        )
+        return _pg_result_count(result)
+
+    async def release_federation_consolidation_targets(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        peer_name: str,
+    ) -> int:
+        result = await _postgres_tx(tx).conn.execute(
+            "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
+            "WHERE consolidated_into = $1 AND federation_source = $2",
             local_id,
             peer_name,
         )

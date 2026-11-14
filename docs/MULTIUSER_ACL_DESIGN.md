@@ -105,19 +105,28 @@ schema migration the codebase explicitly defers) and is tracked as a follow-up
 
 ## Cache coherency
 
-ACL grant/revoke mutate read visibility, so both invalidate the per-user
-search cache (`mnemos:search:*`) after commit — at parity with every other
-visibility-narrowing mutation (memory delete, permission-mode change, archive,
-admin ops, deletion worker). All of these share a one-shot post-commit
-invalidation that has a known write-after-invalidate race bounded by the search
-TTL; closing it uniformly (visibility-epoch-versioned cache keys) is tracked as
-a separate, systemic follow-up — see ncz-os/mnemos#1.
+ACL grant/revoke mutate read visibility, so both bump the visibility epoch
+after commit — at parity with every other visibility-narrowing mutation
+(memory delete, permission-mode change, archive, admin ops, deletion worker).
+The epoch bump is best-effort: a broken epoch store never turns an already
+committed grant/revoke into a 500, and a 404 revoke (nothing removed, so read
+visibility is unchanged) does not bump at all.
+
+There is no per-user search cache to invalidate. It was keyed by
+user/group/namespace/query and wired to `_lc._cache`, which the lifecycle
+hard-wires to `None` (no Redis in the runtime), and the search handler no
+longer reads a cache — so the `SCAN MATCH "mnemos:search:*"` sweep that used
+to run here matched keys of a cache that was never written. The epoch bump
+persists because the MCP principal-context cache (role / namespace —
+authorization inputs) subscribes to it. The remaining `/stats`-surface
+invalidation (`stats:global`, `stats:global:v2`) is unchanged.
 
 ## Tests
 
 `tests/test_acl_routes.py` covers principal/perm validation, the
 owner/root/group-admin gate (incl. 403/404 fail-closed paths), capability
-503-gating, handler round-trips, search-cache invalidation on grant/revoke
-(and the 404 no-op), plus an end-to-end SQLite proof that a `memory_acl` row
-widens read visibility within the namespace. Backend-specific SQL is exercised
-by the live per-backend suites.
+503-gating, handler round-trips, the visibility-epoch bump on grant/revoke
+(including best-effort silence and the 404 no-op), an assertion that neither
+path issues a search-cache SCAN sweep, plus an end-to-end SQLite proof that a
+`memory_acl` row widens read visibility within the namespace. Backend-specific
+SQL is exercised by the live per-backend suites.

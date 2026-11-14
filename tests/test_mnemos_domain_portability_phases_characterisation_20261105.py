@@ -1166,6 +1166,23 @@ def test_cm_malformed_selected_at_marks_failed():
 # ---------------------------------------------------------------------------
 
 
+# The exact statement ``CompressionRepository.fetch_compressed_variant_by_memory_id``
+# issues (Postgres facade, mnemos/persistence/postgres.py). The conflict
+# verification only runs this SELECT after an ``INSERT 0 0``, and the mock
+# routes by ``needle in sql``, so the needle has to be specific enough to
+# select this statement and nothing else. A shorter prefix such as
+# ``"FROM memory_compressed_variants WHERE memory_id"`` also matches the
+# EXPORT query (``... WHERE memory_id = ANY($1::text[])``), which would let
+# the mock answer the wrong call site.
+_CM_FETCH_BY_MEMORY_ID_SQL = (
+    "SELECT owner_id, winner_candidate_id::text AS winner_candidate_id, "
+    "engine_id, engine_version, compressed_content, compressed_tokens, "
+    "compression_ratio, quality_score, composite_score, scoring_profile, "
+    "judge_model, selected_at FROM memory_compressed_variants "
+    "WHERE memory_id = $1"
+)
+
+
 _CM_EXISTING = {
     "owner_id": "alice",
     "winner_candidate_id": None,
@@ -1184,7 +1201,7 @@ _CM_EXISTING = {
 
 def test_cm_conflict_matching_row_skipped():
     conn = _Conn(execute_result="INSERT 0 0")
-    conn.routed = {"FROM memory_compressed_variants WHERE memory_id": [dict(_CM_EXISTING)]}
+    conn.routed = {_CM_FETCH_BY_MEMORY_ID_SQL: [dict(_CM_EXISTING)]}
     backend, tx = _backend(conn)
     stats = _stats()
     asyncio.run(
@@ -1207,7 +1224,7 @@ def test_cm_conflict_mismatched_row_failed():
     existing = dict(_CM_EXISTING)
     existing["engine_id"] = "other-engine"
     conn = _Conn(execute_result="INSERT 0 0")
-    conn.routed = {"FROM memory_compressed_variants WHERE memory_id": [existing]}
+    conn.routed = {_CM_FETCH_BY_MEMORY_ID_SQL: [existing]}
     backend, tx = _backend(conn)
     stats = _stats()
     asyncio.run(

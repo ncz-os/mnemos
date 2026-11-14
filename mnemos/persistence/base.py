@@ -1063,6 +1063,29 @@ class MemoryRepository(ABC):
         """
         ...
 
+    async def upsert_memory_embedding(
+        self, tx: Transaction, memory_id: str, embedding: Sequence[float]
+    ) -> None:
+        """Write a precomputed embedding vector for ``memory_id``.
+
+        Idempotent; a no-op when the embedding is empty. Every backend
+        implements this (inline ``memories.embedding`` column on
+        Postgres/Oracle/Db2/MySQL, the ``memory_embeddings`` join table
+        plus ``memories.embedding`` mirror on SQLite, the
+        ``memory_embeddings`` join table on MariaDB).
+        """
+        ...
+
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (set it NULL).
+
+        NG-MN-13: when a content PATCH re-embed fails, the old vector
+        must not survive — semantic search would keep matching the
+        previous text. Clearing marks the row for the embedding
+        backfill (which selects ``embedding IS NULL`` rows).
+        """
+        ...
+
 
 class KGRepository(ABC):
     """Knowledge graph triple persistence."""
@@ -2120,9 +2143,7 @@ class OAuthRepository(ABC):
     async def mcp_save_token(self, tx: Transaction, row: Row) -> None: ...
 
     @abstractmethod
-    async def mcp_rotate_refresh(
-        self, tx: Transaction, token_hash: str, client_id: str, successor: Row
-    ) -> str:
+    async def mcp_rotate_refresh(self, tx: Transaction, token_hash: str, client_id: str, successor: Row) -> str:
         """Return rotated/invalid/reused, serializing the entire refresh family.
 
         Reuse revokes all active descendants. Revocation and successor insertion
@@ -2168,9 +2189,7 @@ class OAuthRepository(ABC):
     async def get_identity_for_session(self, tx: Transaction, session_id: str) -> Row | None: ...
 
     @abstractmethod
-    async def lookup_api_key(
-        self, tx: Transaction, key_hash: str
-    ) -> Row | None:
+    async def lookup_api_key(self, tx: Transaction, key_hash: str) -> Row | None:
         """Resolve an API key to its user context (role/namespace/groups).
 
         Returns a backend-neutral Row carrying ``id``, ``user_id``,
@@ -2250,9 +2269,7 @@ class OAuthRepository(ABC):
         """
 
     @abstractmethod
-    async def resolve_active_session(
-        self, tx: Transaction, session_id: str, *, now: Any
-    ) -> Row | None:
+    async def resolve_active_session(self, tx: Transaction, session_id: str, *, now: Any) -> Row | None:
         """Resolve an oauth_sessions row, validate it is still active.
 
         Returns the row carrying ``user_id`` and ``identity_id`` for
@@ -2463,6 +2480,113 @@ class ConsultationsRepository(ABC):
 
 class FederationRepository(ABC):
     """Federation persistence surface."""
+
+    # ── MN-24 / D-MN5: repair rows fenced before the replica fence ────────
+    #
+    # A replica row damaged by a LOCAL lifecycle sweep (soft-delete,
+    # archival, local consolidation) *before* the replica fence shipped can
+    # never heal: the receiver's durable sequence fence drops the source's
+    # replay before any write. The repair is a one-off, operator-applied
+    # cleanup: list the damaged population (dry run), then delete the local
+    # copy plus its archive blob, clear the row's receive-state fence and
+    # the peer's journal cursors, so the next ordinary sync replays and
+    # re-pulls through the normal write path. Rows the source withdrew and
+    # consolidations the PEER itself published are never candidates.
+    #
+    # The default implementations below are no-ops (empty page / 0 rows),
+    # like ``compact_journal``: backends that implement the journal override
+    # them. Test doubles and backends that do not implement the journal keep
+    # the semantics they had before MN-24.
+
+    async def fetch_fenced_damaged_replicas(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        """One keyset page of a peer's locally damaged replica rows.
+
+        Returns rows with ``federation_source = peer_name`` and any of
+        ``deleted_at`` / ``archived_at`` / ``consolidated_into`` set, in
+        ``id`` order, resumed with ``after_id`` so a repair sweep never
+        loads the whole population. Each row carries ``local_id`` (the
+        ``fed:<peer>:<remote_id>`` key), ``remote_id`` (derived from the
+        key, like ``fetch_parity_page``), the three damage markers, the
+        row's ``metadata`` (the peer-consolidation marker lives there) and
+        ``withdrawn`` from ``federation_receive_state`` (NULL when the
+        receiver holds no fence row at all).
+        """
+        return []
+
+    async def clear_federation_receive_fence(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        remote_id: str,
+    ) -> int:
+        """Drop one ``federation_receive_state`` fence row. Returns rows deleted."""
+        return 0
+
+    async def clear_federation_peer_cursors(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+    ) -> int:
+        """Drop every ``federation_peer_cursors`` row for a peer.
+
+        The next sync then has no journal cursor for any filter scope and
+        replays from the source, which is what re-pulls rows whose fence
+        the repair cleared. Returns rows deleted.
+        """
+        return 0
+
+    async def delete_federated_archive_blob(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        """Delete one ``memory_archive`` blob row. Returns rows deleted (0/1).
+
+        The archive table references ``memories(id)`` with
+        ``ON DELETE RESTRICT``, so the blob must go before the row it
+        shadows. A live row has no blob; deleting nothing is not an error.
+        """
+        return 0
+
+    async def release_federation_consolidation_targets(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        peer_name: str,
+    ) -> int:
+        """Detach same-peer replica rows that point at ``local_id``.
+
+        ``memories.consolidated_into`` references ``memories(id)``, so a row
+        that is still referenced blocks the DELETE of its target with a
+        FOREIGN KEY error. The repair deletes damaged replicas, and a
+        damaged replica can be the target of another replica's
+        consolidation pointer -- deleting the target first then fails, and
+        the per-row failure leaves the target behind for good.
+
+        The detach is scoped to replicas of the SAME peer
+        (``federation_source = peer_name``): only rows the next sync
+        re-pulls through the normal write path may be touched. A LOCAL row
+        (``federation_source IS NULL``) or another peer's replica that
+        points at the target keeps its pointer; if that pointer still
+        blocks the DELETE, the row fails the repair loudly (collected in
+        ``failed``) instead of being silently detached table-wide. This
+        mirrors the scoped shape of ``prepare_versioned_update``
+        (``WHERE id = ? AND federation_source = ?``).
+
+        Returns the number of rows detached.
+        """
+        return 0
 
     @abstractmethod
     async def fetch_memory_page(

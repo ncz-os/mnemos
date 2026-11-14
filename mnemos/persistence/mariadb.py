@@ -636,6 +636,20 @@ class MariadbMemoryRepository(MysqlMemoryRepository):
                 (memory_id, vec_literal, vec_literal),
             )
 
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13).
+
+        MariaDB keeps vectors in the ``memory_embeddings`` join table,
+        so clear that row (NULL keeps the FK row for the backfill to
+        refill, matching the SQLite join-table behaviour).
+        """
+        conn = tx.conn
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE memory_embeddings SET embedding = NULL WHERE memory_id = %s",
+                (memory_id,),
+            )
+
     async def semantic_search(
         self,
         tx: Transaction,

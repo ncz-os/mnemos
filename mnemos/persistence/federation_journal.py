@@ -418,8 +418,20 @@ def _datetime(value):
     return None
 
 
-async def accept_event(tx, peer_name, remote_id, *, sequence, remote_updated, withdrawn):
-    """Fence replay and persist deletion knowledge in the mutation transaction."""
+async def accept_event(tx, peer_name, remote_id, *, sequence, remote_updated, withdrawn, skipped=False):
+    """Fence replay and persist deletion knowledge in the mutation transaction.
+
+    MN-35: when the row this event targets is soft-deleted on THIS node,
+    the caller passes ``skipped=True``: the fence is still READ (an already
+    fenced replay takes the F-3 repair branch the same way), but nothing is
+    WRITTEN. ``accept_event`` records an inbound sequence as *applied*; a
+    replica this node soft-deleted is deliberately not applied — the row
+    stays deleted and undeleting is a policy decision — so a skipped event
+    must leave the fence where the replica's content actually is. A
+    replica restored later (PERSEPHONE restore, the deletion-request
+    restore phase) is not fenced against its pending revision, and the
+    replay applies normally.
+    """
     ops = _ops(tx)
     # Also serializes the first insert, for which a SELECT FOR UPDATE has no
     # row to lock. This lock shares the source clock but does not increment it.
@@ -442,6 +454,12 @@ async def accept_event(tx, peer_name, remote_id, *, sequence, remote_updated, wi
         prior = _datetime(state["remote_updated"])
         if prior is not None and (timestamp is None or timestamp <= prior):
             return False
+    if skipped:
+        # MN-35: the event is deliberately not applied (its replica is
+        # soft-deleted on this node). The read above already settled the
+        # replay decision; writing the fence would claim the sequence as
+        # applied when nothing was.
+        return True
     if state:
         await ops.execute(
             "UPDATE federation_receive_state SET last_sequence = ?, remote_updated = ?, withdrawn = ? "

@@ -395,17 +395,24 @@ CompressionProfile = Literal["balanced", "quality_first", "speed_first", "custom
 
 
 async def _invalidate_memory_read_caches() -> None:
-    if not _lc._cache:
-        return
-    try:
-        await _lc._cache.delete("stats:global:v2")
+    """Drop the stats cache and bump the visibility epoch after a rewrite.
+
+    The per-user search-key sweep this used to run is gone: it scanned
+    ``_lc._cache``, which the lifecycle hard-wires to ``None`` and which
+    holds no search keys since the per-user search cache was removed
+    (MN-31). ``stats:global:v2`` belongs to the stats surface and is a
+    different cache, so it is still dropped.
+
+    The epoch bump is load-bearing: the MCP principal-context cache
+    subscribes to it. It does not depend on the cache existing — in the
+    runtime ``_cache`` is always ``None``, so returning early here would
+    make the bump unreachable.
+    """
+    if _lc._cache:
         try:
-            async for key in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                await _lc._cache.delete(key)
+            await _lc._cache.delete("stats:global:v2")
         except Exception:
             pass
-    except Exception:
-        pass
     try:
         await _lc._vis_epoch_get_incr()  # bump; errors silently
     except Exception:

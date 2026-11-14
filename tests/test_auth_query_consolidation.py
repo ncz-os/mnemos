@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -73,6 +74,15 @@ def test_api_key_auth_fetches_user_and_groups_in_one_query(monkeypatch):
         return None
 
     monkeypatch.setattr(lc, "_schedule_background", _run_bg)
+    # The M5 cache/touch state is module-global: a test earlier in this file
+    # (or in another module) may have minted an entry for this same key
+    # hash under the real monotonic clock, and the module's default
+    # _touch_interval (60 s) can still suppress this fresh touch. Reset so
+    # the cache is empty and the debounce clock starts here, not in the
+    # previous test's timeline.
+    auth_mod._reset_auth_caches()
+    clock = [time.monotonic()]
+    monkeypatch.setattr(auth_mod.time, "monotonic", lambda: clock[0])
 
     request = MagicMock()
     request.app.state.persistence_backend = backend

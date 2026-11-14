@@ -94,6 +94,13 @@ __pycache__/
 .zoder_task_*.md
 TASK_*.md
 
+# Agent run diagnostics (test-failure baselines, review-round stderr/json).
+# These are per-run scratch, not deliverables: committed logs from
+# 2026-11-07/09 were read as a code delta in review and reported as a
+# "massive test regression" when they were only snapshots of failures that
+# already exist on master.
+.scratch/
+
 # Local scripts not for distribution
 sync_argonas_git.py
 run_monthly_export.sh
@@ -115,3 +122,16 @@ mnemos_os.egg-info/
 .coverage
 .coverage.*
 htmlcov/
+
+# Review verdict artifacts — these live on review refs only (F1, MN-33
+# review round 3); never on an author branch where they would merge into
+# the code tree.
+REVIEW_VERDICT_*.json
+
+# Agent run diagnostics dropped at the repo root by review/delivery loops
+# (review-round stderr/json, suite-verification reports). Per-run scratch,
+# not deliverables (MN-33 review round 2/3: stray artifacts read as code
+# deltas).
+.review1.json
+.review1.err
+VERIFY_*.json

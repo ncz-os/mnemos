@@ -418,12 +418,30 @@ async def test_pull_memory_by_id_uses_explicit_endpoint(monkeypatch):
 
     class _Response:
         status_code = 200
+        # NG2-MN-004: a declared length over the cap is refused before the
+        # body is read, so the stub answers with headers like a real one.
+        headers: dict[str, str] = {}
 
         def raise_for_status(self):
             pass
 
         def json(self):
             return {"id": "mem_1", "content": "ok"}
+
+        async def aiter_bytes(self):
+            # NG2-MN-004: the pull path reads the body as a STREAM under a
+            # byte cap, so the stub answers the streaming API.
+            yield b'{"id": "mem_1", "content": "ok"}'
+
+    class _Stream:
+        def __init__(self, response):
+            self._response = response
+
+        async def __aenter__(self):
+            return self._response
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
 
     class _Client:
         def __init__(self, **kwargs):
@@ -435,9 +453,9 @@ async def test_pull_memory_by_id_uses_explicit_endpoint(monkeypatch):
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
-        async def get(self, url, params, headers):
+        def stream(self, method, url, params=None, headers=None):
             calls.append((url, params, headers, self.kwargs))
-            return _Response()
+            return _Stream(_Response())
 
     # F1 (adversarial review 2026-06-28): pull_memory_by_id now obtains its
     # client via make_safe_client (validate-then-DNS-pin) instead of a bare

@@ -1486,6 +1486,19 @@ class OracleMemoryRepository(MemoryRepository):
         finally:
             await _call(cursor.close)
 
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13)."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET embedding = NULL WHERE id = :id",
+                {"id": memory_id},
+            )
+        finally:
+            await _call(cursor.close)
+
     async def set_suppress_version_snapshot(self, tx: Transaction) -> None:
         # No-op for Oracle — Postgres uses a session GUC to bypass the
         # version-snapshot trigger; the Oracle schema has no equivalent
@@ -2366,14 +2379,32 @@ class OracleMemoryRepository(MemoryRepository):
             # key keeps the newline-folding meaning it has on the text backends.
             #
             # S2: the id list is aggregated as a CLOB. LISTAGG returns VARCHAR2 and
-            # dies with ORA-01489 at 4000 bytes, i.e. at roughly a hundred
-            # duplicates; XMLAGG + getClobVal has no such cap and, unlike
-            # ON OVERFLOW TRUNCATE, cannot silently drop the ids whose duplicates
-            # would then never be consolidated.
+            # dies with ORA-01489 at 4000 bytes. FB115: instead of the former
+            # XMLAGG + getClobVal chain, aggregate the ids as a JSON ARRAY --
+            # an XML serializer cannot be relied on to pass a delimiter
+            # through: U+001F is not a legal XML character (XML 1.0 §2.2,
+            # Characters), so CHR(31) fed to XMLELEMENT is not guaranteed to
+            # come back through getClobVal() verbatim and the Python side's
+            # \x1f split garbles the id list. JSON_ARRAYAGG is a documented
+            # ordered list-of-values constructor that preserves its inputs
+            # exactly and, unlike ON OVERFLOW TRUNCATE, cannot silently drop
+            # ids whose duplicates would then never be consolidated.
+            #
+            # `RETURNING CLOB` is mandatory here, not cosmetic. Oracle's
+            # JSON_ARRAYAGG documentation (JSON_agg_returning_clause) states
+            # that omitting the returning clause -- or naming VARCHAR2 without
+            # a size -- returns the array as VARCHAR2(4000). A duplicate group
+            # of ~100 40-char ids plus JSON quoting/commas crosses 4000 bytes,
+            # and the sweep would then fail with ORA-40478 (output value too
+            # large), reintroducing exactly the LISTAGG cap this change exists
+            # to remove. `CLOB` is an accepted returning type on the vertical
+            # aggregate, so ask for it explicitly. The Python handler parses
+            # the JSON text, not the declared type, so materialising a CLOB is
+            # all it needs.
             sql = (
                 "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count, "
-                "XMLAGG(XMLELEMENT(E, id || CHR(31)) ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) "
-                ".EXTRACT('//text()').getClobVal() AS memory_ids, "
+                "JSON_ARRAYAGG(id ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC RETURNING CLOB) "
+                "AS memory_ids, "
                 "MIN(id) KEEP (DENSE_RANK FIRST ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS keep_id, "
                 "MIN(id) KEEP (DENSE_RANK FIRST ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS canonical_id "
                 "FROM (SELECT id, owner_id, namespace, content_hash, created, quality_rating, "
@@ -2386,8 +2417,35 @@ class OracleMemoryRepository(MemoryRepository):
             await _call(cursor.execute, sql, params)
             rows = await _fetch_all_dicts(cursor)
             for row in rows:
-                raw = row.get("memory_ids") or ""
-                row["memory_ids"] = [part for part in str(raw).split("\x1f") if part]
+                raw = row.get("memory_ids")
+                # The CLOB is materialized by _materialize_value before it
+                # reaches this handler, so the JSON array normally arrives as
+                # a str, e.g. '["a", "b"]'. A pre-FB115 build stored the raw
+                # \x1f-delimited list instead, so the old split fallback is
+                # kept -- and it must also cope with the driver shapes that
+                # are not str (bytes from a BLOB-style read, a native list),
+                # which used to crash json.dumps or collapse to one junk id.
+                # Bytes are decoded first so a JSON array read as bytes is
+                # parsed as JSON too, not split as one legacy id.
+                if isinstance(raw, (bytes, bytearray, memoryview)):
+                    raw = bytes(raw).decode("utf-8", errors="replace")
+                parsed = None
+                if isinstance(raw, str) and raw.lstrip().startswith("["):
+                    try:
+                        loaded = json.loads(raw)
+                    except ValueError:
+                        loaded = None
+                    if isinstance(loaded, list) and all(isinstance(part, str) and part for part in loaded):
+                        parsed = loaded
+                elif isinstance(raw, (list, tuple)):
+                    # An empty native sequence is an empty id list, never the
+                    # str() of it.
+                    if all(isinstance(part, str) and part for part in raw):
+                        parsed = list(raw)
+                if parsed is None:
+                    text = "" if raw is None else str(raw)
+                    parsed = [part for part in text.split("\x1f") if part]
+                row["memory_ids"] = parsed
                 row["duplicate_count"] = int(row.get("duplicate_count") or 0)
             return rows
         finally:
@@ -6938,14 +6996,14 @@ class OracleConsultationsRepository(ConsultationsRepository):
                     "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
                     "FROM graeae_audit_log al "
                     "JOIN graeae_consultations c ON c.id = al.consultation_id "
-                    "WHERE c.owner_id = :uid AND c.namespace = :ns "
+                    "WHERE c.owner_id = :owner_uid AND c.namespace = :ns "
                     "AND c.deleted_at IS NULL AND al.deleted_at IS NULL) "
                     "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, prompt_hash, "
                     "response_hash, CAST(NULL AS VARCHAR2(64)) AS chain_hash, "
                     "scoped_prev_id AS prev_id, task_type, provider, quality_score, created_at "
                     "FROM visible ORDER BY global_sequence_num DESC "
                     "OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY",
-                    {"uid": user_id, "ns": namespace, "off": offset, "lim": limit},
+                    {"owner_uid": user_id, "ns": namespace, "off": offset, "lim": limit},
                 )
             return await _fetch_all_dicts(cursor)
         finally:
@@ -7192,8 +7250,8 @@ class OracleFederationRepository(FederationRepository):
     ) -> list[Row]:
         conn = _conn_from_tx(tx)
         cursor = await _call(conn.cursor)
-        columns = (
-            "id, content, category, subcategory, metadata, owner_id, namespace, updated" + (", content_hash" if include_content_hash else "")
+        columns = "id, content, category, subcategory, metadata, owner_id, namespace, updated" + (
+            ", content_hash" if include_content_hash else ""
         )
         try:
             if updated_after is not None and id_after is not None:
@@ -7657,17 +7715,17 @@ class OracleFederationRepository(FederationRepository):
                 """
                 UPDATE federation_peers SET
                     last_cursor_ts = :cts,
-                    lag_seconds = :lag,
-                    rows_last_sync = :rows,
-                    embedding_status = :status
+                    lag_seconds = :lag_s,
+                    rows_last_sync = :rows_n,
+                    embedding_status = :emb_status
                  WHERE id = :id
                 """,
                 {
                     "id": peer_id,
                     "cts": last_cursor_ts,
-                    "lag": lag_seconds,
-                    "rows": rows_pulled if rows_pulled is not None else rows_last_sync,
-                    "status": embedding_status,
+                    "lag_s": lag_seconds,
+                    "rows_n": rows_pulled if rows_pulled is not None else rows_last_sync,
+                    "emb_status": embedding_status,
                 },
             )
         finally:
@@ -8059,6 +8117,126 @@ class OracleFederationRepository(FederationRepository):
                    AND federation_source = :peer
                 """,
                 {"id": memory_id, "local_id": f"fed:{peer_name}:{memory_id}", "peer": peer_name},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    # ── MN-24: repair rows fenced before the replica fence existed ───────
+
+    async def fetch_fenced_damaged_replicas(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        after_id: str | None = None,
+        limit: int = 500,
+    ) -> list[Row]:
+        where = (
+            "WHERE m.federation_source = :peer "
+            "AND (m.deleted_at IS NOT NULL "
+            "OR m.archived_at IS NOT NULL "
+            "OR m.consolidated_into IS NOT NULL)"
+        )
+        params: dict[str, Any] = {"peer": peer_name, "limit": max(1, int(limit))}
+        if after_id is not None:
+            where += " AND m.id > :after_id"
+            params["after_id"] = after_id
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                f"""
+                SELECT m.id AS local_id,
+                       SUBSTR(m.id, LENGTH(m.federation_source) + 6) AS remote_id,
+                       m.deleted_at AS deleted_at, m.archived_at AS archived_at,
+                       m.consolidated_into AS consolidated_into, m.metadata AS metadata,
+                       frs.withdrawn AS withdrawn
+                  FROM memories m
+                  LEFT JOIN federation_receive_state frs
+                    ON frs.peer_name = m.federation_source
+                   AND frs.remote_id = SUBSTR(m.id, LENGTH(m.federation_source) + 6)
+                  {where}
+                 ORDER BY m.id ASC
+                 FETCH FIRST :limit ROWS ONLY
+                """,
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def clear_federation_receive_fence(
+        self,
+        tx: Transaction,
+        *,
+        peer_name: str,
+        remote_id: str,
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM federation_receive_state WHERE peer_name = :peer AND remote_id = :rid",
+                {"peer": peer_name, "rid": remote_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def clear_federation_peer_cursors(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM federation_peer_cursors WHERE peer_id = :pid",
+                {"pid": peer_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def delete_federated_archive_blob(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "DELETE FROM memory_archive WHERE id = :lid",
+                {"lid": local_id},
+            )
+            return int(getattr(cursor, "rowcount", 0) or 0)
+        finally:
+            await _call(cursor.close)
+
+    async def release_federation_consolidation_targets(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        peer_name: str,
+    ) -> int:
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET consolidated_into = NULL, consolidated_at = NULL "
+                "WHERE consolidated_into = :lid AND federation_source = :peer",
+                {"lid": local_id, "peer": peer_name},
             )
             return int(getattr(cursor, "rowcount", 0) or 0)
         finally:
