@@ -173,6 +173,52 @@ async def _publish_bulk_created_events(events: list[dict], source_node: str) -> 
     await asyncio.gather(*(_publish_one(event) for event in events))
 
 
+async def _reembed_memory_after_patch(
+    backend,
+    memory_id: str,
+    *,
+    embed_text: str,
+) -> None:
+    """Refresh the stored vector for a just-PATCHed memory (NG-MN-13).
+
+    Runs AFTER the update transaction commits (like the create path
+    computes its embedding before opening the transaction): the model
+    round trip must not hold a Postgres pool connection or the SQLite
+    global lock, and the content write must already be durable when
+    the vector lands. On embedder failure the stale vector is cleared
+    (embedding NULL) with a WARNING so the embedding backfill
+    (``embedding IS NULL`` rows) picks the row up instead of semantic
+    search silently matching the previous text. DB write errors on the
+    upsert/clear propagate — the content is already committed, so a
+    lost vector write must surface loudly rather than degrade to a
+    half-state.
+    """
+    try:
+        from mnemos.api.routes.memories import _get_embedding as _route_embed
+
+        vec = await _route_embed(embed_text)
+    except Exception:
+        logger.warning(
+            "[update_memory] post-PATCH embed generation failed for %s; "
+            "clearing stale vector so the backfill re-embeds the row",
+            memory_id,
+        )
+        async with backend.transactional() as tx:
+            await backend.memories.clear_memory_embedding(tx, memory_id)
+        return
+    if not vec:
+        logger.warning(
+            "[update_memory] post-PATCH embed generation returned empty for %s; "
+            "clearing stale vector so the backfill re-embeds the row",
+            memory_id,
+        )
+        async with backend.transactional() as tx:
+            await backend.memories.clear_memory_embedding(tx, memory_id)
+        return
+    async with backend.transactional() as tx:
+        await backend.memories.upsert_memory_embedding(tx, memory_id, vec)
+
+
 async def _invalidate_caches_after_mutation() -> None:
     """Invalidate read-side caches after any memory write.
 

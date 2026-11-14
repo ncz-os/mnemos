@@ -1,0 +1,12 @@
+verdict: request_changes   ($0.0000)   [complete (1 reviewer)]
+
+── cerberus-reviewer :: request_changes ──
+The test suite contains a defect that may cause failures in environments where the real tunnel bridge classes are not available or require external binaries. Specifically, a test that patches the token issuance function but does not patch the bridge resolution function will still invoke the real `get_bridge_class`, potentially importing heavy or missing dependencies.
+  • (high) Test `test_start_resolves_the_token_before_spawning_the_bridge` may import real bridge classes [tests/test_mnemos_api_routes_tunnels_characterisation_20261105.py:line 1020-1030]
+      The test patches `_issue_tunnel_token` to raise an `HTTPException` before the tunnel is started, but it does not patch `get_bridge_class`. Consequently, the test will still call the real `get_bridge_class` implementation, which may import the actual cloudflare or ngrok bridge classes. In environments where these binaries are not installed or the import fails, the test will raise an `ImportError` or other unexpected exception, causing the test suite to fail even though the logic under test is correct. The intended behavior is to avoid any interaction with the real bridge classes when the token issuance fails.
+      
+      To fix this, the test should either use the `fake_bridge` fixture (which patches `get_bridge_class` to return `FakeBridge`) or explicitly patch `get_bridge_class` to a dummy implementation within the test.
+  next:
+    - Modify `test_start_resolves_the_token_before_spawning_the_bridge` to use the `fake_bridge` fixture or patch `get_bridge_class` to a dummy implementation.
+    - Ensure that the test does not import or rely on the real bridge classes when the token issuance is expected to fail.
+

@@ -20,9 +20,10 @@ whether the content is
 Conservatism is deliberate. A 40-hex git SHA in prose, a UUID, or a
 ``token`` word with no value attached must NOT vault a legitimate
 memory. High-confidence shapes (provider-prefixed keys, PEM blocks,
-AWS access keys) are treated as VAULT; the generic
-``key/secret/password = <value>`` assignment is treated as VAULT only
-when the value itself looks secret-grade, otherwise REDACT.
+AWS access keys, Stripe ``sk_live_``/``rk_live_`` keys, JWTs) are treated
+as VAULT; the generic ``key/secret/password = <value>`` assignment is
+treated as VAULT only when the value itself looks secret-grade, otherwise
+REDACT.
 """
 
 from __future__ import annotations
@@ -44,7 +45,9 @@ VAULT_NAMESPACE = "vault"
 # an older classifier stops matching, so ``redact_field_with_stored`` resumes
 # recomputing for those rows. The marker is SERVER-ONLY (see M1,
 # ``persisted_text_classification.strip_caller_secret_metadata``).
-SECRET_CLASSIFIER_VERSION = 1
+# v2 (MN-07): Stripe ``sk_/rk_/pk_live_|test_`` keys, JWTs, the AWS secret
+# access key shape, and whitespace-split tokens are now detected.
+SECRET_CLASSIFIER_VERSION = 2
 
 # Metadata key holding the per-field CLEAN verdicts written at ingest
 # (``{field_name: classifier_version}``). SERVER-ONLY, like every other
@@ -72,6 +75,19 @@ _HIGH_CONFIDENCE: list[tuple[str, re.Pattern]] = [
     ("sk_key", re.compile(r"\bsk-(?:proj-|ant-|or-v1-|live-|test-)?[0-9A-Za-z_-]{20,}")),
     # xAI
     ("xai_key", re.compile(r"\bxai-[0-9A-Za-z]{20,}")),
+    # Stripe secret/restricted/publishable keys. Stripe writes the key family
+    # and mode with an UNDERSCORE (sk_live_, rk_test_, pk_live_, ...), which
+    # the hyphen-only sk_key family above can never match (MN-07). The mode
+    # word is mandatory here so ordinary prose ("pk_", "sk_") cannot trip it.
+    ("stripe_key", re.compile(r"\b[prs]k_(?:live|test)_[0-9A-Za-z]{10,}")),
+    # JWTs (JWS/JWE): the header segment is base64url JSON, so it always
+    # starts "eyJ". Requiring all three dot-separated segments keeps the bare
+    # "eyJ" prefix in prose (a base64url explainer) CLEAN. Slack/other
+    # provider tokens that start with "xox" are matched separately.
+    (
+        "jwt",
+        re.compile(r"\beyJ[0-9A-Za-z_-]{8,}\.eyJ[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,}"),
+    ),
     # AWS access key id
     ("aws_akia", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     # Google API key
@@ -81,6 +97,234 @@ _HIGH_CONFIDENCE: list[tuple[str, re.Pattern]] = [
     # PEM private key blocks
     ("pem_private", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
 ]
+
+# ── Split tokens (MN-07) ───────────────────────────────────────────────
+# A credential written in the middle of a sentence has no prefix anchor:
+#   "the AWS secret access key is wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+# and a long token is often line-wrapped or copied in fragments:
+#   "token: abcdefghijklmn" / "opqrstuvwxyz0123456789"   (continuation line)
+#   "sk_live_51H8...TyU iOpAsDfGh"                        (wrapped key)
+# The generic detectors miss both because neither fragment is anchored or,
+# individually, secret-grade. These two patterns cover that family:
+#
+# * _AWS_SECRET_RE — the AWS secret access key shape (40 chars of mixed
+#   base64 alphabet, as issued); VAULT wherever it appears, since that value
+#   has no non-credential use. ``_iter_vault_shapes`` below keys off the
+#   same pattern, so a status-id exemption can never blank one.
+# * _iter_split_token_spans — a run of 2-6 whitespace-separated fragments
+#   that together form one base64url/Stripe-shaped token.
+_AWS_SECRET_RE = re.compile(r"(?<![0-9A-Za-z/+=])[0-9A-Za-z/+=]{40}(?![0-9A-Za-z/+=])")
+_HEX_ONLY_RE = re.compile(r"[0-9a-fA-F]+")
+
+
+def _aws_secret_shaped(candidate: str) -> bool:
+    """True when a 40-char base64-alphabet run can plausibly be an AWS secret key.
+
+    The pattern alone matches every 40-hex git SHA, every long identifier
+    and many paths. An issued key is random over 64 symbols, so it is not
+    all hex, it carries both an upper- and a lower-case letter, it is not
+    a CamelCase identifier, and it is not a path: a random key holds three
+    or more slashes about 2% of the time, a path nearly always does, and a
+    leading ``/`` or ``~`` is a path whatever follows.
+    """
+    if _HEX_ONLY_RE.fullmatch(candidate):
+        return False
+    if not re.search(r"[A-Z]", candidate) or not re.search(r"[a-z]", candidate):
+        return False
+    if candidate.count("/") >= 3 or candidate[:1] in "/~":
+        return False
+    segments = [seg for seg in candidate.split("/") if seg]
+    if candidate.count("/") >= 2 and segments and all(_path_segment_is_words(seg) for seg in segments):
+        return False
+    if _SPLIT_IDENT_RE.fullmatch(candidate):
+        return False
+    return True
+
+
+def _path_segment_is_words(segment: str) -> bool:
+    return all(_segment_is_word(part) for part in re.split(r"[._-]", segment) if part)
+
+
+def _segment_is_word(part: str) -> bool:
+    """A number, a (Camel)Case word, a 1-2 letter stub or a short capital code."""
+    return bool(
+        re.fullmatch(r"[0-9]+", part)
+        or _SPLIT_IDENT_RE.fullmatch(part)
+        or re.fullmatch(r"[a-z]{1,2}", part)
+        or re.fullmatch(r"[A-Z][0-9A-Z]{0,3}", part)
+    )
+
+
+# The AWS access-key id (aws_akia, above) is what the IAM console shows
+# next to this secret, so "AKIA... <secret>" vaults and masks both halves.
+
+# A token split across a line break or a space: two to six fragments, each
+# >= 6 [0-9A-Za-z_-] chars, joined by one space, two horizontal space/tab
+# chars, or a single newline. At least one fragment must be SECRET-SHAPED
+# (token-grade entropy or a digit) — word-wrapped prose is all lowercase
+# words, so it never joins ("the history shows every recovery run was
+# healthy"). The whole joined run must then reach 20 chars, carry both a
+# digit and a letter, and be mostly token-grade characters once the low-
+# entropy filler (digits, dictionary-style words, hex runs) is discounted;
+# that mix is what a wrapped credential has and a sentence does not. A
+# hard-wrapped JWT that breaks at a dash or a dot is NOT reassembled; both
+# halves are then still caught by their own anchored families in the common
+# case (the eyJ header half by the jwt family), and this is deliberately not
+# widened to "." so that prose sentences and dotted versions cannot be
+# swallowed. Like the hex-blob detector, a run whose immediate context is a
+# sha/commit/digest reference is prose, not a credential, and is exempt.
+
+_SPLIT_PIECE_RE = re.compile(r"(?<![0-9A-Za-z_-])[0-9A-Za-z_-]{6,}(?![0-9A-Za-z_-])")
+_SPLIT_GAP_RE = re.compile(r"[ \t]{1,2}|[ \t]*\r?\n[ \t]{0,2}")
+# A wrapped credential is reassembled as every consequent chain of pieces
+# from each start, not just the longest one: the JWT family is three pieces
+# and the Stripe family two, but the sentence before them is not part of
+# either ("jwt eyJ... eyJ... SflK..." — the safe answer is two spans that
+# leave the word "jwt" alone, not one span that swallows it).
+_SPLIT_MAX_PIECES = 6
+_SPLIT_MIN_TOTAL = 20
+# Characters a base64url/Stripe token body is drawn from. A run whose every
+# character belongs here is a credential; a sentence brings in punctuation,
+# or digits in an ordinary place, that a token never would.
+_SPLIT_TOKEN_CHARS_RE = re.compile(r"[A-Za-z0-9_\-./+=]+")
+_SPLIT_LOW_ENTROPY_RE = re.compile(r"[0-9]{4,}|[0-9a-fA-F]{8,}")
+_SPLIT_MIN_TOKEN_RATIO = 0.6
+# Lowercase word + trailing digits ("build2026") is prose; mixed case is a
+# token tail and is left alone.
+_SPLIT_FRAGMENT_TRAILING_DIGITS_RE = re.compile(r"\A[a-z]{3,}[0-9]{1,9}\Z")
+# A bare YYYYMMDD date is a date, not a token fragment ("payment endpoint
+# 20261017"); a JWT fragment with the same digits also carries mixed case.
+_SPLIT_DATE_FRAGMENT_RE = re.compile(r"\A(?:19|20)[0-9]{6}\Z")
+# Numbers and lowercase words joined by hyphens: a UUID chunk, a version, a
+# kebab-case phrase. A credential fragment joins with "_" or not at all.
+_SPLIT_HYPHENATED_PROSE_RE = re.compile(r"\A(?:[0-9]+|[a-z]+)(?:-(?:[0-9]+|[a-z]+))+\Z")
+_SPLIT_UUID_FRAGMENT_RE = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+_SPLIT_HEX_FRAGMENT_RE = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
+_SPLIT_WORD_FRAGMENT_RE = re.compile(r"\A[A-Z]?[a-z]{5,}\Z")
+
+
+def _iter_split_token_spans_unanchored(text: str):
+    """Yield (start, end) spans of tokens split across whitespace.
+
+    Adjacent fragments (separated only by a space or a single newline) are
+    joined and every consequent chain of them is tested: a chain qualifies
+    when it reaches 20 chars, carries both a digit and a letter, is made
+    only of token-alphabet characters, and is not mostly date/hex filler.
+    Each returned span covers the whole chain including the gaps, so
+    redaction leaves no fragment behind.
+    """
+    pieces = list(_SPLIT_PIECE_RE.finditer(text))
+    for first in range(len(pieces)):
+        end = pieces[first].end()
+        run = [pieces[first].group(0)]
+        for nxt in range(first + 1, min(len(pieces), first + _SPLIT_MAX_PIECES)):
+            gap = text[end : pieces[nxt].start()]
+            if not _SPLIT_GAP_RE.fullmatch(gap):
+                break
+            end = pieces[nxt].end()
+            run.append(pieces[nxt].group(0))
+            if _split_chain_is_token(run, text, pieces, first):
+                yield pieces[first].start(), end
+
+
+# A wrapped credential is only reported when it is ANCHORED: it starts with a
+# known credential prefix, or a credential keyword sits just before it
+# ("API key: <part>\n<part>"). Unanchored, prose and identifiers produced
+# ~3,000 false redactions on the production corpus. A chain that ends in a
+# plain word ("... Models") stops before that word.
+_SPLIT_ANCHOR_PREFIX_RE = re.compile(
+    r"(?:[prs]k_(?:live|test)_|eyJ|gh[pousr]_|github_pat_|glpat-|xox[abprs]-|AKIA|ASIA|AIza|sk-)"
+)
+_SPLIT_ANCHOR_WORD_RE = re.compile(
+    r"(?i)\b(?:token|secret|password|passwd|api[_ -]?key|access[_ -]?key|bearer|credential|private[_ -]?key|"
+    r"client[_ -]?secret)s?\b[^\n]{0,12}\Z"
+)
+_SPLIT_LAST_PIECE_RE = re.compile(r"[0-9A-Za-z_-]+\Z")
+
+
+def _iter_split_token_spans(text: str):
+    """Yield (start, end) spans of anchored credentials split across whitespace."""
+    for start, end in _iter_split_token_spans_unanchored(text):
+        if not (
+            _SPLIT_ANCHOR_PREFIX_RE.match(text, start) or _SPLIT_ANCHOR_WORD_RE.search(text[max(0, start - 40) : start])
+        ):
+            continue
+        last = _SPLIT_LAST_PIECE_RE.search(text[start:end])
+        if last and _SPLIT_WORD_FRAGMENT_RE.match(last.group(0)):
+            continue
+        yield start, end
+
+
+def _fragment_is_token_grade_base(frag: str) -> bool:
+    """True if one fragment alone is credential-shaped rather than a word."""
+    if _SPLIT_DATE_FRAGMENT_RE.match(frag) or _SPLIT_HYPHENATED_PROSE_RE.match(frag):
+        return False
+    # A canonical UUID, a bare hex digest and an ordinary word (lower-case
+    # or Capitalised, "Category") are identifiers and prose, never the tail
+    # of a wrapped credential; without this "job <uuid>\nCategory ..." joined
+    # an id across the newline into the sentence that follows it.
+    if _SPLIT_UUID_FRAGMENT_RE.match(frag) or _SPLIT_HEX_FRAGMENT_RE.match(frag) or _SPLIT_WORD_FRAGMENT_RE.match(frag):
+        return False
+    # A lowercase word with a short trailing number ("build2026") is prose;
+    # the same shape with a case shift is a token tail ("SflKxwRJSMeKK").
+    if _SPLIT_FRAGMENT_TRAILING_DIGITS_RE.match(frag):
+        return False
+    if re.search(r"[A-Z]", frag) or re.search(r"[^0-9A-Za-z]", frag):
+        return True
+    # All-lowercase: token-grade only if the digits are a long run a word
+    # plus a year does not produce ("opqrstuvwxyz0123456789", not
+    # "endpoint20261017").
+    digits = re.search(r"[0-9]+\Z", frag)
+    return bool(digits) and len(digits.group(0)) >= 10
+
+
+_SPLIT_ALLCAPS_RE = re.compile(r"\A[A-Z]{2,}[0-9]{0,4}\Z")
+# cixDrmPlatform2, HTTPServer, MyLongIdentifier: words run together, not a token.
+_SPLIT_IDENT_RE = re.compile(r"\A(?:[A-Z]?[a-z]{3,}|[A-Z]{2,})+[0-9]{0,4}\Z")
+# test_foo_bar_1, R1A-BB, rk3588-v2: segments that are each a word or a number.
+_SPLIT_SEGMENTED_RE = re.compile(r"\A[A-Za-z0-9]+(?:[_-][A-Za-z0-9]+)+\Z")
+
+
+def _fragment_is_token_grade(frag: str) -> bool:
+    """True if one fragment alone is credential-shaped rather than prose or an identifier.
+
+    Measured on the production corpus: snake_case test names, ALLCAPS words,
+    CamelCase identifiers, kebab/snake segments that are all words, and
+    fragments under 8 chars without all of upper, lower and a digit are
+    ordinary text, never the tail of a wrapped credential.
+    """
+    if not _fragment_is_token_grade_base(frag):
+        return False
+    if _SPLIT_ALLCAPS_RE.match(frag) or _SPLIT_IDENT_RE.match(frag):
+        return False
+    if _SPLIT_SEGMENTED_RE.match(frag) and all(_segment_is_word(part) for part in re.split(r"[_-]", frag)):
+        return False
+    if len(frag) < 8 and not (re.search(r"[A-Z]", frag) and re.search(r"[a-z]", frag) and re.search(r"[0-9]", frag)):
+        return False
+    return True
+
+
+def _split_chain_is_token(run: list[str], text: str, pieces, first: int) -> bool:
+    """True when this chain of whitespace-separated fragments is one token."""
+    if len(run) < 2:
+        return False
+    if not any(_fragment_is_token_grade(frag) for frag in run):
+        return False
+    joined = "".join(run)
+    if len(joined) < _SPLIT_MIN_TOTAL:
+        return False
+    if not re.search(r"[0-9]", joined) or not re.search(r"[A-Za-z]", joined):
+        return False
+    if not _SPLIT_TOKEN_CHARS_RE.fullmatch(joined):
+        return False
+    if len(_SPLIT_LOW_ENTROPY_RE.sub("", joined)) < _SPLIT_MIN_TOKEN_RATIO * len(joined):
+        return False
+    # A sha/commit/digest reference is prose, exactly as for the hex-blob
+    # detector, and so is a run that merely continues one.
+    if _SHA_CONTEXT_RE.search(text[max(0, pieces[first].start() - 30) : pieces[first].start()]):
+        return False
+    return True
+
 
 # ── Generic assignment: key/secret/password/token/bearer = <value> ─────
 # Conservative: the *value* must itself be secret-grade (>=12 chars, mixed,
@@ -660,6 +904,9 @@ _PREFILTER_RE = re.compile(
     # provider token prefixes (literal, safe as substrings)
     r" ghp_ | gho_ | ghu_ | ghs_ | ghr_ | github_pat_ | glpat- | sk- | xai- |"
     r" AKIA | AIza | xox |"
+    # MN-07: Stripe key prefixes (underscore family) and a JWT's base64url
+    # JSON header, which always begins "eyJ".
+    r" [prs]k_(?:live|test)_ | eyJ |"
     # NOTE: denylisted literals are deliberately absent here — the prefilter
     # must not carry plaintext credentials (see _DENY_DIGESTS). Their prose
     # carriers ("password", "pw", "sshpass") already anchor the prefilter, and
@@ -694,6 +941,12 @@ PREFILTER_SAMPLES: dict[str, str] = {
     "github_classic": "ghp_" + "a" * 35,
     "gitlab_pat": "glpat-" + "a" * 20,
     "sk_key": "sk-" + "a" * 25,
+    "stripe_key": "sk_live_" + "a" * 24,
+    "jwt": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXBhcnQ",
+    # REVERSED on purpose (see _validated_prefilter_samples): the aws_secret
+    # detector keys on the value shape itself.
+    "aws_secret": "YEKELPMAXEYCifRxPb/GNEDM7K/IMEFntUXrlaJw",
+    "split_token": "token: abcdefghijklmn opqrstuvwxyz0123456789",
     "xai_key": "xai-" + "a" * 25,
     "aws_akia": "AKIA" + "B" * 16,
     "google_api": "AIza" + "a" * 35,
@@ -724,12 +977,32 @@ def verify_prefilter_superset() -> list[str]:
     makes the superset check vacuous). Both properties are checked HERE in a
     single contract helper so tests cannot drift (ngc-review 2026-06-13)."""
     bad: list[str] = []
-    for name, sample in PREFILTER_SAMPLES.items():
+    for name, sample in _validated_prefilter_samples().items():
         if not _prefilter_hits(sample):
             bad.append(f"{name}:prefilter-miss")
         elif classify(sample).cls is SecretClass.CLEAN:
             bad.append(f"{name}:classifies-clean")
     return bad
+
+
+def _validated_prefilter_samples() -> dict[str, str]:
+    """PREFILTER_SAMPLES minus any sample the module ships in REVERSE.
+
+    The AWS secret access key has the SAME shape as its own detector
+    (40 base64-alphabet characters), so shipping a forward sample literal
+    would put a credential-shaped string in the published sdist — exactly
+    what the digest-only denylist exists to avoid. Only that family is
+    stored reversed; it is flipped back here. Every other family's sample
+    is used as written.
+    """
+    return {
+        name: sample[::-1] if name in _REVERSED_SAMPLE_FAMILIES else sample
+        for name, sample in PREFILTER_SAMPLES.items()
+    }
+
+
+# Families whose sample is stored in reverse (see _validated_prefilter_samples).
+_REVERSED_SAMPLE_FAMILIES: frozenset[str] = frozenset({"aws_secret"})
 
 
 # ── FB112 (2026-11-02): typed status ids inside a structured body ─────────
@@ -744,9 +1017,7 @@ def verify_prefilter_superset() -> list[str]:
 # all-caps assignments, denylisted literals). A real secret under any key —
 # including an allowlisted one — keeps matching, so the vault stays sealed.
 _STATUS_SHA_VALUE_RE = re.compile(r"(?i)^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-_STATUS_UUID_VALUE_RE = re.compile(
-    r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
+_STATUS_UUID_VALUE_RE = re.compile(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 # Bounded identifier slug: job_review ids like "J-ab12cd34" or hash-like ids;
 # 3+ chars, no whitespace, no separators that would end a JSON string early.
 _STATUS_ID_VALUE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:/-]{2,64}$")
@@ -797,7 +1068,19 @@ def _collect_vault_shapes() -> None:
     """Gather every VAULT-capable detector pattern once (import time)."""
     global _VAULT_SHAPES
     shapes = [pat for _, pat in _HIGH_CONFIDENCE]
-    shapes.extend((_CONN_URI_RE, _BASIC_AUTH_URI_RE, _SSHPASS_RE, _ENV_SECRET_RE, _PROSE_PASS_RE, _PW_KV_RE))
+    shapes.extend(
+        (
+            _CONN_URI_RE,
+            _BASIC_AUTH_URI_RE,
+            _SSHPASS_RE,
+            _ENV_SECRET_RE,
+            _PROSE_PASS_RE,
+            _PW_KV_RE,
+            # MN-07: an AWS secret access key under an exempted status key
+            # must not be blanked by the FB112 allowance.
+            _AWS_SECRET_RE,
+        )
+    )
     _VAULT_SHAPES = tuple(shapes)
 
 
@@ -904,6 +1187,35 @@ def classify(content: str | None) -> SecretFinding:
             finding.reasons.append(name)
             finding.spans.append((mo.start(), mo.end()))
             cred_span_count += 1
+
+    # 1b. Split / unanchored credential values (MN-07).
+    # The AWS secret access key has a fixed issued shape and no
+    # non-credential use → VAULT. A token reassembled from whitespace-
+    # separated fragments is a wrapped credential in prose → REDACT its
+    # whole run (no fragment left behind).
+    for mo in _AWS_SECRET_RE.finditer(text):
+        # A bare 40-char base64 run is also the shape of a git SHA-1 in a
+        # hex-only digest ("commit a1b2..."), so the same 30-char sha/commit
+        # context window the hex-blob detector uses exempts it — a commit
+        # reference is prose, not a credential.
+        window = text[max(0, mo.start() - 30) : mo.start()]
+        if _SHA_CONTEXT_RE.search(window):
+            continue
+        # A 40-hex run is a SHA-1 wherever it sits ("main <sha> (approved)",
+        # "commits=[<sha>, <sha>]"): a secret access key is drawn from the
+        # 64-symbol base64 alphabet, so one that is all hex has odds of
+        # (16/64)^40. Likewise a key carries both cases, and a path-like
+        # run of words joined by "/" is a path.
+        if not _aws_secret_shaped(mo.group(0)):
+            continue
+        _escalate(finding, SecretClass.VAULT)
+        finding.reasons.append("aws_secret")
+        finding.spans.append((mo.start(), mo.end()))
+        cred_span_count += 1
+    for start, end in _iter_split_token_spans(text):
+        _escalate(finding, SecretClass.REDACT)
+        finding.reasons.append("split_token")
+        finding.spans.append((start, end))
 
     # 2. Generic key/value assignments.
     for mo in _ASSIGN_RE.finditer(text):

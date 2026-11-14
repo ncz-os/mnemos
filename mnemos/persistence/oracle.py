@@ -1486,6 +1486,19 @@ class OracleMemoryRepository(MemoryRepository):
         finally:
             await _call(cursor.close)
 
+    async def clear_memory_embedding(self, tx: Transaction, memory_id: str) -> None:
+        """Clear the stored vector for ``memory_id`` (NG-MN-13)."""
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            await _call(
+                cursor.execute,
+                "UPDATE memories SET embedding = NULL WHERE id = :id",
+                {"id": memory_id},
+            )
+        finally:
+            await _call(cursor.close)
+
     async def set_suppress_version_snapshot(self, tx: Transaction) -> None:
         # No-op for Oracle — Postgres uses a session GUC to bypass the
         # version-snapshot trigger; the Oracle schema has no equivalent
@@ -2366,14 +2379,32 @@ class OracleMemoryRepository(MemoryRepository):
             # key keeps the newline-folding meaning it has on the text backends.
             #
             # S2: the id list is aggregated as a CLOB. LISTAGG returns VARCHAR2 and
-            # dies with ORA-01489 at 4000 bytes, i.e. at roughly a hundred
-            # duplicates; XMLAGG + getClobVal has no such cap and, unlike
-            # ON OVERFLOW TRUNCATE, cannot silently drop the ids whose duplicates
-            # would then never be consolidated.
+            # dies with ORA-01489 at 4000 bytes. FB115: instead of the former
+            # XMLAGG + getClobVal chain, aggregate the ids as a JSON ARRAY --
+            # an XML serializer cannot be relied on to pass a delimiter
+            # through: U+001F is not a legal XML character (XML 1.0 §2.2,
+            # Characters), so CHR(31) fed to XMLELEMENT is not guaranteed to
+            # come back through getClobVal() verbatim and the Python side's
+            # \x1f split garbles the id list. JSON_ARRAYAGG is a documented
+            # ordered list-of-values constructor that preserves its inputs
+            # exactly and, unlike ON OVERFLOW TRUNCATE, cannot silently drop
+            # ids whose duplicates would then never be consolidated.
+            #
+            # `RETURNING CLOB` is mandatory here, not cosmetic. Oracle's
+            # JSON_ARRAYAGG documentation (JSON_agg_returning_clause) states
+            # that omitting the returning clause -- or naming VARCHAR2 without
+            # a size -- returns the array as VARCHAR2(4000). A duplicate group
+            # of ~100 40-char ids plus JSON quoting/commas crosses 4000 bytes,
+            # and the sweep would then fail with ORA-40478 (output value too
+            # large), reintroducing exactly the LISTAGG cap this change exists
+            # to remove. `CLOB` is an accepted returning type on the vertical
+            # aggregate, so ask for it explicitly. The Python handler parses
+            # the JSON text, not the declared type, so materialising a CLOB is
+            # all it needs.
             sql = (
                 "SELECT owner_id, namespace, content_hash, COUNT(*) AS duplicate_count, "
-                "XMLAGG(XMLELEMENT(E, id || CHR(31)) ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) "
-                ".EXTRACT('//text()').getClobVal() AS memory_ids, "
+                "JSON_ARRAYAGG(id ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC RETURNING CLOB) "
+                "AS memory_ids, "
                 "MIN(id) KEEP (DENSE_RANK FIRST ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS keep_id, "
                 "MIN(id) KEEP (DENSE_RANK FIRST ORDER BY created DESC, quality_rating DESC NULLS LAST, id DESC) AS canonical_id "
                 "FROM (SELECT id, owner_id, namespace, content_hash, created, quality_rating, "
@@ -2386,8 +2417,35 @@ class OracleMemoryRepository(MemoryRepository):
             await _call(cursor.execute, sql, params)
             rows = await _fetch_all_dicts(cursor)
             for row in rows:
-                raw = row.get("memory_ids") or ""
-                row["memory_ids"] = [part for part in str(raw).split("\x1f") if part]
+                raw = row.get("memory_ids")
+                # The CLOB is materialized by _materialize_value before it
+                # reaches this handler, so the JSON array normally arrives as
+                # a str, e.g. '["a", "b"]'. A pre-FB115 build stored the raw
+                # \x1f-delimited list instead, so the old split fallback is
+                # kept -- and it must also cope with the driver shapes that
+                # are not str (bytes from a BLOB-style read, a native list),
+                # which used to crash json.dumps or collapse to one junk id.
+                # Bytes are decoded first so a JSON array read as bytes is
+                # parsed as JSON too, not split as one legacy id.
+                if isinstance(raw, (bytes, bytearray, memoryview)):
+                    raw = bytes(raw).decode("utf-8", errors="replace")
+                parsed = None
+                if isinstance(raw, str) and raw.lstrip().startswith("["):
+                    try:
+                        loaded = json.loads(raw)
+                    except ValueError:
+                        loaded = None
+                    if isinstance(loaded, list) and all(isinstance(part, str) and part for part in loaded):
+                        parsed = loaded
+                elif isinstance(raw, (list, tuple)):
+                    # An empty native sequence is an empty id list, never the
+                    # str() of it.
+                    if all(isinstance(part, str) and part for part in raw):
+                        parsed = list(raw)
+                if parsed is None:
+                    text = "" if raw is None else str(raw)
+                    parsed = [part for part in text.split("\x1f") if part]
+                row["memory_ids"] = parsed
                 row["duplicate_count"] = int(row.get("duplicate_count") or 0)
             return rows
         finally:

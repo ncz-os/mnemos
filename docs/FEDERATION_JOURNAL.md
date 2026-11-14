@@ -113,3 +113,123 @@ including that the skip count accumulates across pages of a single sync),
 against commit `0073bb4`; on current master those lookups live at `:5980` and
 `:5986` and no longer carry the filter.** File:line leads from that report are
 against a 48-commit-older tree — re-read before trusting them.
+
+## What writes journal events, and what is metadata-only (0072)
+
+Measured 2026-11-06 on the production source: **2,382,263** journal events for **31,730** live
+memories — **75 events per memory**. A fresh replica replaying that journal in
+pages of 100 at ~0.25 s per page needs ~1.6 hours to catch up, spends most of
+it re-delivering rows it already has (visible as "no growth for long
+stretches"), and the replica pulled 3,959,950 rows for a 29k corpus.
+
+Causes, in order of contribution:
+
+| Cause | Write | Content change? |
+|---|---|---|
+| Recall bookkeeping | `UPDATE memories SET recall_count = recall_count + 1, last_recalled_at = ...` in `bump_recall_and_get_memory` / `bump_recall_counts` (every dialect) | **no** |
+| Embedding / compression touch | `UPDATE memories SET embedding = ...`, distill/compress rewrites | yes (embedding) |
+| Lifecycle | soft-delete, archive, consolidate, restore | yes |
+| Real edit | `content` / `metadata` / `verbatim_content` / `namespace` / `category` / `permission_mode` | yes |
+
+Recall bookkeeping dominates: it is the highest-frequency write in the system
+(every search hit that binds a memory), it does not touch any column the export
+predicate `eligible_for_federation` reads, and the current-state resolver does
+not put `recall_count` / `last_recalled_at` on the wire. An event appended for
+it can therefore only tell a peer *again* about content the peer already has.
+
+Migration `0072_federation_journal_metadata_only` (all five dialect families)
+splits the change predicate column-by-column:
+
+* **CONTENT** — `federation_source`, `content`, `category`, `namespace`,
+  `owner_id`, `permission_mode`, `deleted_at`, `archived_at`,
+  `consolidated_into`, `embedding`, `metadata`, `verbatim_content` → one
+  journal event, as before.
+* **METADATA-ONLY** — `recall_count`, `last_recalled_at` → **no event**.
+
+The outbox row records which kind it is in `federation_changes.event_kind`
+(`content` / `metadata`). A metadata-only write first absorbs any pending
+metadata-only rows already queued for that memory and then does nothing else,
+so N recalls between publisher passes leave zero extra rows, and a recall
+followed by a real edit leaves exactly one content event carrying current
+state.
+
+**`seq` is a nullable watermark, not the identity.** `event_id` is the
+primary key on every dialect; `seq` is assigned by the publisher, so a queued
+row has `seq IS NULL` and a published one does not. The publisher's own
+pending selector is `WHERE seq IS NULL`. That is why the absorption predicate
+keys on it — it selects *unpublished* rows.
+
+**`event_kind` defaults to `'content'`.** The `ADD COLUMN` default backfills
+every pre-existing row (Postgres sets it via a following `ALTER COLUMN …
+SET DEFAULT`). Rows written by the publisher's re-advertise path, which names
+neither `seq` nor `event_kind`, also inherit `'content'`. So no row can be
+left with a NULL kind and escape both branches.
+
+**Absorption is strictly per-memory.** Every absorption `DELETE` is keyed on
+`memory_id = NEW.id` (SQLite, Postgres, MySQL, MariaDB), `memory_id = n.id`
+(Db2) or `memory_id = :NEW.id` (Oracle), *and* on `seq IS NULL` *and*
+`event_kind = 'metadata'`. Dropping the memory key would make one recall wipe
+every other memory's pending metadata row — a defect every single-memory test
+would still pass.
+
+**Both branches absorb.** The content branch deletes any pending metadata-only
+row for the memory *before* appending its content event, because that event
+already carries the current state — leaving both queued would deliver the same
+row twice. This matters on the single-trigger dialects (Postgres, MySQL,
+MariaDB, Db2, Oracle), where one statement can change a content column and
+`recall_count` together. SQLite splits the two into disjoint `AFTER UPDATE OF`
+triggers, so a single statement cannot reach both branches and its content
+trigger needs no delete.
+
+Sequenced rows are never deleted by either branch: a published event is
+journal history, and rewriting it would move a peer's cursor semantics.
+Immutable published history is the point; only *pending* rows coalesce.
+
+**The trigger never inserts an `event_kind='metadata'` row.** That is the
+whole point: the counter may not be journaled. The absorption `DELETE
+(federation_changes … WHERE memory_id = ? AND seq IS NULL AND event_kind =
+'metadata')` therefore targets rows this trigger did not create — rows left
+pending by a node still on pre-0072 code, by a restored backup, or by a
+replica that has not applied this migration yet. On a clean 0072 node it
+matches nothing and costs one indexed lookup; on a fleet mid-upgrade it
+reclaims the stale rows. It is deliberately restricted to
+`seq IS NULL` *and* `event_kind='metadata'` *and* one `memory_id`, so it can
+never delete a published event or a queued content event. Both properties are
+pinned in `tests/test_federation_journal_metadata_only_static.py`, and the
+absorption itself is driven against a real SQLite database in
+`tests/test_federation_journal_metadata_only.py`.
+
+Already-queued rows are left untouched; the publisher coalesces pending rows per
+memory on its own (one event per memory per pass, current state attached), so a
+node that has not applied 0072 yet is still not a correctness problem.
+
+### Per-dialect notes
+
+* **PostgreSQL / MySQL / MariaDB / Db2 / Oracle** — the content/metadata
+  decision is an explicit value comparison, not `UPDATING()` (0068: `UPDATING()`
+  is true even for a same-value write, so it cannot be used to decide whether
+  anything changed).
+* **SQLite `IS NOT` is intentional, not a bug.** `IS NOT` is SQLite's
+  null-safe inequality: it is true for `a='x' b='y'`, true for `a=NULL b='z'`,
+  and false for `a=NULL b=NULL`. `<>` would be the wrong operator here —
+  `NULL <> 'keep this'` evaluates to NULL, so every change *to* or *from* NULL
+  (`verbatim_content` clearing, a nullable `owner_id`) would silently stop
+  being journalled. `IS NOT` is also the convention the pre-existing 0062 /
+  0064 / v7_2 SQLite triggers already use. Replacing it with `<>` breaks
+  absorption and drops null-transition events; both are pinned by tests.
+* **SQLite** — two disjoint `AFTER UPDATE OF` triggers with disjoint column
+  lists: `fed_journal_update` enumerates the content columns only (so a recall
+  bump can never match it) and `fed_journal_update_metadata` names exactly the
+  two bookkeeping columns. Disjoint by construction, so the unspecified firing
+  order of overlapping triggers does not matter.
+* **Column scoping everywhere** — every dialect except Postgres fires only for
+  statements whose `SET` list names a journaled column. That is not an
+  optimisation, it is what makes the METADATA-ONLY branch *absorb* rather than
+  merely stay silent: a statement that touches nothing but
+  `recall_count`/`last_recalled_at` must still delete the pending metadata-only
+  rows for that memory, and a trigger that never fires cannot do that. Postgres
+  fires per row for any UPDATE, so it branches on values alone.
+* **Oracle** — `content` / `metadata` / `verbatim_content` are CLOBs, compared
+  with `DBMS_LOB.COMPARE`; the vector column with `VECTOR_DISTANCE`.
+* **Db2** — no `ELSIF`; the split is computed into INTEGER flags and branched
+  with `IF` / `ELSEIF`.

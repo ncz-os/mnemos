@@ -1,0 +1,3 @@
+ERROR tests/test_mcp_principal_cache_ttl.py::test_set_beyond_cap_evicts_oldest
+ERROR tests/test_mcp_principal_cache_ttl.py::test_bare_context_backward_compat
+75 failed, 6226 passed, 595 skipped, 9 xfailed, 3 xpassed, 901 warnings, 42 errors in 98.08s (0:01:38)
