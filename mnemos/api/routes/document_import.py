@@ -636,7 +636,11 @@ async def import_memories_from_document(
                         # discard a successful import over a delivery-time
                         # fault.
                         stored_namespace = imported.namespace
-                        if stored_namespace is None:
+                        if not stored_namespace:
+                            # Blank counts as missing: the classifier preserves
+                            # a blank namespace faithfully, and "blank as
+                            # stored" is not permission to backfill the
+                            # caller's own namespace.
                             logger.error(
                                 "[DOCLING] import_chunk returned no "
                                 "post-classification namespace for chunk %s; "

@@ -44,30 +44,35 @@ PROFILE_STORAGE = {
 _SESSION_ROW_KEYS = {"id", "created_at", "model"}
 
 # The lifecycle slots every provisioned store registers through.
-#: Snapshot captured by ``_register`` on first write; restored by ``_restore``.
 _REGISTER_SLOTS = ("_persistence_backend", "_pool", "_pool_manager")
-_register_saved: dict = {}
 
 
-def _register(backend) -> None:
-    """Register ``backend`` in the lifecycle module (manual path).
+def _point_to_lifecycle(backend) -> None:
+    """Point the module slots at ``backend`` (caller owns teardown).
 
-    Unlike the monkeypatch path, this borrows no pytest teardown: the caller
-    must pair it with :func:`_restore` so the module never points at a closed
-    store. The slots are captured only on first write so that registering a
-    second store in sequence does not record the first store as "original".
+    Used only inside the ``lifecycle_registration`` fixture, whose
+    ``monkeypatch``-based teardown restores every slot automatically —
+    even when the test body raises.
     """
     for name in _REGISTER_SLOTS:
-        if name not in _register_saved:
-            _register_saved[name] = getattr(lifecycle, name)
         setattr(lifecycle, name, backend if name == "_persistence_backend" else None)
 
 
-def _restore() -> None:
-    """Undo every manual registration, leaving the lifecycle untouched."""
-    for name, value in _register_saved.items():
-        setattr(lifecycle, name, value)
-    _register_saved.clear()
+@pytest.fixture
+def lifecycle_registration(monkeypatch):
+    """Manual lifecycle-registration with pytest-guaranteed teardown.
+
+    Captures the current slot values into ``monkeypatch`` on entry (once,
+    so registering a second store in sequence does not record the first
+    store as "original") and yields :func:`_point_to_lifecycle`.
+    ``monkeypatch`` restores the real values on teardown — no manual
+    restore call, no module-global snapshot, no cross-test leakage if the
+    test fails or is interrupted.
+    """
+    monkeypatch.setattr(lifecycle, "_persistence_backend", lifecycle._persistence_backend)
+    monkeypatch.setattr(lifecycle, "_pool", lifecycle._pool)
+    monkeypatch.setattr(lifecycle, "_pool_manager", lifecycle._pool_manager)
+    yield _point_to_lifecycle
 
 
 def _user() -> UserContext:
@@ -202,7 +207,7 @@ def test_edge_profiles_do_not_reuse_each_others_storage(monkeypatch, tmp_path):
         asyncio.run(second.close())
 
 
-def test_sessions_repository_create_session_on_raw_sqlite(monkeypatch, tmp_path):
+def test_sessions_repository_create_session_on_raw_sqlite(tmp_path, lifecycle_registration):
     """``SessionsRepository.create_session`` on the raw SQLite profile must
     behave like every other backend: it returns the row it just created, with
     a unique session id and the chat-session columns.
@@ -211,58 +216,62 @@ def test_sessions_repository_create_session_on_raw_sqlite(monkeypatch, tmp_path)
     implementation hard-codes a ``sessions`` projection, so a drift between
     the two surfaces as a None/partial row here instead of as a 500 in the
     route.
+
+    The lifecycle slots are managed by the ``lifecycle_registration``
+    fixture (pytest teardown, not a module-global snapshot): the primary
+    store is registered for the duration of the test, and the "no reuse
+    across stores" check provisions a second store directly — without ever
+    leaving the module slots pointing at a store about to be closed.
     """
     backend = SqliteBackend(tmp_path / PROFILE_STORAGE["raw-session-sqlite"], SimpleNamespace())
-    _register(backend)
+    lifecycle_registration(backend)
     # The "no reuse across stores" check needs a second, equally provisioned
-    # store: same per-profile file, same tmp dir, same manual lifecycle
-    # registration. Registering it updates the module's slots for one instant,
-    # so flip them back to ``backend`` — never leave the module pointing at a
-    # store about to be closed.
+    # store. It is exercised directly (its own ``transactional()`` context),
+    # never via the module slots — so there is no intermediate registration
+    # and no need to "flip" the live slots back.
     other_store = SqliteBackend(tmp_path / PROFILE_STORAGE["raw-session-sqlite-copy"], SimpleNamespace())
-    _register(other_store)
-    # Flip the live slots back to ``backend``. ``_register_saved`` still holds
-    # the pre-test values, so ``_restore`` returns the module to exactly the
-    # state the test found it.
-    for name in _REGISTER_SLOTS:
-        setattr(lifecycle, name, backend if name == "_persistence_backend" else None)
 
     try:
-        async def create(store):
-            async with store.transactional() as tx:
-                return await store.sessions.create_session(
-                    tx, user_id="u", namespace="default", model="m", initial_context=None
-                )
+        async def main():
+            async def create(store):
+                async with store.transactional() as tx:
+                    return await store.sessions.create_session(
+                        tx, user_id="u", namespace="default", model="m", initial_context=None
+                    )
 
-        async def read(store, session_id, namespace="default"):
-            async with store.transactional() as tx:
-                return await store.sessions.get_session(tx, session_id, "u", namespace)
+            async def read(store, session_id, namespace="default"):
+                async with store.transactional() as tx:
+                    return await store.sessions.get_session(tx, session_id, "u", namespace)
 
-        first = asyncio.run(create(backend))
-        second = asyncio.run(create(backend))
+            first = await create(backend)
+            second = await create(backend)
 
-        assert first is not None and second is not None
-        assert first["id"] and second["id"]
-        assert first["id"] != second["id"], "two sessions must not share one id"
-        # Contract, not projection drift (review round 1/2, finding F3): the
-        # load-bearing check is that the ABC contract columns are present.
-        # The previous ``set(first.keys()) == _SESSION_ROW_KEYS`` upper bound
-        # forced this SQLite projection to match exactly and failed on any
-        # legitimate addition — even though ``created_at`` is not part of the
-        # ``SessionsRepository.create_session`` contract (only ``id``,
-        # ``user_id``, ``namespace`` and ``model`` are required by the ABC).
-        # Keep the lower bound only; the route round-trip test pins the
-        # response fields separately, where they are actually required.
-        assert _SESSION_ROW_KEYS <= set(first.keys())
+            assert first is not None and second is not None
+            assert first["id"] and second["id"]
+            assert first["id"] != second["id"], "two sessions must not share one id"
+            # Contract, not projection drift (review round 1/2, finding F3):
+            # the load-bearing check is that the ABC contract columns are
+            # present. The previous ``set(first.keys()) == _SESSION_ROW_KEYS``
+            # upper bound forced this SQLite projection to match exactly and
+            # failed on any legitimate addition — even though ``created_at``
+            # is not part of the ``SessionsRepository.create_session``
+            # contract (only ``id``, ``user_id``, ``namespace`` and ``model``
+            # are required by the ABC). Keep the lower bound only; the route
+            # round-trip test pins the response fields separately, where
+            # they are actually required.
+            assert _SESSION_ROW_KEYS <= set(first.keys())
 
-        assert asyncio.run(read(backend, first["id"]))["id"] == first["id"]
+            assert (await read(backend, first["id"]))["id"] == first["id"]
 
-        # The row belongs to one namespace and one store, not to the process.
-        assert asyncio.run(read(backend, first["id"], namespace="elsewhere")) is None
-        assert asyncio.run(read(other_store, first["id"])) is None
+            # The row belongs to one namespace and one store, not to the
+            # process.
+            assert await read(backend, first["id"], namespace="elsewhere") is None
+            assert await read(other_store, first["id"]) is None
+
+        asyncio.run(main())
     finally:
-        # Restore the lifecycle module state and release both file handles.
-        _restore()
+        # Release both file handles; the lifecycle slots are restored by the
+        # fixture teardown, never by this test.
         asyncio.run(backend.close())
         asyncio.run(other_store.close())
 

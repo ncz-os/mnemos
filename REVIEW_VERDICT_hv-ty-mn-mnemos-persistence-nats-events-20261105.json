@@ -1,0 +1,32 @@
+{
+  "branch": "hv/ty-mn-mnemos-persistence-nats-events-20261105",
+  "verdict": "approve",
+  "reason": "Reviewed and approved, then re-refreshed onto master (04e93f18692b). The branch's intended change is the mnemos/persistence/nats_events.py characterisation suite plus the document-import webhook namespace fix and the v7.1.1 documentation re-pin. The refresh needed no conflict resolution: master's new work since the previous refresh (450dcf520777) is the CF-09 deletion-fence (MN-05) work on the document-import/ingest/portability write paths, the CF-22 audit-proof fix, and the Oracle-to-PostgreSQL tooling -- the first of those touches mnemos/api/routes/document_import.py, but in regions disjoint from the branch's namespace fix (the fence probe after the request body is validated, and the batch 409 precedence), so `git merge-tree` reported no conflicts. Every file therefore keeps the branch's reviewed change set on top of master's newer code, and both master's CF-09 fence and the branch's `stored_namespace = imported.namespace` (no `or user.namespace` fallback) are present in the merged file.",
+  "base": "04e93f18692bd75ecf3b67b6f6671f67c07e2c37",
+  "base_ref": "master",
+  "refresh": {
+    "target": "04e93f18692bd75ecf3b67b6f6671f67c07e2c37",
+    "conflicts": 0,
+    "commits_master_lacks_on_branch": 0,
+    "note": "origin/master is an ancestor of the branch head after the merge; the branch is ahead of master, not behind it."
+  },
+  "checks": [
+    {
+      "name": "python3 -m pytest tests/ --ignore=tests/integration_nats (master 04e93f18, before refresh)",
+      "result": "baseline",
+      "detail": "70 failed, 6299 passed, 567 skipped, 9 xfailed, 3 xpassed, 42 errors"
+    },
+    {
+      "name": "python3 -m pytest tests/ --ignore=tests/integration_nats (branch, after refresh)",
+      "result": "pass",
+      "detail": "54 failed, 6369 passed, 567 skipped, 11 xfailed, 3 xpassed, 42 errors -- 16 fewer failures than the target, errors identical, so failures did not grow"
+    }
+  ],
+  "notes": [
+    "The 54 remaining failures and 42 errors are pre-existing environment failures (MCP SDK) present on master before this refresh; the branch introduces zero new failing test ids (comm -13 of the sorted FAILED/ERROR sets is empty) and fixes 16.",
+    "No new features and no unrelated files: the delta against master is exactly the branch's reviewed change set.",
+    "Unknown reference audit: the 16-failure improvement over master comes from the branch's own document-import and version-pin fixes, not from suppressing tests."
+  ],
+  "head_sha_before_refresh_merge": "7a6fffbf05ebc3ddfd89d225712c221fba6550a5",
+  "prior_refresh_target": "450dcf520777464bbbb9ee85902578178f49abd7"
+}
