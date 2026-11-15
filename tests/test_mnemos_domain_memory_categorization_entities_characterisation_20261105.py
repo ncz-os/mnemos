@@ -745,6 +745,22 @@ async def test_get_statistics_total_falsy_becomes_zero():
 async def test_get_statistics_returns_partial_stats_on_driver_error(caplog):
     # The first query fails: total stays at its seed value, by_type empty,
     # and no exception escapes.
+    #
+    # This 0 is NOT a "partial success" tolerance — it is the seed value in
+    # ``stats = {'total_entities': 0, ...}`` surviving because the single
+    # ``try`` block wraps the whole body: the ``fetchval`` raise aborts
+    # before any assignment, and the bare ``except Exception`` swallows it.
+    # Callers therefore see a *confident* 0 rather than an error. That
+    # matters for the pair below, which is why the two tests disagree:
+    #
+    #   fetchval fails -> total 0   (raised before assignment)
+    #   fetch   fails -> total kept (fetchval already assigned)
+    #
+    # Both readings were confirmed against the live implementation. The
+    # swallow-then-return-zero is pinned here as CURRENT behaviour, not
+    # endorsed: a caller that must distinguish "no entities" from "the DB
+    # is down" cannot do so through this API. Changing that is a design
+    # decision for the owner of entities.py, not for this suite.
     manager, _ = _manager(_Conn(raise_on={"fetchval": RuntimeError("boom")}))
 
     with caplog.at_level(logging.ERROR, logger="mnemos.domain.memory_categorization.entities"):

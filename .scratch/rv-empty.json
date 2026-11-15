@@ -1,5 +1,0 @@
-verdict: request_changes   ($0.0000)   [INCOMPLETE (0/1 reviewers completed)]
-
-── (failed) :: comment ──
-reviewer failed: review chunk 1/1: reviewer cerberus-reviewer: provider HTTP 500 Internal Server Error: {"error":{"code":500,"message":"The model produced output that does not match the expected peg-native format","type":"server_error"}}
-

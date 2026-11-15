@@ -1,5 +1,0 @@
-verdict: approve   ($0.0000)   [complete (1 reviewer)]
-
-── cerberus-reviewer :: approve ──
-No defects detected in the supplied diff. The added test suite and verdict file are syntactically correct and reference existing symbols as per the provided context.
-

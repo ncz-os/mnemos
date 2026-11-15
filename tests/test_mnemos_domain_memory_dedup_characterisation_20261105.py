@@ -167,7 +167,6 @@ class Webhooks:
         record = {"event_type": event_type, "payload": dict(payload)}
         record.update(kwargs)
         self.calls.append(record)
-        from mnemos.persistence.base import WebhookDeliveryIntent
 
         return [
             WebhookDeliveryIntent(
@@ -195,6 +194,11 @@ class RecordingAuditChain:
 
     async def insert_audit_entry(self, tx, **kwargs):
         self.inserted.append(kwargs)
+        # entry_id is a keyword-only required arg of the ABC
+        # (mnemos/persistence/base.py) and the production caller
+        # (write_configured_audit_entry, mnemos/audit/route_helper.py)
+        # always passes it; .get() would silently mask a contract
+        # violation, so keep the strict index here on purpose.
         return kwargs["entry_id"]
 
 
@@ -759,9 +763,14 @@ async def test_dedup_apply_webhook_payload_redacts_secret_content_via_stored_spa
     backend = Backend(find_groups=[[row]], webhooks=Webhooks(delivery_ids=["d1"]))
     payload = await dedup_exact_content(backend, apply=True)
     assert payload["deleted_count"] == 1
-    # F3: the outbound webhook content is span-redacted; the raw secret
-    # must not leave the server. Pin the exact redacted form against the
-    # same production helper the module calls.
+    # F3: the outbound webhook content is span-redacted *by the domain
+    # module itself* (dedup_exact_content builds the payload through
+    # redact_field_with_stored at the dispatch call site) — the fake
+    # backend merely RECORDS what it is handed and never transforms it,
+    # so these asserts verify the production redaction, not a mock.
+    # Mutation-verified 2026-11-10: disabling the production call site
+    # makes exactly this test fail (raw phone number reaches the fake).
+    # The raw secret must not leave the server.
     assert backend.webhooks.calls[0]["payload"]["content"] == "call me at 5[REDACTED]ow"
     assert "555-123-4567" not in backend.webhooks.calls[0]["payload"]["content"]
     assert backend.webhooks.calls[0]["payload"]["content"] == redact_field_with_stored(
@@ -783,9 +792,22 @@ async def test_dedup_apply_webhook_payload_untouched_when_content_is_clean_marke
         "keep_id": "mem_keep",
     }
     backend = Backend(find_groups=[[row]], webhooks=Webhooks())
-    await dedup_exact_content(backend, apply=True)
-    # Clean marker present under the current classifier: content passes through.
+    result = await dedup_exact_content(backend, apply=True)
+    # Clean marker present under the current classifier: the redaction step
+    # skips entirely (no stored spans, and the classifier verdict is CLEAN),
+    # so the outbound webhook payload carries the ORIGINAL content verbatim.
+    # Contrast the secret-spans test above, where the same call site yields
+    # "call me at 5[REDACTED]ow" — here nothing is masked.
+    assert result["deleted_count"] == 1
     assert backend.webhooks.calls[0]["payload"]["content"] == "plain text with no secret"
+    assert "[REDACTED]" not in backend.webhooks.calls[0]["payload"]["content"]
+    # Pin the boundary explicitly: the production helper the module calls
+    # leaves CLEAN-marked content untouched — same input, same output.
+    assert backend.webhooks.calls[0]["payload"]["content"] == redact_field_with_stored(
+        "plain text with no secret",
+        {SECRET_CLEAN_MARKER_KEY: clean_marker_fields(["content"])},
+        "content",
+    )
 
 
 @pytest.mark.asyncio
