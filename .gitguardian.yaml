@@ -1,0 +1,9 @@
+version: 2
+secret:
+  ignored_paths:
+    - mnemos/core/secret_detection.py
+    - tests/test_mnemos_installer_agent_characterisation_20261105.py
+    - tests/test_secret_*.py
+    - tests/test_audit_secret_*.py
+    - tests/test_universal_ingest_secret_classification.py
+    - tests/test_status_ids_not_secrets_20261102.py
