@@ -36,7 +36,7 @@ What is in the box:
 
 > **How it is packaged.** MNEMOS ships as a small core (`mnemos-core`) plus
 > separately installable `mnemos.*` namespace subsystems (GRAEAE, PANTHEON,
-> KNEMON) and the standalone STIPHOS hive service. CHARON's portability,
+> KNEMON) and the standalone Hive service (graeae-hive, formerly STIPHOS). CHARON's portability,
 > migration, ingestion, and STYX backup code became first-party core modules
 > on 2026-09-18; only Docling's heavy document-conversion dependencies remain
 > optional through `mnemos-core[docling]`. The published
@@ -107,9 +107,9 @@ mnemos doctor                       # verify subsystems
 # Set MNEMOS_BASE=http://localhost:5002 and MNEMOS_API_KEY=<token from mnemos init>
 # in shell env and any agent config that needs to reach it.
 
-# Hive (STIPHOS) is a SEPARATE service, same pattern:
-git clone https://gitlab.com/ncz-os/mnemos-stiphos && cd mnemos-stiphos
-pip install -e '.[mcp]'   # port 8080
+# Hive is a SEPARATE service. It lives in graeae-hive (mnemos-stiphos is archived):
+#   https://gitlab.com/ncz-os/graeae-hive   (install notes are in its README)
+# We strongly recommend running Hive with MNEMOS: see docs/HIVE_AND_MNEMOS.md
 ```
 
 Run `pip check` afterward as a sanity check — a clean install reports "No
