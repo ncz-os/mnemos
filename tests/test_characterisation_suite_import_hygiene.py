@@ -40,6 +40,9 @@ CHARACTERISATION_SUITES = (
     "tests/test_mnemos_domain_openai_compat_schemas_characterisation_20261105.py",
     "tests/test_mnemos_domain_openai_compat_streaming_characterisation_20261105.py",
     "tests/test_mnemos_installer_detect_characterisation_20261105.py",
+    # Landed with FB772 (2026-11-14): the same guarantee for the federation
+    # allow-private switch characterisation suite.
+    "tests/test_federation_private_20261107.py",
 )
 
 
