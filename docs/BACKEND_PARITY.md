@@ -28,11 +28,11 @@ mariadb, oracle, db2) and answers two questions for every cell:
    over the backend name or via a file named
    `test_<capability>_<backend>*.py`?
 
-Summary: **85/162** cells have a surface and a test candidate
-(◐ surface + test candidate), **39** cells expose a surface
+Summary: **87/162** cells have a surface and a test candidate
+(◐ surface + test candidate), **37** cells expose a surface
 without a test candidate, **5** cells have a test candidate for a
 stub backend implementation, and **33** cells have neither
-implementation nor test. (Categories sum to 162: 85 + 39 + 5 + 33 = 162.)
+implementation nor test. (Categories sum to 162: 87 + 37 + 5 + 33 = 162.)
 
 ## Matrix
 
@@ -43,7 +43,7 @@ implementation nor test. (Categories sum to 162: 85 + 39 + 5 + 33 = 162.)
 | fts_search (FTS5 / native FTS) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
 | kg (KGRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
 | versions (VersionRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
-| branches (BranchRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
+| branches (BranchRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | compression (CompressionRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
 | compression_queue (CompressionQueueRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface, no test candidate |
 | morpheus (MorpheusRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |

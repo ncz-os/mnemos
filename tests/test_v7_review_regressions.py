@@ -215,3 +215,44 @@ async def test_benchmark_cancels_workers_and_removes_db_on_insert_failure(monkey
     with pytest.raises(RuntimeError, match="injected insert failure"):
         await bench._run_one(12, 3, embedding_dim=8, warmup=0, readback_count=1)
     assert not db_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# NG-MN-14 (2026-11): rule D must couple both signals in the SAME test
+# function.  A zero-arg global invariant (e.g.
+# ``test_acl_default_cache_is_disabled()``) sharing a file with an
+# unrelated ``test_postgres_*`` helper used to flip backend cells to
+# "surface + test candidate" with no backend coverage — the postgres
+# acl/ledger false greens.  These pin the coupling both ways: zero-arg
+# fails, fixture-taking passes.
+# ---------------------------------------------------------------------------
+
+
+def test_parity_rule_d_requires_fixture_on_capability_fn(tmp_path):
+    """Zero-arg capability fn + unrelated backend-prefixed fn => no match."""
+    path = tmp_path / "test_mixed.py"
+    path.write_text(
+        "def test_acl_default_cache_is_disabled():\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def test_postgres_upgrade_psql_command_is_well_formed():\n"
+        "    pass\n"
+    )
+    assert parity._test_file_matches(path, "postgres", "acl") is False
+
+
+def test_parity_rule_d_accepts_fixture_taking_capability_fn(tmp_path):
+    """Capability fn with a fixture + backend-prefixed fn => match."""
+    path = tmp_path / "test_mixed.py"
+    path.write_text(
+        "def test_acl_grant_roundtrip(backend_case):\n"
+        "    pass\n"
+        "\n"
+        "\n"
+        "def test_postgres_transactional_uses_pool():\n"
+        "    pass\n"
+    )
+    assert parity._capability_referencing_fn_takes_fixture(
+        __import__("ast").parse(path.read_text()), "acl", backend="postgres"
+    ) is True

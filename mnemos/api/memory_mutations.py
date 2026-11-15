@@ -194,9 +194,15 @@ async def _reembed_memory_after_patch(
     half-state.
     """
     try:
-        from mnemos.api.routes.memories import _get_embedding as _route_embed
-
-        vec = await _route_embed(embed_text)
+        # Layer-correct embedder call: the canonical implementation lives
+        # in mnemos.core.lifecycle (below mnemos.api in the layered
+        # import-linter contract). Do NOT import it back out of
+        # mnemos.api.routes.memories here — that made every route importing
+        # this module an indirect importer of a sibling route and broke
+        # the "routes do not import each other's private names" contract
+        # (NG-MN-13 regression, 2026-11). routes.memories itself binds the
+        # same function, so patching either binding fakes the same model.
+        vec = await _lc._get_embedding(embed_text)
     except Exception:
         logger.warning(
             "[update_memory] post-PATCH embed generation failed for %s; "

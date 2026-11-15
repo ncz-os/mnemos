@@ -1729,6 +1729,58 @@ def _file_has_parametrize_or_fixture_on_backend_cached(tree: ast.Module, backend
     return False
 
 
+def _capability_referencing_fn_takes_fixture(tree: ast.Module, capability_id: str, backend: str | None = None) -> bool:
+    """True iff a test function proving ``capability_id`` takes a fixture/parameter.
+
+    NG-MN-14 (2026-11): rule D (``fn_refs_cap and fn_has_backend_prefix``)
+    used to fire across unrelated functions in the same file — e.g. the
+    zero-arg ``test_acl_default_cache_is_disabled()`` paired with an
+    unrelated ``test_postgres_*`` helper — flipping backend cells to
+    "surface + test candidate" with no backend coverage.  Requiring the
+    capability-referencing function itself to take ≥1 argument (beyond
+    ``self``/``cls``) keeps the intent (the function exercises something;
+    it takes a fixture or parameter) while excluding zero-arg global
+    invariants that happen to share a file with a backend helper.
+    """
+    needles = _CAPABILITY_SYNONYMS.get(capability_id, (capability_id,))
+    ordered_needles = sorted(needles, key=len, reverse=True)
+
+    def _name_matches(name: str) -> bool:
+        if not name.startswith("test_"):
+            return False
+        rest = name[len("test_") :]
+        leading_tokens: list[str] = []
+        for token in rest.split("_"):
+            if token:
+                leading_tokens.append(token)
+            if len(leading_tokens) >= 2:
+                break
+        if not leading_tokens:
+            return False
+        for needle in ordered_needles:
+            if leading_tokens[0] == needle:
+                return True
+        if backend is not None and len(leading_tokens) >= 2 and leading_tokens[0] == backend:
+            for needle in ordered_needles:
+                if leading_tokens[1] == needle:
+                    return True
+        if len(leading_tokens) >= 2:
+            joined = f"{leading_tokens[0]}_{leading_tokens[1]}"
+            for needle in ordered_needles:
+                if needle == joined:
+                    return True
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+            if not _name_matches(node.name):
+                continue
+            params = [a.arg for a in list(node.args.args) + list(node.args.kwonlyargs) if a.arg not in ("self", "cls")]
+            if params:
+                return True
+    return False
+
+
 def _test_file_matches_inner_cached(
     *,
     name: str,
@@ -1767,7 +1819,10 @@ def _test_file_matches_inner_cached(
             return True
 
     if fn_refs_cap and fn_has_backend_prefix:
-        return True
+        # NG-MN-14: the capability-referencing function must itself take a
+        # fixture/parameter — see _capability_referencing_fn_takes_fixture.
+        if _capability_referencing_fn_takes_fixture(tree, capability_id, backend=backend):
+            return True
 
     if backend_in_filename and fn_refs_cap:
         return True
@@ -1805,7 +1860,10 @@ def _test_file_matches_inner(
             return True
 
     if fn_refs_cap and fn_has_backend_prefix:
-        return True
+        # NG-MN-14: the capability-referencing function must itself take a
+        # fixture/parameter — see _capability_referencing_fn_takes_fixture.
+        if _capability_referencing_fn_takes_fixture(tree, capability_id, backend=backend):
+            return True
 
     if backend_in_filename and fn_refs_cap:
         return True

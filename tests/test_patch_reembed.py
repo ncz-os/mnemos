@@ -85,6 +85,12 @@ def _route_no_embed(monkeypatch):
     async def _no_invalidate(*_args, **_kwargs):
         return None
 
+    # NG-MN-13 re-embed runs through mnemos.core.lifecycle._get_embedding
+    # (memory_mutations calls the canonical implementation, not the route
+    # re-export — see the import-linter fix in memory_mutations.py), so the
+    # fake must be installed where the helper reads it, not only on the
+    # route binding.
+    monkeypatch.setattr(lifecycle, "_get_embedding", _fake_embed)
     monkeypatch.setattr(memories_route, "_get_embedding", _fake_embed)
     monkeypatch.setattr(memories_route, "_publish_nats_with_timeout", _no_publish)
     monkeypatch.setattr(memories_route, "_invalidate_caches_after_mutation", _no_invalidate)
@@ -114,6 +120,7 @@ async def test_patch_content_reembeds_stored_vector(sqlite_backend, tmp_path, mo
             state["embed_inside_tx"] += 1
         return _embed(text)
 
+    monkeypatch.setattr(lifecycle, "_get_embedding", _tracking_embed)
     monkeypatch.setattr(memories_route, "_get_embedding", _tracking_embed)
     original_transactional = sqlite_backend.transactional
 
@@ -155,6 +162,7 @@ async def test_patch_metadata_only_does_not_reembed(sqlite_backend, tmp_path, mo
         calls.append(text)
         return _embed(text)
 
+    monkeypatch.setattr(lifecycle, "_get_embedding", _counting_embed)
     monkeypatch.setattr(memories_route, "_get_embedding", _counting_embed)
     monkeypatch.setattr(lifecycle, "_persistence_backend", sqlite_backend)
     created = await memories_route.create_memory(
@@ -187,6 +195,7 @@ async def test_patch_embed_failure_clears_stale_vector(sqlite_backend, tmp_path,
             raise RuntimeError("model exploded")
         return _embed(text)
 
+    monkeypatch.setattr(lifecycle, "_get_embedding", _flaky_embed)
     monkeypatch.setattr(memories_route, "_get_embedding", _flaky_embed)
     monkeypatch.setattr(lifecycle, "_persistence_backend", sqlite_backend)
     created = await memories_route.create_memory(

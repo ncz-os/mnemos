@@ -8,6 +8,7 @@ import pytest
 
 from mnemos.persistence.mariadb import (
     MariadbBackend,
+    MariadbBranchRepository,
     MariadbFederationRepository,
     MariadbMemoryRepository,
     _parse_mariadb_dsn,
@@ -236,3 +237,20 @@ async def test_mariadb_live_ping_when_dsn_configured() -> None:
         assert await backend.ping() is True
     finally:
         await backend.close()
+
+
+def test_mariadb_branch_repository_is_mysql_compatible() -> None:
+    """MariaDB inherits the branch surface from MySQL (NG-MN-14 pin).
+
+    ``MariadbBackend`` extends ``MysqlBackend`` and exposes the same
+    ``memory_branches`` repository (``MariadbBranchRepository`` subclasses
+    ``MysqlBranchRepository``), so the mysql branch round-trip in
+    ``test_mysql_branches_live.py`` covers both dialects.  This pins
+    that inheritance: if MariaDB ever diverges its branch repository,
+    the parity matrix cell must move, not silently stay green.
+    """
+    from mnemos.persistence.mysql import MysqlBranchRepository
+
+    assert issubclass(MariadbBranchRepository, MysqlBranchRepository)
+    backend = MariadbBackend(None, SimpleNamespace(database=SimpleNamespace(embedding_dim=3)))
+    assert isinstance(backend.memory_branches, MysqlBranchRepository)
