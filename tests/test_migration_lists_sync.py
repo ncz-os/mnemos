@@ -958,3 +958,129 @@ def test_postgres_upgrade_psql_command_is_well_formed(compose_path: str) -> None
     assert '"' not in last_f, (
         f"{compose_path}: a double quote leaked into the migration filename {last_f!r}"
     )
+
+
+def test_compose_image_embedding_width_matches_bundled_model(monkeypatch):
+    import re
+
+    from mnemos.core.config import _DatabaseSettings
+
+    dockerfile = (Path(__file__).resolve().parents[1] / "Dockerfile").read_text()
+    values = dict(re.findall(r"^\s+(MNEMOS_EMBED\w+)=(\S+)", dockerfile, re.MULTILINE))
+    for key in ("PG_EMBEDDING_DIM", "MNEMOS_EMBEDDING_DIM", "MNEMOS_EMBED_HTTP_MODEL"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    model = Path(values["MNEMOS_EMBED_MODEL_PATH"]).name
+    assert (model, _DatabaseSettings().embedding_dim) == ("nomic-embed-text-v1.5.Q8_0.gguf", 768)
+
+
+def _extract_ci_multi_worker_heredoc() -> str:
+    """Return the CI multi-worker ``docker-compose.multi-worker.ci.yml`` text.
+
+    The file is written by a ``cat > ... <<'YAML'`` heredoc inside the
+    ``test:multi-worker`` job, so slice between the job key and the
+    ``      YAML`` delimiter — and assert that delimiter actually exists,
+    rather than silently using ``str.split(..., 1)[0]`` on a missing marker.
+    """
+    text = _read_gitlab_ci_yaml()
+    job_head, delimiter, job_tail = text.partition("test:multi-worker:")
+    assert delimiter, ".gitlab-ci.yml has no test:multi-worker job"
+    head, delimiter, tail = job_tail.partition("      YAML")
+    assert delimiter, "test:multi-worker job has no closing '      YAML' heredoc delimiter"
+    return head
+
+
+def _canonical_initdb_mounts(source: str, source_name: str, root: Path) -> list[str]:
+    """Extract ``docker-entrypoint-initdb.d`` mounts from one stack only.
+
+    ``test:multi-worker`` runs ``docker compose -f docker-compose.yml -f
+    docker-compose.multi-worker.ci.yml`` — never the staging file — so the
+    base stack and the staging stack must each be validated on their own.
+    Merging them into one dict hides a mount missing from the base: the
+    staging entry backfills the dict and the test still passes. Returns the
+    container target paths in mount order, and asserts each target appears
+    exactly once in this stack (no silent overwrite).
+    """
+    import re
+
+    mounts: dict[str, str] = {}
+    for path, target in re.findall(
+        r"^\s*- \./(\S+):/docker-entrypoint-initdb.d/([^:\s]+)", source, re.M
+    ):
+        assert (root / path).is_file()
+        assert target not in mounts, (
+            f"{source_name}: container target {target!r} mounted more than once "
+            f"(first {mounts[target]}, then {Path(path).name})"
+        )
+        mounts[target] = Path(path).name
+    return [mounts[key] for key in sorted(mounts)]
+
+
+def test_multi_worker_uses_canonical_postgres_bootstrap():
+    """The CI multi-worker smoke must bootstrap exactly the installer list.
+
+    The CI job runs ``docker compose -f docker-compose.yml -f
+    docker-compose.multi-worker.ci.yml`` — the base file plus the CI
+    override, never the staging file — so ``docker-compose.yml`` alone
+    must carry the full canonical bootstrap (role-seeding script plus the
+    installer migration list).
+
+    ``docker-compose.staging.yml`` is also a REQUIRED repository file:
+    the other guards in this suite
+    (``test_docker_compose_migration_lists_match_installer`` and
+    ``test_postgres_upgrade_psql_command_is_well_formed``) read it
+    unconditionally, so this guard does too. It is validated as an
+    independent stack, never merged with the base into one dict where a
+    staging-only mount could backfill a missing base entry.
+    """
+    import re
+
+    from mnemos.persistence.schema import postgres_migration_paths
+
+    root = Path(__file__).resolve().parents[1]
+    migration_dir = root / "mnemos/db_migrations/migrations"
+    installer = _extract_migration_list(root / "mnemos/installer/db.py", "run_migrations")
+    expected = ["0_init_roles_staging.sql", *installer]
+
+    base = _canonical_initdb_mounts((root / "docker-compose.yml").read_text(), "docker-compose.yml", root)
+    assert base == expected, (
+        "docker-compose.yml (the base stack the CI multi-worker job actually "
+        f"loads) has drifted from the installer list.\n"
+        f"  expected ({len(expected)}): {expected}\n"
+        f"  docker-compose.yml ({len(base)}): {base}\n"
+        f"  missing: {[n for n in expected if n not in base]}\n"
+        f"  extra:   {[n for n in base if n not in expected]}"
+    )
+    staging = _canonical_initdb_mounts(
+        (root / "docker-compose.staging.yml").read_text(), "docker-compose.staging.yml", root
+    )
+    assert staging == expected, (
+        "docker-compose.staging.yml (validated independently — CI never loads it "
+        f"with the base) has drifted from the installer list.\n"
+        f"  expected ({len(expected)}): {expected}\n"
+        f"  docker-compose.staging.yml ({len(staging)}): {staging}\n"
+        f"  missing: {[n for n in expected if n not in staging]}\n"
+        f"  extra:   {[n for n in staging if n not in expected]}"
+    )
+
+    # The CI override (docker-compose.multi-worker.ci.yml) only resets
+    # ports, adds redis/smoke services, and overrides the mnemos
+    # command/environment — it contributes no initdb mounts. Parsing the
+    # heredoc proves the job text is well-formed and lets a future CI
+    # override that DOES add a mount be caught by the same check.
+    ci = _extract_ci_multi_worker_heredoc()
+    ci_mounts = _canonical_initdb_mounts(ci, "docker-compose.multi-worker.ci.yml (CI heredoc)", root)
+    assert ci_mounts == [], f"CI multi-worker override unexpectedly adds initdb mounts: {ci_mounts}"
+
+    runtime = {path.resolve() for path in postgres_migration_paths()}
+    assert set(migration_dir.glob("*.sql")) <= runtime
+    sql = "\n".join(path.read_text() for path in runtime)
+    ddl = re.sub(r"--[^\n]*", "", sql)
+    tables = set(re.findall(r"CREATE TABLE (?:IF NOT EXISTS )?(\w+)", ddl, re.I))
+    assert {
+        "memories", "memory_versions", "memory_branches", "memory_acl", "memory_tags",
+        "webhook_subscriptions", "webhook_deliveries", "memory_audit_chain", "usage_ledger",
+        "federation_changes",
+    } <= tables
+    assert re.search(r"CREATE TRIGGER fed_journal_insert\s+AFTER INSERT ON memories", ddl, re.I)

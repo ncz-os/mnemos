@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 
 import pytest
+from tests._route_helpers import flatten_routes
 
 # ─── Model tests ─────────────────────────────────────────────────────────────
 
@@ -168,7 +169,7 @@ async def test_schedule_background_tracks_task():
 def test_app_routes_registered():
     """All expected route prefixes should be present (v3.0.0)."""
     from mnemos.api.main import app
-    paths = {r.path for r in app.routes}
+    paths = {r.path for r in flatten_routes(app.routes)}
     # v3.0.0 unified routes
     assert "/health" in paths
     assert "/v1/memories" in paths

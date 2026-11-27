@@ -9,9 +9,15 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 import mnemos.core.lifecycle as _lc
 from mnemos._version import __version__ as _MNEMOS_VERSION
-from mnemos.api.dependencies import require_root
+from mnemos.api.dependencies import require_root_or_monitor
 from mnemos.core.config import get_settings
 from mnemos.core.auth_context import UserContext
+from mnemos.core.replica_mode import (
+    health_probe_refresh,
+    is_replica,
+    replay_lag_seconds,
+    replica_mode_env,
+)
 from mnemos.persistence.base import capability_details_for_backend
 from mnemos.nats.client import publishing_enabled
 from mnemos.domain.models import HealthResponse, StatsResponse
@@ -34,14 +40,23 @@ async def health_check(response: Response) -> HealthResponse:
     """Return health status including DB pool and background workers."""
     db_ok = False
     backend = _lc._persistence_backend
-    backend_name = None
+    backend_name = type(backend).__name__ if backend is not None else None
     backend_capabilities: list[str] = []
     backend_capability_details: list[str] = []
     if backend is not None:
-        backend_name = type(backend).__name__
         backend_capabilities = sorted(str(cap) for cap in getattr(backend, "capabilities", set()))
         backend_capability_details = sorted(capability_details_for_backend(backend))
         db_ok = await backend.ping()
+    replica = is_replica()
+    # Replica mode is Postgres-only; every other backend reports primary.
+    if backend_name == "PostgresBackend" and replica_mode_env() == "auto":
+        # Health probe: re-read pg_is_in_recovery() and switch to primary
+        # behaviour without a restart if the standby was promoted (auto only).
+        try:
+            await health_probe_refresh(backend)
+        except Exception:
+            pass
+        replica = is_replica()
 
     # Get worker status
     worker_status = _lc._worker_status.get("distillation_worker", "unknown")
@@ -69,6 +84,18 @@ async def health_check(response: Response) -> HealthResponse:
     healthy = db_ok and not critical_worker_failed
     if not healthy:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    replay_lag = None
+    if replica and backend is not None:
+        replay_lag = await replay_lag_seconds(backend)
+
+    try:
+        from mnemos.runtime.embedding_contract import embedding_identity_from_settings
+
+        embedding_model = embedding_identity_from_settings(settings).model or None
+    except Exception:
+        embedding_model = None
+
     return HealthResponse(
         status="healthy" if healthy else "degraded",
         timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
@@ -83,11 +110,14 @@ async def health_check(response: Response) -> HealthResponse:
         persistence_backend=backend_name,
         persistence_capabilities=backend_capabilities,
         persistence_capability_details=backend_capability_details,
+        role="replica" if replica else "primary",
+        replay_lag_seconds=replay_lag,
+        embedding_model=embedding_model,
     )
 
 
 @router.get("/stats", response_model=StatsResponse)
-async def get_stats(_user: UserContext = Depends(require_root)) -> StatsResponse:
+async def get_stats(_user: UserContext = Depends(require_root_or_monitor)) -> StatsResponse:
     """Get system statistics from database (cached 60 s)."""
     # Cache key versioned to invalidate after the federation-aware
     # native/federated split shipped in v3.4.x. Bumping the suffix
@@ -106,6 +136,18 @@ async def get_stats(_user: UserContext = Depends(require_root)) -> StatsResponse
     backend = _lc._persistence_backend
     if backend is None:
         raise HTTPException(status_code=503, detail="Persistence backend not available")
+
+    replica = is_replica()
+    if replica:
+        replay_lag = await replay_lag_seconds(backend)
+    else:
+        replay_lag = None
+    try:
+        from mnemos.runtime.embedding_contract import embedding_identity_from_settings
+
+        embedding_model = embedding_identity_from_settings(get_settings()).model or None
+    except Exception:
+        embedding_model = None
 
     try:
         async with backend.transactional() as tx:
@@ -130,6 +172,9 @@ async def get_stats(_user: UserContext = Depends(require_root)) -> StatsResponse
             memories_by_subcategory=memory_stats.memories_by_subcategory,
             unreviewed_compressions=compression_stats.unreviewed_compressions,
             timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
+            role="replica" if replica else "primary",
+            replay_lag_seconds=replay_lag,
+            embedding_model=embedding_model,
         )
 
         if _lc._cache:

@@ -190,13 +190,9 @@ class _FailOpenLimiter(Limiter):
             self._fail_open_suppressed = 0
         suffix = f" ({suppressed} similar failures suppressed)" if suppressed else ""
         logger.warning(
-            "rate-limit store unavailable (%s: %s); allowing the request through. "
-            "Rate limiting is DISABLED until the store recovers. storage_uri=%s%s",
-            type(exc).__name__,
-            exc,
-            RATE_LIMIT_STORAGE,
-            suffix,
+            "rate-limit store unavailable; allowing request until recovery%s", suffix,
         )
+
 
     def _check_request_limit(self, request, endpoint_func, in_middleware=True) -> None:  # type: ignore[override]
         try:

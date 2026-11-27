@@ -143,6 +143,7 @@ class StyxConfig:
     rclone_remote: str | None = None
     host_label: str = field(default_factory=socket.gethostname)
     work_dir: Path = Path("/var/tmp/styx")
+    receipt_dir: Path | None = None
     source_mode: str = SOURCE_BACKEND
     sqlite_path: Path | None = None
     http_endpoint: str | None = None
@@ -223,6 +224,7 @@ class StyxConfig:
             rclone_remote=src.get(ENV_RCLONE_REMOTE),
             host_label=src.get(ENV_HOST_LABEL) or socket.gethostname(),
             work_dir=Path(src.get(ENV_WORK_DIR, "/var/tmp/styx")),
+            receipt_dir=Path(src["MNEMOS_STYX_RECEIPT_DIR"]) if src.get("MNEMOS_STYX_RECEIPT_DIR") else None,
             source_mode=src.get(ENV_SOURCE_MODE, SOURCE_BACKEND),
             sqlite_path=Path(sqlite_raw) if sqlite_raw else None,
             http_endpoint=src.get(ENV_HTTP_ENDPOINT),

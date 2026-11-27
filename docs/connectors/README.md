@@ -46,15 +46,15 @@ connector permissions, etc.) — partial matches don't fire.
 Source of truth: ``mnemos/mcp/tools/{memory,kg,dag,models,graeae,deletions,kronos}.py``,
 or the ordered list at ``_TOOL_ORDER`` in ``mnemos/mcp/tools/__init__.py``.
 
-**25 tools total; some are capability-filtered.** ``pantheon_list_models``,
+**27 tools total; some are capability-filtered.** ``pantheon_list_models``,
 ``pantheon_route_explain``, ``graeae_consult``, and
 ``graeae_get_consultation`` require the ``pantheon``/``graeae`` extras;
 ``kronos_anomalies`` and ``kronos_forecast`` require the ``kronos`` extra.
 Any of the 6 not installed on a given deployment is removed from the
 registry at startup, so two correctly-configured instances on the same
-version can legitimately expose 19–25 tools.
+version can legitimately expose 21–27 tools.
 
-**Read tools (safe to auto-approve on any key) — 17:**
+**Read tools (safe to auto-approve on any key) — 19:**
 
 | Tool                       | Surface   | Purpose                                  |
 |----------------------------|-----------|--------------------------------------------|
@@ -67,6 +67,8 @@ version can legitimately expose 19–25 tools.
 | ``log_memory``             | dag       | Per-memory version history               |
 | ``diff_memory_commits``    | dag       | Diff between two commits                 |
 | ``checkout_memory``        | dag       | Fetch a specific commit (read-only view) |
+| ``list_memory_versions``   | dag       | List version snapshots on a branch       |
+| ``get_memory_version``     | dag       | Fetch one version snapshot by number     |
 | ``recommend_model``        | models    | Provider/model catalog query             |
 | ``list_deletions``         | deletions | List pending deletion requests           |
 | ``pantheon_list_models``   | pantheon  | List models — needs the `pantheon` extra |
@@ -236,7 +238,7 @@ Automated connector smoke coverage lives in
 subcommand for Claude Code, Claude Desktop, Cursor, Codex CLI,
 Continue.dev, and Cline, plus the HTTP/SSE bridge used by ChatGPT
 Pro Developer Mode. The tests use a loopback mock MNEMOS REST backend,
-send MCP `tools/list`, assert the canonical 25-tool registry, then call
+send MCP `tools/list`, assert the canonical 27-tool registry, then call
 `search_memories` with a benign query and verify the success envelope.
 
 Run the connector smoke directly:

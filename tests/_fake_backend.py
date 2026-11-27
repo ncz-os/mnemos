@@ -1044,7 +1044,17 @@ def install_fake_backend(monkeypatch, *, rls_enabled: bool = False) -> FakeBacke
     """
     import mnemos.core.lifecycle as lc
 
+    from mnemos.persistence import worker_lifecycle
+
     backend = FakeBackend()
+    original_lookup = worker_lifecycle.active_deletion_for_scope
+
+    async def lookup(candidate, **kwargs):
+        if candidate is backend:
+            return None
+        return await original_lookup(candidate, **kwargs)
+
+    monkeypatch.setattr(worker_lifecycle, "active_deletion_for_scope", lookup)
     monkeypatch.setattr(lc, "_pool", None)
     monkeypatch.setattr(lc, "_persistence_backend", backend)
     monkeypatch.setattr(lc, "_rls_enabled", rls_enabled)

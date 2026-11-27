@@ -22,7 +22,9 @@ from mnemos.api.persistence_helpers import (
     backend_or_503 as _backend_or_503,
     maybe_set_pg_rls as _maybe_set_pg_rls,
     require_postgres_pool_or_503,
+    require_write_allowed as _require_write_allowed,
 )
+from mnemos.core.replica_mode import is_replica
 
 # Shared read/write policy helpers live outside this module so the other
 # route modules import them from a library instead of from this file. They
@@ -383,6 +385,10 @@ def _is_memory_owner(row, user: UserContext) -> bool:
 async def _bump_recall_counters(memory_ids: list) -> None:
     """Increment recall_count + set last_recalled_at for a hit set.
 
+    Replica mode: search must stay fully read-only, so the counter bump is
+    skipped entirely on a standby (the write would fail with
+    "read-only transaction" and the background task would log it).
+
     Called fire-and-forget after a search returns its response, so
     counter updates don't add latency to the user-visible search path.
     Failures log and swallow — recall counters are observability, not
@@ -401,6 +407,10 @@ async def _bump_recall_counters(memory_ids: list) -> None:
     every backend except Postgres. Routing through the ABC is what makes
     the counters move everywhere.
     """
+    from mnemos.core.replica_mode import replica_mode_enabled as _replica_active
+
+    if _replica_active():
+        return
     if not memory_ids:
         return
     try:
@@ -999,6 +1009,7 @@ async def search_memories(
 
     backend = _backend_or_503()
     semantic_boosted_order = False
+    embedding_degraded = False
     # Root callers can search across namespaces (no namespace pin);
     # non-root callers are pinned. The visibility factory
     # rejects namespace=None for non-root, which the namespace 403
@@ -1049,6 +1060,10 @@ async def search_memories(
             if not embedding:
                 logger.warning("[VECTOR] Embedding failed, falling back to FTS")
                 rows = await _fts_fallback()
+                # Replica mode: missing/unreachable embedder endpoint must
+                # degrade to lexical search with a clear flag, never crash.
+                if is_replica():
+                    embedding_degraded = True
             else:
                 logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
                 semantic_trace_kwargs = {}
@@ -1291,6 +1306,7 @@ async def search_memories(
         memories=memories,
         compression_applied=compression_applied,
         compression_metadata=compression_metadata if compression_applied else None,
+        embedding_degraded=embedding_degraded or None,
     )
     _log_search_phase(search_trace_id, search_started_at, "serialize")
 
@@ -1306,6 +1322,7 @@ async def create_memory(
     response: Response,
     user: UserContext = Depends(get_current_user),
 ):
+    _require_write_allowed()
     if not request.content or not request.content.strip():
         raise HTTPException(status_code=422, detail="Memory content cannot be empty")
     backend = _backend_or_503()
@@ -1568,6 +1585,7 @@ async def bulk_create_memories(
     user: UserContext = Depends(get_current_user),
 ):
     """Create multiple memories in one request. Per-item errors are collected, not raised."""
+    _require_write_allowed()
     backend = _backend_or_503()
     created_ids: list[str] = []
     errors: list[str] = []
@@ -1777,6 +1795,7 @@ async def update_memory(
     user: UserContext = Depends(get_current_user),
 ):
     """Partially update a memory (content, category, subcategory, metadata)."""
+    _require_write_allowed()
     backend = _backend_or_503()
     updates: dict = {}
     if request.content is not None:
@@ -2012,6 +2031,7 @@ async def delete_memory(
     user: UserContext = Depends(get_current_user),
 ):
     """Delete a memory by ID."""
+    _require_write_allowed()
     backend = _backend_or_503()
     # Mutation visibility: non-root pinned to (owner_id, namespace);
     # root sees everything. Closes the cross-namespace deletion path
@@ -2116,6 +2136,7 @@ async def rehydrate_memories(
     framed as untrusted DATA. Trusted callers needing verbatim operational
     recall use search/get with operational=true instead.
     """
+    _require_write_allowed()
     require_postgres_pool_or_503(route_label="POST /v1/memories/rehydrate")
     # Same v3.1.2 Tier 3 pinning as /memories/search — rehydrate is a
     # read path for the caller's own corpus.

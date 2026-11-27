@@ -70,7 +70,7 @@ MCP registration as interactive sessions.
 For Codex CLI/desktop on a *different* machine from MNEMOS, or for ChatGPT's
 own desktop/mobile apps, use the same OAuth 2.1 MCP gateway documented in
 [ChatGPT Pro Developer Mode](./chatgpt-pro-developer-mode.md#setup--oauth-21-path)
-rather than the local stdio path above. Same MCP edge, same 25-tool registry,
+rather than the local stdio path above. Same MCP edge, same 27-tool registry,
 same underlying MNEMOS memory — the difference is transport (stdio child
 process vs. HTTPS to a public MCP endpoint) and auth (a static bearer token
 vs. a full OAuth 2.1 authorization-code + PKCE flow with dynamic client

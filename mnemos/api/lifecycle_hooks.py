@@ -17,6 +17,39 @@ logger = logging.getLogger(__name__)
 _registered = False
 
 
+def _audit_sealer_worker(_pool: Any):
+    from mnemos.core.config import audit_chain_key_required, get_settings
+    from mnemos.workers.audit_sealer import AuditSealer, audit_chain_enabled
+
+    if not service_enabled(get_settings(), "audit_sealer_worker") or not audit_chain_enabled():
+        lifecycle._worker_status["audit_sealer_worker"] = "disabled"
+        return None
+
+    backend = lifecycle.get_persistence_backend()
+    if backend.audit_chain is None:
+        lifecycle._worker_status["audit_sealer_worker"] = "unavailable"
+        logger.warning("Audit sealer unavailable: backend has no audit chain repository")
+        return None
+    try:
+        sealer = AuditSealer(backend)
+    except (TypeError, ValueError) as exc:
+        lifecycle._worker_status["audit_sealer_worker"] = "unavailable"
+        logger.warning("Audit sealer unavailable: %s", exc)
+        if audit_chain_key_required():
+            raise
+        return None
+
+    async def run():
+        lifecycle._worker_status["audit_sealer_worker"] = "healthy"
+        try:
+            await sealer.run_forever()
+        finally:
+            sealer.stop()
+            lifecycle._worker_status["audit_sealer_worker"] = "idle"
+
+    return run()
+
+
 def _morpheus_queue_worker(_pool: Any):
     if not is_extra_installed("morpheus"):
         return None
@@ -438,6 +471,7 @@ def register_lifespan_hooks() -> None:
         honor_worker_enabled=True,
     )
     lifecycle.register_lifespan_worker("persephone archival worker", _persephone_archival_worker)
+    lifecycle.register_lifespan_worker("audit_sealer_worker", _audit_sealer_worker, honor_worker_enabled=True)
     lifecycle.register_lifespan_worker("morpheus queued runs", _morpheus_queue_worker)
     lifecycle.register_lifespan_worker("webhook retry repair worker", _webhook_repair_worker)
     lifecycle.register_lifespan_worker("webhook delivery recovery worker", _webhook_delivery_worker)

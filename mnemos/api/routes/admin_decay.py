@@ -16,7 +16,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from mnemos.api.dependencies import UserContext, require_root
-from mnemos.api.persistence_helpers import backend_or_503 as _backend_or_503
+from mnemos.api.persistence_helpers import (
+    backend_or_503 as _backend_or_503,
+    require_write_allowed,
+)
 from mnemos.domain.search.decay import (
     DEFAULT_CATEGORY,
     invalidate_decay_cache,
@@ -80,6 +83,7 @@ async def update_category_decay(
     _: UserContext = Depends(require_root),
 ) -> DecayRowResponse:
     """UPSERT one category row. Cache invalidated post-write."""
+    require_write_allowed()
     if not category or len(category) > 64:
         raise HTTPException(
             status_code=400,
@@ -114,6 +118,7 @@ async def reseed_category_decay(
     _: UserContext = Depends(require_root),
 ) -> list[DecayRowResponse]:
     """Reset all rows to schema defaults."""
+    require_write_allowed()
     backend = _backend_or_503()
     for category, hl, kind, floor in _DEFAULT_SEED:
         await _upsert_category_row(

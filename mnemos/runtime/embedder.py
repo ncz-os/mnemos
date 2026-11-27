@@ -44,6 +44,7 @@ import concurrent.futures
 import logging
 import os
 from pathlib import Path
+from threading import Lock
 from typing import Iterable
 
 from mnemos.core.config import (
@@ -67,6 +68,16 @@ from mnemos.core.config import (
     embed_threads_env,
     embed_trust_remote_code_env,
 )
+
+# Replica-mode item 5 (operator decision 2026-11-21/22): the CANONICAL
+# replica predicate from mnemos.core.replica_mode, imported explicitly at
+# module level (same pattern as lifecycle.py) and read LIVE at every
+# embedder decision point — there is no cached/private replica flag, so a
+# promotion observed by a health probe is honoured without rebuilding the
+# embedder. On a replica the embedder is HTTP-only (the shared client the
+# primary uses); a missing/dead endpoint returns [] => lexical degrade
+# with the embedding_degraded flag, never a per-host local model.
+from mnemos.core.replica_mode import is_replica
 
 logger = logging.getLogger(__name__)
 
@@ -435,6 +446,18 @@ class _HttpBackend:
         self._cb_cooldown = cb_cooldown
         self._consecutive_failures = 0
         self._breaker_opened_at: float | None = None
+        self._breaker_probe_in_flight = False
+        # Non-reentrant lock over circuit-breaker state (Lock, not RLock:
+        # _breaker_open, _record_success and _record_failure never call each
+        # other; mirrors Reranker). These methods mutate _breaker_opened_at,
+        # _breaker_probe_in_flight and _consecutive_failures together; the
+        # half-open "claim the slot" transition must be atomic so exactly one
+        # concurrent caller probes. A threading Lock is used (not
+        # asyncio.Lock) because the backend is shared across worker threads
+        # and the request path; the critical sections are pure CPU work with
+        # no await inside, so holding it across them does not block the
+        # event loop.
+        self._breaker_lock = Lock()
         self._embed_dim: int | None = None
         self._client = None  # lazy httpx.AsyncClient
         self._disabled_logged = False
@@ -527,35 +550,56 @@ class _HttpBackend:
         return self._embed_dim
 
     def _breaker_open(self) -> bool:
-        """Return True iff breaker is currently open (block calls)."""
-        if self._breaker_opened_at is None:
-            return False
+        """Return True iff breaker is currently open (block calls).
+
+        All reads and the half-open slot claim happen under ``_breaker_lock``
+        so that concurrent callers see a consistent state and exactly one of
+        them claims the probe slot.
+        """
         import time as _t
 
-        if _t.monotonic() - self._breaker_opened_at >= self._cb_cooldown:
-            # Cooldown elapsed; half-open: allow next call to probe.
-            self._breaker_opened_at = None
-            self._consecutive_failures = 0
-            logger.info("[EMBED][http] circuit breaker half-open; probing %s", self.url)
-            return False
-        return True
+        with self._breaker_lock:
+            if self._breaker_opened_at is None:
+                return False
+            if self._breaker_probe_in_flight:
+                return True
+            if _t.monotonic() - self._breaker_opened_at >= self._cb_cooldown:
+                # Claim the half-open slot before returning so other callers
+                # continue to see the breaker as open until this probe completes.
+                self._breaker_probe_in_flight = True
+                logger.info("[EMBED][http] circuit breaker half-open; probing %s", self.url)
+                return False
+            return True
 
     def _record_success(self) -> None:
-        self._consecutive_failures = 0
-        self._breaker_opened_at = None
+        with self._breaker_lock:
+            self._consecutive_failures = 0
+            self._breaker_opened_at = None
+            self._breaker_probe_in_flight = False
 
     def _record_failure(self) -> None:
         import time as _t
 
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= self._cb_threshold and self._breaker_opened_at is None:
-            self._breaker_opened_at = _t.monotonic()
-            logger.warning(
-                "[EMBED][http] circuit breaker OPEN after %d consecutive failures; cooling down %.1fs (url=%s)",
-                self._consecutive_failures,
-                self._cb_cooldown,
-                self.url,
-            )
+        with self._breaker_lock:
+            if self._breaker_probe_in_flight:
+                self._breaker_probe_in_flight = False
+                self._consecutive_failures = self._cb_threshold
+                self._breaker_opened_at = _t.monotonic()
+                logger.warning(
+                    "[EMBED][http] circuit breaker OPEN after probe failure; cooling down %.1fs (url=%s)",
+                    self._cb_cooldown,
+                    self.url,
+                )
+                return
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._cb_threshold and self._breaker_opened_at is None:
+                self._breaker_opened_at = _t.monotonic()
+                logger.warning(
+                    "[EMBED][http] circuit breaker OPEN after %d consecutive failures; cooling down %.1fs (url=%s)",
+                    self._consecutive_failures,
+                    self._cb_cooldown,
+                    self.url,
+                )
 
     async def embed_async(self, text: str) -> list[float]:
         """Async embed; respects breaker. Returns [] on failure (caller falls
@@ -906,13 +950,24 @@ class InProcessEmbedder:
         if self._backend is not None:
             return
         resolved, reason = _select_backend(self.backend_choice)
+        if is_replica() and resolved != "http":
+            # Replica hosts have no per-host embedder: force the shared
+            # HTTP client (same endpoint configuration the primary uses)
+            # regardless of MNEMOS_EMBED_BACKEND / accelerator detection.
+            logger.info(
+                "[EMBED][replica] read-only standby: forcing http backend "
+                "(was %s); no local embedder is started on a replica",
+                resolved,
+            )
+            resolved, reason = "http", "replica mode: shared HTTP embedder only"
         logger.info("[EMBED] backend=%s (%s)", resolved, reason)
         self._backend = self._make_backend(resolved)
         self._backend_name = resolved
         # Hybrid: if primary != cix-npu but NPU is available, attach a sidecar
         # for short-input routing. If primary IS cix-npu, no sidecar — caller
-        # explicitly asked for NPU-only.
-        if self.hybrid and resolved != "cix-npu" and _cix_npu_available():
+        # explicitly asked for NPU-only. Never on a replica: the NPU sidecar
+        # is a local embedder.
+        if self.hybrid and resolved != "cix-npu" and _cix_npu_available() and not is_replica():
             logger.info(
                 "[EMBED] hybrid mode: NPU sidecar active, threshold=%d chars",
                 self.npu_threshold_chars,
@@ -1103,6 +1158,22 @@ class InProcessEmbedder:
         # returned as ``[]`` — preserving the pre-fix behaviour where
         # ``embed()`` swallows backend-construction errors.
         try:
+            # Replica safety net: if the singleton was constructed before
+            # the replica flag was set and resolved to a LOCAL backend,
+            # refuse it before _ensure_loaded() can load a per-host model.
+            # (_build_backend forces http for replicas, so this only fires
+            # for a pre-existing singleton.) [] => lexical degrade.
+            if (
+                is_replica()
+                and self._backend is not None
+                and not isinstance(self._backend, _HttpBackend)
+            ):
+                logger.warning(
+                    "[EMBED][replica] local backend %s refused on read-only "
+                    "standby; returning empty embedding (lexical degrade)",
+                    self._backend_name,
+                )
+                return []
             await self._ensure_loaded()
             if isinstance(self._backend, _HttpBackend):
                 # Nothing configured at all: primary URL empty AND no remote
@@ -1145,8 +1216,11 @@ class InProcessEmbedder:
                         return vec
                 # Then in-process local llamacpp — non-reentrant, must run
                 # under _lock so the single-worker executor (F15)
-                # serializes any concurrent callers.
-                if self._http_fallback is not None:
+                # serializes any concurrent callers. NEVER on a replica:
+                # replica hosts have no per-host embedder; a missing/dead
+                # HTTP endpoint degrades to lexical search ([]) instead of
+                # loading a local GGUF.
+                if self._http_fallback is not None and not is_replica():
                     logger.warning("[EMBED][http] remote+fallback failed -> llamacpp local")
                     async with self._lock:
                         return await self._run_serial_sync(self._http_fallback._embed_sync, truncated)
@@ -1245,7 +1319,9 @@ class InProcessEmbedder:
                     # Local fallback for any rows still empty — touches the
                     # non-reentrant local backend, so it goes back under
                     # ``_lock`` (and the single-worker executor serializes).
-                    if any(not v for v in vecs) and self._http_fallback is not None:
+                    # Never on a replica: no per-host embedder; empty rows
+                    # stay empty and search degrades to lexical.
+                    if any(not v for v in vecs) and self._http_fallback is not None and not is_replica():
                         async with self._lock:
                             if not self._http_fallback.loaded:
                                 await self._run_serial_sync(self._http_fallback._load_sync)

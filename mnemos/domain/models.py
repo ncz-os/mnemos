@@ -79,6 +79,15 @@ class ConsultationRequest(BaseModel):
 
 
 class StatsResponse(BaseModel):
+    # Role of this process: "primary" (default) or "replica" (Postgres hot
+    # standby serving reads only).
+    role: str = "primary"
+    # Replica replay lag in seconds; None on a primary or when the standby
+    # is not streaming (no WAL receiver / replay data available).
+    replay_lag_seconds: Optional[float] = None
+    # Embedding model identity (backend + model id + dim) — the shared
+    # endpoint configuration a replica uses via HTTP.
+    embedding_model: Optional[str] = None
     total_memories: int  # native + federated
     native_memories: int = 0  # locally-created (federation_source IS NULL)
     federated_memories: int = 0  # pulled from peers (federation_source IS NOT NULL)
@@ -106,6 +115,15 @@ class HealthResponse(BaseModel):
     persistence_backend: Optional[str] = None
     persistence_capabilities: List[str] = Field(default_factory=list)
     persistence_capability_details: List[str] = Field(default_factory=list)
+    # Replica-mode identity: 'replica' (Postgres hot standby serving reads)
+    # or 'primary' (default; every non-Postgres backend reports primary).
+    role: str = "primary"
+    # Standby replay lag in seconds when the pg_stat_wal_receiver /
+    # pg_last_xact_replay_timestamp data is available; None otherwise.
+    replay_lag_seconds: Optional[float] = None
+    # The configured embedding model identity (shared HTTP embedder on a
+    # replica; never a local embedder).
+    embedding_model: Optional[str] = None
 
 
 class MemoryItem(BaseModel):
@@ -871,6 +889,11 @@ class MemoryListResponse(BaseModel):
     memories: List[MemoryItem]
     compression_applied: Optional[bool] = False
     compression_metadata: Optional[Dict[str, Any]] = None
+    # Replica-mode signal: True when semantic search was requested but the
+    # embedder endpoint was unreachable/missing and the response was served
+    # by lexical (FTS/ILIKE) search instead. Callers that need vector results
+    # should retry on the primary named by /health's primary_hint.
+    embedding_degraded: Optional[bool] = None
 
 
 class MemoryListRequest(BaseModel):
@@ -1227,10 +1250,10 @@ class UserCreateRequest(BaseModel):
     id: str
     display_name: str
     email: Optional[str] = None
-    # #169: Literal["user", "root", "federation"] enforces the same
+    # Literal role set keeps user provisioning closed to known roles.
     # set the route handler used to check at runtime. Earlier comment
     # said "user or root" but the runtime accepted "federation" too.
-    role: Literal["user", "root", "federation"] = "user"
+    role: Literal["user", "root", "federation", "monitor"] = "user"
     # Per-user tenancy namespace. v3.2 added users.namespace (2aa41ea)
     # and wired non-root reads to filter on it; the admin provisioning
     # API still silently defaulted every new user to 'default' which

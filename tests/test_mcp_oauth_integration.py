@@ -77,7 +77,6 @@ import jwt
 import pytest
 import pytest_asyncio
 
-from tests.oauth_backend_helpers import oauth_database as oauth_database
 from httpx import ASGITransport, AsyncClient, Client
 from urllib.parse import parse_qs, urlparse
 

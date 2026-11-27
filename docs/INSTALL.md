@@ -17,7 +17,7 @@ There are two ways to deploy: **pre-built container images** (turnkey) or
 
 | Image | Contains | Arch | Pull |
 |---|---|---|---|
-| `ghcr.io/ncz-os/mnemos-enterprise` | **Everything**: core (including CHARON/STYX) + GRAEAE + PANTHEON + KNEMON in one API process, plus rclone and the Oracle / MySQL / MariaDB / Db2 drivers | `amd64` + `arm64` (Db2 driver on the amd64 layer only) | `docker pull ghcr.io/ncz-os/mnemos-enterprise:7.2.0` |
+| `ghcr.io/ncz-os/mnemos-enterprise` | **Everything**: core (including CHARON/STYX) + GRAEAE + PANTHEON + KNEMON in one API process, plus rclone and the Oracle / MySQL / MariaDB / Db2 drivers | `amd64` + `arm64` (Db2 driver on the amd64 layer only) | `docker pull ghcr.io/ncz-os/mnemos-enterprise:7.3.0` |
 
 The build is still OCI-layered internally -- `Dockerfile.core` and
 `Dockerfile.everything` are separate BuildKit Bake targets built `FROM` one
@@ -25,8 +25,8 @@ another -- but those intermediate layers are passed between targets as
 in-memory named contexts and are **never pushed or tagged** as their own
 packages. See `.github/workflows/release-images.yml` and
 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md). The `ghcr.io/ncz-os/mnemos` and
-`ghcr.io/ncz-os/mnemos-core` packages still exist in the registry but stopped
-being published at 6.2.5; do not pull them for a v7 deployment.
+`ghcr.io/ncz-os/mnemos-core` packages were last published at 6.2.5 and are
+removed from the registry; `ghcr.io/ncz-os/mnemos-enterprise` is the only image.
 
 > **Db2 is the only amd64 restriction.** The published manifest is a real
 > multi-arch OCI index (verified: `7.0.0` resolves to `linux/amd64` and
@@ -42,7 +42,7 @@ being published at 6.2.5; do not pull them for a v7 deployment.
 ### Run the everything image (SQLite, zero config)
 
 ```bash
-docker run --rm -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:7.2.0
+docker run --rm -p 5002:5002 -v mnemos-data:/data ghcr.io/ncz-os/mnemos-enterprise:7.3.0
 # → http://localhost:5002/health
 ```
 
@@ -54,12 +54,12 @@ The backend is chosen by `MNEMOS_DATABASE_DSN` at runtime — no rebuild:
 # PostgreSQL + pgvector
 docker run -p 5002:5002 \
   -e MNEMOS_DATABASE_DSN='postgres://user:pass@host:5432/mnemos' \
-  ghcr.io/ncz-os/mnemos-enterprise:7.2.0
+  ghcr.io/ncz-os/mnemos-enterprise:7.3.0
 
 # Oracle Database 26ai (thin mode — no extra driver install needed)
 docker run -p 5002:5002 \
   -e MNEMOS_DATABASE_DSN='oracle://MNEMOS:pass@host:1521/ORCLPDB1' \
-  ghcr.io/ncz-os/mnemos-enterprise:7.2.0
+  ghcr.io/ncz-os/mnemos-enterprise:7.3.0
 
 # IBM Db2 — amd64 layer only (the ibm_db driver has no arm64 wheel)
 docker run -p 5002:5002 \
@@ -92,6 +92,15 @@ docker run -p 5002:5002 \
 > (11.4/11.7+) and less battle-tested at scale than pgvector. SQLite + sqlite-vec
 > is the zero-dependency edge/dev default; Oracle 26ai and IBM Db2 12.1.5 target
 > enterprise/big-iron deployments.
+
+### Read-only monitoring key
+
+The `monitor` role can read only `GET /stats` and `GET /v1/federation/status`.
+Create a user with `POST /admin/users` and `{"id":"dashboard","display_name":"Dashboard","role":"monitor"}`, then create its API key with `POST /admin/users/{id}/apikeys`. Store the returned key in the monitoring system's secret store.
+
+Monitor credentials have aggregate status access only. They cannot use MCP
+tools or memory access. The legacy `operator` role remains accepted for
+existing users and API keys; its HTTP route permissions remain unchanged.
 
 ### Run the STIPHOS hive service (separate process)
 
@@ -310,3 +319,9 @@ auth. Set `MNEMOS_MCP_AUTH_ENABLED=true` to keep the old behaviour.
 Machine-readable install instructions (which dist/image to choose for a
 requested module set, with copy-paste commands) live in
 [`AGENTS.md`](../AGENTS.md) at the repo root.
+
+OAuth providers must return an immutable subject (`sub`, GitHub `id`, or Azure
+`oid`). Email-only identities require provider configuration updates and fresh
+authentication. Existing email-derived identities are not automatically linked
+to a replacement subject; reconcile them through an administrator-approved
+account migration before enabling the updated provider.

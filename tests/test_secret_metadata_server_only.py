@@ -409,6 +409,7 @@ def test_federation_worker_event_strips_peer_supplied_secret_keys():
 def test_classify_persisted_text_fields_ignores_caller_secret_keys():
     """The choke point: the classifier rebuilds secret_* from scratch."""
     from mnemos.core.persisted_text_classification import classify_persisted_text_fields
+    from mnemos.core.secret_detection import SECRET_CLASSIFIER_VERSION
 
     classified = classify_persisted_text_fields(
         content=CLEAN_TEXT,
@@ -417,6 +418,7 @@ def test_classify_persisted_text_fields_ignores_caller_secret_keys():
             "secret_redact_spans": [[0, 0]],
             "secret_vaulted": True,
             "secret_original_namespace": "team",
+            "secret_field_classifiers": {"content": -1, "verbatim_content": -1},
             "host": "web-1",
         },
         namespace="team",
@@ -424,9 +426,8 @@ def test_classify_persisted_text_fields_ignores_caller_secret_keys():
         memory_id="mem_m1_unit",
     )
     meta = classified.metadata
-    # The server's own M6 CLEAN stamp for the field it just classified is the
-    # only extra key: every caller-supplied ``secret_*`` key is gone.
-    assert meta == {"host": "web-1", "secret_field_classifiers": {"content": 2}}
+    # Only the server-classified field receives the current classifier version.
+    assert meta == {"host": "web-1", "secret_field_classifiers": {"content": SECRET_CLASSIFIER_VERSION}}
     assert classified.namespace == "team"
 
 

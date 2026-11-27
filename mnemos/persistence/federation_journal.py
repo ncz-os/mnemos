@@ -19,6 +19,15 @@ from mnemos.persistence.worker_lifecycle import _Ops, transaction_dialect
 CURSOR_PREFIX = "journal:"
 # Rows sequenced per ``_publish`` call; bounds the CASE/IN statement size.
 _PUBLISH_BATCH = 256
+_JOURNAL_EMBEDDING_FRAGMENTS = frozenset(
+    {
+        (
+            "VEC_ToText(journal_embedding.embedding)",
+            " LEFT JOIN memory_embeddings journal_embedding ON journal_embedding.memory_id = m.id",
+        ),
+        ("FROM_VECTOR(m.embedding)", ""),
+    }
+)
 
 
 class FeedRows(list):
@@ -136,7 +145,7 @@ async def _publish(ops: _Ops, memory_id=None, *, memory_ids=None):
 async def _current_states(ops, ids, prefer_compressed=False, *, repo=None, include_embedding=False):
     if not ids:
         return {}
-    placeholders = ",".join("?" for _ in ids)
+    placeholders = _id_placeholders(ids)
     # One statement snapshot binds the row to its latest source sequence, even
     # on READ COMMITTED. Reading these separately can label new data with an
     # older sequence (or old data with a newer one) during concurrent writes.
@@ -145,8 +154,13 @@ async def _current_states(ops, ids, prefer_compressed=False, *, repo=None, inclu
     embedding_column = ", m.embedding" if include_embedding else ""
     embedding_join = ""
     if include_embedding and getattr(repo, "_journal_embedding_sql", None):
-        embedding_column = ", " + repo._journal_embedding_sql + " AS journal_embedding_value"
-        embedding_join = repo._journal_embedding_join
+        # Backend fragments are selected only from the constant set below.
+        embedding_sql = getattr(repo, "_journal_embedding_sql")
+        embedding_join_sql = getattr(repo, "_journal_embedding_join", None)
+        if (embedding_sql, embedding_join_sql) not in _JOURNAL_EMBEDDING_FRAGMENTS:
+            raise ValueError("Unsupported journal embedding projection")
+        embedding_column = ", " + embedding_sql + " AS journal_embedding_value"
+        embedding_join = embedding_join_sql
     # Do not fetch multi-kilobyte vectors when the peer did not request them.
     memory_columns = ", ".join(
         "m." + name
@@ -191,6 +205,11 @@ async def _current_states(ops, ids, prefer_compressed=False, *, repo=None, inclu
         *ids,
     )
     return {row["journal_memory_id"]: row for row in rows}
+
+
+def _id_placeholders(ids):
+    """Return one bound placeholder per supplied identifier."""
+    return ",".join("?" for _ in ids)
 
 
 def _authorized(row, namespaces, categories):

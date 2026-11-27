@@ -20,6 +20,7 @@ from mnemos.api.persistence_helpers import (
     backend_or_503,
     require_oauth_backend,
     require_postgres_pool_or_503,
+    require_write_allowed,
 )
 from mnemos.core.config import get_settings
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
@@ -47,6 +48,19 @@ from mnemos.domain.models import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
+_OAUTH_PROVIDER_UPDATE_COLUMNS = frozenset(
+    {
+        "display_name",
+        "issuer_url",
+        "client_id",
+        "client_secret",
+        "scope",
+        "authorize_url",
+        "token_url",
+        "userinfo_url",
+        "enabled",
+    }
+)
 _admin_lifecycle_repo = AdminLifecycleRepository()
 
 
@@ -59,6 +73,7 @@ async def create_user(
     _: UserContext = Depends(require_root),
 ):
     """Create a new user. id must be unique."""
+    require_write_allowed()
     require_postgres_pool_or_503(route_label="POST /admin/users")
     # #169: role is now Literal["user", "root", "federation"] in
     # the request model — Pydantic auto-422s on invalid values
@@ -131,6 +146,7 @@ async def create_api_key(
     key must never reach the persistence layer, matching the existing
     split where ``lookup_api_key`` takes a hash rather than a raw key.
     """
+    require_write_allowed()
     backend = require_oauth_backend()
     oauth = backend.oauth
 
@@ -212,6 +228,7 @@ async def revoke_api_key(
     Oracle/Db2; the repository owns that difference and returns a plain
     "did a row change" boolean.
     """
+    require_write_allowed()
     backend = require_oauth_backend()
     async with backend.transactional() as tx:
         revoked = await backend.oauth.revoke_api_key(tx, key_id)
@@ -253,6 +270,7 @@ async def create_oauth_provider(
     _: UserContext = Depends(require_root),
 ):
     """Register a new OAuth provider (root only)."""
+    require_write_allowed()
     require_postgres_pool_or_503(route_label="POST /admin/oauth/providers")
     # #169: kind is now Literal["oidc", "oauth2"] in the request
     # model — Pydantic auto-422s on invalid values before we get here.
@@ -304,8 +322,12 @@ async def update_oauth_provider(
     request: OAuthProviderUpdateRequest,
     _: UserContext = Depends(require_root),
 ):
+    require_write_allowed()
     require_postgres_pool_or_503(route_label="PATCH /admin/oauth/providers/{name}")
-    updates = {k: v for k, v in request.model_dump().items() if v is not None}
+    supplied = request.model_dump()
+    if unexpected := set(supplied) - _OAUTH_PROVIDER_UPDATE_COLUMNS:
+        raise HTTPException(status_code=422, detail=f"Unsupported fields: {', '.join(sorted(unexpected))}")
+    updates = {k: v for k, v in supplied.items() if v is not None}
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update")
     set_clauses = [f"{col}=${i + 2}" for i, col in enumerate(updates.keys())]
@@ -326,6 +348,7 @@ async def delete_oauth_provider(
     name: str,
     _: UserContext = Depends(require_root),
 ):
+    require_write_allowed()
     require_postgres_pool_or_503(route_label="DELETE /admin/oauth/providers/{name}")
     async with _lc.get_pool_manager().acquire() as conn:
         result = await conn.execute(
@@ -553,16 +576,11 @@ def _installed_engine_flags() -> tuple[dict, dict, Optional[str], Optional[str]]
     partially present.
     """
     settings = get_settings().compression
-    apollo_installed = _engine_extra_installed(
-        "apollo", "mnemos.domain.compression.apollo"
-    )
-    artemis_installed = _engine_extra_installed(
-        "artemis", "mnemos.domain.compression.artemis"
-    )
+    apollo_installed = _engine_extra_installed("apollo", "mnemos.domain.compression.apollo")
+    artemis_installed = _engine_extra_installed("artemis", "mnemos.domain.compression.artemis")
     apollo_flags = {
         "installed": apollo_installed,
-        "enabled": bool(settings.contest_enabled and settings.apollo_enabled
-                       and apollo_installed),
+        "enabled": bool(settings.contest_enabled and settings.apollo_enabled and apollo_installed),
     }
     # ARTEMIS is the default contest engine: the distillation worker
     # adds it when the contest is on and the extra is installed, and
@@ -618,9 +636,7 @@ async def compression_status(_: UserContext = Depends(require_root)):
         # (e.g. pre-v3.1 schema without the variants table). Report
         # null with a reason, never a fabricated zero.
         variant_count = None
-        variant_count_reason = (
-            "variant count unavailable: memory_compressed_variants table not present"
-        )
+        variant_count_reason = "variant count unavailable: memory_compressed_variants table not present"
 
     return CompressionStatusResponse(
         contest_enabled=bool(settings.contest_enabled),
@@ -679,6 +695,7 @@ async def compression_enqueue(
     supersedes on the variant. Operators who want dedupe should check
     for existing pending rows first.
     """
+    require_write_allowed()
     backend = backend_or_503()
     # #170: reason + scoring_profile are now Literal[...] in the
     # request model — Pydantic auto-422s on invalid values before
@@ -750,6 +767,7 @@ async def compression_enqueue_all(
     raise limit — but run the endpoint repeatedly rather than trying to
     enqueue the full corpus in one call.
     """
+    require_write_allowed()
     backend = backend_or_503()
     # #170: reason + scoring_profile are now Literal[...] in the
     # request model — Pydantic auto-422s on invalid values before
@@ -780,6 +798,7 @@ async def persephone_sweep(
     _: UserContext = Depends(require_root),
 ):
     """Run one namespace-scoped PERSEPHONE archival sweep."""
+    require_write_allowed()
     _require_persephone_enabled()
     backend = backend_or_503()
     settings = get_settings().persephone
@@ -809,6 +828,7 @@ async def persephone_archive_memory(
     user: UserContext = Depends(require_root),
 ):
     """Archive a specific memory. Root-only operator override."""
+    require_write_allowed()
     _require_persephone_enabled()
     backend = backend_or_503()
 
@@ -831,6 +851,7 @@ async def persephone_restore_memory(
     user: UserContext = Depends(get_current_user),
 ):
     """Restore an archived memory. Allowed for root or the memory owner."""
+    require_write_allowed()
     _require_persephone_enabled()
     backend = backend_or_503()
 
@@ -895,6 +916,7 @@ async def reload_graeae_providers(_: UserContext = Depends(require_root)):
     Lets the daily provider /v1/models cron rotate model_ids in-process
     without restarting the container. Returns a dict of changes.
     """
+    require_write_allowed()
     if not is_extra_installed("graeae"):
         raise HTTPException(status_code=503, detail=missing_extra_detail("graeae", label="GRAEAE"))
     backend = backend_or_503()
@@ -1105,6 +1127,7 @@ async def create_deletion_request(
     transaction catches the NULL-vs-specific containment
     cases. Codex review of round-77 caught this gap.
     """
+    require_write_allowed()
     backend = backend_or_503()
 
     target_user_id, target_namespace = _normalize_deletion_target(request.target_user_id, request.target_namespace)
@@ -1218,6 +1241,7 @@ async def confirm_deletion_request(
     rows in any other state — operators must cancel and
     re-create if they want to revert a state past 'confirmed'.
     """
+    require_write_allowed()
     backend = backend_or_503()
     async with backend.transactional() as tx:
         row = await _admin_lifecycle_repo.confirm_deletion_request(tx, request_id)
@@ -1264,6 +1288,7 @@ async def cancel_deletion_request(
     data. Operators can still cancel ``requested`` and
     ``confirmed`` rows that haven't reached the worker yet.
     """
+    require_write_allowed()
     backend = backend_or_503()
     async with backend.transactional() as tx:
         row = await _admin_lifecycle_repo.cancel_deletion_request(tx, request_id)
@@ -1303,6 +1328,7 @@ async def restore_deletion_request(
     _: UserContext = Depends(require_root),
 ):
     """Restore a soft-deleted deletion request during its grace window."""
+    require_write_allowed()
     backend = backend_or_503()
     from mnemos.workers.deletion_request_worker import (
         invalidate_deletion_scope_caches,
@@ -1372,6 +1398,7 @@ async def force_purge_deletion_request(
     be in ``status='soft_deleted'`` so requested/confirmed/restored
     lifecycle states cannot be purged accidentally.
     """
+    require_write_allowed()
     backend = backend_or_503()
     from mnemos.workers.deletion_request_worker import (
         invalidate_deletion_scope_caches,

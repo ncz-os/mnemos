@@ -40,6 +40,9 @@ async def create_journal_entry(
     owner_id: Optional[str] = Query(None, description="Admin-only: write on behalf of another owner"),
     namespace: Optional[str] = Query(None, description="Admin-only: write into another namespace"),
 ):
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     backend = backend_or_503()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
@@ -115,6 +118,9 @@ async def delete_journal_entry(
     owner_id: Optional[str] = Query(None),
     namespace: Optional[str] = Query(None),
 ):
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     backend = backend_or_503()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)

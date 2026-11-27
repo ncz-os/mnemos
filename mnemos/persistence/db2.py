@@ -126,6 +126,78 @@ def _boosted_rank_supersession_sort_key(row: Row, *, today: date, recency_weight
     return superseded, _boosted_rank_score_sort_key(row, today=today, recency_weight=recency_weight)
 
 
+def _version_visibility_clause(
+    user_id: str | None,
+    group_ids: Sequence[str],
+    *,
+    namespace: str | None = None,
+    exclude_namespaces: Sequence[str] = (),
+) -> tuple[str, list[Any]]:
+    """Per-snapshot tenancy predicate for ``memory_versions`` rows (Db2).
+
+    Mirrors ``mnemos.core.visibility.version_visibility_predicate``
+    (Postgres ``$N`` form), the SQLite ``_version_visibility_clause``,
+    the Oracle ``_version_visibility_clause``, and the MySQL
+    ``_version_visibility_clause`` in Db2 ``?`` positional form: tenancy
+    is evaluated against THE SNAPSHOT's own ``owner_id`` /
+    ``namespace`` / ``permission_mode`` / ``group_id`` columns, with the
+    ACL escape hatch joined on the parent ``memory_id``. Deliberately
+    NOT the generic ``_render_visibility`` live-memory predicate
+    (imported from the Oracle module): ``memory_versions`` has no
+    ``federation_source`` column (a federation term would 500), the ACL
+    join must use ``memory_id`` (not the snapshot row id), and the
+    Oracle ``:name`` binds need a finditer→``?`` rewrite whose ordering
+    is only safe when the clause is built positionally from the start.
+    """
+    from mnemos.core.visibility import ACL_READ_BIT, acl_principals
+
+    params: list[Any] = [user_id]
+    group_list = list(group_ids or [])
+    if group_list:
+        group_clause = f"group_id IN ({', '.join(['?'] * len(group_list))})"
+        params += group_list
+    else:
+        group_clause = "0=1"
+    principals = acl_principals(user_id or "", group_list)
+    if principals:
+        params += principals
+        acl_clause = (
+            " OR EXISTS (SELECT 1 FROM memory_acl macl "
+            "WHERE macl.memory_id = memory_versions.memory_id "
+            f"AND macl.principal IN ({', '.join(['?'] * len(principals))}) "
+            f"AND BITAND(macl.perm, {ACL_READ_BIT}) > 0)"
+        )
+    else:
+        acl_clause = ""
+    clause = (
+        "("
+        "owner_id = ?"
+        " OR (MOD(COALESCE(permission_mode, 0), 10)) >= 4"
+        " OR ((MOD(TRUNC(COALESCE(permission_mode, 0) / 10), 10)) >= 4 "
+        "AND group_id IS NOT NULL AND " + group_clause + ")"
+        + acl_clause + ")"
+    )
+    # The caller filter's namespace pin is applied alongside this
+    # fragment (see ``list_memory_versions`` / ``fetch_memory_version``):
+    # a NULL namespace in the filter never reaches the SQL layer —
+    # non-root callers with an unresolved namespace fail closed before
+    # execution, so the bind here is always a concrete value and
+    # ``namespace = ?`` never degenerates to a NULL comparison
+    # (``= NULL`` evaluates UNKNOWN on every backend and hides rows
+    # that should match).
+    clause = f"{clause} AND namespace = ?"
+    params.append(namespace)
+    excl = tuple(exclude_namespaces or ())
+    if excl:
+        placeholders = ", ".join(["?"] * len(excl))
+        clause = (
+            f"{clause} AND (namespace IS NULL "
+            f"OR namespace NOT IN ({placeholders}))"
+        )
+        params += list(excl)
+    return clause, params
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # Oracle → Db2 SQL translation helpers
 # ────────────────────────────────────────────────────────────────────────────
@@ -425,6 +497,7 @@ class _Db2AsyncConnectionPool:
         self._lock = asyncio.Lock()
         self._not_full = asyncio.Condition(self._lock)
         self._closed = False
+        self._pending_cleanup: set[asyncio.Task] = set()
 
     async def _open(self) -> _Db2AsyncConnection:
         import ibm_db_dbi  # type: ignore
@@ -498,23 +571,46 @@ class _Db2AsyncConnectionPool:
 
         # Heavy connect happens OUTSIDE the lock; readers/releasers progress freely.
         if need_open:
+            opening = asyncio.create_task(self._open())
             try:
-                conn = await self._open()
-            except Exception:
+                conn = await asyncio.shield(opening)
                 async with self._lock:
+                    if self._closed:
+                        raise RuntimeError("DB2 pool is closed")
                     self._reserved -= 1
-                    self._not_full.notify()
+                    self._in_use.add(conn)
+                    self._not_full.notify_all()
+            except BaseException:
+                released = asyncio.Event()
+
+                async def reclaim():
+                    async with self._lock:
+                        self._reserved -= 1
+                        self._not_full.notify_all()
+                        released.set()
+                    try:
+                        opened = await opening
+                    except BaseException:
+                        return
+                    await opened.close()
+
+                def cleanup_done(task):
+                    self._pending_cleanup.discard(task)
+                    if not task.cancelled() and task.exception() is not None:
+                        _LOG.warning("Db2 connection cleanup failed")
+
+                cleanup = asyncio.create_task(reclaim())
+                self._pending_cleanup.add(cleanup)
+                cleanup.add_done_callback(cleanup_done)
+                await asyncio.shield(released.wait())
                 raise
-            async with self._lock:
-                self._reserved -= 1
-                self._in_use.add(conn)
 
         try:
             yield conn
         finally:
             async with self._lock:
                 self._in_use.discard(conn)
-                if self._closed:
+                if self._closed or getattr(conn, "_mnemos_discard", False):
                     await conn.close()
                 else:
                     self._idle.append(conn)
@@ -526,6 +622,8 @@ class _Db2AsyncConnectionPool:
             self._not_full.notify_all()
             while self._idle:
                 await self._idle.pop().close()
+        if self._pending_cleanup:
+            await asyncio.gather(*self._pending_cleanup, return_exceptions=True)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1570,7 +1668,15 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
         from mnemos.persistence.visibility import VisibilityScope
 
         if isinstance(user, UserContext):
-            ns = getattr(user, "namespace", None) or "default"
+            ns = getattr(user, "namespace", None)
+            if ns is None:
+                # Uniform fail-closed contract (all six backends, every
+                # version-read path): namespace-None non-root principals
+                # never reach SQL — list/fetch return [], get returns None,
+                # and PermissionError raises only at the shared facade
+                # boundary (`_visibility_to_user`). No default-namespace
+                # widening is ever applied.
+                raise PermissionError("Access denied: namespace required")
             visibility = VisibilityFilter.for_read(user, namespace=ns)
         else:
             visibility = VisibilityFilter(
@@ -1594,7 +1700,7 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             await _call(cursor.execute, sql, tuple(params_list))
             rows = await _fetch_all_dicts(cursor)
             if not rows:
-                raise PermissionError("Memory not found")
+                raise PermissionError("Access denied")
         finally:
             await _call(cursor.close)
 
@@ -2000,6 +2106,123 @@ class Db2MemoryRepository(_Db2OraCompatMixin, OracleMemoryRepository):
             return await _row_to_dict(cursor, await _call(cursor.fetchone))
         finally:
             await _call(cursor.close)
+
+    async def fetch_memory_versions(
+        self,
+        tx: Any,
+        memory_id: str,
+        branch: str,
+        user: Any,
+    ) -> list[Row]:
+        # NG2-MN-020: mirror of GET /v1/memories/{id}/versions (oldest
+        # first). Root sees every non-deleted row; everyone else goes
+        # through the owner/world/group/ACL + namespace-pin SQL gate
+        # (same shape as the REST route's version_visibility_predicate),
+        # with the vault subtraction as a Python re-check.
+        from mnemos.core.security import is_root
+        from mnemos.core.secret_detection import VAULT_NAMESPACE
+        from mnemos.persistence.oracle import _oracle_version_where_nonroot
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if is_root(user):
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT version_num, snapshot_at, snapshot_by, change_type,
+                           content, branch, commit_hash, owner_id, namespace,
+                           permission_mode, group_id
+                      FROM memory_versions
+                     WHERE memory_id = ?
+                       AND branch = ?
+                       AND deleted_at IS NULL
+                     ORDER BY version_num
+                    """,
+                    (memory_id, branch),
+                )
+                return await _fetch_all_dicts(cursor)
+            vis_clause, vis_params = _oracle_version_where_nonroot(user)
+            pos_clause = _BIND_RE.sub("?", vis_clause)
+            params_list: list[Any] = [memory_id, branch]
+            for m in _BIND_RE.finditer(vis_clause):
+                params_list.append(vis_params[m.group(1)])
+            params_list.append(getattr(user, "namespace", None))
+            sql = (
+                "SELECT version_num, snapshot_at, snapshot_by, change_type, "
+                "content, branch, commit_hash, owner_id, namespace, "
+                "permission_mode, group_id "
+                "FROM memory_versions "
+                "WHERE memory_id = ? AND branch = ? AND deleted_at IS NULL "
+                f"AND {pos_clause} AND namespace = ? "
+                "ORDER BY version_num"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        return [r for r in rows if r.get("namespace") != VAULT_NAMESPACE]
+
+    async def fetch_memory_version(
+        self,
+        tx: Any,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        user: Any,
+    ) -> Row | None:
+        # NG2-MN-020: mirror of GET /v1/memories/{id}/versions/{n}.
+        from mnemos.core.security import is_root
+        from mnemos.core.secret_detection import VAULT_NAMESPACE
+        from mnemos.persistence.oracle import _oracle_version_where_nonroot
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if is_root(user):
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT id, memory_id, version_num, content, category,
+                           subcategory, metadata, verbatim_content, owner_id,
+                           namespace, permission_mode, source_model,
+                           source_provider, source_session, source_agent,
+                           snapshot_at, snapshot_by, change_type, commit_hash,
+                           branch, group_id
+                      FROM memory_versions
+                     WHERE memory_id = ?
+                       AND version_num = ?
+                       AND branch = ?
+                       AND deleted_at IS NULL
+                    """,
+                    (memory_id, version_num, branch),
+                )
+                return await _row_to_dict(cursor, await _call(cursor.fetchone))
+            vis_clause, vis_params = _oracle_version_where_nonroot(user)
+            pos_clause = _BIND_RE.sub("?", vis_clause)
+            params_list = [memory_id, version_num, branch]
+            for m in _BIND_RE.finditer(vis_clause):
+                params_list.append(vis_params[m.group(1)])
+            params_list.append(getattr(user, "namespace", None))
+            sql = (
+                "SELECT id, memory_id, version_num, content, category, "
+                "subcategory, metadata, verbatim_content, owner_id, "
+                "namespace, permission_mode, source_model, "
+                "source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type, commit_hash, "
+                "branch, group_id "
+                "FROM memory_versions "
+                "WHERE memory_id = ? AND version_num = ? AND branch = ? "
+                "AND deleted_at IS NULL "
+                f"AND {pos_clause} AND namespace = ?"
+            )
+            await _call(cursor.execute, sql, tuple(params_list))
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+        if row is None or row.get("namespace") == VAULT_NAMESPACE:
+            return None
+        return row
 
     async def fetch_referenced_memory_allowlist(
         self,
@@ -2436,6 +2659,82 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
     - ``SYSIBM.SYSDUMMY1`` (no ``dual``)
     """
 
+    async def fetch_version_contents(
+        self,
+        tx: Any,
+        memory_id: str,
+        version_nums: Sequence[int],
+        branch: str,
+        visibility: Any,
+    ) -> list[Row]:
+        """Db2-native ``fetch_version_contents``: ``?`` positional binds.
+
+        The Oracle facade renders ``:name`` binds; Db2 executes only
+        positional binds. The Db2 ``_version_visibility_clause`` already
+        emits ``?`` placeholders (the ``_BIND_RE`` rewrite applies at
+        render time), so this override builds the positional parameter
+        tuple — (memory, branch, versions, clause params) — and splices
+        the clause directly, matching every other Db2 version-read path.
+        """
+        from mnemos.core.auth_context import UserContext
+
+        # Convert the ABC VisibilityFilter envelope to the facade's
+        # UserContext (shared helper; fails closed for namespace-None).
+        user = self._visibility_to_user(visibility)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            cols = "version_num, content"
+            nums = list(version_nums)
+            if not nums:
+                return []
+            if isinstance(user, UserContext) and user.role == "root":
+                ph = ", ".join(["?"] * len(nums))
+                params: tuple[Any, ...] = (memory_id, branch, *nums)
+                await _call(
+                    cursor.execute,
+                    f"SELECT {cols} FROM memory_versions "
+                    f"WHERE memory_id = ? AND branch = ? "
+                    f"AND version_num IN ({ph}) "
+                    "AND deleted_at IS NULL ORDER BY version_num ASC",
+                    params,
+                )
+                return await _fetch_all_dicts(cursor)
+            ns = getattr(user, "namespace", None)
+            if ns is None:
+                # Uniform fail-closed contract (all six backends, every
+                # version-read path): namespace-None non-root principals
+                # never reach SQL — list/fetch return [], get returns None,
+                # and PermissionError raises only at the shared facade
+                # boundary (`_visibility_to_user`). No default-namespace
+                # widening is ever applied.
+                return []
+            visibility_filter = VisibilityFilter.for_read(user, namespace=ns)
+            clause, vis_params = _version_visibility_clause(
+                visibility_filter.user_id,
+                visibility_filter.group_ids,
+                namespace=ns,
+                exclude_namespaces=visibility_filter.exclude_namespaces,
+            )
+            # The Db2 clause builder already renders ``?`` positional
+            # placeholders; the ordered clause params follow the base
+            # (memory, branch, versions) binds.
+            ph = ", ".join(["?"] * len(nums))
+            where = (
+                "memory_id = ? AND branch = ? "
+                f"AND version_num IN ({ph}) AND deleted_at IS NULL"
+            )
+            if clause:
+                where += f" AND ({clause})"
+            await _call(
+                cursor.execute,
+                f"SELECT {cols} FROM memory_versions WHERE {where} ORDER BY version_num ASC",
+                tuple([memory_id, branch, *nums, *vis_params]),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
     async def insert_memory_version(
         self,
         tx: Any,
@@ -2559,6 +2858,121 @@ class Db2VersionRepository(_Db2OraCompatMixin, OracleVersionRepository):
                         pass
                 return out
             return None
+        finally:
+            await _call(cursor.close)
+
+    async def list_memory_versions(
+        self,
+        tx: Any,
+        memory_id: str,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        """List version summaries for ``memory_id`` on ``branch`` (oldest first)."""
+        from mnemos.core.auth_context import UserContext
+
+        user = self._visibility_to_user(visibility)
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            cols = "version_num, snapshot_at, snapshot_by, change_type, content, branch"
+            if isinstance(user, UserContext) and user.role == "root":
+                await _call(
+                    cursor.execute,
+                    f"SELECT {cols} FROM memory_versions "
+                    "WHERE memory_id = ? AND branch = ? AND deleted_at IS NULL "
+                    "ORDER BY version_num ASC",
+                    (memory_id, branch),
+                )
+                return await _fetch_all_dicts(cursor)
+            ns = getattr(user, "namespace", None)
+            if ns is None:
+                # Uniform fail-closed contract (all six backends, every
+                # version-read path): namespace-None non-root principals
+                # never reach SQL — list/fetch return [], get returns None,
+                # and PermissionError raises only at the shared facade
+                # boundary (`_visibility_to_user`). No default-namespace
+                # widening is ever applied.
+                return []
+            visibility = VisibilityFilter.for_read(user, namespace=ns)
+            clause, vis_params = _version_visibility_clause(
+                visibility.user_id,
+                visibility.group_ids,
+                namespace=ns,
+                exclude_namespaces=visibility.exclude_namespaces,
+            )
+            where = "memory_id = ? AND branch = ? AND deleted_at IS NULL"
+            params: list[Any] = [memory_id, branch]
+            if clause:
+                where += f" AND ({clause})"
+                params.extend(vis_params)
+            await _call(
+                cursor.execute,
+                f"SELECT {cols} FROM memory_versions WHERE {where} ORDER BY version_num ASC",
+                tuple(params),
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def fetch_memory_version(
+        self,
+        tx: Any,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        user: Any,
+    ) -> Row | None:
+        """Fetch one version snapshot with per-snapshot tenancy applied."""
+        from mnemos.core.auth_context import UserContext
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            cols = (
+                "id, memory_id, version_num, content, category, subcategory, metadata, "
+                "verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type"
+            )
+            if isinstance(user, UserContext) and user.role == "root":
+                await _call(
+                    cursor.execute,
+                    f"SELECT {cols} FROM memory_versions "
+                    "WHERE memory_id = ? AND version_num = ? AND branch = ? "
+                    "AND deleted_at IS NULL",
+                    (memory_id, version_num, branch),
+                )
+                rows = await _fetch_all_dicts(cursor)
+                return rows[0] if rows else None
+            ns = getattr(user, "namespace", None)
+            if ns is None:
+                # Uniform fail-closed contract (all six backends, every
+                # version-read path): namespace-None non-root principals
+                # never reach SQL — list/fetch return [], get returns None,
+                # and PermissionError raises only at the shared facade
+                # boundary (`_visibility_to_user`). No default-namespace
+                # widening is ever applied.
+                return None
+            visibility = VisibilityFilter.for_read(user, namespace=ns)
+            clause, vis_params = _version_visibility_clause(
+                visibility.user_id,
+                visibility.group_ids,
+                namespace=ns,
+                exclude_namespaces=visibility.exclude_namespaces,
+            )
+            where = "memory_id = ? AND version_num = ? AND branch = ? AND deleted_at IS NULL"
+            params: list[Any] = [memory_id, version_num, branch]
+            if clause:
+                where += f" AND ({clause})"
+                params.extend(vis_params)
+            await _call(
+                cursor.execute,
+                f"SELECT {cols} FROM memory_versions WHERE {where}",
+                tuple(params),
+            )
+            rows = await _fetch_all_dicts(cursor)
+            return rows[0] if rows else None
         finally:
             await _call(cursor.close)
 
@@ -5692,22 +6106,43 @@ class Db2Backend(OracleBackend):
             if level is None:
                 raise ValueError(f"unsupported isolation level for Db2: {isolation!r}")
         async with self._pool.acquire() as conn:
-            if level is not None:
-                cursor = await _call(conn.cursor)
-                try:
-                    await _call(cursor.execute, f"SET CURRENT ISOLATION = {level}")
-                finally:
-                    await _call(cursor.close)
+            previous = None
             tx = _OracleTransaction(conn)
             try:
-                yield tx
-            except BaseException:
-                if not tx.closed:
-                    await tx.rollback()
-                raise
-            else:
-                if not tx.closed:
-                    await tx.commit()
+                if level is not None:
+                    cursor = await _call(conn.cursor)
+                    try:
+                        await _call(cursor.execute, "VALUES CURRENT ISOLATION")
+                        row = await _call(cursor.fetchone)
+                        previous = str(row[0]).strip() if row else ""
+                        if previous not in {"", "UR", "CS", "RS", "RR"}:
+                            raise ValueError("unsupported current Db2 isolation")
+                        await _call(conn.commit)
+                        await _call(cursor.execute, f"SET CURRENT ISOLATION = {level}")
+                    finally:
+                        await _call(cursor.close)
+                try:
+                    yield tx
+                except BaseException:
+                    if not tx.closed:
+                        await tx.rollback()
+                    raise
+                else:
+                    if not tx.closed:
+                        await tx.commit()
+            finally:
+                if previous is not None:
+                    try:
+                        if not tx.closed:
+                            await tx.rollback()
+                        cursor = await _call(conn.cursor)
+                        try:
+                            await _call(cursor.execute, f"SET CURRENT ISOLATION = {previous or 'RESET'}")
+                        finally:
+                            await _call(cursor.close)
+                    except BaseException:
+                        conn._mnemos_discard = True
+                        raise
 
     async def fetch_server_now(self, tx: Any) -> datetime:
         """Db2's ``CURRENT TIMESTAMP`` is SERVER-LOCAL and naive.
@@ -6336,6 +6771,27 @@ class Db2MorpheusNativeBridge(Db2MorpheusRepository):
     phase_extract_store = _morpheus_native_bridge(Db2MorpheusRepository.phase_extract_store)
 
 
+class Db2SessionsNativeBridge(Db2SessionsRepository):
+    """Adapt session SQL on the existing native transaction."""
+
+    create_session = _morpheus_native_bridge(Db2SessionsRepository.create_session)
+    get_session = _morpheus_native_bridge(Db2SessionsRepository.get_session)
+    list_injected_memory_ids = _morpheus_native_bridge(Db2SessionsRepository.list_injected_memory_ids)
+    add_message = _morpheus_native_bridge(Db2SessionsRepository.add_message)
+    fetch_provider_history = _morpheus_native_bridge(Db2SessionsRepository.fetch_provider_history)
+    add_memory_injections = _morpheus_native_bridge(Db2SessionsRepository.add_memory_injections)
+    update_metrics = _morpheus_native_bridge(Db2SessionsRepository.update_metrics)
+    fetch_history = _morpheus_native_bridge(Db2SessionsRepository.fetch_history)
+    delete_session = _morpheus_native_bridge(Db2SessionsRepository.delete_session)
+
+
+class Db2ConsultationsNativeBridge(Db2ConsultationsRepository):
+    """Adapt registry selection on the same native transaction."""
+
+    resolve_models = _morpheus_native_bridge(Db2ConsultationsRepository.resolve_models)
+    resolve_tier_lineup = _morpheus_native_bridge(Db2ConsultationsRepository.resolve_tier_lineup)
+
+
 class Db2BackendNative(Db2Backend):
     """Db2 backend with native-cursor pass-through (no Oracle→Db2 token translation).
 
@@ -6371,6 +6827,8 @@ class Db2BackendNative(Db2Backend):
         # Db2Backend unchanged.
         super().__init__(pool, settings)
         self._morpheus_repo = Db2MorpheusNativeBridge()
+        self._sessions_repo = Db2SessionsNativeBridge()
+        self._consultations_repo = Db2ConsultationsNativeBridge()
 
 
 __all__ = [

@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 #: ``createdTime`` reflects when the upload happened, which drifts from the
 #: backup's logical date whenever a run is retried or backfilled.
 ARTIFACT_SUFFIX = ".mif.tar.gz.age"
-_STAMP = re.compile(r"-(\d{8}T\d{6}Z)" + re.escape(ARTIFACT_SUFFIX) + r"$")
+_STAMP = re.compile(r"-(\d{8}T\d{6}Z)(?:-[a-z0-9_]+)?" + re.escape(ARTIFACT_SUFFIX) + r"$")
 _STAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 
 

@@ -119,10 +119,77 @@ class _PoolCtx:
 
 def _install_pool(monkeypatch, conn):
     import mnemos.core.lifecycle as lc
+    from mnemos.persistence.postgres import (
+        PostgresMemoryRepository,
+        PostgresTransaction,
+        PostgresVersionRepository,
+    )
+
+    # list/get-version/diff routes resolve the backend facade (NG2-MN-018);
+    # the fake backend serves the REAL Postgres repositories over the
+    # stub connection. A plain object (not MagicMock) has no ``pool``
+    # attribute, so the still-raw revert route keeps falling
+    # through to the installed ``_pool``.
+    tx = PostgresTransaction(conn, MagicMock())
+
+    class _Ctx:
+        async def __aenter__(self):
+            return tx
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _VersionsBackend:
+        def __init__(self):
+            self.memories = PostgresMemoryRepository()
+            self.memory_versions = PostgresVersionRepository()
+
+        def transactional(self):
+            return _Ctx()
+
+    monkeypatch.setattr(lc, "_persistence_backend", _VersionsBackend())
 
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
+
+
+class _DeniedTx:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _DeniedBackend:
+    """Backend double where the live memory is unreadable (tenancy gate)."""
+
+    def __init__(self):
+        self.memories = self
+        self.memory_versions = self
+        self.memory_branches = self
+
+    def transactional(self, **_kwargs):
+        return _DeniedTx()
+
+    async def assert_memory_readable(self, tx, memory_id, user):
+        raise PermissionError(f"Memory {memory_id} not found")
+
+    async def list_memory_versions(self, tx, memory_id, branch, user):
+        raise AssertionError("unreachable: tenancy gate fires first")
+
+    async def get_memory_version(self, tx, memory_id, version_num, branch, visibility):
+        raise AssertionError("unreachable: tenancy gate fires first")
+
+    async def fetch_memory_branch_heads(self, tx, memory_ids, **_kwargs):
+        return []
+
+
+def _install_denied_backend(monkeypatch):
+    import mnemos.core.lifecycle as lc
+
+    monkeypatch.setattr(lc, "_persistence_backend", _DeniedBackend())
 
 
 def _memory_row() -> dict:
@@ -312,6 +379,10 @@ def test_feature_branch_revert_preserves_target_head_tenancy(monkeypatch):
     assert conn.inserted_version["namespace"] == "alice-ns"
     assert conn.inserted_version["permission_mode"] == 600
     assert conn.inserted_version["parent_version_id"] == "target-head-id"
+
+    # get_version is ABC-routed now: it reads the backend, not the pool.
+    # Bob cannot read the live memory, so the tenancy gate 404s.
+    _install_denied_backend(monkeypatch)
 
     with pytest.raises(HTTPException) as exc:
         asyncio.run(

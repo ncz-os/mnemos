@@ -28,6 +28,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+import os
 import tarfile
 import urllib.parse
 import urllib.request
@@ -44,6 +45,15 @@ from mnemos.tools.export_stream import completion_count_matches
 _STREAM_CHUNK = 1024 * 256
 _HTTP_EXPORT_PAGE_LIMIT = 1000
 _LOOPBACK_HOSTS = {"localhost", "ip6-localhost"}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _private_file(path, mode="wb"):
+    return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600), mode)
 
 
 @dataclass(frozen=True)
@@ -146,12 +156,12 @@ def _produce_from_http(config: StyxConfig, dest: Path, *, allow_remote: bool = F
     if config.http_token:
         request.add_header("Authorization", f"Bearer {config.http_token}")
 
-    dest.mkdir(parents=True, exist_ok=True)
+    dest.mkdir(mode=0o700, parents=True, exist_ok=True)
     payload = dest / "export.ndjson"
     try:
         with (
-            urllib.request.urlopen(request, timeout=900) as response,  # noqa: S310
-            payload.open("wb") as handle,
+            urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open(request, timeout=900) as response,  # noqa: S310
+            _private_file(payload) as handle,
         ):
             content_type = response.headers.get("Content-Type", "").lower()
             if "application/x-ndjson" not in content_type:
@@ -186,8 +196,8 @@ def _produce_from_http(config: StyxConfig, dest: Path, *, allow_remote: bool = F
         (dest / "export.mpf.json").unlink(missing_ok=True)
         raise StyxError(f"streaming export from {parts.path} failed: {exc}") from exc
 
-    (dest / "styx-source.json").write_text(
-        json.dumps(
+    with _private_file(dest / "styx-source.json", "w") as handle:
+        handle.write(json.dumps(
             {
                 "source": "http",
                 "endpoint": parts.path,
@@ -196,9 +206,7 @@ def _produce_from_http(config: StyxConfig, dest: Path, *, allow_remote: bool = F
                 "snapshot": "repeatable-read",
             },
             indent=2,
-        ),
-        encoding="utf-8",
-    )
+        ))
     return BundleResult(path=dest, record_count=record_count, kind="mpf-envelope", vault_included=True)
 
 
@@ -233,68 +241,126 @@ def _validate_http_export(payload: Path) -> int:
     record_count = 0
     completed = False
     unique_count = 0
-    payloads_by_identity: dict[str, str] = {}
+    # T-010: the seen-identity set lives in a disk-backed SQLite spool, not
+    # in a caller-side dict, so peak RAM stays flat however large the corpus
+    # grows. Fixed working-set budget: 16MB (see tests/test_streaming_export.py
+    # _VALIDATOR_PEAK_BUDGET_BYTES).
+    import hashlib as _hashlib
+    import sqlite3 as _sqlite3
+    import tempfile as _tempfile
+
     duplicates: list[str] = []
-    try:
-        with payload.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                if completed:
-                    raise StyxError("streaming export sent data after its completion marker")
-                try:
-                    frame = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    raise StyxError(f"streaming export contains invalid NDJSON at line {line_number}") from exc
-                if not isinstance(frame, dict):
-                    raise StyxError(f"streaming export frame {line_number} is not an object")
-                if frame.get("export_complete") is True:
-                    declared = frame.get("record_count")
-                    if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0:
-                        raise StyxError("streaming export completion marker has an invalid record_count")
-                    if frame.get("records") not in (None, []):
-                        raise StyxError("streaming export completion marker also contains records")
-                    if not completion_count_matches(declared, unique=unique_count, wire=record_count):
-                        raise StyxError(
-                            "streaming export completion count does not match unique "
-                            f"record identities or received records ({declared} vs "
-                            f"{unique_count} unique / {record_count} received)"
-                        )
-                    if duplicates:
-                        logger.warning(
-                            "streaming export contained %d byte-identical duplicate "
-                            "record(s) at page boundaries; counted unique identities. "
-                            "duplicated ids: %s",
-                            len(duplicates),
-                            ", ".join(duplicates[:20]) + (" …" if len(duplicates) > 20 else ""),
-                        )
-                    completed = True
-                    continue
-                records = frame.get("records")
-                if not isinstance(records, list):
-                    raise StyxError(f"streaming export frame {line_number} has no records array")
-                record_count += len(records)
-                for entry in records:
-                    if not isinstance(entry, dict):
-                        raise StyxError(f"streaming export frame {line_number} has a non-object record")
-                    identity = entry.get("id")
-                    if not isinstance(identity, str) or not identity:
-                        raise StyxError(f"streaming export frame {line_number} has a record without an identity")
-                    serialized = json.dumps(entry, sort_keys=True, ensure_ascii=False)
-                    prior = payloads_by_identity.get(identity)
-                    if prior is None:
-                        payloads_by_identity[identity] = serialized
-                        unique_count += 1
-                    elif prior != serialized:
-                        raise StyxError(
-                            f"streaming export re-emitted record {identity!r} with a "
-                            "DIFFERENT payload (first at line unknown, again at line "
-                            f"{line_number}); refusing to back up a divergent stream"
-                        )
-                    elif identity not in duplicates:
-                        duplicates.append(identity)
-    except UnicodeDecodeError as exc:
-        raise StyxError("streaming export is not valid UTF-8 NDJSON") from exc
+    duplicates_seen_count = 0
+    duplicate_sample_limit = 20
+    # Spool lifecycle is context-managed, not manual: both the
+    # TemporaryDirectory and the SQLite handle close deterministically on
+    # every exit path (StyxError, UnicodeDecodeError, sqlite3.Error, or any
+    # unexpected exception), in close-then-remove order. Nothing here is a
+    # persistence write through the ABC — the spool is a private validator
+    # scratch file, not a store backend.
+    with _tempfile.TemporaryDirectory(prefix=".mnemos-styx-validate-", dir=str(payload.parent)) as spool_name:
+        with _sqlite3.connect(str(Path(spool_name) / "spool.db")) as spool:
+            # Separate batch counters for the two logical streams so commit
+            # frequency stays predictable regardless of duplicate density.
+            # Commits happen every `commit_batch` uncommitted rows per
+            # stream — the journal never grows with corpus size — and each
+            # flush one commit for both tables, resetting both counters.
+            # _sqlite3.Error from a failed flush propagates to the handler
+            # below, so in-memory counters and spool state never diverge.
+            commit_batch = 1000
+            pending_seen = 0
+            pending_dups = 0
+
+            def _flush() -> None:
+                nonlocal pending_seen, pending_dups
+                spool.commit()
+                pending_seen = pending_dups = 0
+
+            try:
+                spool.execute("CREATE TABLE seen (identity TEXT PRIMARY KEY, digest TEXT)")
+                spool.execute("CREATE TABLE dup_seen (identity TEXT PRIMARY KEY)")
+                with payload.open("r", encoding="utf-8") as handle:
+                    for line_number, line in enumerate(handle, start=1):
+                        if not line.strip():
+                            continue
+                        if completed:
+                            raise StyxError("streaming export sent data after its completion marker")
+                        try:
+                            frame = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            raise StyxError(f"streaming export contains invalid NDJSON at line {line_number}") from exc
+                        if not isinstance(frame, dict):
+                            raise StyxError(f"streaming export frame {line_number} is not an object")
+                        if frame.get("export_complete") is True:
+                            declared = frame.get("record_count")
+                            if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0:
+                                raise StyxError("streaming export completion marker has an invalid record_count")
+                            if frame.get("records") not in (None, []):
+                                raise StyxError("streaming export completion marker also contains records")
+                            if not completion_count_matches(declared, unique=unique_count, wire=record_count):
+                                raise StyxError(
+                                    "streaming export completion count does not match unique "
+                                    f"record identities or received records ({declared} vs "
+                                    f"{unique_count} unique / {record_count} received)"
+                                )
+                            if duplicates_seen_count:
+                                logger.warning(
+                                    "streaming export contained %d byte-identical duplicate "
+                                    "record(s) at page boundaries; counted unique identities. "
+                                    "duplicated ids: %s",
+                                    duplicates_seen_count,
+                                    ", ".join(duplicates) + (" …" if duplicates_seen_count > len(duplicates) else ""),
+                                )
+                            completed = True
+                            continue
+                        records = frame.get("records")
+                        if not isinstance(records, list):
+                            raise StyxError(f"streaming export frame {line_number} has no records array")
+                        record_count += len(records)
+                        for entry in records:
+                            if not isinstance(entry, dict):
+                                raise StyxError(f"streaming export frame {line_number} has a non-object record")
+                            identity = entry.get("id")
+                            if not isinstance(identity, str) or not identity:
+                                raise StyxError(
+                                    f"streaming export frame {line_number} has a record without an identity"
+                                )
+                            serialized = json.dumps(entry, sort_keys=True, ensure_ascii=False)
+                            digest = _hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+                            prior = spool.execute("SELECT digest FROM seen WHERE identity=?", (identity,)).fetchone()
+                            if prior is None:
+                                spool.execute("INSERT INTO seen VALUES (?,?)", (identity, digest))
+                                pending_seen += 1
+                                if pending_seen >= commit_batch:
+                                    _flush()
+                                unique_count += 1
+                            elif prior[0] != digest:
+                                raise StyxError(
+                                    f"streaming export re-emitted record {identity!r} with a "
+                                    "DIFFERENT payload (first at line unknown, again at line "
+                                    f"{line_number}); refusing to back up a divergent stream"
+                                )
+                            else:
+                                # Byte-identical page-seam repeat: every repeat
+                                # sighting counts toward the WARNING total, while
+                                # the spool table keeps the distinct-id sample
+                                # bounded — dedupe state lives on disk, not RAM.
+                                # INSERT OR IGNORE is a single round-trip: a
+                                # repeat sighting that changes nothing reports
+                                # no change, which tells us this id is already
+                                # sampled without a second query.
+                                cursor = spool.execute("INSERT OR IGNORE INTO dup_seen VALUES (?)", (identity,))
+                                duplicates_seen_count += 1
+                                if cursor.rowcount:
+                                    pending_dups += 1
+                                    if pending_dups >= commit_batch:
+                                        _flush()
+                                    if len(duplicates) < duplicate_sample_limit:
+                                        duplicates.append(identity)
+            except UnicodeDecodeError as exc:
+                raise StyxError("streaming export is not valid UTF-8 NDJSON") from exc
+            except _sqlite3.Error as exc:
+                raise StyxError(f"streaming export validation spool failed: {exc}") from exc
     if not completed:
         raise StyxError("streaming export ended before its completion marker")
     return unique_count
@@ -319,7 +385,7 @@ def archive_bundle(bundle_dir: Path, archive_path: Path) -> Path:
     """
     archive_path.parent.mkdir(parents=True, exist_ok=True)
     members = sorted(bundle_dir.rglob("*"), key=lambda p: str(p.relative_to(bundle_dir)))
-    with tarfile.open(archive_path, "w:gz") as tar:
+    with _private_file(archive_path) as handle, tarfile.open(fileobj=handle, mode="w:gz") as tar:
         for member in members:
             tar.add(member, arcname=str(member.relative_to(bundle_dir)), recursive=False)
     if not archive_path.exists() or archive_path.stat().st_size == 0:

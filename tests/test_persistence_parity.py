@@ -411,9 +411,15 @@ async def _seed_versioned_memory(case: BackendCase, tx: Any) -> tuple[str, str, 
         await tx.conn.execute("RELEASE SAVEPOINT mnemos_seed_suppress")
         await tx.conn.execute("RESET mnemos.suppress_version_snapshot")
     else:
-        # SQLite has no version trigger; suppression is a no-op here
-        # and there is nothing to scope.
-        memory_id = await _insert_memory(case, tx)
+        # SQLite has no version trigger, but insert_memory writes the v1
+        # snapshot in-repo (NG2-MN-019) — suppress for the seed insert so
+        # the known version_id below does not collide on the natural
+        # key. Savepoint-scoped (re-armed on RELEASE, mirroring the
+        # Postgres SAVEPOINT + RESET pairing above); suppression never
+        # leaks to the rest of the test transaction.
+        async with tx.savepoint():
+            await case.backend.memories.set_suppress_version_snapshot(tx)
+            memory_id = await _insert_memory(case, tx)
 
     version_id, commit_hash = await _insert_version(case, tx, memory_id, version_num=1, content="v1 content")
     await case.backend.memory_branches.upsert_memory_branch_head(
@@ -1739,5 +1745,6 @@ def test_acl_default_cache_is_disabled():
 
     from mnemos.core import lifecycle as lifecycle_module
 
-    source = inspect.getsource(lifecycle_module.lifespan)
-    assert "app.state.cache = None" in source
+    source = inspect.getsource(lifecycle_module._shutdown_resources)
+    assert 'await close_one("cache", _cache.aclose)' in source
+    assert '("pool", "pool_manager", "persistence_backend", "cache")' in source

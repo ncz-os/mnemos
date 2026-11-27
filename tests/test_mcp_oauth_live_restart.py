@@ -13,7 +13,6 @@ import pytest
 from starlette.datastructures import FormData
 
 from mnemos.mcp import oauth as mcp_oauth
-from tests.oauth_backend_helpers import oauth_database as oauth_database
 
 
 class _FormPostRequest:

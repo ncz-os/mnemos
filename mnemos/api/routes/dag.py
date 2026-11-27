@@ -480,6 +480,9 @@ async def create_branch(
     user: UserContext = Depends(get_current_user),
 ):
     """Create new branch from HEAD or specific commit hash."""
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     pool = _require_pool(route_label="POST /v1/memories/{memory_id}/branch")
 
     try:
@@ -731,6 +734,9 @@ async def merge_branch(
     user: UserContext = Depends(get_current_user),
 ):
     """Merge source_branch into target_branch."""
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     _require_pool(route_label="POST /v1/memories/{memory_id}/merge")
     backend = _require_postgres_backend()
     # #170: strategy is now Literal["latest-wins", "manual"] in the

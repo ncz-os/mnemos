@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Iterable
+from tests._route_helpers import flatten_routes
 
 REPO_ROOT = Path(__file__).parent.parent
 MCP_TOOLS = REPO_ROOT / "mnemos" / "mcp" / "tools"
@@ -51,7 +52,7 @@ def _registered_prefixes() -> list[str]:
     # stubs, which conftest.py sets up.
     from mnemos.api.main import app  # noqa: E402
     prefixes: set[str] = set()
-    for route in app.routes:
+    for route in flatten_routes(app.routes):
         path = getattr(route, "path", "")
         if not path:
             continue

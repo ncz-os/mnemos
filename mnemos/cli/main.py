@@ -36,7 +36,8 @@ def _patch_typer_click_compat() -> None:
                 parameter_make_metavar._mnemos_click_compat = True
                 Parameter.make_metavar = parameter_make_metavar
 
-        if len(inspect.signature(TyperArgument.make_metavar).parameters) == 1:
+        argument_make_metavar = getattr(TyperArgument, "make_metavar", None)
+        if argument_make_metavar is not None and len(inspect.signature(argument_make_metavar).parameters) == 1:
 
             def make_metavar(self: Any, ctx: Any = None) -> str:
                 if self.metavar is not None:
@@ -82,8 +83,9 @@ def _patch_typer_click_compat() -> None:
             option_init._mnemos_click_compat = True
             TyperOption.__init__ = option_init
 
-        if len(inspect.signature(TyperOption.make_metavar).parameters) == 2:
-            original_option_make_metavar = TyperOption.make_metavar
+        option_make_metavar = getattr(TyperOption, "make_metavar", None)
+        if option_make_metavar is not None and len(inspect.signature(option_make_metavar).parameters) == 2:
+            original_option_make_metavar = option_make_metavar
 
             def option_make_metavar(self: Any, ctx: Any = None) -> str:
                 return original_option_make_metavar(self, ctx)
@@ -400,66 +402,7 @@ async def _open_cli_persistence_backend():
     except Exception:
         pass
 
-    settings = get_settings()
-    backend_type = lifecycle._select_persistence_backend(settings)
-    if backend_type == "sqlite":
-        backend = await lifecycle._build_sqlite_backend(
-            lifecycle._sqlite_path_from_settings(settings),
-            settings,
-        )
-        return backend, True
-
-    if backend_type == "oracle":
-        oracle_dsn = lifecycle._oracle_dsn_from_settings(settings) or lifecycle.oracle_dsn_env()
-        if not oracle_dsn:
-            raise RuntimeError(
-                "Oracle backend selected but no oracle:// DSN configured. "
-                "Set MNEMOS_DATABASE_DSN=oracle://user:pass@host:port/service "
-                "or ORACLE_DSN."
-            )
-        return await lifecycle._build_oracle_backend(oracle_dsn, settings), True
-
-    if backend_type == "db2":
-        db2_dsn = lifecycle._db2_dsn_from_settings(settings) or lifecycle.db2_dsn_env()
-        if not db2_dsn:
-            raise RuntimeError(
-                "Db2 backend selected but no db2:// DSN configured. "
-                "Set MNEMOS_DATABASE_DSN=db2://user:pass@host:port/database "
-                "or DB2_DSN."
-            )
-        return await lifecycle._build_db2_backend(db2_dsn, settings), True
-
-    if backend_type == "mysql":
-        mysql_dsn = lifecycle._mysql_dsn_from_settings(settings)
-        if not mysql_dsn:
-            raise RuntimeError(
-                "MySQL backend selected but no mysql:// DSN configured. "
-                "Set MNEMOS_DATABASE_DSN=mysql://user:pass@host:3306/mnemos."
-            )
-        return await lifecycle._build_mysql_backend(mysql_dsn, settings), True
-
-    if backend_type != "postgres":
-        raise RuntimeError(f"Backend {backend_type!r} is not supported by CLI maintenance commands.")
-
-    import asyncpg
-
-    database_dsn = lifecycle._database_dsn_from_settings(settings)
-    if database_dsn:
-        pool = await asyncpg.create_pool(database_dsn)
-    else:
-        from mnemos.core.config import PG_CONFIG
-
-        pool = await asyncpg.create_pool(
-            user=PG_CONFIG["user"],
-            password=PG_CONFIG["password"],
-            database=PG_CONFIG["database"],
-            host=PG_CONFIG["host"],
-            port=PG_CONFIG["port"],
-            min_size=PG_CONFIG["pool_min_size"],
-            max_size=PG_CONFIG["pool_max_size"],
-        )
-    backend = lifecycle._build_postgres_backend(pool, settings)
-    await backend.open()
+    _, backend = await lifecycle.build_configured_persistence_backend(get_settings())
     return backend, True
 
 
@@ -505,11 +448,13 @@ async def _dedup_sweep_async(
 
     backend, close_backend = await _open_cli_persistence_backend()
     try:
-        return await sweep_duplicate_content(
+        result = await sweep_duplicate_content(
             backend,
             namespace=namespace,
             auto_merge=auto_merge,
         )
+        _schedule_dedup_side_effects(result)
+        return result
     finally:
         if close_backend:
             await backend.close()

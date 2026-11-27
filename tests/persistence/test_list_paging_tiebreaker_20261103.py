@@ -60,26 +60,34 @@ def _bypass() -> VisibilityFilter:
 
 async def _insert_memory(backend: SqliteBackend, memory_id: str) -> None:
     async with backend.transactional() as tx:
-        await backend.memories.insert_memory(
-            tx,
-            memory_id=memory_id,
-            content=f"fb137 {memory_id}",
-            category="projects",
-            subcategory=None,
-            metadata_json="{}",
-            quality_rating=75,
-            owner_id="root",
-            namespace="default",
-            permission_mode=700,
-            source_model=None,
-            source_provider=None,
-            source_session=None,
-            source_agent=None,
-            verbatim_content=f"fb137 {memory_id}",
-            embedding=None,
-            created=_IDENTICAL_TS,
-            updated=_IDENTICAL_TS,
-        )
+        # Suppress the in-repo v1 version snapshot (NG2-MN-019): this
+        # fixture's golden pins the exact statements emitted by
+        # list_memories, so the seed insert must stay single-statement —
+        # same pattern as tests/test_charon_backend_roundtrip.py,
+        # tests/test_sqlite_branch_repo_20261107.py and
+        # tests/test_persistence_parity.py.
+        async with tx.savepoint():
+            await backend.memories.set_suppress_version_snapshot(tx)
+            await backend.memories.insert_memory(
+                tx,
+                memory_id=memory_id,
+                content=f"fb137 {memory_id}",
+                category="projects",
+                subcategory=None,
+                metadata_json="{}",
+                quality_rating=75,
+                owner_id="root",
+                namespace="default",
+                permission_mode=700,
+                source_model=None,
+                source_provider=None,
+                source_session=None,
+                source_agent=None,
+                verbatim_content=f"fb137 {memory_id}",
+                embedding=None,
+                created=_IDENTICAL_TS,
+                updated=_IDENTICAL_TS,
+            )
 
 
 def _collapsed(sql: str) -> str:

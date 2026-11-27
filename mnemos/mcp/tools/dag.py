@@ -332,6 +332,155 @@ async def tool_checkout_memory(
         return {"success": False, "error": str(e)}
 
 
+async def tool_list_memory_versions(
+    memory_id: str,
+    branch: str = "main",
+    user: UserContext | None = None,
+) -> dict[str, Any]:
+    """List version snapshots for a memory on a branch (oldest first)."""
+    safe_id = _safe_path_segment(memory_id, label="memory_id")
+    _safe_path_segment(branch, label="branch")
+    if user is None:
+        versions = await _rest_get(
+            f"/v1/memories/{safe_id}/versions",
+            params={"branch": branch},
+        )
+        return {
+            "success": True,
+            "memory_id": memory_id,
+            "branch": branch,
+            "versions": [
+                {
+                    "version": v.get("version_num"),
+                    "timestamp": v.get("snapshot_at"),
+                    "author": v.get("snapshot_by"),
+                    "type": v.get("change_type"),
+                    "preview": v.get("content_preview"),
+                    "branch": v.get("branch"),
+                }
+                for v in versions
+            ],
+            "count": len(versions),
+        }
+
+    try:
+        user = _mcp_user_required(user)
+    except PermissionError as e:
+        return {"success": False, "error": str(e)}
+
+    backend = _get_persistence_backend()
+    if backend is None:
+        return {"success": False, "error": "Database unavailable"}
+
+    try:
+        async with backend.transactional() as tx:
+            try:
+                await _mcp_assert_memory_readable(backend, tx, memory_id, user)
+            except PermissionError as e:
+                return {"success": False, "error": str(e)}
+
+            rows = await backend.memories.fetch_memory_versions(tx, memory_id, branch, user)
+            versions = []
+            for r in rows:
+                preview = r.get("content") or ""
+                preview = _redact_history_content(preview, user)
+                versions.append(
+                    {
+                        "version": r["version_num"],
+                        "timestamp": _memory_log_timestamp(r.get("snapshot_at")),
+                        "author": r.get("snapshot_by"),
+                        "type": r.get("change_type"),
+                        "preview": preview[:120],
+                        "branch": r.get("branch"),
+                    }
+                )
+            return {
+                "success": True,
+                "memory_id": memory_id,
+                "branch": branch,
+                "versions": versions,
+                "count": len(versions),
+            }
+
+    except Exception as e:
+        logger.error(f"[MCP] list_memory_versions failed: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+async def tool_get_memory_version(
+    memory_id: str,
+    version_num: int,
+    branch: str = "main",
+    user: UserContext | None = None,
+) -> dict[str, Any]:
+    """Fetch one version snapshot by version number."""
+    safe_id = _safe_path_segment(memory_id, label="memory_id")
+    _safe_path_segment(branch, label="branch")
+    if not isinstance(version_num, int) or isinstance(version_num, bool):
+        return {"success": False, "error": "version_num must be an integer"}
+    safe_version = _safe_path_segment(str(version_num), label="version_num")
+    if user is None:
+        row = await _rest_get(
+            f"/v1/memories/{safe_id}/versions/{safe_version}",
+            params={"branch": branch},
+        )
+        return {
+            "success": True,
+            "memory_id": memory_id,
+            "version": {
+                "version": row.get("version_num"),
+                "branch": row.get("branch", branch),
+                "type": row.get("change_type"),
+                "category": row.get("category"),
+                "subcategory": row.get("subcategory"),
+                "timestamp": row.get("snapshot_at"),
+                "author": row.get("snapshot_by"),
+            },
+            "content": row.get("content"),
+        }
+
+    try:
+        user = _mcp_user_required(user)
+    except PermissionError as e:
+        return {"success": False, "error": str(e)}
+
+    backend = _get_persistence_backend()
+    if backend is None:
+        return {"success": False, "error": "Database unavailable"}
+
+    try:
+        async with backend.transactional() as tx:
+            try:
+                await _mcp_assert_memory_readable(backend, tx, memory_id, user)
+            except PermissionError as e:
+                return {"success": False, "error": str(e)}
+
+            row = await backend.memories.fetch_memory_version(
+                tx, memory_id, version_num, branch, user
+            )
+            if not row:
+                return {"success": False, "error": "Version not found"}
+
+            return {
+                "success": True,
+                "memory_id": memory_id,
+                "version": {
+                    "version": row["version_num"],
+                    "branch": row.get("branch"),
+                    "type": row.get("change_type"),
+                    "category": row.get("category"),
+                    "subcategory": row.get("subcategory"),
+                    "timestamp": _memory_log_timestamp(row.get("snapshot_at")),
+                    "author": row.get("snapshot_by"),
+                },
+                "content": _redact_history_content(row.get("content") or "", user),
+            }
+
+    except Exception as e:
+        logger.error(f"[MCP] get_memory_version failed: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
 TOOLS: dict[str, dict[str, Any]] = {
     "log_memory": _tool(
         "Walk commit DAG from branch HEAD to root.",
@@ -376,5 +525,24 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         ["memory_id", "commit_hash"],
         tool_checkout_memory,
+    ),
+    "list_memory_versions": _tool(
+        "List version snapshots for a memory on a branch (oldest first).",
+        {
+            "memory_id": {"type": "string", "description": "Memory ID"},
+            "branch": {"type": "string", "description": "Branch name (default: main)", "maxLength": 128},
+        },
+        ["memory_id"],
+        tool_list_memory_versions,
+    ),
+    "get_memory_version": _tool(
+        "Fetch one version snapshot by version number.",
+        {
+            "memory_id": {"type": "string", "description": "Memory ID"},
+            "version_num": {"type": "integer", "description": "Version number", "minimum": 1},
+            "branch": {"type": "string", "description": "Branch name (default: main)", "maxLength": 128},
+        },
+        ["memory_id", "version_num"],
+        tool_get_memory_version,
     ),
 }

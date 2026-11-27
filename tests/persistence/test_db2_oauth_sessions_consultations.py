@@ -198,3 +198,37 @@ async def test_db2_repositories_emit_native_positional_sql() -> None:
     assert ":session_id" not in sql
     assert "CURRENT TIMESTAMP" in sql
     assert "?" in sql
+
+
+@pytest.mark.asyncio
+async def test_db2_transactional_accepts_readonly_repeatable_read() -> None:
+    class TransactionCursor(_RecordingCursor):
+        def fetchone(self) -> tuple[str]:
+            return ("CS",)
+
+    class TransactionConn(_RecordingConn):
+        def __init__(self) -> None:
+            self.cursor_obj = TransactionCursor()
+            self._mnemos_discard = False
+
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    class Acquire:
+        async def __aenter__(self) -> TransactionConn:
+            self.conn = TransactionConn()
+            return self.conn
+
+        async def __aexit__(self, *_: object) -> None:
+            return None
+
+    class Pool:
+        def acquire(self) -> Acquire:
+            return Acquire()
+
+    backend = Db2Backend(pool=Pool(), settings=_settings())
+    async with backend.transactional(readonly=True, isolation="repeatable_read"):
+        pass

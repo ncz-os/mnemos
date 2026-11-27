@@ -12,8 +12,8 @@ def test_mcp_dependency_excludes_incompatible_major_version() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = project["project"]["dependencies"]
 
-    assert "mcp>=1.0.0,<2" in dependencies
-    assert re.search(r"^mcp>=1\.0\.0,<2$", (ROOT / "requirements.txt").read_text(encoding="utf-8"), re.MULTILINE)
+    assert "mcp>=1.30.0,<2" in dependencies
+    assert re.search(r"^mcp>=1\.30\.0,<2$", (ROOT / "requirements.txt").read_text(encoding="utf-8"), re.MULTILINE)
 
 
 def test_runtime_recovery_commands_name_the_installable_distribution() -> None:

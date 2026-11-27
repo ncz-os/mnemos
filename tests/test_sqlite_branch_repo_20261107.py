@@ -55,25 +55,30 @@ async def backend(tmp_path):
 
 async def _add_memory(be: SqliteBackend, memory_id: str) -> None:
     async with be.transactional() as tx:
-        await be.memories.insert_memory(
-            tx,
-            memory_id=memory_id,
-            content="branch fixture",
-            category="facts",
-            subcategory=None,
-            metadata_json="{}",
-            quality_rating=75,
-            owner_id="alice",
-            namespace="alice-ns",
-            permission_mode=0,
-            source_model=None,
-            source_provider=None,
-            source_session=None,
-            source_agent=None,
-            verbatim_content="branch fixture",
-            created=None,
-            updated=None,
-        )
+        # No auto-snapshot: this file plants memory_branches rows by
+        # hand (chosen heads, NULL heads); the in-repo v1 snapshot
+        # (NG2-MN-019) would pre-create the main row and collide.
+        async with tx.savepoint():
+            await be.memories.set_suppress_version_snapshot(tx)
+            await be.memories.insert_memory(
+                tx,
+                memory_id=memory_id,
+                content="branch fixture",
+                category="facts",
+                subcategory=None,
+                metadata_json="{}",
+                quality_rating=75,
+                owner_id="alice",
+                namespace="alice-ns",
+                permission_mode=0,
+                source_model=None,
+                source_provider=None,
+                source_session=None,
+                source_agent=None,
+                verbatim_content="branch fixture",
+                created=None,
+                updated=None,
+            )
 
 
 def test_subclasses_the_documented_mixin_and_base() -> None:

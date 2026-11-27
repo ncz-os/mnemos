@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -661,7 +662,12 @@ def test_start_gate_runs_before_any_bridge_is_resolved(monkeypatch):
     """A disabled host must not even look up a backend."""
     _patch_settings(monkeypatch, tunnels_enabled=False)
     resolved = []
-    monkeypatch.setattr(tr, "get_bridge_class", lambda b: resolved.append(b) or FakeBridge)
+
+    def _resolve(b):
+        resolved.append(b)
+        return FakeBridge
+
+    monkeypatch.setattr(tr, "get_bridge_class", _resolve)
     with pytest.raises(HTTPException):
         _run(tr.start_tunnel(_request(), _root_user()))
     assert resolved == []
@@ -671,7 +677,12 @@ def test_start_gate_runs_before_any_token_is_issued(monkeypatch):
     """No live credential may be minted for a request that will be refused."""
     _patch_settings(monkeypatch, tunnels_enabled=False)
     issued = []
-    monkeypatch.setattr(tr, "_oauth_service", lambda: issued.append(1) or object())
+
+    def _oauth_service():
+        issued.append(1)
+        return object()
+
+    monkeypatch.setattr(tr, "_oauth_service", _oauth_service)
     with pytest.raises(HTTPException):
         _run(tr.start_tunnel(_request(), _root_user()))
     assert issued == []
@@ -721,7 +732,12 @@ def test_start_validates_backend_before_issuing_a_token(monkeypatch):
 
     monkeypatch.setattr(tr, "get_bridge_class", _get)
     token_calls = []
-    monkeypatch.setattr(tr, "_issue_tunnel_token", lambda: token_calls.append(1) or ("t", "oauth", 1))
+
+    def _issue_token():
+        token_calls.append(1)
+        return ("t", "oauth", 1)
+
+    monkeypatch.setattr(tr, "_issue_tunnel_token", _issue_token)
     with pytest.raises(HTTPException):
         _run(tr.start_tunnel(_request(), _root_user()))
     assert token_calls == []
@@ -731,7 +747,12 @@ def test_start_resolves_the_bridge_class_before_issuing_a_token(monkeypatch, fak
     """Ordering pin: backend validation happens first, so a 503 from token
     issuance is reached only after a valid backend was resolved."""
     order = []
-    monkeypatch.setattr(tr, "get_bridge_class", lambda b: order.append("resolve") or FakeBridge)
+
+    def _resolve(b):
+        order.append("resolve")
+        return FakeBridge
+
+    monkeypatch.setattr(tr, "get_bridge_class", _resolve)
 
     def _no_token():
         order.append("token")
@@ -813,7 +834,12 @@ def test_a_refused_second_start_mints_no_credential(monkeypatch):
     tr._active_bridge = running
 
     minted = []
-    monkeypatch.setattr(tr, "_issue_tunnel_token", lambda: minted.append(1) or ("t", "oauth", 1))
+
+    def _issue_token():
+        minted.append(1)
+        return ("t", "oauth", 1)
+
+    monkeypatch.setattr(tr, "_issue_tunnel_token", _issue_token)
 
     with pytest.raises(HTTPException) as ei:
         _run(tr.start_tunnel(_request(), _root_user()))
@@ -927,6 +953,75 @@ def test_a_dead_existing_bridge_does_not_block_a_new_start(monkeypatch):
     monkeypatch.setattr(tr, "get_bridge_class", lambda b: FakeBridge)
     resp = _run(tr.start_tunnel(_request(), _root_user()))
     assert resp.url == "https://fake.trycloudflare.com"
+
+
+def test_start_tunnel_contract_names_all_five_steps():
+    """The ordering contract in the source names every refusal path.
+
+    Steps 1-4 are the refusal paths that must run before any token is minted
+    or bridge spawned; step 5 is the spawn itself. If a future change adds
+    a refusal path without updating the contract, this test fails.
+    """
+    source = inspect.getsource(tr.start_tunnel)
+    assert "1. host opt-in gate" in source
+    assert "2. backend resolution" in source
+    assert "3. single-tunnel guard" in source
+    assert "4. credential resolution" in source
+    assert "5. bridge construction and start" in source
+    # The 503 path is named in step 4, not hidden
+    assert "503" in source
+
+
+def test_start_runs_the_five_contract_steps_in_order(monkeypatch):
+    """End-to-end sequencing pin for the whole contract in one start.
+
+    The per-branch tests above each pin one adjacent pair of steps; this one
+    records every step a single successful start performs and asserts the
+    exact executed order, so a change that lets the credential be minted
+    before the single-tunnel guard (or the gate run after backend resolution)
+    fails here even though each pairwise assertion in isolation would still
+    hold.
+
+    With no live tunnel present the single-tunnel guard (step 3) is a
+    pass-through, so it contributes nothing observable to the sequence; its
+    refusal path is pinned separately by
+    ``test_a_refused_second_start_mints_no_credential``. The order asserted
+    here therefore covers the four steps that actually execute on a clean
+    start: gate, resolve, credential, spawn.
+    """
+    order: list[str] = []
+
+    real_gate = tr._require_enabled
+
+    def _gate():
+        real_gate()
+        order.append("gate")
+
+    monkeypatch.setattr(tr, "_require_enabled", _gate)
+
+    def _resolve_bridge_class(backend):
+        order.append("resolve")
+        return FakeBridge
+
+    monkeypatch.setattr(tr, "get_bridge_class", _resolve_bridge_class)
+
+    def _issue():
+        order.append("credential")
+        return ("t", "static", None)
+
+    monkeypatch.setattr(tr, "_issue_tunnel_token", _issue)
+
+    real_start = FakeBridge.start
+
+    async def _start(self, *, target_port, authtoken=None):
+        order.append("spawn")
+        return await real_start(self, target_port=target_port, authtoken=authtoken)
+
+    monkeypatch.setattr(FakeBridge, "start", _start)
+
+    _run(tr.start_tunnel(_request(), _root_user()))
+
+    assert order == ["gate", "resolve", "credential", "spawn"]
 
 
 # ── tunnel_status ────────────────────────────────────────────────────────

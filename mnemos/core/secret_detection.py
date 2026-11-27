@@ -47,7 +47,7 @@ VAULT_NAMESPACE = "vault"
 # ``persisted_text_classification.strip_caller_secret_metadata``).
 # v2 (MN-07): Stripe ``sk_/rk_/pk_live_|test_`` keys, JWTs, the AWS secret
 # access key shape, and whitespace-split tokens are now detected.
-SECRET_CLASSIFIER_VERSION = 2
+SECRET_CLASSIFIER_VERSION = 3
 
 # Metadata key holding the per-field CLEAN verdicts written at ingest
 # (``{field_name: classifier_version}``). SERVER-ONLY, like every other
@@ -95,7 +95,10 @@ _HIGH_CONFIDENCE: list[tuple[str, re.Pattern]] = [
     # Slack tokens
     ("slack", re.compile(r"\bxox[baprs]-[0-9A-Za-z-]{10,}")),
     # PEM private key blocks
-    ("pem_private", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    (
+        "pem_private",
+        re.compile(r"-----BEGIN (?P<pem_kind>[A-Z ]*PRIVATE KEY)-----[\s\S]*?(?:-----END (?P=pem_kind)-----|\Z)"),
+    ),
 ]
 
 # ── Split tokens (MN-07) ───────────────────────────────────────────────
@@ -1349,7 +1352,7 @@ def redact(content: str | None, spans: List[Tuple[int, int]]) -> str:
         return content or ""
     n = len(content)
     norm: list[tuple[int, int]] = []
-    for s, e in spans:
+    for s, e in [*spans, *private_key_spans(content)]:
         cs, ce = max(0, min(s, n)), max(0, min(e, n))
         if ce > cs:
             norm.append((cs, ce))
@@ -1417,6 +1420,12 @@ def _stored_spans(metadata: Any, field_name: str) -> list[tuple[int, int]]:
     return []
 
 
+def private_key_spans(content: str) -> list[tuple[int, int]]:
+    """Complete private-key spans supplement stored classification metadata."""
+    pattern = next(pattern for name, pattern in _HIGH_CONFIDENCE if name == "pem_private")
+    return [match.span() for match in pattern.finditer(content)]
+
+
 def redact_field_with_stored(content: str | None, metadata: Any, field_name: str) -> str:
     """Redact ``content`` using stored ingest spans; fall back to recompute.
 
@@ -1449,6 +1458,7 @@ def redact_field_with_stored(content: str | None, metadata: Any, field_name: str
         return content or ""
     spans = _stored_spans(metadata, field_name)
     if spans and _spans_mask_anything(content, spans):
+        spans = [*spans, *(match.span() for name, pattern in _HIGH_CONFIDENCE if name == "pem_private" for match in pattern.finditer(content))]
         return redact(content, spans)
     if is_clean_under_current_classifier(metadata, field_name):
         return content

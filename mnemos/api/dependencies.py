@@ -38,6 +38,7 @@ Set a shorter TTL when that window matters more than the saved round trips,
 or the longest acceptable lag when it does not.
 """
 
+import asyncio
 import collections
 import hashlib
 import logging
@@ -51,6 +52,7 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPBearer
 
 from mnemos.core.auth_context import UserContext
+from mnemos.core.roles import KNOWN_ROLES
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,16 @@ _personal_user_id: str = "default"
 PERSONAL_SINGLETON: "Optional[UserContext]" = None  # set by configure_auth(); None before startup
 
 _bearer = HTTPBearer(auto_error=False)
+_MONITOR_ALLOWED_ROUTES = {("GET", "/stats"), ("GET", "/v1/federation/status")}
+
+
+def _enforce_role_route_boundary(request: Request, user: UserContext) -> UserContext:
+    """Reject invalid roles and keep monitor credentials on aggregate reads."""
+    if user.role not in KNOWN_ROLES:
+        raise HTTPException(status_code=403, detail="Role not permitted")
+    if user.role == "monitor" and (request.method.upper(), request.url.path) not in _MONITOR_ALLOWED_ROUTES:
+        raise HTTPException(status_code=403, detail="Monitor access is limited to status reads")
+    return user
 
 # ── Per-request authentication cost (decision M5) ───────────────────────────
 #
@@ -117,11 +129,21 @@ def _reset_auth_caches() -> None:
     Called by ``configure_auth`` at startup and available to tests that
     reconfigure auth mid-process: entries minted under one configuration must
     not leak into the next one.
+
+    Also drops the shared flusher handle so a task minted under the previous
+    configuration is never mistaken for the current flusher: the orphaned
+    task still drains whatever it snapshotted (harmless — the queue was just
+    cleared), but the next touch mints a fresh flusher instead of joining a
+    stale one. Never cancelled here: this runs on the event loop while the
+    flusher may be mid-transaction, and cancelling mid-write would strand
+    the batch; the orphan exits on its own when its snapshot drains.
     """
+    global _touch_task
     with _auth_lock:
         _key_cache.clear()
         _touch_times.clear()
         _dirty_keys.clear()
+        _touch_task = None
 
 
 def _cache_get(key_hash: str, now: float) -> "Optional[UserContext]":
@@ -227,6 +249,30 @@ def _requeue_touch(key_id) -> None:
         _touch_times[key_id] = time.monotonic()
 
 
+def _task_live(task) -> bool:
+    """True when *task* is a flusher that may still drain the queue.
+
+    Unreadable is False, not True: the shared handle is the only gate, so a
+    handle whose ``done()`` raises must not be mistaken for a live flusher,
+    or every later touch would be dropped and the queue would never drain.
+    A real Task never raises here, so treating it as dead costs nothing and
+    lets the guard recover by scheduling a fresh flusher (the key that
+    arrived just before was already queued in ``_dirty_keys``).
+    """
+    if task is None:
+        return False
+    done = getattr(task, "done", None)
+    # A stubbed scheduler (tests, no loop) returns None: it drove the flush
+    # synchronously, so nothing is in flight.
+    if done is None:
+        return False
+    try:
+        return not done()
+    except Exception as e:
+        logger.debug(f"[AUTH] unreadable flusher handle, scheduling recovery: {e}")
+        return False
+
+
 async def _write_touches(backend, oauth, key_ids) -> None:
     """One transaction per batch of last_used bumps."""
     async with backend.transactional() as tx:
@@ -235,15 +281,25 @@ async def _write_touches(backend, oauth, key_ids) -> None:
 
 
 async def _flush_dirty_touches(backend, oauth) -> None:
-    """Write every queued last_used bump in one transaction, then clear the queue.
+    """Write every queued last_used bump in batches, one transaction a batch.
 
-    One transaction for the whole batch, not one per request: keys queued
-    while the previous batch was being written are picked up by the next turn
-    of the loop. A failed write is *not* retried in the same task — a store
-    that stays down must not spin here, it must wait for the debounce (or the
-    next request).
+    Single-flight: while this coroutine runs it is the only flusher allowed
+    to drain the queue. Keys queued while a batch is being written are
+    picked up by the next turn of the loop. A failed write is *not* retried
+    in the same task — a store that stays down must not spin here, it must
+    wait for the debounce (or the next request).
+
+    When this coroutine exits while keys are still queued (cancelled, or a
+    failure), it hands the queue to exactly one successor flusher so a key
+    is never stranded waiting for an unrelated later request. On
+    cancellation the in-flight batch is re-offered with debounce backoff —
+    through the same ``_requeue_touch`` path as the failure branch — so a
+    shutdown-cancellation that leaves keys queued cannot turn into an
+    immediate retry; the next write comes after the normal interval, on
+    the next request.
     """
     global _touch_task
+    cancelled = False
     try:
         while True:
             with _auth_lock:
@@ -253,32 +309,70 @@ async def _flush_dirty_touches(backend, oauth) -> None:
                 _dirty_keys.clear()
             try:
                 await _write_touches(backend, oauth, key_ids)
+            except asyncio.CancelledError:
+                cancelled = True
+                with _auth_lock:
+                    for key_id in key_ids:
+                        _dirty_keys.setdefault(key_id, None)
+                # Same debounce as the failure path: the cancelled batch is
+                # offered again only after the touch interval, never hot.
+                for key_id in key_ids:
+                    _requeue_touch(key_id)
+                raise
             except Exception as e:
                 logger.warning(f"[AUTH] Failed to update last_used for keys {key_ids}: {e}")
                 for key_id in key_ids:
                     _requeue_touch(key_id)
                 return
     finally:
-        # Drop our own reference on every exit path, not just the empty one:
-        # a failed write requeues nothing but leaves a concurrent touch in
-        # ``_dirty_keys``, and leaving ``_touch_task`` set there would be a
-        # dangling handle to a finished task. A touch queued after this point
-        # simply starts the next flusher -- ``_ensure_touch_flusher`` always
-        # schedules, it never waits on the old handle.
+        # Only clear the shared handle when it still points at this task:
+        # a successor scheduled near our exit owns the queue now, and
+        # clearing its handle would fork a second flusher on the next touch.
+        try:
+            me = asyncio.current_task()
+        except RuntimeError:  # no running loop (sync-driven stubs)
+            me = None
         with _auth_lock:
-            _touch_task = None
+            if _touch_task is me:
+                _touch_task = None
+            pending = bool(_dirty_keys)
+        if pending and not cancelled and me is not None and not me.cancelling():
+            # Keys arrived after our last snapshot (or we failed): hand
+            # them to exactly one chained flusher instead of waiting for
+            # an unrelated later request. Never chain out of a
+            # cancellation — shutdown is tearing the loop down, and a
+            # successor scheduled now would outlive the cancel sweep.
+            # ``cancelled`` covers cancellation delivered at the
+            # _write_touches await; me.cancelling() covers cancellation
+            # requested but not yet delivered (cancel() landing during the
+            # synchronous snapshot section, or during any other await in
+            # this task, with no await point reached before finally runs
+            # and the task was never marked cancelling by our own handler).
+            # Both guards stay — removing either reopens a chain-on-cancel
+            # path. A store failure racing shutdown could still chain here
+            # if the sweep has not reached this task yet; the successor is
+            # a tracked background task, so the sweep cancels it in turn.
+            try:
+                _ensure_touch_flusher(backend, oauth)
+            except RuntimeError:
+                # Loop is closing under us (shutdown): leave the keys
+                # queued. They debounce-retry on the next request; minting
+                # a task on a closing loop would raise anyway.
+                pass
 
 
 def _ensure_touch_flusher(backend, oauth) -> bool:
     """True when a flusher that will drain the queue is (now) running.
 
-    A task created here cannot have started yet — the caller has not yielded —
-    so its first drain is guaranteed to see the key queued by ``_schedule_touch``
-    just before. An existing flusher that is still running may already have
-    taken its last snapshot of the queue, so it is *not* cancelled (that would
-    drop the batch it is in the middle of): a second one is started instead,
-    and it drains whatever is left. At most one extra drain is in flight, and
-    only for the turn in which a new touch is queued.
+    Genuinely single-flight: a live flusher task is reused, never
+    duplicated. A task is only started when no flusher is in flight; a
+    newly created task cannot have started yet (the caller has not
+    yielded), so its first drain is guaranteed to see the key queued by
+    ``_schedule_touch`` just before. Because the running flusher loops
+    until the queue is empty, a key queued while it is writing is picked
+    up on its next turn — no second task is needed. A key queued after
+    the flusher's final snapshot is handed to a single chained successor
+    by the flusher's own exit path.
     """
     global _touch_task
     try:
@@ -288,6 +382,8 @@ def _ensure_touch_flusher(backend, oauth) -> bool:
         logger.debug(f"[AUTH] last_used update not scheduled: {e}")
         return False
     with _auth_lock:
+        if _task_live(_touch_task):
+            return True
         current = _touch_task
         try:
             _touch_task = _schedule_background(_flush_dirty_touches(backend, oauth))
@@ -295,11 +391,27 @@ def _ensure_touch_flusher(backend, oauth) -> bool:
             logger.debug(f"[AUTH] last_used update not scheduled: {e}")
             _touch_task = current
             return False
+        if not _task_live(_touch_task):
+            # The scheduler drove the flush synchronously (tests / sync
+            # stubs): nothing is in flight, so drop the handle instead of
+            # keeping a stale reference that would look "live" later.
+            _touch_task = current
     return True
 
 
 def _schedule_touch(backend, oauth, key_id) -> bool:
     """Debounced, single-flight last_used bump. Returns True when queued."""
+    # Replica mode: authentication must work read-only. A Bearer lookup on
+    # a hot standby must not queue a last_used write — the flusher would
+    # fail with "read-only transaction" on the standby. Skip the queue
+    # entirely, including the debounce registration.
+    try:
+        from mnemos.core.replica_mode import replica_mode_enabled
+
+        if replica_mode_enabled():
+            return False
+    except Exception:
+        pass
     if key_id is None or _touch_interval <= 0 or not _note_touch(key_id):
         return False
     if _ensure_touch_flusher(backend, oauth):
@@ -386,7 +498,7 @@ async def get_current_user(
     if not _auth_enabled:
         if PERSONAL_SINGLETON is None:
             raise HTTPException(status_code=503, detail="Auth not yet configured — startup incomplete")
-        return PERSONAL_SINGLETON
+        return _enforce_role_route_boundary(request, PERSONAL_SINGLETON)
 
     oauth, backend = _auth_backend(request)
 
@@ -422,7 +534,7 @@ async def get_current_user(
         # on cache hits as well as misses (a token used all day still shows a
         # recent last_used).
         _schedule_touch(backend, oauth, context.api_key_id)
-        return context
+        return _enforce_role_route_boundary(request, context)
 
     # 2. Session cookie — v3.0.0+ path (only checked when no Bearer).
     from mnemos.core.oauth import SESSION_COOKIE_NAME
@@ -441,7 +553,7 @@ async def get_current_user(
                 authenticated=True,
             )
             context.session_id = cookie_value
-            return context
+            return _enforce_role_route_boundary(request, context)
 
     # 3. No credentials.
     raise HTTPException(status_code=401, detail="Authentication required")
@@ -451,4 +563,11 @@ async def require_root(user: UserContext = Depends(get_current_user)) -> UserCon
     """FastAPI dependency — raises 403 if caller is not root."""
     if user.role != "root":
         raise HTTPException(status_code=403, detail="Root access required")
+    return user
+
+
+async def require_root_or_monitor(user: UserContext = Depends(get_current_user)) -> UserContext:
+    """Allow root and monitor roles on explicitly approved aggregate reads."""
+    if user.role not in {"root", "monitor"}:
+        raise HTTPException(status_code=403, detail="Root or monitor access required")
     return user

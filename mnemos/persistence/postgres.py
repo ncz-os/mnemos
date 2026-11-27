@@ -53,6 +53,7 @@ from mnemos.persistence.base import (
     ConsultationAuditRepository,
     ConsultationsRepository,
     FederationRepository,
+    CuratedRouting,
     FieldObservation,
     IsolationLevel,
     KGRepository,
@@ -63,6 +64,10 @@ from mnemos.persistence.base import (
     ModelRegistryHealth,
     ModelRegistryNotSupported,
     ModelRegistryRepository,
+    PriceBand,
+    SyncLogEntry,
+    PRICE_BANDS,
+    PRICING_MODELS,
     canonical_registry_number,
     model_registry_snapshot_digest,
     MorpheusConsolidationResult,
@@ -76,7 +81,6 @@ from mnemos.persistence.base import (
     OAuthRepository,
     SessionsRepository,
     StateRepository,
-    SyncLogEntry,
     Transaction,
     UsageLedgerRecord,
     UsageLedgerResult,
@@ -89,6 +93,7 @@ from mnemos.persistence.base import (
     WebhookRepository,
     WebhookSubscriptionRecord,
 )
+
 from mnemos.persistence.types import (
     MEMORY_COLS as _MEMORY_COLS,
     Row,
@@ -99,7 +104,16 @@ from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import webhook_constants
 from mnemos.persistence import nats_events as persistence_nats_events
 from mnemos.persistence.schema import ensure_postgres_schema
+from mnemos.core.replica_mode import (
+    detect_replica_mode,
+    is_replica as replica_mode_active,
+    set_replica_mode as replica_mode_set,
+)
 
+_SIDECAR_COLUMNS_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:::(?:text|uuid) AS [A-Za-z_][A-Za-z0-9_]*)?(?:, [A-Za-z_][A-Za-z0-9_]*(?:::(?:text|uuid) AS [A-Za-z_][A-Za-z0-9_]*)?)*$"
+)
+_SIDECAR_TABLES = frozenset({"kg_triples", "memory_versions", "memory_compressed_variants"})
 logger = logging.getLogger(__name__)
 _RECENCY_E_FOLD_SECONDS = 7 * 24 * 60 * 60
 _FEDERATION_NATS_MEMORY_ROW_COLS = (
@@ -125,6 +139,90 @@ def _log_search_phase(
 #: ``hnsw.iterative_scan`` only exists in pgvector >= 0.8, so the GUC is
 #: gated on the *installed* version rather than assumed.
 _PGVECTOR_VERSION_SQL = "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
+
+
+#: Tables the replica must be able to read. Verified against the live
+#: catalog with SELECTs only — no DDL, no advisory locks, no writes.
+_REPLICA_REQUIRED_TABLES = (
+    "memories",
+    "api_keys",
+    "users",
+    "oauth_sessions",
+    "kg_triples",
+    "memory_versions",
+    "memory_compressed_variants",
+)
+
+
+async def verify_postgres_replica_schema(pool: Any, settings: Any | None = None) -> None:
+    """Read-only schema verification for a replica (hot standby) startup.
+
+    A standby must not run migrations or any DDL (``CREATE EXTENSION``
+    fails with "read-only transaction"). Instead we verify with pure
+    SELECTs that the replicated catalog is usable:
+
+    * every required table exists;
+    * the pgvector extension is present when this deployment uses it
+      (``MNEMOS_EMBEDDING_DIM`` / the configured embedding dim implies it);
+    * the ``memories.embedding`` column width matches the configured
+      embedding dim (when both are readable).
+
+    Raises ``RuntimeError`` with an operator-actionable message when the
+    schema is behind — a replica serves reads, but a broken schema must
+    fail loudly at startup, not 500 on every search.
+    """
+    async with pool.acquire() as conn:
+        missing: list[str] = []
+        for table in _REPLICA_REQUIRED_TABLES:
+            row = await conn.fetchrow(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = $1",
+                table,
+            )
+            if row is None:
+                missing.append(table)
+        if missing:
+            raise RuntimeError(
+                "Replica schema verification failed: missing table(s) "
+                f"{', '.join(missing)}. The standby's WAL replay may be behind "
+                "the primary, or the primary has not applied the latest "
+                "migrations. Serve reads only after the schema catches up."
+            )
+        # pgvector presence: required only when the deployment actually
+        # uses vector search (embedding dim configured > 0, which is always
+        # the case for the default fleet). A missing extension on a replica
+        # means the primary's migration set is not fully replayed.
+        ext_row = await conn.fetchrow("SELECT extname FROM pg_extension WHERE extname = 'vector'")
+        if ext_row is None:
+            logger.warning(
+                "[REPLICA] pgvector extension not present on standby; "
+                "semantic search will fail until WAL replay applies it. "
+                "Skipping column-width check (the vector type is unavailable)."
+            )
+            # The vector column type does not exist without the extension;
+            # ``read_postgres_embedding_column_dim`` would fail or return
+            # garbage. Skip the width check — the missing extension is
+            # already reported above, and the table check passed.
+            return
+        # Column-width check (M8-style, read-only): the live catalog must
+        # agree with the configured embedding dim, or searches will cast
+        # wrong-width vectors.
+        if settings is not None:
+            try:
+                from mnemos.persistence.schema import read_postgres_embedding_column_dim
+
+                live_dim = await read_postgres_embedding_column_dim(conn)
+                configured_dim = int(getattr(getattr(settings, "database", None), "embedding_dim", 0) or 0)
+                if live_dim is not None and configured_dim > 0 and live_dim != configured_dim:
+                    raise RuntimeError(
+                        f"Replica schema verification failed: memories.embedding is "
+                        f"vector({live_dim}) but the configured embedding dim is "
+                        f"{configured_dim}. The standby catalog is out of sync with "
+                        "the primary's provisioning."
+                    )
+            except RuntimeError:
+                raise
+            except Exception:
+                logger.warning("[REPLICA] embedding-column dim check skipped (catalog unreadable)")
 
 
 async def _probe_pgvector_version(conn: Any) -> str | None:
@@ -367,6 +465,15 @@ async def _fetch_sidecar(
     order_by: Optional[str] = None,
     include_secrets: bool = False,
 ):
+    if table not in _SIDECAR_TABLES:
+        raise ValueError("Unsupported sidecar table")
+    if order_by not in {None, "memory_id ASC, branch ASC, version_num ASC"}:
+        raise ValueError("Unsupported sidecar ordering")
+    if memory_id_column != "memory_id":
+        raise ValueError("Unsupported sidecar memory identifier column")
+    if not _SIDECAR_COLUMNS_RE.fullmatch(columns):
+        raise ValueError("Unsupported sidecar column list")
+    hard_limit = int(hard_limit)
     if bound_to_memories and not memory_ids and not null_ok:
         return []
 
@@ -491,6 +598,26 @@ def _pg_result_count(result: str | None) -> int:
         return int(str(result).rsplit(" ", 1)[-1])
     except (IndexError, ValueError):
         return 0
+
+
+def _pg_timestamptz(value: Any) -> datetime | None:
+    """Coerce an ABC timestamp string to a ``datetime`` asyncpg can bind.
+
+    The ABC carries ``observed_at``/``fetched_at``/``synced_at`` as ISO-8601
+    strings (SQLite binds them as text); asyncpg rejects ``str`` for a
+    ``timestamptz`` parameter outright, so the Postgres side parses. ``None``
+    stays ``None`` (the SQL wraps it in ``COALESCE(..., NOW())``); a real
+    ``datetime`` passes through; anything unparseable raises ``ValueError``
+    rather than silently becoming "now".
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid timestamp {value!r}; expected ISO-8601")
 
 
 def _json_list(value: Any) -> list[Any]:
@@ -631,7 +758,7 @@ class PostgresMemoryRepository(MemoryRepository):
             user.namespace,
         )
         if not row:
-            raise PermissionError("Memory not found")
+            raise PermissionError("Access denied")
 
     async def fetch_memory_log(
         self,
@@ -787,6 +914,97 @@ class PostgresMemoryRepository(MemoryRepository):
             user.namespace,
         )
 
+    async def fetch_memory_versions(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        user: UserContext,
+    ) -> list[Row]:
+        # NG2-MN-020: mirror of GET /v1/memories/{id}/versions (oldest
+        # first). Root sees every non-deleted row; non-root callers only
+        # see snapshots their own per-version tenancy entitles them to
+        # (same predicate the REST route applies), ANDed with the
+        # namespace pin so cross-tenant history stays invisible.
+        conn = _postgres_tx(tx).conn
+        if user.role == "root":
+            return list(
+                await conn.fetch(
+                    "SELECT version_num, snapshot_at, snapshot_by, change_type, "
+                    "content, branch, commit_hash, owner_id, namespace, "
+                    "permission_mode, group_id "
+                    "FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
+                    "AND deleted_at IS NULL ORDER BY version_num ASC",
+                    memory_id,
+                    branch,
+                )
+            )
+        vis_clause, vis_params = _core_version_visibility_predicate(
+            user.user_id,
+            user.group_ids,
+            start_param_idx=3,
+        )
+        ns_ph = f"${len(vis_params) + 3}"
+        return list(
+            await conn.fetch(
+                f"SELECT version_num, snapshot_at, snapshot_by, change_type, "
+                f"content, branch, commit_hash, owner_id, namespace, "
+                f"permission_mode, group_id "
+                f"FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
+                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph} "
+                f"ORDER BY version_num ASC",
+                memory_id,
+                branch,
+                *vis_params,
+                user.namespace,
+            )
+        )
+
+    async def fetch_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        user: UserContext,
+    ) -> Row | None:
+        # NG2-MN-020: mirror of GET /v1/memories/{id}/versions/{n}.
+        conn = _postgres_tx(tx).conn
+        if user.role == "root":
+            return await conn.fetchrow(
+                "SELECT id, memory_id, version_num, content, category, "
+                "subcategory, metadata, verbatim_content, owner_id, "
+                "namespace, permission_mode, source_model, source_provider, "
+                "source_session, source_agent, snapshot_at, snapshot_by, "
+                "change_type, commit_hash, branch "
+                "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 "
+                "AND branch = $3 AND deleted_at IS NULL",
+                memory_id,
+                version_num,
+                branch,
+            )
+        vis_clause, vis_params = _core_version_visibility_predicate(
+            user.user_id,
+            user.group_ids,
+            start_param_idx=4,
+        )
+        ns_ph = f"${len(vis_params) + 4}"
+        return await conn.fetchrow(
+            "SELECT id, memory_id, version_num, content, category, "
+            "subcategory, metadata, verbatim_content, owner_id, "
+            "namespace, permission_mode, source_model, source_provider, "
+            "source_session, source_agent, snapshot_at, snapshot_by, "
+            "change_type, commit_hash, branch "
+            "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 "
+            f"AND branch = $3 AND deleted_at IS NULL "
+            f"AND {vis_clause} AND namespace = {ns_ph}",
+            memory_id,
+            version_num,
+            branch,
+            *vis_params,
+            user.namespace,
+        )
+
     async def fetch_memory_export(
         self,
         tx: Transaction,
@@ -906,22 +1124,22 @@ class PostgresMemoryRepository(MemoryRepository):
             idx += 1
         if from_executed_at:
             conditions.append(f"executed_at >= ${idx}::timestamptz")
-            params.append(from_executed_at)
+            params.append(_coerce_timestamptz_param(from_executed_at))
             idx += 1
         if to_executed_at:
             conditions.append(f"executed_at <= ${idx}::timestamptz")
-            params.append(to_executed_at)
+            params.append(_coerce_timestamptz_param(to_executed_at))
             idx += 1
         # Keyset cursor over (executed_at, id). Backed by the composite index
         # from migrations_v5_3_3_deletion_log_export_index.sql.
         if cursor_executed_at and cursor_id:
             conditions.append(f"(executed_at, id) > (${idx}::timestamptz, ${idx + 1}::uuid)")
-            params.append(cursor_executed_at)
+            params.append(_coerce_timestamptz_param(cursor_executed_at))
             params.append(cursor_id)
             idx += 2
         if export_as_of:
             conditions.append(f"executed_at <= ${idx}::timestamptz")
-            params.append(export_as_of)
+            params.append(_coerce_timestamptz_param(export_as_of))
             idx += 1
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
         sql = (
@@ -2186,6 +2404,180 @@ class PostgresVersionRepository(VersionRepository):
             "change_type "
             "FROM memory_versions WHERE id = $1::uuid AND deleted_at IS NULL",
             version_id,
+        )
+
+    async def list_memory_versions(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        # SQL moved verbatim out of ``api/routes/versions.py::list_versions``
+        # (NG2-MN-018): the same per-snapshot tenancy — the snapshot's own
+        # owner/namespace/permission_mode, not the live memory's — so a
+        # snapshot taken while private stays hidden after a later public
+        # flip. ``VisibilityFilter`` carries the envelope; the group/ACL
+        # predicate is the shared ``version_visibility_predicate`` plus the
+        # namespace pin, exactly as the route rendered it.
+        conn = _postgres_tx(tx).conn
+        if visibility.scope == VisibilityScope.ROOT_BYPASS:
+            return list(
+                await conn.fetch(
+                    "SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
+                    "FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
+                    "AND deleted_at IS NULL ORDER BY version_num ASC",
+                    memory_id,
+                    branch,
+                )
+            )
+        if visibility.namespace is None:
+            return []
+        vis_clause, vis_params = _core_version_visibility_predicate(
+            visibility.user_id or "",
+            list(visibility.group_ids),
+            start_param_idx=3,
+        )
+        # Vault subtraction: honour ``exclude_namespaces`` exactly like the
+        # SQLite / MySQL / Oracle / Db2 version repositories — a snapshot
+        # row sitting in an excluded namespace (the secret vault) must never
+        # reach a non-root caller even when the tenancy predicate matches.
+        # The non-root path always pins ``namespace = <visibility.namespace>``
+        # (fail-closed ``1=0``/early-return when unset), so a bare
+        # ``NOT IN`` is the precise subtraction: no NULL row can pass the
+        # pin, and the shared-renderer ``IS NULL OR`` form would be dead
+        # code here. Placeholder numbers derive from the real args list
+        # (``params``) rather than hardcoded offsets so a future
+        # ``vis_params`` shape change cannot desync $N from its bind.
+        params: list[Any] = [memory_id, branch, *vis_params, visibility.namespace]
+        ns_ph = f"${len(params)}"
+        excl = tuple(visibility.exclude_namespaces or ())
+        excl_sql = ""
+        if excl:
+            start = len(params) + 1
+            phs = ", ".join(f"${start + i}" for i in range(len(excl)))
+            excl_sql = f" AND namespace NOT IN ({phs})"
+            params.extend(excl)
+        return list(
+            await conn.fetch(
+                "SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
+                "FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
+                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}{excl_sql} "
+                "ORDER BY version_num ASC",
+                *params,
+            )
+        )
+
+    async def get_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        # SQL moved verbatim out of ``api/routes/versions.py::get_version``
+        # (NG2-MN-018); same per-snapshot tenancy note as
+        # :meth:`list_memory_versions`.
+        conn = _postgres_tx(tx).conn
+        if visibility.scope == VisibilityScope.ROOT_BYPASS:
+            return await conn.fetchrow(
+                "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
+                "verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type "
+                "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 "
+                "AND branch = $3 AND deleted_at IS NULL",
+                memory_id,
+                version_num,
+                branch,
+            )
+        if visibility.namespace is None:
+            return None
+        vis_clause, vis_params = _core_version_visibility_predicate(
+            visibility.user_id or "",
+            list(visibility.group_ids),
+            start_param_idx=4,
+        )
+        # Vault subtraction: bare ``NOT IN`` (no dead ``IS NULL`` — the
+        # non-root namespace pin above already rules NULL rows out), with
+        # placeholders derived from the real args list so a future
+        # ``vis_params`` shape change cannot desync $N from its bind.
+        params2: list[Any] = [memory_id, version_num, branch, *vis_params, visibility.namespace]
+        ns_ph = f"${len(params2)}"
+        excl = tuple(visibility.exclude_namespaces or ())
+        excl_sql = ""
+        if excl:
+            start = len(params2) + 1
+            phs = ", ".join(f"${start + i}" for i in range(len(excl)))
+            excl_sql = f" AND namespace NOT IN ({phs})"
+            params2.extend(excl)
+        return await conn.fetchrow(
+            "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
+            "verbatim_content, owner_id, namespace, permission_mode, "
+            "source_model, source_provider, source_session, source_agent, "
+            "snapshot_at, snapshot_by, change_type "
+            "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3 "
+            f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}{excl_sql}",
+            *params2,
+        )
+
+    async def fetch_version_contents(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_nums: Sequence[int],
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        # SQL moved verbatim out of ``api/routes/versions.py::diff_versions``
+        # (NG2-MN-018); same per-snapshot tenancy note as
+        # :meth:`list_memory_versions`.
+        conn = _postgres_tx(tx).conn
+        if visibility.scope == VisibilityScope.ROOT_BYPASS:
+            return list(
+                await conn.fetch(
+                    "SELECT version_num, content FROM memory_versions "
+                    "WHERE memory_id = $1 AND version_num = ANY($2::int[]) "
+                    "AND branch = $3 AND deleted_at IS NULL",
+                    memory_id,
+                    list(version_nums),
+                    branch,
+                )
+            )
+        if visibility.namespace is None:
+            return []
+        vis_clause, vis_params = _core_version_visibility_predicate(
+            visibility.user_id or "",
+            list(visibility.group_ids),
+            start_param_idx=4,
+        )
+        # Vault subtraction: bare ``NOT IN`` (no dead ``IS NULL`` — the
+        # non-root namespace pin above already rules NULL rows out), with
+        # placeholders derived from the real args list so a future
+        # ``vis_params`` shape change cannot desync $N from its bind.
+        params3: list[Any] = [
+            memory_id,
+            list(version_nums),
+            branch,
+            *vis_params,
+            visibility.namespace,
+        ]
+        ns_ph = f"${len(params3)}"
+        excl = tuple(visibility.exclude_namespaces or ())
+        excl_sql = ""
+        if excl:
+            start = len(params3) + 1
+            phs = ", ".join(f"${start + i}" for i in range(len(excl)))
+            excl_sql = f" AND namespace NOT IN ({phs})"
+            params3.extend(excl)
+        return list(
+            await conn.fetch(
+                "SELECT version_num, content FROM memory_versions "
+                "WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3 "
+                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}{excl_sql}",
+                *params3,
+            )
         )
 
 
@@ -4159,17 +4551,9 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
         if row is None:
             return 0, None
 
-        old = {
-            "price_in": float(row["price_in"] or 0),
-            "price_out": float(row["price_out"] or 0),
-            "price_cached": float(row["price_cached"] or 0),
-        }
-        # Only update if pricing actually changed
-        if (
-            abs(old["price_in"] - price_in) < 0.000001
-            and abs(old["price_out"] - price_out) < 0.000001
-            and abs(old["price_cached"] - price_cached) < 0.000001
-        ):
+        prices = {"price_in": price_in, "price_out": price_out, "price_cached": price_cached}
+        old = {column: None if row[column] is None else float(row[column]) for column in prices}
+        if all(old[column] is not None and abs(old[column] - price) < 0.000001 for column, price in prices.items()):
             return 0, None
 
         result = await conn.execute(
@@ -4220,16 +4604,15 @@ _PRICED_SQL = "(price_in IS NOT NULL OR price_out IS NOT NULL OR price_cached IS
 
 
 class PostgresModelRegistryRepository(ModelRegistryRepository):
-    """Postgres end of the model-registry contract (phase 1.5, partial).
+    """Postgres end of the model-registry contract (phase 2, complete).
 
-    Scope discipline: phase 1.5 adds no DDL to Postgres and no live migration.
-    Model rows, alias resolution, the sync log, per-field observations and
-    health counters are served from columns that already exist, so those are
-    implemented. Everything that needs the new physical shape
-    (``model_prices``, ``model_benchmarks``, ``curated_routing``) is listed by
-    name in :attr:`MISSING_OPERATIONS` and raises
-    :class:`ModelRegistryNotSupported` — it is never silently stubbed with an
-    empty result. Phase 2 lands the DDL and closes the gap.
+    Phase 2 closed the gap: ``model_prices``, ``model_benchmarks``,
+    ``curated_routing`` and ``model_registry_health`` land through migration
+    ``0073_model_registry_repository_phase2.sql``,
+    and the five operations below are implemented against that shape with the
+    same semantics as the SQLite reference — NULL stays unpriced, payg is
+    authoritative on the model-row mirror, curated routing is versioned and
+    append-only.
 
     The plain pricing upsert that predates the ABC stays where it is and keeps
     working (``upsert_model_pricing`` / ``write_price_history``); it is not the
@@ -4238,16 +4621,11 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
 
     backend_name = "postgres"
 
-    #: Operations this class does not implement yet. Naming them (rather than
-    #: raising bare ``NotImplementedError``) is what lets the contract suite
-    #: report "unsupported backend: postgres — phase 2" instead of passing.
-    MISSING_OPERATIONS: tuple[str, ...] = (
-        "upsert_price",
-        "upsert_benchmark",
-        "curated_routing_get",
-        "curated_routing_replace",
-        "health_write",
-    )
+    #: Operations this class does not implement yet. Empty since phase 2:
+    #: kept (rather than deleted) so the contract suite's historical
+    #: ``MISSING_OPERATIONS`` assertion keeps passing and a future regression
+    #: that re-adds a raiser has a named place to declare it.
+    MISSING_OPERATIONS: tuple[str, ...] = ()
 
     @classmethod
     def _unsupported(cls, operation: str) -> ModelRegistryNotSupported:
@@ -4357,9 +4735,9 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
         """Register ``alias`` -> ``target_model_id``.
 
         Same validation as SQLite: self-pointing, alias-to-alias chains and
-        case/separator lookalikes are refused. Postgres has no ``alias_of``
-        unique index yet, so the collision check runs inside the caller's
-        transaction (``SELECT ... FOR UPDATE`` on the provider's rows).
+        case/separator lookalikes are refused. Distinct aliases can share a
+        target. The lookalike check locks the provider's rows in the caller's
+        transaction.
         """
         if alias == target_model_id:
             raise ValueError(f"alias {alias!r} may not point at itself")
@@ -4442,7 +4820,7 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
             obs.field,
             obs.value,
             obs.source,
-            obs.fetched_at,
+            _pg_timestamptz(obs.fetched_at),
         )
 
     async def merge_fields(
@@ -4455,8 +4833,11 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
     ) -> ModelRecord | None:
         """Project per-field observations onto the model row.
 
-        Only the fields Postgres already stores as columns can be projected;
-        everything else stays as an observation until phase 2 adds the rest.
+        Only fields that exist as columns on the Postgres shape are
+        projected; everything else stays as an observation. The set matches
+        the SQLite reference's ``_MODEL_FIELD_TYPES`` for the columns both
+        shapes share (arena fields included — the base Postgres migration
+        carries them).
         """
         conn = _postgres_tx(tx).conn
         exists = await conn.fetchrow(
@@ -4472,8 +4853,46 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
             params.append(authoritative_source)
             sql += f" AND source = ${len(params)}"
         observations = await conn.fetch(sql, *params)
-        updatable = {"display_name", "family", "context_window", "max_output_tokens", "alias_of"}
-        updates = {row["field"]: row["value"] for row in observations if row["field"] in updatable}
+        # The observations table stores every value as text; coerce to the
+        # column type before writing back (SQLite coerces implicitly, asyncpg
+        # does not). Only columns that exist on the Postgres shape are
+        # projected; anything else stays as an observation. ``None``
+        # (known-unknown) stays ``None`` — never 0. A value that cannot be
+        # parsed to the column type is kept as an observation (skipped here)
+        # rather than aborting the whole projection: provider payloads are
+        # free-form text, and one malformed field must not block every other
+        # good field for the model.
+        updatable = {
+            "display_name": "text",
+            "family": "text",
+            "context_window": "int",
+            "max_output_tokens": "int",
+            "arena_score": "float",
+            "arena_rank": "int",
+            "graeae_weight": "float",
+            "alias_of": "text",
+        }
+        updates: dict[str, Any] = {}
+        for row in observations:
+            field = row["field"]
+            kind = updatable.get(field)
+            if kind is None:
+                continue
+            raw = row["value"]
+            if raw is None:
+                updates[field] = None
+                continue
+            try:
+                if kind == "int":
+                    updates[field] = int(float(raw))
+                elif kind == "float":
+                    updates[field] = float(raw)
+                else:
+                    updates[field] = raw
+            except (TypeError, ValueError):
+                # Non-numeric (or otherwise malformed) text for a numeric
+                # column: leave the observation unprojected and keep going.
+                continue
         if updates:
             assignments = []
             values: list[Any] = []
@@ -4503,7 +4922,7 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
             VALUES ($1, COALESCE($2::timestamptz, NOW()), $3, $4, $5, $6, $7, $8)
             """,
             entry.provider,
-            entry.synced_at,
+            _pg_timestamptz(entry.synced_at),
             entry.models_found,
             entry.models_added,
             entry.models_updated,
@@ -4522,7 +4941,7 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
             """
         )
         last_sync = await conn.fetchval("SELECT MAX(synced_at) FROM model_registry_sync_log")
-        curated = await conn.fetchval("SELECT COALESCE(MAX(version), 0) FROM curated_routing_versions")
+        curated = await conn.fetchval("SELECT COALESCE(MAX(version), 0) FROM curated_routing")
         total = int(row["total"] or 0)
         priced = int(row["priced"] or 0)
         return ModelRegistryHealth(
@@ -4534,56 +4953,187 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
             last_sync_at=last_sync.isoformat() if last_sync else None,
         )
 
-    # ── phase-2 operations: named, explicit, never silently empty ─────────────
+    # ── phase-2 operations (same semantics as the SQLite reference) ──────────
 
-    async def upsert_price(self, tx: Transaction, band: Any) -> None:
-        raise self._unsupported("upsert_price")
+    @staticmethod
+    def _validate_pricing_model(value: str) -> str:
+        if value not in PRICING_MODELS:
+            raise ValueError(f"invalid pricing_model {value!r}; expected one of {PRICING_MODELS}")
+        return value
 
-    async def upsert_benchmark(self, tx: Transaction, **kwargs: Any) -> None:
-        raise self._unsupported("upsert_benchmark")
+    @staticmethod
+    def _validate_band(value: str) -> str:
+        if value not in PRICE_BANDS:
+            raise ValueError(f"invalid band {value!r}; expected one of {PRICE_BANDS}")
+        return value
 
-    async def curated_routing_get(self, tx: Transaction) -> Any:
-        raise self._unsupported("curated_routing_get")
+    async def upsert_price(self, tx: Transaction, band: PriceBand) -> None:
+        self._validate_pricing_model(band.pricing_model)
+        self._validate_band(band.band)
+        conn = _postgres_tx(tx).conn
+        await conn.execute(
+            "INSERT INTO model_prices "
+            "(provider, model_id, pricing_model, band, price_in, price_out, price_cached, observed_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8::timestamptz, NOW())) "
+            "ON CONFLICT (provider, model_id, pricing_model, band) DO UPDATE SET "
+            "price_in = EXCLUDED.price_in, price_out = EXCLUDED.price_out, "
+            "price_cached = EXCLUDED.price_cached, observed_at = EXCLUDED.observed_at",
+            band.provider,
+            band.model_id,
+            band.pricing_model,
+            band.band,
+            band.price_in,
+            band.price_out,
+            band.price_cached,
+            _pg_timestamptz(band.observed_at),
+        )
+        # The model row mirrors its standard band, exactly as SQLite does:
+        # payg is authoritative (always applies); any other pricing model
+        # only fills a row that carries no price yet; a row with no prices
+        # mirrors nothing so an unpriced model stays NULL, never 0.
+        carries_price = band.price_in is not None or band.price_out is not None or band.price_cached is not None
+        if band.band == "standard" and carries_price:
+            await conn.execute(
+                "UPDATE model_registry SET price_in = $1, price_out = $2, price_cached = $3, "
+                "price_updated_at = COALESCE($4::timestamptz, NOW()), "
+                "pricing_model = $5, band = $6 "
+                "WHERE provider = $7 AND model_id = $8 "
+                "AND ($9 = 'payg' OR ("
+                "price_in IS NULL AND price_out IS NULL AND price_cached IS NULL"
+                "))",
+                band.price_in,
+                band.price_out,
+                band.price_cached,
+                _pg_timestamptz(band.observed_at),
+                band.pricing_model,
+                band.band,
+                band.provider,
+                band.model_id,
+                band.pricing_model,
+            )
 
-    async def curated_routing_replace(self, tx: Transaction, **kwargs: Any) -> Any:
-        raise self._unsupported("curated_routing_replace")
+    async def upsert_benchmark(
+        self,
+        tx: Transaction,
+        *,
+        provider: str,
+        model_id: str,
+        benchmark: str,
+        score: float,
+        source: str,
+        fetched_at: str,
+    ) -> None:
+        conn = _postgres_tx(tx).conn
+        await conn.execute(
+            "INSERT INTO model_benchmarks (provider, model_id, benchmark, score, source, fetched_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6::timestamptz) "
+            "ON CONFLICT (provider, model_id, benchmark) DO UPDATE SET "
+            "score = EXCLUDED.score, source = EXCLUDED.source, fetched_at = EXCLUDED.fetched_at",
+            provider,
+            model_id,
+            benchmark,
+            score,
+            source,
+            _pg_timestamptz(fetched_at),
+        )
+
+    async def curated_routing_get(self, tx: Transaction) -> CuratedRouting | None:
+        row = await _postgres_tx(tx).conn.fetchrow(
+            "SELECT version, rules, note, created_at FROM curated_routing ORDER BY version DESC LIMIT 1"
+        )
+        if row is None:
+            return None
+        rules_raw = row["rules"]
+        try:
+            parsed = json.loads(rules_raw) if isinstance(rules_raw, str) else (rules_raw or [])
+        except (TypeError, ValueError):
+            parsed = []
+        rules = tuple(dict(rule) for rule in parsed if isinstance(rule, Mapping))
+        created = row["created_at"]
+        return CuratedRouting(
+            version=int(row["version"]),
+            rules=rules,
+            created_at=created.isoformat() if hasattr(created, "isoformat") else str(created),
+            note=row["note"],
+        )
+
+    async def curated_routing_replace(
+        self,
+        tx: Transaction,
+        *,
+        rules: Sequence[Mapping[str, Any]],
+        note: str | None = None,
+    ) -> CuratedRouting:
+        conn = _postgres_tx(tx).conn
+        payload = json.dumps([dict(rule) for rule in rules], sort_keys=True, separators=(",", ":"))
+        # Serialize writers through commit so each read-committed INSERT
+        # sees the version allocated by the previous writer.
+        await conn.execute("LOCK TABLE curated_routing IN SHARE ROW EXCLUSIVE MODE")
+        row = await conn.fetchrow(
+            "INSERT INTO curated_routing (version, rules, note, created_at) "
+            "SELECT COALESCE(MAX(version), 0) + 1, $1::jsonb, $2, NOW() "
+            "FROM curated_routing "
+            "RETURNING version, rules, note, created_at",
+            payload,
+            note,
+        )
+        assert row is not None
+        rules_raw = row["rules"]
+        try:
+            parsed = json.loads(rules_raw) if isinstance(rules_raw, str) else (rules_raw or [])
+        except (TypeError, ValueError):
+            parsed = []
+        created = row["created_at"]
+        return CuratedRouting(
+            version=int(row["version"]),
+            rules=tuple(dict(rule) for rule in parsed if isinstance(rule, Mapping)),
+            created_at=created.isoformat() if hasattr(created, "isoformat") else str(created),
+            note=row["note"],
+        )
 
     async def export_snapshot(self, tx: Transaction) -> dict[str, Any]:
-        """Canonical export document, from the columns Postgres actually has.
-
-        Same document shape and logical ordering as the SQLite reference, so
-        the two backends export the same registry the same way:
+        """Canonical export document, same shape as the SQLite reference.
 
         * ``models`` — every non-alias ``model_registry`` row, sorted by
           ``(provider, model_id)``;
-        * ``prices`` — one entry per *priced* model, derived from the model
-          row's ``price_in`` / ``price_out`` / ``price_cached``. Postgres has no
-          ``model_prices`` table (phase 1.5 adds no DDL), so per-band price
-          history is not part of this backend's export; the row's current
-          price is, because that is what Postgres stores;
-        * ``benchmarks`` — one entry per model carrying ``arena_score``, the
-          only benchmark the Postgres schema models;
-        * ``curated_version`` — ``0``: Postgres has no ``curated_routing``
-          table, so the curated layer is empty rather than unknown.
+        * ``prices`` — the ``model_prices`` rows, sorted by
+          ``(provider, model_id, pricing_model, band)``. Until the band table
+          holds data for a legacy-priced model (migration ``0073`` backfills
+          it only where it was empty), the model row's own price columns are
+          the fallback, so a registry priced through the legacy path never
+          reports an empty export;
+        * ``benchmarks`` — the ``model_benchmarks`` rows, sorted by
+          ``(provider, model_id, benchmark)``. A model with no benchmark row
+          falls back to its legacy ``arena_score`` column (the backfill in
+          ``0073`` only runs where the table was empty);
+        * ``curated_version`` — newest ``curated_routing`` version, ``0``
+          when the curated layer was never written.
 
-        ``pricing_model`` / ``band`` are reported as ``"unknown"`` /
-        ``"standard"`` because those columns do not exist in the Postgres
-        schema yet — the ABC's defaults, not invented data. Numbers use the
-        shared canonical form, so ``NULL`` (unpriced) stays ``None`` and ``0``
-        (free) stays ``"0"``.
+        Numbers use the shared canonical form, so ``NULL`` (unpriced) stays
+        ``None`` and ``0`` (free) stays ``"0"``.
         """
         conn = _postgres_tx(tx).conn
         rows = await conn.fetch(
             "SELECT provider, model_id, display_name, family, context_window, "
             "max_output_tokens, capabilities, price_in, price_out, price_cached, "
-            "arena_score, available, deprecated "
+            "pricing_model, band, available, deprecated, arena_score "
             "FROM model_registry WHERE alias_of IS NULL "
             "ORDER BY provider ASC, model_id ASC"
         )
+        price_rows = await conn.fetch(
+            "SELECT provider, model_id, pricing_model, band, price_in, price_out, price_cached "
+            "FROM model_prices ORDER BY provider ASC, model_id ASC, pricing_model ASC, band ASC"
+        )
+        bench_rows = await conn.fetch(
+            "SELECT provider, model_id, benchmark, score "
+            "FROM model_benchmarks ORDER BY provider ASC, model_id ASC, benchmark ASC"
+        )
+        curated_version = await conn.fetchval("SELECT MAX(version) FROM curated_routing")
+
+        priced_keys = {(str(pr["provider"]), str(pr["model_id"])) for pr in price_rows}
+        benchmark_keys = {(str(br["provider"]), str(br["model_id"])) for br in bench_rows}
 
         canonical_models: list[dict[str, Any]] = []
-        canonical_prices: list[dict[str, Any]] = []
-        canonical_benchmarks: list[dict[str, Any]] = []
         for row in rows:
             provider = str(row["provider"])
             model_id = str(row["model_id"])
@@ -4603,46 +5153,85 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
                     "price_in": price_in,
                     "price_out": price_out,
                     "price_cached": price_cached,
-                    "pricing_model": "unknown",
-                    "band": "standard",
+                    # pricing_model / band are selected explicitly and carry
+                    # NOT NULL defaults (0073); the fallbacks are defensive
+                    # only, against schema drift.
+                    "pricing_model": row.get("pricing_model") or "unknown",
+                    "band": row.get("band") or "standard",
                     "available": bool(row["available"]),
                     "deprecated": bool(row["deprecated"]),
                     "alias_of": None,
                 }
             )
-            # An unpriced row contributes no price entry at all -- exporting a
-            # row of NULLs would let "unpriced" read as "priced at zero".
-            if price_in is not None or price_out is not None or price_cached is not None:
-                canonical_prices.append(
-                    {
-                        "provider": provider,
-                        "model_id": model_id,
-                        "pricing_model": "unknown",
-                        "band": "standard",
-                        "price_in": price_in,
-                        "price_out": price_out,
-                        "price_cached": price_cached,
-                    }
-                )
-            arena_score = canonical_registry_number(row["arena_score"])
-            if arena_score is not None:
-                canonical_benchmarks.append(
-                    {
-                        "provider": provider,
-                        "model_id": model_id,
-                        "benchmark": "arena_score",
-                        "score": arena_score,
-                    }
-                )
 
-        canonical_prices.sort(key=lambda pr: (pr["provider"], pr["model_id"], pr["pricing_model"], pr["band"]))
+        canonical_prices = [
+            {
+                "provider": str(pr["provider"]),
+                "model_id": str(pr["model_id"]),
+                "pricing_model": str(pr["pricing_model"]),
+                "band": str(pr["band"]),
+                "price_in": canonical_registry_number(pr["price_in"]),
+                "price_out": canonical_registry_number(pr["price_out"]),
+                "price_cached": canonical_registry_number(pr["price_cached"]),
+            }
+            for pr in price_rows
+        ]
+        canonical_benchmarks = [
+            {
+                "provider": str(br["provider"]),
+                "model_id": str(br["model_id"]),
+                "benchmark": str(br["benchmark"]),
+                "score": canonical_registry_number(br["score"]),
+            }
+            for br in bench_rows
+        ]
+
+        # Legacy fallbacks: a model priced through the pre-ABC path
+        # (``upsert_model_pricing``) or carrying an ``arena_score`` before the
+        # 0073 backfill ran still exports its values. The band table and the
+        # benchmark table stay authoritative — the fallback only applies when
+        # neither holds data for that model.
+        canonical_prices.extend(
+            {
+                "provider": str(row["provider"]),
+                "model_id": str(row["model_id"]),
+                "pricing_model": "unknown",
+                "band": "standard",
+                "price_in": canonical_registry_number(row["price_in"]),
+                "price_out": canonical_registry_number(row["price_out"]),
+                "price_cached": canonical_registry_number(row["price_cached"]),
+            }
+            for row in rows
+            if (
+                str(row["provider"]),
+                str(row["model_id"]),
+            )
+            not in priced_keys
+            and any(row[k] is not None for k in ("price_in", "price_out", "price_cached"))
+        )
+        canonical_benchmarks.extend(
+            {
+                "provider": str(row["provider"]),
+                "model_id": str(row["model_id"]),
+                "benchmark": "arena_score",
+                "score": canonical_registry_number(row["arena_score"]),
+            }
+            for row in rows
+            if (
+                str(row["provider"]),
+                str(row["model_id"]),
+            )
+            not in benchmark_keys
+            and row["arena_score"] is not None
+        )
+        canonical_prices.sort(key=lambda p: (p["provider"], p["model_id"], p["pricing_model"], p["band"]))
         canonical_benchmarks.sort(key=lambda b: (b["provider"], b["model_id"], b["benchmark"]))
 
         return {
             "models": canonical_models,
             "prices": canonical_prices,
             "benchmarks": canonical_benchmarks,
-            "curated_version": 0,
+            "curated_version": int(curated_version) if curated_version is not None else 0,
         }
 
     async def snapshot_digest(self, tx: Transaction) -> str:
@@ -4650,7 +5239,22 @@ class PostgresModelRegistryRepository(ModelRegistryRepository):
         return model_registry_snapshot_digest(await self.export_snapshot(tx))
 
     async def health_write(self, tx: Transaction, health: ModelRegistryHealth) -> None:
-        raise self._unsupported("health_write")
+        conn = _postgres_tx(tx).conn
+        await conn.execute(
+            "INSERT INTO model_registry_health "
+            "(backend, model_count, priced_count, unpriced_count, curated_version, last_sync_at, recorded_at) "
+            "VALUES ($1, $2, $3, $4, $5, $6::timestamptz, NOW()) "
+            "ON CONFLICT (backend) DO UPDATE SET "
+            "model_count = EXCLUDED.model_count, priced_count = EXCLUDED.priced_count, "
+            "unpriced_count = EXCLUDED.unpriced_count, curated_version = EXCLUDED.curated_version, "
+            "last_sync_at = EXCLUDED.last_sync_at, recorded_at = NOW()",
+            health.backend,
+            health.model_count,
+            health.priced_count,
+            health.unpriced_count,
+            health.curated_version,
+            _pg_timestamptz(health.last_sync_at),
+        )
 
 
 class PostgresOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
@@ -4900,10 +5504,15 @@ class PostgresOAuthRepository(MCPOAuthRepositoryMixin, OAuthRepository):
             return None
         if row["expires_at"] <= now:
             return None
-        await conn.execute(
-            "UPDATE oauth_sessions SET last_used_at=NOW() WHERE session_id=$1",
-            session_id,
-        )
+        # Replica mode: authentication must work read-only. The
+        # last_used_at update is the only write this method performs;
+        # skipping it keeps Bearer/session auth fully functional on a
+        # read-only standby.
+        if not replica_mode_active():
+            await conn.execute(
+                "UPDATE oauth_sessions SET last_used_at=NOW() WHERE session_id=$1",
+                session_id,
+            )
         return row
 
     async def gc_expired_sessions(
@@ -5164,7 +5773,7 @@ class PostgresConsultationsRepository(ConsultationsRepository):
                 "SELECT DISTINCT ON (provider) provider, model_id FROM model_registry "
                 "WHERE available=true AND deprecated=false "
                 "AND ((arena_rank IS NOT NULL AND arena_rank <= 5) OR graeae_weight >= 0.95) "
-                "ORDER BY provider, graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST"
+                "ORDER BY provider, graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST, model_id"
             )
         elif tier == "premium":
             sql = (
@@ -5172,14 +5781,15 @@ class PostgresConsultationsRepository(ConsultationsRepository):
                 "WHERE available=true AND deprecated=false "
                 "AND ((arena_rank IS NOT NULL AND arena_rank BETWEEN 6 AND 15) "
                 "OR (graeae_weight >= 0.85 AND graeae_weight < 0.95)) "
-                "ORDER BY provider, graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST"
+                "ORDER BY provider, graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST, model_id"
             )
         else:
             sql = (
                 "SELECT DISTINCT ON (provider) provider, model_id FROM model_registry "
                 "WHERE available=true AND deprecated=false AND graeae_weight >= 0.75 "
                 "AND input_cost_per_mtok IS NOT NULL AND output_cost_per_mtok IS NOT NULL "
-                "ORDER BY provider, (input_cost_per_mtok + output_cost_per_mtok) ASC"
+                "ORDER BY provider, (input_cost_per_mtok + output_cost_per_mtok) ASC, "
+                "graeae_weight DESC NULLS LAST, arena_rank ASC NULLS LAST, model_id"
             )
         return await _postgres_tx(tx).conn.fetch(sql)
 
@@ -7926,10 +8536,20 @@ class PostgresBackend:
         self._acl = PostgresAclRepository()
         self._closed = False
         self._schema_ensured = False
+        # Replica (hot-standby) mode: resolved in ``open()`` via
+        # ``pg_is_in_recovery()`` (or forced by MNEMOS_REPLICA_MODE).
+        # True skips migrations/CREATE EXTENSION at startup; reads stay
+        # fully working; mutations are rejected with 503.
+        self._replica_mode = False
 
     @property
     def settings(self) -> Any:
         return self._settings
+
+    @property
+    def replica_mode(self) -> bool:
+        """True when this backend serves a read-only Postgres standby."""
+        return self._replica_mode
 
     @property
     def capabilities(self) -> set[str]:
@@ -8372,16 +8992,34 @@ class PostgresBackend:
         return self._audit_chain
 
     async def ensure_schema(self) -> None:
-        """Create or upgrade the configured Postgres schema idempotently."""
+        """Create or upgrade the configured Postgres schema idempotently.
+
+        In replica mode this is a READ-ONLY verification, never a write:
+        a hot standby cannot run migrations or ``CREATE EXTENSION``.
+        """
         if self._closed or self._pool is None:
             return
-        await ensure_postgres_schema(self._pool, self._settings)
+        if self._replica_mode:
+            await verify_postgres_replica_schema(self._pool, self._settings)
+            logger.info("[REPLICA] schema verified read-only on standby; " "migrations skipped (read-only API)")
+        else:
+            await ensure_postgres_schema(self._pool, self._settings)
         self._schema_ensured = True
 
     async def open(self) -> None:
-        """Lifecycle hook: ensure schema and validate connectivity."""
+        """Lifecycle hook: detect replica mode, then ensure schema and validate
+        connectivity.
+
+        Detection runs first: on a real standby ``pg_is_in_recovery()`` is
+        true, so ``ensure_schema`` takes the read-only verification path
+        before any DDL is attempted. The process-level flag is set so the
+        API layer (route guards, health probes, worker skipping) sees the
+        same answer without re-querying.
+        """
         if self._closed:
             return
+        self._replica_mode = await detect_replica_mode(self._pool)
+        await replica_mode_set(self._replica_mode, reason="startup")
         if not self._schema_ensured:
             await self.ensure_schema()
         async with self._pool.acquire() as conn:
@@ -8404,3 +9042,19 @@ class PostgresBackend:
             if inspect.isawaitable(result):
                 await result
         self._closed = True
+
+
+def _coerce_timestamptz_param(value: Any) -> Any:
+    """asyncpg binds ``$n::timestamptz`` only from ``datetime``/``date``.
+
+    The export cursor and snapshot anchor travel as ISO-8601 strings (they
+    are serialised into the opaque page cursor), so parse them here instead
+    of letting asyncpg raise ``DataError`` mid-stream.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return value

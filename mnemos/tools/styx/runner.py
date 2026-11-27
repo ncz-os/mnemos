@@ -15,6 +15,11 @@ the destination is Google Drive, Cloudflare R2, or an rclone remote.
 from __future__ import annotations
 
 import logging
+import hashlib
+import os
+import stat
+import tempfile
+import fcntl
 import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -66,6 +71,43 @@ def _gate(condition: bool, message: str) -> None:
         raise StyxIntegrityError(message)
 
 
+def _prepare_work_dir(work_dir: Path) -> None:
+    """Validate the existing ancestor chain before creating private directories."""
+    requested = work_dir.absolute()
+    if ".." in requested.parts:
+        raise StyxIntegrityError("work directory must not contain parent components")
+    current = Path(requested.anchor)
+    controlled = False
+    missing: list[Path] = []
+    for component in requested.parts[1:]:
+        current = current / component
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            missing.append(current)
+            controlled = True
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            # Only the system-owned chain above the first user-owned
+            # ancestor may redirect to its canonical location.
+            if controlled or current == requested or info.st_uid != 0:
+                raise StyxIntegrityError("work directory must not use symlinks")
+            canonical = current.resolve(strict=True)
+            info = os.lstat(canonical)
+            if info.st_uid != 0 or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
+                raise StyxIntegrityError("work directory ancestor must be system-owned")
+        if not stat.S_ISDIR(info.st_mode):
+            raise StyxIntegrityError("work directory ancestor must be a directory")
+        if info.st_uid == os.getuid() and (info.st_uid != 0 or not info.st_mode & 0o077):
+            controlled = True
+
+    for directory in missing:
+        directory.mkdir(mode=0o700)
+    info = os.lstat(work_dir)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise StyxIntegrityError("work directory must be owned and private (mode 0700)")
+
+
 async def run_backup(
     config: StyxConfig,
     *,
@@ -87,10 +129,28 @@ async def run_backup(
         started_at=moment.isoformat(),
         dry_run=config.dry_run,
     )
-    run_dir = config.work_dir / f"run-{moment.strftime('%Y%m%dT%H%M%SZ')}"
+    _prepare_work_dir(config.work_dir)
+    lock_root = Path(tempfile.gettempdir()) / f"mnemos-styx-locks-{os.getuid()}"
+    lock_root.mkdir(mode=0o700, exist_ok=True)
+    lock_info = lock_root.lstat()
+    if not stat.S_ISDIR(lock_info.st_mode) or lock_info.st_uid != os.getuid() or lock_info.st_mode & 0o077:
+        raise StyxIntegrityError("lock directory must be owned and private")
+    lock_name = hashlib.sha256(config.host_label.encode("utf-8")).hexdigest()
+    lock_fd = os.open(lock_root / lock_name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(lock_fd)
+        raise StyxIntegrityError("backup already running") from None
+    try:
+        run_dir = Path(tempfile.mkdtemp(prefix="run-", dir=config.work_dir))
+    except BaseException:
+        os.close(lock_fd)
+        raise
     bundle_dir = run_dir / "bundle"
     archive_path = run_dir / "bundle.mif.tar.gz"
     name = artifact_name(config.host_label, moment)
+    name = name.replace(".mif.tar.gz.age", f"-{run_dir.name[4:]}.mif.tar.gz.age")
     receipt.artifact_name = name
 
     try:
@@ -205,6 +265,7 @@ async def run_backup(
         # operator asked to keep it for forensics.
         if not keep_workdir and run_dir.exists():
             shutil.rmtree(run_dir, ignore_errors=True)
+        os.close(lock_fd)
 
 
 def _write_receipt(config: StyxConfig, receipt: BackupReceipt) -> Path | None:
@@ -217,9 +278,19 @@ def _write_receipt(config: StyxConfig, receipt: BackupReceipt) -> Path | None:
     import json  # noqa: PLC0415 - local to keep the failure path dependency-free
 
     try:
-        config.work_dir.mkdir(parents=True, exist_ok=True)
-        path = config.work_dir / "styx-last-run.json"
-        path.write_text(json.dumps(receipt.to_dict(), indent=2), encoding="utf-8")
+        directory = config.receipt_dir or config.work_dir
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "styx-last-run.json"
+        data = receipt.to_dict()
+        if data.get("error"):
+            data["error"] = "backup_failed"
+        fd, temporary = tempfile.mkstemp(prefix=".receipt-", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2)
+            os.replace(temporary, path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
         return path
     except Exception:  # noqa: BLE001 - best-effort observability, never fatal
         logger.warning("styx: could not write run receipt", exc_info=True)

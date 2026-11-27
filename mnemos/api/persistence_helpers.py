@@ -15,6 +15,7 @@ from fastapi import HTTPException
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext
+from mnemos.core.replica_error import check_replica_write_allowed
 from mnemos.persistence.base import (
     ACL_CAPABILITY,
     AUDIT_CAPABILITY,
@@ -43,6 +44,20 @@ def backend_or_503():
             detail="Persistence backend not available",
         )
     return backend
+
+
+def require_write_allowed() -> None:
+    """Reject a mutation on a read-only Postgres standby.
+
+    Raises 503 with the machine-readable body
+    ``{"error": "replica_read_only", "primary_hint": ...}``. Call it at the
+    top of every mutating route handler. No-op when replica mode is off
+    (primary, or any non-Postgres backend — they never enter replica mode).
+
+    This is the SINGLE canonical definition; route modules import it from
+    here (admin.py and oauth.py at module level) rather than redefining it.
+    """
+    check_replica_write_allowed()
 
 
 def _capability_503(capability: str, backend: object) -> HTTPException:

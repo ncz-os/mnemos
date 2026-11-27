@@ -19,7 +19,9 @@
 # already installed in the base image and satisfies the add-ons' first-party
 # dependency, so it is not reinstalled.
 # ─────────────────────────────────────────────────────────────────────────────
-ARG MNEMOS_CORE_IMAGE=ghcr.io/ncz-os/mnemos-core:latest
+# Supply a versioned digest for standalone builds. Release builds provide the
+# in-graph core target through the named context below.
+ARG MNEMOS_CORE_IMAGE
 FROM ${MNEMOS_CORE_IMAGE}
 
 ARG MNEMOS_CORE_REF=unknown

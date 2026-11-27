@@ -98,8 +98,8 @@ def _write_env_file(config: Config, env_path: str) -> bool:
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".mnemos.env", delete=False
             ) as _tf:
-                _tf.write("\n".join(lines) + "\n")
                 _tmp = _tf.name
+                _tf.write("\n".join(lines) + "\n")
             # Restrict temp file immediately before moving
             os.chmod(_tmp, 0o600)
             # Atomically install with correct owner/mode (sudo install is atomic)
@@ -119,8 +119,6 @@ def _write_env_file(config: Config, env_path: str) -> bool:
                 _run(["sudo", "chmod", "640", env_path])
                 _run(["sudo", "chown", f"root:{config.service_user}", env_path])
                 _tmp = None  # mv succeeded, no cleanup needed
-            else:
-                _tmp = None  # install succeeded
         finally:
             # Clean up temp file if it still exists (e.g. mv/install failed)
             if _tmp and os.path.exists(_tmp):

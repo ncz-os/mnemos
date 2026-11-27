@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests._route_helpers import flatten_routes
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -43,7 +44,7 @@ class TestWebhookModuleWiring:
 
     def test_router_registered_in_app(self):
         import mnemos.api.main as api_server
-        paths = {r.path for r in api_server.app.routes}
+        paths = {r.path for r in flatten_routes(api_server.app.routes)}
         webhook_paths = [p for p in paths if p.startswith("/v1/webhooks")]
         assert len(webhook_paths) >= 3, f"expected webhook routes, got: {webhook_paths}"
 

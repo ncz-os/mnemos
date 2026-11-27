@@ -30,6 +30,7 @@ from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import (
     maybe_set_pg_rls,
     require_acl_backend,
+    require_write_allowed,
 )
 from mnemos.core import lifecycle as _lc
 from mnemos.core.security import is_root
@@ -202,6 +203,7 @@ async def grant_memory_acl(
     user: UserContext = Depends(get_current_user),
 ):
     """Grant (or update) a per-principal ACL on a memory."""
+    require_write_allowed()
     backend = require_acl_backend()
     _validate_principal(request.principal)
     _validate_perm(request.perm)
@@ -233,6 +235,7 @@ async def revoke_memory_acl(
     user: UserContext = Depends(get_current_user),
 ):
     """Revoke a per-principal ACL grant on a memory."""
+    require_write_allowed()
     backend = require_acl_backend()
     _validate_principal(principal)
     async with backend.transactional() as tx:

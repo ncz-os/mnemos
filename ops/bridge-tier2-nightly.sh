@@ -63,24 +63,34 @@ ADAPTERS=(
 
 declare -a results
 overall_status="pass"
+executed=0
+passed=0
+failed=0
+skipped=0
 
 for spec in "${ADAPTERS[@]}"; do
     IFS='|' read -r name dir env_var <<<"$spec"
     if [ -n "$env_var" ] && [ -z "${!env_var}" ]; then
         echo "[$(date -uIseconds)] $name: SKIPPED (no $env_var)"
         results+=("{\"bridge\":\"$name\",\"status\":\"skipped\",\"reason\":\"no_$env_var\"}")
+        skipped=$((skipped + 1))
+        overall_status="fail"
         continue
     fi
     if [ ! -d "$dir" ]; then
         echo "[$(date -uIseconds)] $name: SKIPPED (no $dir)"
         results+=("{\"bridge\":\"$name\",\"status\":\"skipped\",\"reason\":\"no_dir\"}")
+        skipped=$((skipped + 1))
+        overall_status="fail"
         continue
     fi
 
     echo
     echo "[$(date -uIseconds)] $name: starting"
+    executed=$((executed + 1))
     t0=$(date +%s)
     if (cd "$dir" && "$VENV_PYTHON" -m pytest tests/integration -q --tb=line) >>"$LOG" 2>&1; then
+        passed=$((passed + 1))
         dt=$(($(date +%s) - t0))
         echo "[$(date -uIseconds)] $name: PASS in ${dt}s"
         results+=("{\"bridge\":\"$name\",\"status\":\"pass\",\"duration_s\":$dt}")
@@ -88,9 +98,13 @@ for spec in "${ADAPTERS[@]}"; do
         dt=$(($(date +%s) - t0))
         echo "[$(date -uIseconds)] $name: FAIL in ${dt}s"
         results+=("{\"bridge\":\"$name\",\"status\":\"fail\",\"duration_s\":$dt}")
+        failed=$((failed + 1))
         overall_status="fail"
     fi
 done
+
+if [ "$executed" -eq 0 ]; then overall_status="no-coverage"; fi
+echo "executed=$executed passed=$passed failed=$failed skipped=$skipped"
 
 # Compose the summary memory
 results_json=$(printf '%s,' "${results[@]}" | sed 's/,$//')
@@ -98,7 +112,7 @@ content="Nightly bridge tier-2 summary $DATE — overall=$overall_status. Per-br
 
 if [ -z "$MNEMOS_API_TOKEN" ]; then
     echo "[$(date -uIseconds)] no MNEMOS_API_TOKEN; skipping memory write"
-    exit 0
+    exit 1
 fi
 
 memory_payload=$(python3 -c "
@@ -116,12 +130,16 @@ print(json.dumps({
 ")
 
 echo "[$(date -uIseconds)] writing summary memory"
-curl -sS -X POST \
-    -H "Authorization: Bearer $MNEMOS_API_TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "$memory_payload" \
-    "$MNEMOS_API_BASE/v1/memories" >/tmp/bridge-tier2-${DATE}-write.json
-echo "[$(date -uIseconds)] write response: $(cat /tmp/bridge-tier2-${DATE}-write.json | head -c 100)"
+umask 077
+header_file=$(mktemp) || exit 1
+trap 'rm -f "$header_file"' EXIT
+printf 'Authorization: Bearer %s\n' "$MNEMOS_API_TOKEN" > "$header_file"
+if ! curl --fail --silent --show-error --connect-timeout 5 --max-time 20 -X POST \
+    -H "@$header_file" -H "Content-Type: application/json" \
+    -d "$memory_payload" "$MNEMOS_API_BASE/v1/memories" >/dev/null; then
+    echo "telemetry write failed"
+    overall_status="fail"
+fi
 
 echo
 echo "[$(date -uIseconds)] bridge-tier2-nightly done — overall=$overall_status"

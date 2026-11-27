@@ -61,21 +61,15 @@ async def test_assert_no_active_deletion_passes_when_no_active_request():
 
 
 @pytest.mark.asyncio
-async def test_assert_no_active_deletion_swallows_backend_errors():
-    """If the fence probe itself errors (e.g. transient pool hiccup),
-    the write is allowed and the worker's resweep+verify loop is the
-    second line of defence — it refuses to mark ``hard_deleted`` on
-    any live row.
-    """
+async def test_assert_no_active_deletion_requires_available_lookup():
     from mnemos.api.routes.memories import _assert_no_active_deletion
+    from mnemos.domain.deletion_fence import DeletionFenceUnavailable
 
-    backend = SimpleNamespace()
-    fake_active_deletion = AsyncMock(side_effect=RuntimeError("boom"))
-    with patch(
-        "mnemos.persistence.worker_lifecycle.active_deletion_for_scope",
-        fake_active_deletion,
-    ):
-        await _assert_no_active_deletion(backend, owner_id="u1", namespace="ns1")
+    with patch("mnemos.persistence.worker_lifecycle.active_deletion_for_scope", AsyncMock(side_effect=TimeoutError())):
+        with pytest.raises(DeletionFenceUnavailable) as exc:
+            await _assert_no_active_deletion(SimpleNamespace(), owner_id="u1", namespace="ns1")
+    assert exc.value.status_code == 503
+    assert exc.value.headers["Retry-After"] == "1"
 
 
 @pytest.mark.asyncio

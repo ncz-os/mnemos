@@ -188,6 +188,14 @@ def _base_env(base_url: str, config_path: Path) -> dict[str, str]:
     }
 
 
+def _http_server_env(base_url: str, config_path: Path, state_path: Path) -> dict[str, str]:
+    env = _base_env(base_url, config_path)
+    # Standalone MCP startup wires the shared persistence backend for its
+    # budget ledger. Keep that backend inside this test's temporary directory.
+    env["MNEMOS_SQLITE_PATH"] = str(state_path)
+    return env
+
+
 def _safe_process_env() -> dict[str, str]:
     return {key: os.environ[key] for key in ("HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER") if key in os.environ}
 
@@ -388,7 +396,7 @@ def test_streamable_http_mcp_smoke(tmp_path: Path) -> None:
     with _mock_mnemos_backend() as (backend_url, requests):
         config_path = _write_empty_config(tmp_path)
         env = _safe_process_env()
-        env.update(_base_env(backend_url, config_path))
+        env.update(_http_server_env(backend_url, config_path, tmp_path / "mcp-http.db"))
         env["MNEMOS_MCP_TOKENS"] = f"smoke:{MCP_EDGE_TOKEN}:{BACKEND_TOKEN}"
         env["MNEMOS_MCP_AUTH_ENABLED"] = "true"  # enforced-auth smoke; edge default is off
         proc = subprocess.Popen(
@@ -453,7 +461,7 @@ def test_documented_http_sse_connector_smoke(surface: str, doc_path: Path, tmp_p
     with _mock_mnemos_backend() as (backend_url, requests):
         config_path = _write_empty_config(tmp_path)
         env = _safe_process_env()
-        env.update(_base_env(backend_url, config_path))
+        env.update(_http_server_env(backend_url, config_path, tmp_path / "mcp-http.db"))
         env["MNEMOS_MCP_TOKENS"] = f"smoke:{MCP_EDGE_TOKEN}:{BACKEND_TOKEN}"
         env["MNEMOS_MCP_AUTH_ENABLED"] = "true"  # enforced-auth smoke; edge default is off
         proc = subprocess.Popen(

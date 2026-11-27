@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.routes import tunnels as tr
+from tests._route_helpers import flatten_routes
 from mnemos.tunnels.base import (
     TunnelAuthError,
     TunnelBinaryMissingError,
@@ -129,7 +130,7 @@ def test_every_tunnel_route_is_gated_by_require_root(app):
     from mnemos.api.dependencies import require_root
 
     seen = {}
-    for route in app.routes:
+    for route in flatten_routes(app.routes):
         path = getattr(route, "path", None)
         if path in TUNNEL_PATHS:
             calls = {dep.call for dep in route.dependant.dependencies}

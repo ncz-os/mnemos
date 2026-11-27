@@ -4,6 +4,46 @@ All notable changes to MNEMOS are documented here.
 
 ## Unreleased
 
+## 7.3.0 — 2026-11-26
+
+### Added
+
+- **PostgreSQL hot standby** — replica mode detects recovery, serves reads, suppresses startup writes and returns a structured 503 for mutations. Operators can select `MNEMOS_REPLICA_MODE=auto|on|off`.
+- **Monitoring** — the read-only `monitor` role can read `GET /stats` and `GET /v1/federation/status`.
+- **Memory history** — repository-backed REST list, get and diff reads use snapshot visibility across backend families. MCP adds `list_memory_versions` and `get_memory_version`. Non-Postgres stores record version snapshots on value changes.
+- **Model registry** — PostgreSQL persists banded prices, benchmark provenance, field observations, versioned curated routing and health summaries. Concurrent routing replacements allocate distinct versions.
+- **Federation repair** — operators can inspect fenced, damaged replicas through the API or CLI on all six backends. Dry-run is the default. Apply releases same-peer consolidation references before deletion and resets the affected sync state for replay.
+- **Portability** — CHARON streams MIF exports with keyset paging and spooled indexes. STYX validates identities using a disk-backed spool and reports spool failures. Progress includes the final batch.
+
+### Fixed
+
+- **Embedding and search** — editing memory content refreshes its embedding and clears the old vector when embedding fails. Embedder and reranker each admit one recovery probe under concurrent load.
+- **Federation configuration** — explicitly clearing a nullable peer filter takes effect while required settings retain their values.
+- **PostgreSQL export** — timestamp filters bind as datetimes.
+- **Sessions** — context attaches to the actual system message. Session operations select the active backend's session store.
+- **MCP sessions** — an open streamable GET no longer keeps an idle MCP session alive, so abandoned client streams expire after the idle window instead of filling the per-principal session cap.
+- **KRONOS** — hourly forecasts use completed hours.
+- **Document import** — conversions wait asynchronously for capacity, use separate converters and release capacity on cancellation.
+- **API keys** — last-used updates coalesce into one active flush and recover after a cancelled update.
+- **Audit** — the service-profile worker switch controls sealer startup and shutdown. Startup handles an unavailable signing key or chain and reports disabled sealing.
+- **Repository queries** — consultation selection uses the owner bind consistently and accepts the Db2 read-only query hint. Model alias validation trims surrounding whitespace.
+
+### Hardening
+
+- **Federation** — outbound responses stream under `FEDERATION_MAX_RESPONSE_BYTES` (64 MiB by default). Oversize reads record a transient failure and retry on the next tick. Peer HTTP status handling is preserved.
+- **Visibility and redaction** — version reads apply namespace exclusions and principal ACLs. Missing namespace context receives a consistent access decision. Classification version 3 redacts full private-key spans, including reads with older stored classification metadata.
+- **Operations and persistence** — validate work directories, staging ownership, session and repository inputs, and bound resource use in maintenance, export and backup paths. Installer environment-file creation sets permissions before writing configuration.
+
+### Migrations and changed behaviour
+
+- **Registry and ACL schema** — the two dialect-specific 0073 changes are listed below. Unobserved prices become NULL, and a recorded zero remains a free price. Multiple aliases can identify the same target.
+- **Import events** — document-import webhook delivery requires a classified namespace. Clients should use the namespace returned by classification.
+- **Standby clients** — direct writes to the primary. Clients using bounded peer reads or the monitor role should handle the retry and access semantics above. No public endpoint removal identified in the endpoint diff.
+
+## 7.2.1 — 2026-11-22
+
+- Added the read-only `monitor` role for `GET /stats` and `GET /v1/federation/status`.
+
 - **Federation (security)** — an outbound peer response is now read as a STREAM under a byte cap (`FEDERATION_MAX_RESPONSE_BYTES`, default 64 MiB) instead of being buffered whole by `r.json()`. Every caller keeps its old failure contract: a non-2xx peer answer is still an `httpx.HTTPStatusError` carrying that status (the bounded read hands back the status, not a response object that is already closed), a 401/403/404 keeps its meaning, and a 2xx that is not JSON is a peer defect rather than a decode crash in the reconcile. The cap applies to every peer call on the sync tick: the feed pull, the by-id pull, the schema preflight, the embedder-fingerprint exchange, the anti-entropy digest and the parity redispatch. A declared `content-length` over the cap is refused before a byte of the body is read. A peer that answers with more than the cap is a transient sync failure: nothing is applied, the peer's `last_error` names the peer and the byte count, and the pull retries on the next tick. The inbound side already had a bound (`MAX_BODY_BYTES`, a chunked-aware ASGI limiter); this is its outbound counterpart. Without it a registered peer (or anything that could answer on its URL after the DNS pin) could return a multi-GB body and take the worker — which also serves the API in the default profile — down.
 
 ## 7.2.0 — 2026-11-12
@@ -4996,3 +5036,29 @@ gateway.
 Apache License 2.0 — see [`LICENSE`](./LICENSE). Contributions accepted
 under the Developer Certificate of Origin (DCO), see
 [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+
+## 2026-11-18 — Verification round 2 (hv/ty-mnemos-api-routes-tunnels-20261105)
+
+Rebuilt branch `hv/ty-mnemos-api-routes-tunnels-20261105` (head `bdbd91e5`) onto
+the rewritten master (`1faee712`). The verification regression reported at old
+head `e84e7dac` — 20 tests failing on the branch but passing on master — is
+fully resolved by this rebuild:
+
+- **CF-24 search-namespace test** (`test_no_search_key_namespace_remains_in_any_of_the_five_modules`):
+  master commit `0d5028c2` reworded the `mnemos:search:*` docstring in
+  `mnemos/api/routes/admin.py`, removing the literal namespace the static check
+  forbids.
+- **Import-hygiene suite** (10 tests in
+  `tests/test_characterisation_suite_import_hygiene.py`): master commit
+  `0d5028c2` dropped the untracked `.scratch/prev_streaming_test.py` references
+  and the `BASELINE_BEFORE_AFTER.txt` pin test that depended on scratch files
+  never tracked in git.
+- **Doc internal-detail scan** (`test_no_internal_infrastructure_detail_in_docs`):
+  master commit `0d5028c2` redacted the internal remote name from three refresh
+  docs.
+- **Morpheus cluster / replay / cross-owner / user-namespace tests**: verified
+  passing on both base (`c2d79dbe`) and head (`bdbd91e5`) — not regressions.
+
+All 20 named tests pass on the rebuilt head. The branch's intended delta
+(tunnel route docstring refinement + characterisation tests) is preserved
+exactly; no unrelated files were touched.

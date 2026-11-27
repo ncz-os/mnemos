@@ -68,6 +68,18 @@ class Reranker:
         self._cb_cooldown = cb_cooldown
         self._consecutive_failures = 0
         self._breaker_opened_at: float | None = None
+        self._breaker_probe_in_flight = False
+        # Non-reentrant lock over circuit-breaker state (Lock, not RLock:
+        # _breaker_open, _record_success and _record_failure never call each
+        # other). These methods mutate _breaker_opened_at,
+        # _breaker_probe_in_flight and _consecutive_failures together; the
+        # half-open "claim the slot" transition must be atomic so exactly one
+        # concurrent caller probes. A threading.Lock is used (not
+        # asyncio.Lock) because Reranker is a process-wide singleton shared
+        # across worker threads and the request path; the critical sections
+        # are pure CPU work with no await inside, so holding it across them
+        # does not block the event loop.
+        self._breaker_lock = Lock()
         self._client: Any = None
         self._disabled_logged = False
 
@@ -103,29 +115,52 @@ class Reranker:
         )
 
     def _breaker_open(self) -> bool:
-        if self._breaker_opened_at is None:
-            return False
-        if _t.monotonic() - self._breaker_opened_at >= self._cb_cooldown:
-            self._breaker_opened_at = None
-            self._consecutive_failures = 0
-            logger.info("[RERANK] breaker half-open; probing %s", self.url)
-            return False
-        return True
+        """Return True iff breaker is currently open (block calls).
+
+        All reads and the half-open slot claim happen under ``_breaker_lock``
+        so that concurrent callers see a consistent state and exactly one of
+        them claims the probe slot.
+        """
+        with self._breaker_lock:
+            if self._breaker_opened_at is None:
+                return False
+            if self._breaker_probe_in_flight:
+                return True
+            if _t.monotonic() - self._breaker_opened_at >= self._cb_cooldown:
+                # Claim the half-open slot before returning so other callers
+                # continue to see the breaker as open until this probe completes.
+                self._breaker_probe_in_flight = True
+                logger.info("[RERANK] breaker half-open; probing %s", self.url)
+                return False
+            return True
 
     def _record_success(self) -> None:
-        self._consecutive_failures = 0
-        self._breaker_opened_at = None
+        with self._breaker_lock:
+            self._consecutive_failures = 0
+            self._breaker_opened_at = None
+            self._breaker_probe_in_flight = False
 
     def _record_failure(self) -> None:
-        self._consecutive_failures += 1
-        if self._consecutive_failures >= self._cb_threshold and self._breaker_opened_at is None:
-            self._breaker_opened_at = _t.monotonic()
-            logger.warning(
-                "[RERANK] breaker OPEN after %d consecutive failures; cooling down %.1fs url=%s",
-                self._consecutive_failures,
-                self._cb_cooldown,
-                self.url,
-            )
+        with self._breaker_lock:
+            if self._breaker_probe_in_flight:
+                self._breaker_probe_in_flight = False
+                self._consecutive_failures = self._cb_threshold
+                self._breaker_opened_at = _t.monotonic()
+                logger.warning(
+                    "[RERANK] breaker OPEN after probe failure; cooling down %.1fs url=%s",
+                    self._cb_cooldown,
+                    self.url,
+                )
+                return
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._cb_threshold and self._breaker_opened_at is None:
+                self._breaker_opened_at = _t.monotonic()
+                logger.warning(
+                    "[RERANK] breaker OPEN after %d consecutive failures; cooling down %.1fs url=%s",
+                    self._consecutive_failures,
+                    self._cb_cooldown,
+                    self.url,
+                )
 
     async def rerank(
         self,

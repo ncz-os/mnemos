@@ -224,7 +224,7 @@ def _isolate_bind_guard_env(monkeypatch) -> None:
 
 
 def _stable_daily_rows(memory_id: str, baseline_count: int, current_count: int) -> list[dict]:
-    today = _day_start()
+    today = _day_start() - timedelta(days=1)
     rows = [
         {
             "memory_id": memory_id,
@@ -364,7 +364,303 @@ async def test_forecast_recall_load_window_is_aligned_to_the_pinned_hour():
     # The extra row the shift contributes is the one real NEWEST hour, whose
     # count is the fixture's highest (10 + 0 % 4 against a tail of 10 + 3): a
     # one-hour misalignment changes the answer, it does not merely move it.
+    # The forecast amplitude (not the direction) is what matters: a busier
+    # newest hour must still land above the aligned answer.
     assert shifted.predicted_total_recalls > aligned.predicted_total_recalls > 0
+
+
+class _MinutePinnedDatetime(_FrozenDatetime):
+    """``_FrozenDatetime`` whose ``now()`` returns the pinned hour at ``minute``.
+
+    The module-level fixture pins the clock to 00:00 UTC because the anomaly
+    tests need a midnight-aligned instant. The partial-hour forecast tests
+    need the opposite: an instant *inside* the current hour, so the newest
+    hourly bucket is the in-progress one.
+
+    Subclasses ``_FrozenDatetime`` (not ``datetime``) on purpose: the
+    fixture rows are built through the module-level helpers, which return
+    ``_FrozenDatetime``, and ``isinstance(row, forecast.datetime)`` must
+    hold against whatever class the patch installed -- a sibling subclass
+    would be rejected. Keep the two as one family.
+    """
+
+    minute_of_hour = 5
+
+    @classmethod
+    def now(cls, tz=None):
+        pinned = _as_frozen(_PINNED_NOW + timedelta(minutes=cls.minute_of_hour))
+        if tz is None:
+            return cls(
+                pinned.year,
+                pinned.month,
+                pinned.day,
+                pinned.hour,
+                pinned.minute,
+                pinned.second,
+                pinned.microsecond,
+            )
+        return cls(
+            pinned.year,
+            pinned.month,
+            pinned.day,
+            pinned.hour,
+            pinned.minute,
+            pinned.second,
+            pinned.microsecond,
+            tzinfo=pinned.tzinfo,
+        )
+
+
+@pytest.fixture
+def _kronos_partial_hour(monkeypatch: pytest.MonkeyPatch):
+    """Pin the forecast module's clock ``minute_of_hour`` into its hour.
+
+    Yields a helper that returns the instant the module now reads, so the
+    fixture rows are always stamped with the very same clock value the code
+    under test uses. Rows must be built from *that* value and not from the
+    module-level ``_PINNED_NOW``: ``forecast._as_utc`` tests rows against the
+    ``datetime`` bound in the module under test, and the pin replaces it.
+    """
+
+    def _pin(minute_of_hour: int) -> datetime:
+        _MinutePinnedDatetime.minute_of_hour = minute_of_hour
+        monkeypatch.setattr("mnemos.domain.kronos.forecast.datetime", _MinutePinnedDatetime)
+        from mnemos.domain.kronos import forecast as forecast_mod
+
+        return forecast_mod.datetime.now(timezone.utc)
+
+    yield _pin
+    _MinutePinnedDatetime.minute_of_hour = 5
+
+
+def _hour_bucket(value: datetime, hours_back: int = 0) -> datetime:
+    """``value`` floored to its hour, ``hours_back`` hours earlier.
+
+    Built through the frozen subclass rather than ``.replace()``: CPython's
+    ``datetime.replace`` on a subclass returns a plain ``datetime``, which
+    the module under test would then reject in ``_as_utc``.
+    """
+    shifted = value - timedelta(hours=hours_back)
+    return _MinutePinnedDatetime(
+        shifted.year,
+        shifted.month,
+        shifted.day,
+        shifted.hour,
+        tzinfo=shifted.tzinfo,
+    )
+
+
+def _constant_rate_rows(now: datetime, *, per_hour: int = 100, hours: int = 24 * 7) -> list[dict]:
+    """``hours`` complete hourly buckets of ``per_hour`` recalls, ending at ``now``."""
+    return [{"bucket_hour": _hour_bucket(now, idx), "recall_count": per_hour} for idx in range(hours)]
+
+
+@pytest.mark.asyncio
+async def test_forecast_recall_load_ignores_in_progress_hour(_kronos_partial_hour):
+    """NG2-MN-015: the incomplete current hour must not drag the forecast down.
+
+    A steady 100 recalls/hour history plus the in-progress current hour (8
+    recalls, what 5 elapsed minutes of a 100/hour bucket looks like) has to
+    forecast ~100/hour. Fed to the EWMA as if it were a complete hour, that
+    newest point collapses to ~72 at alpha 0.3 and the 24 h total drops from
+    2400 to ~1738.
+    """
+    from mnemos.domain.kronos import forecast_recall_load
+
+    now = _kronos_partial_hour(5)
+    now_hour = _hour_bucket(now)
+    rows = _constant_rate_rows(now_hour - timedelta(hours=1))
+    rows.append({"bucket_hour": now_hour, "recall_count": 8})
+
+    result = await forecast_recall_load(_Pool(hourly_rows=rows), "default", hours_ahead=24)
+
+    assert result.predicted_total_recalls == pytest.approx(2400.0, rel=0.05)
+    # The pre-fix answer for this exact input was ~1737.6 (72.4/hour: the
+    # partial bucket pulled the EWMA level down 28%). Pin that the fix is not
+    # merely a different number but the right one.
+    assert result.predicted_total_recalls > 1737.6 * 1.2
+    # ... and the partial hour must not inflate the residual spread either:
+    # a +/- 60% band around a flat 100/hour history is not plausible.
+    assert result.ci_upper - result.predicted_total_recalls < 0.1 * result.predicted_total_recalls
+
+
+@pytest.mark.asyncio
+async def test_forecast_recall_load_complete_history_is_unchanged(_kronos_partial_hour):
+    """A history ending at the last COMPLETED hour still forecasts exactly.
+
+    With the newest bucket being a whole hour (the case at minute 0, or any
+    time after the in-progress hour is dropped), 100 recalls/hour must give
+    exactly 2400 over 24 h. This guards the other direction: always
+    discarding the newest bucket would make every forecast lag a rising or
+    falling trend by one hour, and would halve this answer.
+    """
+    from mnemos.domain.kronos import forecast_recall_load
+
+    now = _kronos_partial_hour(5)
+    now_hour = _hour_bucket(now)
+    rows = _constant_rate_rows(now_hour - timedelta(hours=1))
+
+    result = await forecast_recall_load(_Pool(hourly_rows=rows), "default", hours_ahead=24)
+    assert result.predicted_total_recalls == pytest.approx(2400.0, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_forecast_recall_load_at_an_hour_boundary_is_unaffected(_kronos_partial_hour):
+    """At minute 0 there is no completed hour yet for the current bucket.
+
+    The recall log has no row for the just-started hour, so the history is the
+    complete 168 hours ending one hour back and the answer is the same 2400.
+    """
+    from mnemos.domain.kronos import forecast_recall_load
+
+    now = _kronos_partial_hour(0)
+    assert now.minute == 0
+    now_hour = _hour_bucket(now)
+    rows = _constant_rate_rows(now_hour - timedelta(hours=1))
+
+    result = await forecast_recall_load(_Pool(hourly_rows=rows), "default", hours_ahead=24)
+    assert result.predicted_total_recalls == pytest.approx(2400.0, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_forecast_recall_load_in_progress_hour_alone_is_empty(_kronos_partial_hour):
+    """Only the in-progress hour has recalls: nothing is forecast yet."""
+    from mnemos.domain.kronos import forecast_recall_load
+
+    now = _kronos_partial_hour(5)
+    rows = [{"bucket_hour": _hour_bucket(now), "recall_count": 8}]
+
+    result = await forecast_recall_load(_Pool(hourly_rows=rows), "default", hours_ahead=24)
+    assert result.predicted_total_recalls == 0.0
+
+
+@pytest.mark.asyncio
+async def test_forecast_recall_load_empty_history_is_unchanged(_kronos_partial_hour):
+    """An empty history still returns the all-zero forecast."""
+    from mnemos.domain.kronos import forecast_recall_load
+
+    _kronos_partial_hour(5)
+    result = await forecast_recall_load(_Pool(hourly_rows=[]), "default", hours_ahead=24)
+
+    assert result.predicted_total_recalls == 0.0
+    assert result.predicted_p95_per_hour == 0.0
+    assert result.ci_lower == 0.0
+    assert result.ci_upper == 0.0
+
+
+@pytest.mark.asyncio
+async def test_forecast_in_progress_bucket_is_the_last_slot(_kronos_partial_hour):
+    """Invariant the partial-hour handling rests on: ``history[-1]`` is the
+    hour containing "now", and every earlier slot is a whole hour.
+
+    The extrapolation divides the last bucket by the fraction of *this* hour
+    that has elapsed, so it is only meaningful if that bucket is indeed the
+    in-progress hour. Pin the indexing rather than assume it.
+    """
+    from mnemos.domain.kronos import forecast as forecast_mod
+
+    now = _kronos_partial_hour(5)
+    now_hour = _hour_bucket(now)
+    rows = _constant_rate_rows(now_hour - timedelta(hours=1), hours=3)
+    rows.append({"bucket_hour": now_hour, "recall_count": 8})
+
+    history = forecast_mod._hourly_counts_from_rows(rows, window_hours=24 * 7)
+
+    assert history[-1] == 8.0
+    assert history[-2] == 100.0
+    # The elapsed fraction is measured inside that same hour.
+    assert forecast_mod._elapsed_hour_fraction() == pytest.approx(5 / 60, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_forecast_recall_load_caps_a_partial_hour_burst(_kronos_partial_hour):
+    """A burst in the first minutes must not extrapolate without limit.
+
+    Two thousand recalls 5 minutes into the hour naively project to 24k/hour.
+    The in-progress contribution is capped at a small multiple of the fitted
+    level, so the answer stays a multiple of the 2400 a 100/hour history
+    implies instead of exploding.
+    """
+    from mnemos.domain.kronos import forecast as forecast_mod
+    from mnemos.domain.kronos import forecast_recall_load
+
+    now = _kronos_partial_hour(5)
+    now_hour = _hour_bucket(now)
+    rows = _constant_rate_rows(now_hour - timedelta(hours=1))
+    rows.append({"bucket_hour": now_hour, "recall_count": 2000})
+
+    result = await forecast_recall_load(_Pool(hourly_rows=rows), "default", hours_ahead=24)
+
+    naive_hourly = 0.3 * (2000 / (5 / 60)) + 0.7 * 100
+    assert result.predicted_total_recalls / 24 < naive_hourly
+    assert result.predicted_total_recalls <= (0.3 * forecast_mod._MAX_PARTIAL_HOUR_MULTIPLE + 0.7) * 100.0 * 24 * 1.001
+
+
+@pytest.mark.asyncio
+async def test_forecast_recall_load_heavy_partial_hour_raises_the_forecast(_kronos_partial_hour):
+    """The in-progress hour is not discarded: real early load lifts the rate.
+
+    Same history as the flat case, but the current hour has already seen 40
+    recalls at minute 5 (a 480/hour pace). The forecast must land above the
+    flat 2400 -- and below the naive 480/hour extrapolation of 11520, because
+    one partial hour is damped rather than taken at face value.
+    """
+    from mnemos.domain.kronos import forecast_recall_load
+
+    now = _kronos_partial_hour(5)
+    now_hour = _hour_bucket(now)
+    rows = _constant_rate_rows(now_hour - timedelta(hours=1))
+    rows.append({"bucket_hour": now_hour, "recall_count": 40})
+
+    result = await forecast_recall_load(_Pool(hourly_rows=rows), "default", hours_ahead=24)
+
+    assert 2400.0 < result.predicted_total_recalls < 480.0 * 24
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("minute", [0, 1, 4, 5, 30, 59])
+async def test_forecast_elapsed_fraction_is_floored_and_bounded(_kronos_partial_hour, minute):
+    """The elapsed fraction never divides by ~0 and never exceeds one hour.
+
+    Below the 5-minute floor the partial count must not be scaled up as if
+    only seconds had passed, and at any later minute the fraction must stay in
+    (0, 1]. This is what bounds the extrapolation for a burst in the first
+    minutes of an hour.
+    """
+    from mnemos.domain.kronos import forecast as forecast_mod
+
+    _kronos_partial_hour(minute)
+    elapsed = forecast_mod._elapsed_hour_fraction()
+
+    assert elapsed >= forecast_mod._MIN_ELAPSED_HOUR_FRACTION
+    assert 0.0 < elapsed <= 1.0
+    if minute >= 5:
+        assert elapsed == pytest.approx(minute / 60, abs=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_forecast_partial_hour_survives_ewma_decay_to_zero(_kronos_partial_hour):
+    """A live current hour still counts after a long quiet stretch.
+
+    One spike far back, then quiet hours, drives the EWMA level to ~0 while
+    the completed sum stays non-zero. The cap must follow the completed-hour
+    mean rather than the decayed level, so the current hour's real traffic is
+    not silently squeezed to a fraction of a recall per hour.
+    """
+    from mnemos.domain.kronos import forecast_recall_load
+
+    now = _kronos_partial_hour(5)
+    now_hour = _hour_bucket(now)
+    rows = [{"bucket_hour": _hour_bucket(now_hour, hours_back), "recall_count": 0} for hours_back in range(1, 168)]
+    rows[-1]["recall_count"] = 10_000  # the long-ago spike (oldest completed bucket)
+    rows.append({"bucket_hour": now_hour, "recall_count": 40})
+
+    result = await forecast_recall_load(_Pool(hourly_rows=rows), "default", hours_ahead=24)
+
+    # A live hour at a 480/hour pace must move the forecast well above nothing.
+    # With the decayed level (1.9e-22) used as the cap basis the answer is
+    # ~0.9/hour (~22 total); with the completed-hour mean it is ~54/hour.
+    assert result.predicted_total_recalls > 24 * 10.0
 
 
 @pytest.mark.asyncio

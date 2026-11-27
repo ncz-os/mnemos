@@ -12,7 +12,7 @@ from mnemos.api.memory_mutations import (
     _insert_memory_with_created_webhook,
     _rls_context,
 )
-from mnemos.api.persistence_helpers import backend_or_503, require_postgres_pool_or_503
+from mnemos.api.persistence_helpers import backend_or_503, require_postgres_pool_or_503, require_write_allowed
 from mnemos.api.read_policy import _validate_permission_mode
 from mnemos.core.ids import new_memory_id
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
@@ -45,6 +45,7 @@ def _extract_readable(items: list, max_items: int = 20) -> str:
 @router.post("/ingest/session", response_model=SessionIngestResponse)
 async def ingest_session(request: SessionIngestRequest, user: UserContext = Depends(get_current_user)):
     """Ingest Claude Code session data into MNEMOS."""
+    require_write_allowed()
     require_postgres_pool_or_503(route_label="POST /v1/ingest/session")
     permission_mode = _validate_permission_mode(request.permission_mode, default=600)
     # CF-09 GDPR fence (MN-05): this route writes memory rows under the

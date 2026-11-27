@@ -72,7 +72,7 @@ CREATE INDEX IF NOT EXISTS idx_memories_federation
 ALTER TABLE memories
     ADD COLUMN IF NOT EXISTS federation_remote_updated TIMESTAMPTZ;
 
--- Relax the users.role CHECK constraint to include 'federation' (#M31-03).
+-- Relax the users.role CHECK constraint to include 'federation' and 'monitor'.
 -- The v1_multiuser migration declared CHECK (role IN ('user', 'root')),
 -- which blocks admin-created federation users at INSERT time. Drop-and-
 -- recreate is idempotent — safe for fresh installs (v1 creates, this
@@ -81,4 +81,4 @@ ALTER TABLE memories
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_role_check;
 ALTER TABLE users
     ADD CONSTRAINT users_role_check
-    CHECK (role IN ('user', 'root', 'federation'));
+    CHECK (role IN ('user', 'root', 'federation', 'monitor'));

@@ -1686,12 +1686,16 @@ def test_check_port_free_does_not_listen_or_connect(monkeypatch):
 
     result = check_port_free(0)
 
-    assert forbidden == []
-    # A socket must genuinely be opened and bound: an implementation that
-    # returned early would leave `opened` empty and make the assertion above
-    # vacuous, so pin that the probe actually reached the kernel.
-    assert opened == ["socket"]
+    # The probe must open and bind a socket, report success, and never reach
+    # listen/accept/connect. All three assertions live on the lines directly
+    # after the call so the guarantee is visible without scrolling: a
+    # `forbidden` that is not empty means the probe started listening.
     assert result is True
+    assert forbidden == []
+    assert opened == ["socket"]
+    # Note: an implementation that returned early would leave `opened` empty
+    # and make the `forbidden` assertion above vacuous, so the third assertion
+    # pins that the probe actually reached the kernel.
 
 
 # ---------------------------------------------------------------------------

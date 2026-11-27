@@ -25,6 +25,7 @@ from mnemos.core.config import (
     required_capabilities_env,
 )
 from mnemos.core.pool import PoolManager
+from mnemos.core.replica_mode import replica_mode_enabled
 
 # Redis is not a runtime dependency. The optional aioredis cache this shim
 # existed for was never read by anything and has been removed; rate limiting
@@ -32,6 +33,8 @@ from mnemos.core.pool import PoolManager
 # RATE_LIMIT_STORAGE_URI when a shared counter is needed (multi-worker or
 # multi-node). Nothing here imports redis.
 logger = logging.getLogger(__name__)
+_SEARCH_FILTER_COLUMNS = ("category", "subcategory", "source_provider", "source_model", "source_agent", "namespace")
+_SEARCH_FILTER_COLUMN_ALLOWLIST = frozenset(_SEARCH_FILTER_COLUMNS)
 
 
 class PersistenceBackend(Protocol):
@@ -46,6 +49,7 @@ class PersistenceBackend(Protocol):
 _background_tasks: set = set()
 _worker_tasks: set = set()
 _delivery_attempt_tasks: set = set()
+_MAX_PENDING_DELIVERIES = get_settings().webhook.pending_limit
 _WORKER_SHUTDOWN_CANCEL_SECONDS = get_settings().runtime.worker_shutdown_cancel_seconds
 _FINAL_CANCEL_WAIT_SECONDS = 5.0
 
@@ -58,6 +62,7 @@ _worker_status: dict = {
     "deletion_request_worker": "idle",
     "hard_deletion_request_worker": "idle",
     "persephone_archival_worker": "idle",
+    "audit_sealer_worker": "disabled",
     "last_heartbeat": None,
 }
 
@@ -83,6 +88,9 @@ def _schedule_worker(coro):
 
 def _schedule_delivery_attempt(coro):
     """Schedule a finite webhook send that graceful shutdown drains before cancel."""
+    if len(_delivery_attempt_tasks) >= _MAX_PENDING_DELIVERIES:
+        coro.close()
+        return None
     return _schedule_tracked(coro, _delivery_attempt_tasks)
 
 
@@ -138,8 +146,22 @@ def register_post_db_startup_hook(name: str, hook) -> None:
 
 
 async def _run_post_db_startup_hooks(db_handle: Any, settings: Any) -> None:
-    """Run registered post-DB hooks with the active backend handle."""
+    """Run registered post-DB hooks with the active backend handle.
+
+    Replica mode: every registered post-DB hook launches a writing
+    consumer loop (federation NATS consumers, webhook NATS trigger,
+    PANTHEON routing audit consumer) via ``schedule_worker``. They run
+    AFTER the lifespan worker-skip block, so they need their own gate —
+    on a read-only standby the primary runs these consumers and the
+    results arrive via WAL replay.
+    """
     if db_handle is None:
+        return
+    if replica_mode_enabled():
+        logger.info(
+            "[REPLICA] post-DB startup hooks skipped (read-only standby): %s",
+            ", ".join(_post_db_startup_hooks) or "(none registered)",
+        )
         return
     for hook_name, hook in _post_db_startup_hooks.items():
         try:
@@ -795,6 +817,16 @@ async def _log_federation_startup_guidance(pool: asyncpg.Pool | None) -> None:
 
 @asynccontextmanager
 async def lifespan(app):
+    """Release acquired resources on every exit path."""
+    try:
+        async with _lifespan_resources(app):
+            yield
+    finally:
+        await _shutdown_resources(app)
+
+
+@asynccontextmanager
+async def _lifespan_resources(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
     global _pool, _pool_manager, _persistence_backend, _cache, _rls_enabled, _worker_status
 
@@ -943,6 +975,11 @@ async def lifespan(app):
                 f"asyncpg connection pool initialized "
                 f"(min={PG_CONFIG['pool_min_size']}, max={PG_CONFIG['pool_max_size']})"
             )
+            if replica_mode_enabled():
+                logger.info(
+                    "[REPLICA] Postgres hot-standby detected (pg_is_in_recovery=true): "
+                    "serving READ-ONLY API — migrations skipped, mutations return 503"
+                )
     except Exception as e:
         logger.error(f"Failed to initialize {backend_type} persistence backend: {e}", exc_info=True)
         raise
@@ -991,7 +1028,11 @@ async def lifespan(app):
     # the background task lands. POST /admin/graeae/reload-providers is also
     # available for on-demand refresh (and is what the daily systemd timer
     # uses after sync_provider_models.py finishes).
-    if _provider_manifest_reloader is not None and _pool is not None:
+    #
+    # Replica mode: this reload writes provider-manifest rows, so it is
+    # skipped entirely on a read-only standby — the manifest is already
+    # replicated from the primary via WAL.
+    if _provider_manifest_reloader is not None and _pool is not None and not replica_mode_enabled():
         import asyncio as _asyncio_for_reload
 
         async def _bg_provider_manifest_reload():
@@ -1028,17 +1069,48 @@ async def lifespan(app):
 
     # Start registered background workers. API owns registrations so core stays
     # below API/domain/webhook/worker packages in the dependency graph.
+    #
+    # Replica mode: every registered worker performs writes (compression
+    # queue processing, deletion-request handling, archival, audit-chain
+    # sealing, federation sync, etc.). On a read-only standby they are all
+    # skipped — the primary runs them; this host only serves reads.
     worker_enabled = config.get("worker", {}).get("enabled", True)
     if not worker_enabled:
         _worker_status["distillation_worker"] = "disabled"
     scheduled_workers = 0
     worker_handle = _pool if _pool is not None else _persistence_backend
+    if replica_mode_enabled():
+        # Replica mode: every registered worker performs writes (compression
+        # queue processing, deletion-request handling, archival, audit-chain
+        # sealing, federation sync, etc.). On a read-only standby they are all
+        # skipped — the primary runs them; this host only serves reads.
+        # The flag is set unconditionally so health/stats report the skip
+        # even when no worker factory is registered yet.
+        for _worker_name in _lifespan_worker_factories:
+            _worker_status[_worker_name] = "disabled"
+        _worker_status["distillation_worker"] = "disabled"
+        _worker_status["deletion_request_worker"] = "disabled"
+        _worker_status["hard_deletion_request_worker"] = "disabled"
+        _worker_status["persephone_archival_worker"] = "disabled"
+        _worker_status["audit_sealer_worker"] = "disabled"
+        logger.info("[REPLICA] background workers skipped (read-only standby)")
+        worker_enabled = False
     if worker_handle is not None:
         for worker_name, (factory, honor_worker_enabled) in _lifespan_worker_factories.items():
+            if replica_mode_enabled():
+                # Replica mode: skip EVERY registered worker, including the
+                # ones registered with honor_worker_enabled=False (persephone
+                # archival, morpheus queued runs, webhook repair/delivery,
+                # federation sync, federation local-embed). They all write;
+                # the general worker switch alone only gates the honor=True
+                # subset, which used to let the rest launch on a standby.
+                logger.info("%s skipped (read-only standby)", worker_name)
+                continue
             if _pool is None and worker_name not in {
                 "deletion_request_worker",
                 "hard_deletion_request_worker",
                 "persephone archival worker",
+                "audit_sealer_worker",
             }:
                 continue
             if honor_worker_enabled and not worker_enabled:
@@ -1049,6 +1121,14 @@ async def lifespan(app):
                     _worker_status["deletion_request_worker"] = "disabled"
                 if worker_name == "hard_deletion_request_worker":
                     _worker_status["hard_deletion_request_worker"] = "disabled"
+                if worker_name == "audit_sealer_worker":
+                    _worker_status["audit_sealer_worker"] = "disabled"
+                    from mnemos.core.config import audit_chain_enabled_flag
+
+                    if audit_chain_enabled_flag():
+                        logger.warning(
+                            "Audit chain writes are enabled but the audit sealer worker is disabled by the general worker switch"
+                        )
                 continue
             worker_coro = factory(worker_handle)
             if worker_coro is None:
@@ -1072,7 +1152,10 @@ async def lifespan(app):
         _worker_status["distillation_worker"] = "disabled"
 
     # OAuth expired-session GC worker (v3.0.0, item 13: backend-neutral via OAuthRepository)
-    if _persistence_backend is not None:
+    #
+    # Replica mode: this loop deletes expired sessions, so it is skipped on a
+    # read-only standby — session GC runs on the primary and replicates.
+    if _persistence_backend is not None and not replica_mode_enabled():
         import asyncio as _asyncio
         from datetime import datetime as _datetime, timedelta as _timedelta, timezone as _timezone
 
@@ -1126,34 +1209,44 @@ async def lifespan(app):
 
     yield
 
-    await _cancel_tracked_tasks(
-        _worker_tasks,
-        label="worker",
-        timeout=_WORKER_SHUTDOWN_CANCEL_SECONDS,
-    )
-    await _drain_delivery_attempt_tasks()
-    await _cancel_tracked_tasks(
-        _background_tasks,
-        label="background",
-        timeout=_WORKER_SHUTDOWN_CANCEL_SECONDS,
-    )
-    for hook_name, hook in _lifespan_cleanup_hooks.items():
+
+async def _shutdown_resources(app):
+    """Close resources independently in dependency order."""
+    global _persistence_backend, _pool, _pool_manager, _cache, _rls_enabled
+
+    async def close_one(label, action):
         try:
-            await hook()
-        except Exception:
-            logger.exception("[shutdown] %s cleanup hook failed", hook_name)
-    if _persistence_backend is not None:
-        await _persistence_backend.close()
-        logger.info("Persistence backend closed")
-    elif _pool:
-        await _pool.close()
-        logger.info("DB pool closed")
-    _persistence_backend = None
-    _pool = None
-    _pool_manager = None
-    if _cache:
-        await _cache.aclose()
-        logger.info("Redis cache closed")
+            await action()
+        except BaseException:
+            logger.exception("[shutdown] %s cleanup failed", label)
+
+    await close_one(
+        "workers", lambda: _cancel_tracked_tasks(_worker_tasks, label="worker", timeout=_WORKER_SHUTDOWN_CANCEL_SECONDS)
+    )
+    await close_one("delivery", _drain_delivery_attempt_tasks)
+    await close_one(
+        "background",
+        lambda: _cancel_tracked_tasks(_background_tasks, label="background", timeout=_WORKER_SHUTDOWN_CANCEL_SECONDS),
+    )
+    for name, hook in list(_lifespan_cleanup_hooks.items()):
+        await close_one(name, hook)
+    try:
+        if _persistence_backend is not None:
+            await close_one("database", _persistence_backend.close)
+        elif _pool is not None:
+            await close_one("database", _pool.close)
+        if _cache is not None:
+            await close_one("cache", _cache.aclose)
+    finally:
+        _persistence_backend = None
+        _pool = None
+        _pool_manager = None
+        _cache = None
+        _rls_enabled = False
+        state = getattr(app, "state", None)
+        if state is not None:
+            for name in ("pool", "pool_manager", "persistence_backend", "cache"):
+                setattr(state, name, None)
     logger.info("Shutting down MNEMOS API Server")
 
 
@@ -1288,6 +1381,19 @@ async def _vis_epoch_get_incr() -> int:
     return epoch
 
 
+def visibility_epoch_cached() -> int:
+    """Read the last epoch this process has seen, WITHOUT any I/O.
+
+    A synchronous snapshot for callers that need an inexpensive
+    invalidation key and cannot await (e.g. the MCP SSE bridge, whose
+    per-stream envelopes are keyed on it). The value is the high-water
+    mark maintained in-process by :class:`NatsVisibilityEpoch`, so it
+    advances on every local bump and on every observed shared bump; it
+    never goes backward. Returns 0 before anything has been observed.
+    """
+    return _vis_epoch().observed_epoch()
+
+
 async def _get_embedding(text: str) -> list:
     """Get embedding vector for `text`. Returns [] on failure.
 
@@ -1348,14 +1454,9 @@ async def _vector_search(
     # Dynamic WHERE builder: $1=vec_str, filter params at $2+, limit always last
     params: list = [vec_str]
     conditions: list = ["embedding IS NOT NULL", "deleted_at IS NULL", "archived_at IS NULL"]
-    for col, val in [
-        ("category", category),
-        ("subcategory", subcategory),
-        ("source_provider", source_provider),
-        ("source_model", source_model),
-        ("source_agent", source_agent),
-        ("namespace", namespace),
-    ]:
+    filter_values = (category, subcategory, source_provider, source_model, source_agent, namespace)
+    for col, val in zip(_SEARCH_FILTER_COLUMNS, filter_values):
+        assert col in _SEARCH_FILTER_COLUMN_ALLOWLIST
         if val is not None:
             params.append(val)
             conditions.append(f"{col}=${len(params)}")
@@ -1424,14 +1525,9 @@ async def _fts_fetch(
         """
         params = list(start_params)
         conditions: list = []
-        for col, val in [
-            ("category", category),
-            ("subcategory", subcategory),
-            ("source_provider", source_provider),
-            ("source_model", source_model),
-            ("source_agent", source_agent),
-            ("namespace", namespace),
-        ]:
+        filter_values = (category, subcategory, source_provider, source_model, source_agent, namespace)
+        for col, val in zip(_SEARCH_FILTER_COLUMNS, filter_values):
+            assert col in _SEARCH_FILTER_COLUMN_ALLOWLIST
             if val is not None:
                 params.append(val)
                 conditions.append(f"{col}=${len(params)}")

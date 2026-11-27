@@ -29,7 +29,7 @@ from fastapi import APIRouter, Body, Depends, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import backend_or_503
+from mnemos.api.persistence_helpers import backend_or_503, require_write_allowed
 from mnemos.core.config import get_settings
 from mnemos.domain.mcp_audit_repo import VALID_OUTCOMES, insert_audit_record
 
@@ -198,6 +198,7 @@ async def write_mcp_audit_record(
     API token holders from forging audit rows. The bearer token
     still establishes caller_user_id/role attribution.
     """
+    require_write_allowed()
     backend = backend_or_503()
     async with backend.transactional() as tx:
         try:

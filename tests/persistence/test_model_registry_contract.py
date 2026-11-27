@@ -30,14 +30,18 @@ The cases are the contract, not the implementation:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
 import os
+import re
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -107,11 +111,33 @@ async def _postgres_handle() -> AsyncIterator[RegistryHandle]:
     from mnemos.persistence.postgres import PostgresBackend
 
     dsn = os.environ[POSTGRES_DSN_ENV]
-    backend = await PostgresBackend.open(dsn=dsn, settings=SimpleNamespace(database=SimpleNamespace(embedding_dim=8)))
+    # The pool is created here, not by ``PostgresBackend.open`` (a lifecycle
+    # hook, not a factory): the backend borrows it and ``close`` releases it,
+    # but the pool is closed explicitly below too, so no connection leaks
+    # across parametrized cases even if the backend is already closed.
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    backend = PostgresBackend(pool, SimpleNamespace(database=SimpleNamespace(embedding_dim=8)))
     try:
+        await backend.open()
+        # The sqlite arm gets a fresh tmp file per test; the shared Postgres
+        # test database does not. Truncate the registry tables so each
+        # parametrized case starts from an empty registry like sqlite does.
+        async with backend.transactional() as tx:
+            conn = tx.conn
+            # Table names are fixed literals (not interpolated): asyncpg
+            # cannot parameterise identifiers, so each DELETE names its
+            # table directly instead of formatting a variable into SQL.
+            await conn.execute("DELETE FROM model_registry_health")
+            await conn.execute("DELETE FROM curated_routing")
+            await conn.execute("DELETE FROM model_benchmarks")
+            await conn.execute("DELETE FROM model_prices")
+            await conn.execute("DELETE FROM model_registry_field_obs")
+            await conn.execute("DELETE FROM model_registry_sync_log")
+            await conn.execute("DELETE FROM model_registry")
         yield RegistryHandle(backend=backend, repo=backend.model_registry, transaction=backend.transactional)
     finally:
         await backend.close()
+        await pool.close()
 
 
 # async fixtures must use pytest_asyncio.fixture: the repo runs pytest-asyncio
@@ -327,44 +353,33 @@ async def test_priced_filter_distinguishes_null_from_zero(registry: RegistryHand
 
 @pytest.mark.asyncio
 @_conforming()
-async def test_cached_only_price_counts_as_priced(registry: RegistryHandle) -> None:
-    """A cache-only price is a known price, not an unpriced model.
-
-    Regression: the ``priced`` predicate tested only ``price_in``/``price_out``
-    on both SQLite and Postgres, so a row whose only known price was
-    ``price_cached`` was counted and filtered as unpriced — contradicting the
-    rule that ANY non-NULL price column means priced. ``price_in`` and
-    ``price_out`` stay ``NULL`` here, so the case fails if the predicate ever
-    drops ``price_cached`` again.
-    """
-    only_cached = ModelRecord(provider="anthropic", model_id="cache-only")
+@pytest.mark.parametrize("field", ["price_in", "price_out", "price_cached"])
+async def test_each_price_column_counts_as_priced(registry: RegistryHandle, field: str) -> None:
     async with registry.transaction() as tx:
-        await registry.repo.upsert_model(tx, only_cached)
+        await registry.repo.upsert_model(tx, MODEL)
         await registry.repo.upsert_price(
             tx,
             PriceBand(
-                provider="anthropic",
-                model_id="cache-only",
+                provider=MODEL.provider,
+                model_id=MODEL.model_id,
                 pricing_model="payg",
                 band="standard",
-                price_in=None,
-                price_out=None,
-                price_cached=0.3,
+                **{field: 0.3},
             ),
         )
-        model = await registry.repo.get_model(tx, "anthropic", "cache-only")
+        model = await registry.repo.get_model(tx, MODEL.provider, MODEL.model_id)
         health = await registry.repo.health_read(tx)
         priced = await registry.repo.list_models(tx, ModelFilter(priced=True))
         unpriced = await registry.repo.list_models(tx, ModelFilter(priced=False))
 
     assert model is not None
-    assert model.price_cached == 0.3
-    # NULL is still NULL, and a cached-only row is not free.
-    assert model.price_in is None and model.price_out is None
+    assert getattr(model, field) == 0.3
+    for other in {"price_in", "price_out", "price_cached"} - {field}:
+        assert getattr(model, other) is None
     assert health.model_count == 1
     assert health.priced_count == 1
     assert health.unpriced_count == 0
-    assert {m.model_id for m in priced} == {"cache-only"}
+    assert {m.model_id for m in priced} == {MODEL.model_id}
     assert unpriced == []
 
 
@@ -1007,10 +1022,6 @@ async def test_export_snapshot_keeps_null_distinct_from_zero(registry: RegistryH
     """An unpriced row and a free row must not export to the same document."""
     async with registry.transaction() as tx:
         await registry.repo.upsert_model(tx, ModelRecord(provider="p", model_id="m"))
-        await registry.repo.upsert_price(
-            tx,
-            PriceBand(provider="p", model_id="m", pricing_model="payg", band="standard", price_in=None, price_out=None),
-        )
         unpriced = await registry.repo.export_snapshot(tx)
         await registry.repo.upsert_price(
             tx,
@@ -1022,7 +1033,8 @@ async def test_export_snapshot_keeps_null_distinct_from_zero(registry: RegistryH
     free_model = free["models"][0]
     # Prices export in canonical numeric string form: ``None`` for unknown, and
     # ``"0"`` for demonstrably free. The two must never converge on one value.
-    assert unpriced_model["price_in"] is None
+    assert all(unpriced_model[column] is None for column in ("price_in", "price_out", "price_cached"))
+    assert unpriced["prices"] == []
     assert free_model["price_in"] == "0"
     assert unpriced_model != free_model
 
@@ -1061,43 +1073,412 @@ def test_export_snapshot_helper_encodes_canonically() -> None:
     assert model_registry_snapshot_digest({"x": None}) != model_registry_snapshot_digest({"x": 0.0})
 
 
-def test_priced_predicate_covers_all_three_price_columns() -> None:
-    """Both conforming backends use the same three-column ``priced`` predicate.
+def _sql_params(sql: str, args: tuple[Any, ...]) -> dict[int, Any]:
+    """Map ``$n`` placeholder positions to bound args.
 
-    The cached-only case above runs on SQLite (and on Postgres only with a
-    live DSN). This pins the SQL itself, so a backend that drops
-    ``price_cached`` from its predicate fails here even when the live arm is
-    skipped — the regression that started this fix was exactly a two-column
-    predicate on both backends.
+    asyncpg binds positionally: ``$1`` is ``args[0]``, ``$2`` is ``args[1]``,
+    and so on. Parsing the placeholders out of the SQL (rather than slicing
+    ``args`` by position or using negative indexing) keeps the mock correct
+    even when a WHERE clause gains or reorders parameters.
     """
-    from mnemos.persistence import postgres, sqlite
-
-    expected = "(price_in IS NOT NULL OR price_out IS NOT NULL OR price_cached IS NOT NULL)"
-    assert sqlite._PRICED_SQL == expected
-    assert postgres._PRICED_SQL == expected
-    for module in (sqlite, postgres):
-        source = inspect.getsource(module)
-        # No call site may hand-roll a two-column predicate again.
-        assert "(price_in IS NOT NULL OR price_out IS NOT NULL)" not in source
+    placeholders = [int(m) for m in re.findall(r"\$(\d+)", sql)]
+    return {
+        number: args[number - 1]
+        for number in placeholders
+        if 1 <= number <= len(args)
+    }
 
 
-def _fake_postgres_tx(rows: list[dict[str, Any]]):
-    """A Postgres transaction stub whose ``conn.fetch`` honours the export SQL.
+def _fake_postgres_tx(
+    rows: list[dict[str, Any]],
+    prices: list[dict[str, Any]] | None = None,
+    benchmarks: list[dict[str, Any]] | None = None,
+    curated_version: int = 0,
+):
+    """A Postgres transaction stub whose ``conn`` honours the registry SQL.
 
-    Lets the Postgres export run in CI without a live database. It rejects a
-    query that does not exclude alias rows or does not sort, so a future
-    rewrite that drops either property fails here rather than silently
-    producing an unstable digest.
+    Lets the Postgres implementation run in CI without a live database. The
+    ``fetch`` stub rejects a model query that does not exclude alias rows or
+    does not sort, so a future rewrite that drops either property fails here
+    rather than silently producing an unstable digest. Write-path stubs
+    (``execute``/``fetchrow``/``fetchval``) replay against in-memory tables so
+    the phase-2 operations (price bands, benchmarks, curated routing, health
+    writes) can exercise repository inputs and outputs without a server.
     """
     from unittest.mock import MagicMock
 
     from mnemos.persistence.postgres import PostgresTransaction
 
+    price_rows: list[dict[str, Any]] = [dict(p) for p in (prices or [])]
+    bench_rows: list[dict[str, Any]] = [dict(b) for b in (benchmarks or [])]
+    curated: list[dict[str, Any]] = []
+    health: dict[str, Any] = {}
+    model_rows: list[dict[str, Any]] = list(rows)
+    version = {"current": int(curated_version)}
+
+    def _project(columns: list[str], row: dict[str, Any]) -> dict[str, Any]:
+        """Return only the columns named in the SELECT clause.
+
+        asyncpg ``Record`` objects expose exactly what was selected; returning
+        the whole stored dict here would let an implementation read a column
+        it never selected (e.g. ``arena_score`` after it was dropped from the
+        export SELECT) and pass in CI while raising ``KeyError`` on a real
+        database. ``row[column]`` (not ``row.get``) reproduces that behaviour:
+        a missing stored key fails loudly instead of masking the bug with
+        ``None``.
+        """
+        if not columns:
+            return dict(row)
+        return {column: row[column] for column in columns}
+
+    def _model_registry_columns(sql: str) -> list[str]:
+        """Parse the top-level column list of a ``SELECT ... FROM`` query.
+
+        Case-insensitive and whitespace-tolerant; stops at the first top-level
+        ``FROM`` keyword. Splits on top-level commas only — commas inside
+        parentheses (``COALESCE(pricing_model, 'unknown')``, ``CAST(...)``)
+        do not start a new item — and resolves an explicit
+        ``<expr> AS <name>`` alias (or a bare trailing identifier) to the
+        output column name, exactly as Postgres does. Simple column
+        references resolve to themselves, so the parser works for both the
+        production ``COALESCE(...) AS pricing_model`` projection and flat
+        ``SELECT a, b FROM t`` queries.
+        """
+        match = re.search(r"\bselect\b\s+(.*?)\s+from\b", sql, re.IGNORECASE)
+        if match is None:
+            return []
+        items: list[str] = []
+        depth = 0
+        current = ""
+        for char in match.group(1):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char == "," and depth == 0:
+                items.append(current.strip())
+                current = ""
+                continue
+            current += char
+        if current.strip():
+            items.append(current.strip())
+        names: list[str] = []
+        for item in items:
+            if not item:
+                continue
+            alias = re.search(r"\bas\s+([a-z_][a-z0-9_]*)\s*$", item, re.IGNORECASE)
+            if alias:
+                names.append(alias.group(1))
+            elif re.fullmatch(r"[a-z_][a-z0-9_]*", item, re.IGNORECASE):
+                names.append(item)
+            else:
+                raise AssertionError(f"unparseable SELECT item: {item!r}")
+        return names
+
+    obs_rows: list[dict[str, Any]] = []
+
+    def _apply_update(column_values: dict[str, Any], provider: str, model_id: str) -> None:
+        for model in model_rows:
+            if model.get("provider") == provider and model.get("model_id") == model_id:
+                model.update(column_values)
+
     class _Conn:
-        async def fetch(self, sql: str, *_args: Any) -> list[dict[str, Any]]:
-            assert "alias_of IS NULL" in sql, "alias rows must not enter the export"
-            assert "ORDER BY provider ASC, model_id ASC" in sql, "export must be sorted"
-            return sorted(rows, key=lambda r: (r["provider"], r["model_id"]))
+        async def fetch(self, sql: str, *args: Any) -> list[dict[str, Any]]:
+            if "FROM model_registry_field_obs" in sql:
+                rows = [
+                    r
+                    for r in obs_rows
+                    if r.get("provider") == args[0] and r.get("model_id") == args[1]
+                ]
+                if "AND source =" in sql:
+                    rows = [r for r in rows if r.get("source") == args[-1]]
+                return rows
+            if "FROM model_registry WHERE alias_of IS NULL" in sql:
+                assert "ORDER BY provider ASC, model_id ASC" in sql, "export must be sorted"
+                # Filter alias rows out of the data, not just the SQL text, so
+                # a stub with an alias present cannot feed it back through.
+                canonical = [
+                    row for row in model_rows if row.get("alias_of") is None
+                ]
+                columns = _model_registry_columns(sql)
+                coerced_rows = [
+                    {
+                        **dict(row),
+                        "pricing_model": row.get("pricing_model") or "unknown",
+                        "band": row.get("band") or "standard",
+                    }
+                    for row in canonical
+                ]
+                return sorted(
+                    (
+                        _project(columns, dict(row))
+                        for row in coerced_rows
+                    ),
+                    key=lambda r: (r["provider"], r["model_id"]),
+                )
+            if "FROM model_prices" in sql:
+                return sorted(
+                    price_rows,
+                    key=lambda r: (r["provider"], r["model_id"], r["pricing_model"], r["band"]),
+                )
+            if "FROM model_benchmarks" in sql:
+                return sorted(
+                    bench_rows, key=lambda r: (r["provider"], r["model_id"], r["benchmark"])
+                )
+            raise AssertionError(f"unexpected fetch: {sql[:120]}")
+
+        async def fetchrow(self, sql: str, *args: Any) -> dict[str, Any] | None:
+            if "FROM curated_routing ORDER BY version DESC" in sql:
+                if not curated:
+                    return None
+                return dict(sorted(curated, key=lambda r: r["version"])[-1])
+            if "SELECT field, value FROM model_registry_field_obs" in sql:
+                return [
+                    {"field": r["field"], "value": r["value"]}
+                    for r in obs_rows
+                    if r.get("provider") == args[0] and r.get("model_id") == args[1]
+                ]
+            if "INSERT INTO curated_routing" in sql and "RETURNING version" in sql:
+                # The atomic production form is
+                # ``INSERT INTO curated_routing (version, rules, note,
+                # created_at) SELECT COALESCE(MAX(version), 0) + 1,
+                # $1::jsonb, $2, NOW() ... RETURNING version, rules, note,
+                # created_at`` — so ``args[0]`` is rules ($1) and ``args[1]``
+                # is note ($2). Assert the call shape so a change that
+                # shifts the parameter order fails loudly here, not with
+                # mislaid data later.
+                assert len(args) == 2, (
+                    f"curated_routing INSERT must bind exactly rules+note; got {len(args)} args: {sql[:120]}"
+                )
+                # The atomic form computes COALESCE(MAX(version), 0) + 1 inside
+                # the INSERT itself; replay that allocation here.
+                next_version = (
+                    max([r["version"] for r in curated] + [version["current"]]) + 1
+                )
+                row = {
+                    "version": next_version,
+                    "rules": args[0],
+                    "note": args[1],
+                    "created_at": "2026-11-18T00:00:00+00:00",
+                }
+                curated.append(row)
+                version["current"] = next_version
+                return dict(row)
+            if re.search(r"select\s+count\(\*\)\s+as\s+total", sql, re.IGNORECASE):
+                total = len([r for r in model_rows if r.get("alias_of") is None])
+                priced = len(
+                    [
+                        r
+                        for r in model_rows
+                        if r.get("alias_of") is None
+                        and (
+                            r.get("price_in") is not None
+                            or r.get("price_out") is not None
+                            or r.get("price_cached") is not None
+                        )
+                    ]
+                )
+                return {"total": total, "priced": priced}
+            if "SELECT 1 FROM model_registry" in sql:
+                return {"1": 1} if any(
+                    r.get("provider") == args[0] and r.get("model_id") == args[1]
+                    for r in model_rows
+                ) else None
+            # merge_fields final read: the full column projection of the
+            # matching model row, so ``_row_to_model`` sees every field it
+            # needs (including ones not touched by the update).
+            if "SELECT provider, model_id, display_name, family, context_window" in sql:
+                matches = [
+                    dict(r)
+                    for r in model_rows
+                    if r.get("provider") == args[0] and r.get("model_id") == args[1]
+                ]
+                return matches[0] if matches else None
+            raise AssertionError(f"unexpected fetchrow: {sql[:120]}")
+
+        async def fetchval(self, sql: str, *args: Any) -> Any:
+            if "MAX(version)" in sql:
+                # Replay the production SQL exactly: health_read runs
+                # ``SELECT COALESCE(MAX(version), 0) FROM curated_routing``,
+                # which yields ``0`` (never ``None``) for an empty table.
+                # A bare ``MAX(...)`` would be ``None``; branch on the text
+                # so the two forms behave like real Postgres.
+                versions = [r["version"] for r in curated]
+                if version["current"]:
+                    versions.append(version["current"])
+                max_version = max(versions) if versions else None
+                if re.search(r"\bcoalesce\(", sql, re.IGNORECASE):
+                    # COALESCE(MAX(version), 0): only fall back on NULL, never
+                    # via truthiness — a valid version of 0 must survive intact.
+                    return 0 if max_version is None else max_version
+                return max_version
+            if "MAX(synced_at)" in sql:
+                return None
+            raise AssertionError(f"unexpected fetchval: {sql[:120]}")
+
+        async def execute(self, sql: str, *args: Any) -> str:
+            if sql.startswith("LOCK TABLE curated_routing "):
+                return "LOCK TABLE"
+            if sql.strip().startswith("INSERT INTO model_prices"):
+                provider, model_id, pricing_model, band = args[0], args[1], args[2], args[3]
+                row = {
+                    "provider": provider,
+                    "model_id": model_id,
+                    "pricing_model": pricing_model,
+                    "band": band,
+                    "price_in": args[4],
+                    "price_out": args[5],
+                    "price_cached": args[6],
+                }
+                for existing in price_rows:
+                    if (
+                        existing["provider"] == provider
+                        and existing["model_id"] == model_id
+                        and existing["pricing_model"] == pricing_model
+                        and existing["band"] == band
+                    ):
+                        existing.update(row)
+                        break
+                else:
+                    price_rows.append(row)
+                return "INSERT 0 1"
+            if sql.strip().startswith("INSERT INTO model_benchmarks"):
+                provider, model_id, benchmark = args[0], args[1], args[2]
+                row = {
+                    "provider": provider,
+                    "model_id": model_id,
+                    "benchmark": benchmark,
+                    "score": args[3],
+                }
+                for existing in bench_rows:
+                    if (
+                        existing["provider"] == provider
+                        and existing["model_id"] == model_id
+                        and existing["benchmark"] == benchmark
+                    ):
+                        existing.update(row)
+                        break
+                else:
+                    bench_rows.append(row)
+                return "INSERT 0 1"
+            if sql.strip().startswith("UPDATE model_registry SET price_in"):
+                # Mirror the SQLite guard: payg always applies; any other
+                # pricing model only fills a row that carries no price yet.
+                # args: price_in, price_out, price_cached, observed_at,
+                #       pricing_model, band, provider, model_id, pricing_model.
+                payg = args[8] == "payg"
+                carries_price = args[0] is not None or args[1] is not None or args[2] is not None
+                for model in model_rows:
+                    if model["provider"] == args[6] and model["model_id"] == args[7]:
+                        if args[5] != "standard" or not carries_price:
+                            return "UPDATE 0"
+                        unpriced = (
+                            model.get("price_in") is None
+                            and model.get("price_out") is None
+                            and model.get("price_cached") is None
+                        )
+                        if payg or unpriced:
+                            model["price_in"] = args[0]
+                            model["price_out"] = args[1]
+                            model["price_cached"] = args[2]
+                            model["pricing_model"] = args[4]
+                            model["band"] = args[5]
+                            return "UPDATE 1"
+                        return "UPDATE 0"
+                return "UPDATE 0"
+            if sql.strip().startswith("INSERT INTO model_registry_health"):
+                health["row"] = {
+                    "backend": args[0],
+                    "model_count": args[1],
+                    "priced_count": args[2],
+                    "unpriced_count": args[3],
+                    "curated_version": args[4],
+                }
+                return "INSERT 0 1"
+            if sql.strip().startswith("INSERT INTO curated_routing "):
+                version["current"] = int(args[0])
+                row = {
+                    "version": int(args[0]),
+                    "rules": args[1],
+                    "note": args[2],
+                    "created_at": "2026-11-18T00:00:00+00:00",
+                }
+                curated.append(row)
+                return "INSERT 0 1"
+            if "INSERT INTO model_registry_field_obs" in sql:
+                # Parse the column list straight from the SQL
+                # (``INSERT INTO t (c1, c2, ...) VALUES (...)``) and bind
+                # ``args`` positionally to it — never assume a hard-coded
+                # argument order.
+                col_match = re.search(
+                    r"insert\s+into\s+model_registry_field_obs\s*\(([^)]*)\)",
+                    sql,
+                    re.IGNORECASE,
+                )
+                if col_match is None:
+                    raise AssertionError(
+                        f"INSERT field_obs missing column list: {sql[:120]}"
+                    )
+                columns = [column.strip() for column in col_match.group(1).split(",")]
+                if len(columns) != len(args):
+                    raise AssertionError(
+                        f"INSERT field_obs column/arg mismatch: {columns} vs {len(args)} args"
+                    )
+                row = dict(zip(columns, args))
+                provider, model_id, field = row["provider"], row["model_id"], row["field"]
+                for existing in obs_rows:
+                    if (
+                        existing["provider"] == provider
+                        and existing["model_id"] == model_id
+                        and existing["field"] == field
+                    ):
+                        existing.update(row)
+                        break
+                else:
+                    obs_rows.append(row)
+                return "INSERT 0 1"
+            if sql.strip().startswith("UPDATE model_registry SET "):
+                # merge_fields projection: apply the coerced column values to
+                # the matching model row(s). The SQL binds SET values and WHERE
+                # parameters with explicit ``$n`` placeholders, so resolve each
+                # column's value through its own index — never by slicing
+                # ``args`` or using negative indexing.
+                match = re.match(
+                    r"\s*UPDATE\s+model_registry\s+SET\s+(.*?)(?=\s+WHERE\s)",
+                    sql,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                if match is None:
+                    raise AssertionError(f"unexpected UPDATE shape: {sql[:120]}")
+                where_match = re.search(
+                    r"\bWHERE\s+provider\s*=\s*\$(\d+)\s+AND\s+model_id\s*=\s*\$(\d+)",
+                    sql,
+                    re.IGNORECASE,
+                )
+                if where_match is None:
+                    raise AssertionError(f"missing WHERE provider/model_id: {sql[:120]}")
+                params = _sql_params(sql, args)
+                provider = params.get(int(where_match.group(1)))
+                model_id = params.get(int(where_match.group(2)))
+                column_values: dict[str, Any] = {}
+                for assignment in match.group(1).split(","):
+                    column, separator, placeholder = assignment.partition("=")
+                    if not separator:
+                        raise AssertionError(
+                            f"assignment without '=' in UPDATE SET: {assignment!r}"
+                        )
+                    match_placeholder = re.search(r"\$(\d+)", placeholder)
+                    if match_placeholder is None:
+                        # Non-placeholder assignment (e.g. ``updated_at =
+                        # NOW()``): merge_fields never generates these; fail
+                        # loudly instead of silently skipping the column.
+                        raise AssertionError(
+                            f"expected '$n' placeholder in UPDATE SET assignment: {assignment!r}"
+                        )
+                    column_values[column.strip()] = params[int(match_placeholder.group(1))]
+                _apply_update(column_values, provider, model_id)
+                return "UPDATE 1"
+            raise AssertionError(f"unexpected execute: {sql[:120]}")
 
     tx = MagicMock(spec=PostgresTransaction)
     tx.conn = _Conn()
@@ -1116,6 +1497,10 @@ def _registry_row(provider: str, model_id: str, **overrides: Any) -> dict[str, A
         "price_in": None,
         "price_out": None,
         "price_cached": None,
+        "pricing_model": "unknown",
+        "band": "standard",
+        "alias_of": None,
+        "price_updated_at": None,
         "arena_score": None,
         "available": True,
         "deprecated": False,
@@ -1137,25 +1522,132 @@ async def test_postgres_export_snapshot_is_concrete_and_sorted() -> None:
     assert not type(repo).__abstractmethods__
     assert "export_snapshot" not in repo.MISSING_OPERATIONS
     assert "snapshot_digest" not in repo.MISSING_OPERATIONS
+    assert repo.MISSING_OPERATIONS == (), "phase 2 closes every named Postgres gap"
 
     rows = [
         _registry_row("xai", "grok-4"),
-        _registry_row("openai", "gpt-5", price_in=1, price_out=2, arena_score=1300),
-        _registry_row("anthropic", "claude-x", price_cached=0.3),
+        _registry_row("openai", "gpt-5", price_in=1, price_out=2, pricing_model="payg", band="standard"),
+        _registry_row("anthropic", "claude-x", price_cached=0.3, pricing_model="local", band="standard"),
     ]
-    snapshot = await repo.export_snapshot(_fake_postgres_tx(rows))
+    prices = [
+        {"provider": "openai", "model_id": "gpt-5", "pricing_model": "payg", "band": "standard", "price_in": 1, "price_out": 2, "price_cached": None},
+        {"provider": "openai", "model_id": "gpt-5", "pricing_model": "payg", "band": "peak", "price_in": 9, "price_out": 9, "price_cached": None},
+        {"provider": "anthropic", "model_id": "claude-x", "pricing_model": "local", "band": "standard", "price_in": None, "price_out": None, "price_cached": 0.3},
+    ]
+    benchmarks = [
+        {"provider": "openai", "model_id": "gpt-5", "benchmark": "arena_score", "score": 1300},
+    ]
+    snapshot = await repo.export_snapshot(_fake_postgres_tx(rows, prices, benchmarks, curated_version=2))
 
     assert [m["model_id"] for m in snapshot["models"]] == ["claude-x", "gpt-5", "grok-4"]
     # The document shape matches the SQLite reference.
     assert set(snapshot) == {"models", "prices", "benchmarks", "curated_version"}
-    assert snapshot["curated_version"] == 0
-    # A cached-only price is a price; an unpriced row exports no price at all.
-    assert {p["model_id"] for p in snapshot["prices"]} == {"claude-x", "gpt-5"}
+    assert snapshot["curated_version"] == 2
+    # Per-band rows export (peak no longer collapses into the model row).
+    assert [(p["model_id"], p["band"]) for p in snapshot["prices"]] == [
+        ("claude-x", "standard"),
+        ("gpt-5", "peak"),
+        ("gpt-5", "standard"),
+    ]
     assert next(p for p in snapshot["prices"] if p["model_id"] == "claude-x")["price_cached"] == "0.3"
     # NULL stays NULL: unpriced is never exported as "0".
     grok = next(m for m in snapshot["models"] if m["model_id"] == "grok-4")
     assert grok["price_in"] is None and grok["price_cached"] is None
-    assert [b["benchmark"] for b in snapshot["benchmarks"]] == ["arena_score"]
+    assert [(b["model_id"], b["benchmark"]) for b in snapshot["benchmarks"]] == [("gpt-5", "arena_score")]
+
+
+@pytest.mark.asyncio
+async def test_postgres_phase2_operations_behave_like_sqlite() -> None:
+    """Exercise phase-2 repository inputs and outputs with an in-memory connection stub."""
+    from mnemos.persistence.base import (
+        CuratedRouting,
+        ModelRegistryHealth,
+        PriceBand,
+    )
+    from mnemos.persistence.postgres import PostgresModelRegistryRepository
+
+    repo = PostgresModelRegistryRepository()
+    rows = [_registry_row("openai", "gpt-5")]
+    tx = _fake_postgres_tx(rows)
+
+    # A free_tier 0.0 mirrors onto the unpriced row ...
+    await repo.upsert_price(
+        tx,
+        PriceBand(
+            provider="openai", model_id="gpt-5", pricing_model="free_tier", band="standard",
+            price_in=0.0, price_out=0.0,
+        ),
+    )
+    assert rows[0]["price_in"] == 0.0
+    assert rows[0]["pricing_model"] == "free_tier"
+    # ... and a later non-payg row must NOT displace it (SQLite guard parity).
+    await repo.upsert_price(
+        tx,
+        PriceBand(
+            provider="openai", model_id="gpt-5", pricing_model="subscription", band="standard",
+            price_in=42.0, price_out=84.0,
+        ),
+    )
+    assert rows[0]["price_in"] == 0.0, "non-payg must not displace a mirrored price"
+    assert rows[0]["pricing_model"] == "free_tier"
+    # ... but payg is authoritative and overwrites.
+    await repo.upsert_price(
+        tx,
+        PriceBand(
+            provider="openai", model_id="gpt-5", pricing_model="payg", band="standard",
+            price_in=1.0, price_out=2.0,
+        ),
+    )
+    assert rows[0]["price_in"] == 1.0
+    assert rows[0]["pricing_model"] == "payg"
+    # A peak band never touches the model row.
+    await repo.upsert_price(
+        tx,
+        PriceBand(
+            provider="openai", model_id="gpt-5", pricing_model="payg", band="peak",
+            price_in=9.0, price_out=9.0,
+        ),
+    )
+    assert rows[0]["price_in"] == 1.0
+    # Invalid band / pricing model are rejected, not stored.
+    with pytest.raises(ValueError):
+        await repo.upsert_price(
+            tx, PriceBand(provider="openai", model_id="gpt-5", pricing_model="payg", band="surge")
+        )
+    with pytest.raises(ValueError):
+        await repo.upsert_price(
+            tx, PriceBand(provider="openai", model_id="gpt-5", pricing_model="barter", band="standard")
+        )
+
+    # Benchmarks upsert with provenance.
+    await repo.upsert_benchmark(
+        tx, provider="openai", model_id="gpt-5", benchmark="arena_score",
+        score=1300.5, source="arena", fetched_at="2026-10-01T00:00:00+00:00",
+    )
+    snapshot = await repo.export_snapshot(tx)
+    assert snapshot["benchmarks"] == [
+        {"provider": "openai", "model_id": "gpt-5", "benchmark": "arena_score", "score": "1300.5"}
+    ]
+
+    # Curated routing: empty at first, then versioned and append-only.
+    assert await repo.curated_routing_get(tx) is None
+    first = await repo.curated_routing_replace(tx, rules=[{"task_type": "code"}], note="initial")
+    second = await repo.curated_routing_replace(tx, rules=[{"task_type": "chat"}], note="adjusted")
+    assert isinstance(first, CuratedRouting) and isinstance(second, CuratedRouting)
+    assert (first.version, second.version) == (1, 2)
+    current = await repo.curated_routing_get(tx)
+    assert current is not None and current.version == 2
+    assert current.rules == ({"task_type": "chat"},)
+    assert current.note == "adjusted"
+
+    # Health writes land without raising.
+    await repo.health_write(
+        tx,
+        ModelRegistryHealth(
+            backend="postgres", model_count=1, priced_count=1,
+            unpriced_count=0, curated_version=2, last_sync_at=None,
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -1175,3 +1667,255 @@ async def test_postgres_snapshot_digest_is_the_canonical_export_hash() -> None:
     # A price change that matters must move the digest.
     repriced = [_registry_row("openai", "gpt-5", price_in=9), _registry_row("xai", "grok-4")]
     assert await repo.snapshot_digest(_fake_postgres_tx(repriced)) != digest
+
+
+@pytest.mark.asyncio
+async def test_postgres_export_snapshot_keeps_legacy_prices_and_arena_scores() -> None:
+    """``export_snapshot`` never silently empties prices or benchmarks.
+
+    A registry priced through the legacy path (``upsert_model_pricing``) and a
+    model carrying only ``arena_score`` must still export values even when the
+    ``model_prices`` / ``model_benchmarks`` tables hold no rows for them.
+    """
+    from mnemos.persistence.postgres import PostgresModelRegistryRepository
+
+    repo = PostgresModelRegistryRepository()
+    rows = [
+        _registry_row("openai", "gpt-legacy", price_in=5.0, price_out=10.0),
+        _registry_row("xai", "grok-arena", arena_score=1299.5),
+        _registry_row("openai", "gpt-band", price_in=1.0),
+    ]
+    prices = [
+        {
+            "provider": "openai",
+            "model_id": "gpt-band",
+            "pricing_model": "payg",
+            "band": "standard",
+            "price_in": 1,
+            "price_out": None,
+            "price_cached": None,
+        },
+    ]
+    tx = _fake_postgres_tx(rows, prices=prices, benchmarks=[], curated_version=0)
+    snapshot = await repo.export_snapshot(tx)
+
+    # The legacy-priced model gets a standard-band fallback entry ...
+    legacy = [p for p in snapshot["prices"] if p["model_id"] == "gpt-legacy"]
+    assert legacy == [
+        {
+            "provider": "openai",
+            "model_id": "gpt-legacy",
+            "pricing_model": "unknown",
+            "band": "standard",
+            "price_in": "5",
+            "price_out": "10",
+            "price_cached": None,
+        }
+    ]
+    # The benchmark comes from the legacy arena_score column.
+    assert [b["benchmark"] for b in snapshot["benchmarks"]] == ["arena_score"]
+    arena = snapshot["benchmarks"][0]
+    assert arena["model_id"] == "grok-arena"
+    assert arena["score"] == "1299.5"
+    # No duplicate fallback for the model that already has a band row.
+    band_entries = [p for p in snapshot["prices"] if p["model_id"] == "gpt-band"]
+    assert len(band_entries) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry", ["postgres"], indirect=True)
+async def test_postgres_curated_routing_concurrent_writers(registry: RegistryHandle) -> None:
+    second_pid = asyncio.get_running_loop().create_future()
+
+    async def replace_second() -> CuratedRouting:
+        async with registry.transaction() as tx:
+            second_pid.set_result(tx.conn.get_server_pid())
+            return await registry.repo.curated_routing_replace(tx, rules=[{"task_type": "chat"}])
+
+    async with asyncio.TaskGroup() as tasks:
+        async with registry.transaction() as tx:
+            first = await registry.repo.curated_routing_replace(tx, rules=[{"task_type": "code"}])
+            second_task = tasks.create_task(replace_second())
+            # Let the second writer reach the database while the first write is uncommitted.
+            async with asyncio.timeout(5):
+                pid = await second_pid
+                while not await tx.conn.fetchval(
+                    "SELECT pg_backend_pid() = ANY(pg_blocking_pids($1))", pid
+                ):
+                    await asyncio.sleep(0.01)
+
+    second = second_task.result()
+    assert (first.version, second.version) == (1, 2)
+    async with registry.transaction() as tx:
+        assert await registry.repo.curated_routing_get(tx) == second
+        assert await tx.conn.fetchval("SELECT COUNT(*) FROM curated_routing") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry", ["postgres"], indirect=True)
+async def test_postgres_distinct_aliases_can_share_a_target(registry: RegistryHandle) -> None:
+    async with registry.transaction() as tx:
+        await registry.repo.upsert_model(tx, MODEL)
+        for alias in ("gpt-latest", "gpt-preview"):
+            await registry.repo.set_alias(tx, MODEL.provider, alias, MODEL.model_id)
+            resolved = await registry.repo.resolve_alias(tx, MODEL.provider, alias)
+            assert resolved is not None and resolved.model_id == MODEL.model_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry", ["postgres"], indirect=True)
+async def test_postgres_legacy_pricing_records_explicit_zero(registry: RegistryHandle) -> None:
+    async with registry.transaction() as tx:
+        await registry.repo.upsert_model(tx, MODEL)
+        updates, old = await registry.backend.consultations_audit.upsert_model_pricing(
+            tx, provider=MODEL.provider, model_id=MODEL.model_id,
+            price_in=0, price_out=0, price_cached=0,
+        )
+        assert updates == 1
+        assert old == {"price_in": None, "price_out": None, "price_cached": None}
+        assert [model.model_id for model in await registry.repo.list_models(tx, ModelFilter(priced=True))] == [
+            MODEL.model_id
+        ]
+        snapshot = await registry.repo.export_snapshot(tx)
+        assert snapshot["prices"][0]["price_in"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_postgres_migration_0073_backfills_observed_prices_only() -> None:
+    dsn = os.environ.get(POSTGRES_DSN_ENV)
+    if not dsn:
+        pytest.skip(f"set {POSTGRES_DSN_ENV} to run this migration test")
+
+    import asyncpg
+
+    migrations = Path(__file__).resolve().parents[2] / "mnemos/db_migrations/migrations"
+    schema = f"registry_0073_{uuid4().hex}"
+    conn = await asyncpg.connect(dsn)
+    try:
+        await conn.execute(f"CREATE SCHEMA {schema}")
+        await conn.execute(f"SET search_path TO {schema}")
+        await conn.execute(
+            """
+            CREATE TABLE model_registry (
+                provider VARCHAR(50), model_id TEXT, alias_of TEXT, arena_score NUMERIC,
+                PRIMARY KEY (provider, model_id)
+            );
+            CREATE TABLE model_registry_sync_log (synced_at TIMESTAMPTZ);
+            INSERT INTO model_registry (provider, model_id, alias_of) VALUES
+                ('example', 'unpriced', NULL), ('example', 'free', NULL),
+                ('example', 'alias-one', 'unpriced'), ('example', 'alias-two', 'unpriced');
+            """
+        )
+        await conn.execute((migrations / "0044_model_registry_pricing.sql").read_text())
+        await conn.execute(
+            """
+            UPDATE model_registry
+            SET price_updated_at = '2026-01-01T00:00:00Z', arena_score = 1234
+            WHERE model_id = 'free'
+            """
+        )
+        migration = (migrations / "0073_model_registry_repository_phase2.sql").read_text()
+        await conn.execute(migration)
+        await conn.execute(migration)
+        await conn.execute(
+            "INSERT INTO model_registry (provider, model_id) VALUES ('example', 'new-model')"
+        )
+
+        rows = await conn.fetch(
+            "SELECT model_id, price_in, price_out, price_cached FROM model_registry ORDER BY model_id"
+        )
+        assert [tuple(row) for row in rows] == [
+            ("alias-one", None, None, None),
+            ("alias-two", None, None, None),
+            ("free", 0, 0, 0),
+            ("new-model", None, None, None),
+            ("unpriced", None, None, None),
+        ]
+        prices = await conn.fetch(
+            "SELECT model_id, price_in, observed_at = '2026-01-01T00:00:00Z' AS original_time "
+            "FROM model_prices"
+        )
+        assert [tuple(row) for row in prices] == [("free", 0, True)]
+        assert await conn.fetchval("SELECT benchmark FROM model_benchmarks") == "arena_score"
+    finally:
+        try:
+            await conn.execute("ROLLBACK")
+            await conn.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        finally:
+            await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_merge_fields_skips_malformed_observations() -> None:
+    """One bad observation must not abort the projection of good ones.
+
+    ``context_window = "128k"`` (free-form provider text) is kept as an
+    unprojected observation; ``display_name`` is still merged, and no
+    ``ValueError`` escapes.
+    """
+    from mnemos.persistence.base import FieldObservation
+    from mnemos.persistence.postgres import PostgresModelRegistryRepository
+
+    repo = PostgresModelRegistryRepository()
+    rows = [_registry_row("openai", "gpt-5")]
+    tx = _fake_postgres_tx(rows)
+    conn = tx.conn
+
+    # Record observations through the replayed INSERT ...
+    await repo.record_field_obs(
+        tx,
+        FieldObservation(
+            provider="openai",
+            model_id="gpt-5",
+            field="context_window",
+            value="128k",
+            source="provider",
+            fetched_at="2026-11-01T00:00:00+00:00",
+        ),
+    )
+    await repo.record_field_obs(
+        tx,
+        FieldObservation(
+            provider="openai",
+            model_id="gpt-5",
+            field="display_name",
+            value="GPT-5",
+            source="provider",
+            fetched_at="2026-11-01T00:00:00+00:00",
+        ),
+    )
+    merged = await repo.merge_fields(tx, "openai", "gpt-5")
+    assert merged is not None
+    # The good field was projected; the malformed one was not.
+    assert merged.display_name == "GPT-5"
+    assert merged.context_window is None
+    # The malformed observation survives in the table, unprojected. The stub
+    # stores full row dicts (as asyncpg Records would), so filter by the
+    # columns we care about rather than comparing whole dicts.
+    remaining = await conn.fetch(
+        "SELECT field, value FROM model_registry_field_obs WHERE provider = $1 AND model_id = $2",
+        "openai",
+        "gpt-5",
+    )
+    fields = [r["field"] for r in remaining]
+    assert "context_window" in fields
+
+
+@pytest.mark.asyncio
+async def test_postgres_health_read_reports_existing_curated_version() -> None:
+    """``health_read`` reports a non-zero curated version after migration.
+
+    The authoritative table is ``curated_routing``; once the operator layer
+    has written versions (or 0073 copied them over), the health snapshot
+    must carry them, never reset to 0.
+    """
+    from mnemos.persistence.base import ModelRegistryHealth
+    from mnemos.persistence.postgres import PostgresModelRegistryRepository
+
+    repo = PostgresModelRegistryRepository()
+    tx = _fake_postgres_tx([], curated_version=2)
+    health = await repo.health_read(tx)
+    assert isinstance(health, ModelRegistryHealth)
+    assert health.curated_version == 2
+    assert health.model_count == 0
+    assert health.unpriced_count == 0

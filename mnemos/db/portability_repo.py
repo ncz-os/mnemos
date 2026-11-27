@@ -6,10 +6,18 @@ module owns every SELECT / INSERT / UPDATE / DELETE used by that flow.
 
 from __future__ import annotations
 
+import re
+
 from typing import Any, Optional, Sequence
 
 from mnemos.core.persisted_text_classification import classify_persisted_text_fields
 from mnemos.core.secret_detection import VAULT_NAMESPACE
+
+_SIDECAR_TABLES = frozenset({"kg_triples", "memory_versions", "memory_compressed_variants"})
+_SIDECAR_ORDERINGS = frozenset({None, "memory_id ASC, branch ASC, version_num ASC"})
+_SIDECAR_COLUMNS_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?:::(?:text|uuid) AS [A-Za-z_][A-Za-z0-9_]*)?(?:, [A-Za-z_][A-Za-z0-9_]*(?:::(?:text|uuid) AS [A-Za-z_][A-Za-z0-9_]*)?)*$"
+)
 
 
 async def fetch_memory_export(
@@ -87,6 +95,13 @@ async def _fetch_sidecar(
     order_by: Optional[str] = None,
     include_secrets: bool = False,
 ):
+    if table not in _SIDECAR_TABLES or order_by not in _SIDECAR_ORDERINGS:
+        raise ValueError("Unsupported sidecar query shape")
+    if memory_id_column != "memory_id":
+        raise ValueError("Unsupported sidecar memory identifier column")
+    if not _SIDECAR_COLUMNS_RE.fullmatch(columns):
+        raise ValueError("Unsupported sidecar column list")
+    hard_limit = int(hard_limit)
     if bound_to_memories and not memory_ids and not null_ok:
         return []
 

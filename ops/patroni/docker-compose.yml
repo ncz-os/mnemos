@@ -9,15 +9,24 @@ services:
       ETCDCTL_API: "3"
     volumes:
       - etcd3_data:/etcd-data
+      - ${MNEMOS_TLS_DIR:?Required TLS directory}:/etc/mnemos/tls:ro
     command:
       - /usr/local/bin/etcd
       - --name=${MNEMOS_ETCD_NAME:-pythia}
       - --data-dir=/etcd-data
-      - --listen-client-urls=http://0.0.0.0:2379
-      - --advertise-client-urls=http://${MNEMOS_NODE_IP:-192.0.2.67}:2379
-      - --listen-peer-urls=http://0.0.0.0:2380
-      - --initial-advertise-peer-urls=http://${MNEMOS_NODE_IP:-192.0.2.67}:2380
-      - --initial-cluster=pythia=http://192.0.2.67:2380,cerberus=http://192.0.2.96:2380,proteus=http://192.0.2.25:2380
+      - --client-cert-auth=true
+      - --trusted-ca-file=/etc/mnemos/tls/ca.crt
+      - --cert-file=/etc/mnemos/tls/server.crt
+      - --key-file=/etc/mnemos/tls/server.key
+      - --peer-client-cert-auth=true
+      - --peer-trusted-ca-file=/etc/mnemos/tls/ca.crt
+      - --peer-cert-file=/etc/mnemos/tls/peer.crt
+      - --peer-key-file=/etc/mnemos/tls/peer.key
+      - --listen-client-urls=https://${MNEMOS_NODE_IP:?Required management address}:2379
+      - --advertise-client-urls=https://${MNEMOS_NODE_IP:-192.0.2.67}:2379
+      - --listen-peer-urls=https://${MNEMOS_NODE_IP:?Required management address}:2380
+      - --initial-advertise-peer-urls=https://${MNEMOS_NODE_IP:-192.0.2.67}:2380
+      - --initial-cluster=pythia=https://192.0.2.67:2380,cerberus=https://192.0.2.96:2380,proteus=https://192.0.2.25:2380
       - --initial-cluster-token=mnemos-patroni-v5
       - --initial-cluster-state=${MNEMOS_ETCD_CLUSTER_STATE:-new}
 
@@ -28,10 +37,16 @@ services:
     user: postgres
     environment:
       PGDATA: /var/lib/postgresql/data
+      MNEMOS_DB_PASSWORD: ${MNEMOS_DB_PASSWORD:?Required runtime credential}
+      MNEMOS_ADMIN_PASSWORD: ${MNEMOS_ADMIN_PASSWORD:?Required administration credential}
+      MNEMOS_REPLICATION_PASSWORD: ${MNEMOS_REPLICATION_PASSWORD:?Required replication credential}
+      MNEMOS_PATRONI_PASSWORD: ${MNEMOS_PATRONI_PASSWORD:?Required management credential}
     volumes:
       - pythia_pgdata:/var/lib/postgresql/data
       - ./patroni-pythia.yml:/etc/patroni/patroni.yml:ro
-    command: ["patroni", "/etc/patroni/patroni.yml"]
+      - ./render.py:/etc/patroni/render.py:ro
+      - ${MNEMOS_TLS_DIR:?Required TLS directory}:/etc/mnemos/tls:ro
+    command: ["sh", "-ec", "python3 /etc/patroni/render.py /etc/patroni/patroni.yml /tmp/patroni.yml && exec patroni /tmp/patroni.yml"]
     restart: unless-stopped
 
   patroni-cerberus:
@@ -41,17 +56,26 @@ services:
     user: postgres
     environment:
       PGDATA: /var/lib/postgresql/data
+      MNEMOS_DB_PASSWORD: ${MNEMOS_DB_PASSWORD:?Required runtime credential}
+      MNEMOS_ADMIN_PASSWORD: ${MNEMOS_ADMIN_PASSWORD:?Required administration credential}
+      MNEMOS_REPLICATION_PASSWORD: ${MNEMOS_REPLICATION_PASSWORD:?Required replication credential}
+      MNEMOS_PATRONI_PASSWORD: ${MNEMOS_PATRONI_PASSWORD:?Required management credential}
     volumes:
       - cerberus_pgdata:/var/lib/postgresql/data
       - ./patroni-cerberus.yml:/etc/patroni/patroni.yml:ro
-    command: ["patroni", "/etc/patroni/patroni.yml"]
+      - ./render.py:/etc/patroni/render.py:ro
+      - ${MNEMOS_TLS_DIR:?Required TLS directory}:/etc/mnemos/tls:ro
+    command: ["sh", "-ec", "python3 /etc/patroni/render.py /etc/patroni/patroni.yml /tmp/patroni.yml && exec patroni /tmp/patroni.yml"]
     restart: unless-stopped
 
   haproxy:
     image: docker.io/haproxy:2.9
     network_mode: host
     profiles: ["proxy"]
+    environment:
+      MNEMOS_PATRONI_PASSWORD: ${MNEMOS_PATRONI_PASSWORD:?Required management credential}
     volumes:
+      - ${MNEMOS_TLS_DIR:?Required TLS directory}:/etc/mnemos/tls:ro
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     restart: unless-stopped
 

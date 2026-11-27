@@ -24,7 +24,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libpq-dev curl git && \
     rm -rf /var/lib/apt/lists/*
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+# Install a versioned uv installer and verify its bytes before execution.
+ARG UV_INSTALLER_SHA256=505407eb4b5bec00e0b231c8c86e968ee3f5aa0136d49dd8a541179e7f76ce7d
+RUN curl -fsSL -o /tmp/uv-install.sh https://astral.sh/uv/0.5.11/install.sh && \
+    echo "${UV_INSTALLER_SHA256}  /tmp/uv-install.sh" | sha256sum -c - && \
+    sh /tmp/uv-install.sh && rm /tmp/uv-install.sh
 ENV PATH="/root/.local/bin:$PATH"
 
 COPY pyproject.toml .
@@ -56,6 +60,14 @@ ENV MNEMOS_PERSISTENCE_BACKEND=oracle
 # when `MNEMOS_ALLOW_UNAUTHENTICATED_NETWORK_BIND=1` is set explicitly.
 ENV MNEMOS_PROFILE=server
 ENV MNEMOS_AUTH_ENABLED=true
+
+RUN useradd --uid 10001 --gid 0 --no-create-home --home-dir /home/mnemos \
+      --shell /usr/sbin/nologin mnemos && \
+    mkdir -p /home/mnemos /data /opt/mnemos && \
+    chown -R 10001:0 /app /home/mnemos /data /opt/mnemos && \
+    chmod -R g=u /app /home/mnemos /data /opt/mnemos
+USER 10001:0
+ENV HOME=/home/mnemos
 
 EXPOSE 5002
 

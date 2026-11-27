@@ -416,3 +416,32 @@ async def test_sqlite_snapshot_is_pinned_at_transaction_entry(tmp_path):
     finally:
         await reader.close()
         await writer.close()
+
+
+def test_the_timestamptz_param_coercion_resolves_its_datetime_imports():
+    """The export cursor/anchor parser must not depend on call-site imports.
+
+    ``_coerce_timestamptz_param`` parses the ISO-8601 strings carried in the
+    opaque page cursor into ``datetime`` before asyncpg sees them. A landing
+    review claimed the module never imports ``datetime``/``timezone`` for it
+    and that the helper would raise ``NameError`` on first use — it does
+    import both at module scope (``from datetime import datetime, timedelta,
+    timezone``). Exercise the function rather than assert on the import, so
+    the test keeps its value if the imports move.
+    """
+
+    from mnemos.persistence.postgres import _coerce_timestamptz_param
+
+    zulu = _coerce_timestamptz_param("2026-11-06T12:34:56Z")
+    naive = _coerce_timestamptz_param("2026-11-06T12:34:56")
+    offset = _coerce_timestamptz_param("2026-11-06T12:34:56+05:30")
+
+    assert zulu == datetime(2026, 11, 6, 12, 34, 56, tzinfo=timezone.utc)
+    # A naive string is anchored to UTC rather than left for asyncpg to reject.
+    assert naive == datetime(2026, 11, 6, 12, 34, 56, tzinfo=timezone.utc)
+    # A real offset is preserved, not converted to UTC.
+    assert offset.utcoffset() == timedelta(hours=5, minutes=30)
+    # Non-strings (an already-parsed datetime, or a stray int) pass through.
+    already = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert _coerce_timestamptz_param(already) is already
+    assert _coerce_timestamptz_param(5) == 5

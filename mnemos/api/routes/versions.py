@@ -9,9 +9,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+from mnemos.api.persistence_helpers import (
+    backend_or_503,
+    maybe_set_pg_rls,
+    require_postgres_pool_or_503,
+)
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
+from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.api.read_policy import _should_frame_data, _should_redact_secrets
 from mnemos.domain.models import MemoryItem, row_to_memory as _row_to_memory
 from mnemos.persistence.types import MEMORY_COLS
@@ -63,6 +68,23 @@ class DiffResponse(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _snapshot_at_str(value) -> str:
+    """Normalise a ``snapshot_at`` cell to an ISO-8601 string.
+
+    SQLite returns TEXT; Postgres returns ``datetime``. Both shapes flow
+    through here and through the list endpoint below. A NULL (legacy row
+    written without the column default) normalises to ``""`` so one bad
+    cell cannot AttributeError/500 the whole listing.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
 
 def _row_to_version(row, *, redact_secrets: bool = False, frame_data: bool = False) -> MemoryVersion:
     """Build a ``MemoryVersion`` from a ``memory_versions`` row.
@@ -119,7 +141,7 @@ def _row_to_version(row, *, redact_secrets: bool = False, frame_data: bool = Fal
         source_provider=row.get("source_provider"),
         source_session=row.get("source_session"),
         source_agent=row.get("source_agent"),
-        snapshot_at=row["snapshot_at"].isoformat(),
+        snapshot_at=_snapshot_at_str(row["snapshot_at"]),
         snapshot_by=row.get("snapshot_by"),
         change_type=row["change_type"],
     )
@@ -174,6 +196,46 @@ async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> No
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+def _history_visibility(user: UserContext) -> VisibilityFilter:
+    """Build the per-snapshot read envelope for version-history routes.
+
+    Root bypasses the predicate (same as the pre-ABC route SQL); non-root
+    callers get the full ``READABLE`` envelope pinned to their namespace.
+    """
+    if is_root(user):
+        return VisibilityFilter(
+            scope=VisibilityScope.ROOT_BYPASS,
+            user_id=None,
+            group_ids=(),
+            namespace=None,
+        )
+    return VisibilityFilter(
+        scope=VisibilityScope.READABLE,
+        user_id=user.user_id,
+        group_ids=tuple(user.group_ids),
+        namespace=user.namespace,
+    )
+
+
+def _version_backend_503(route_label: str) -> HTTPException:
+    """503 for a version-history read the backend cannot serve.
+
+    NG2-MN-018 moved the SQL into ``VersionRepository``; all six backends
+    now serve list/get/diff through the ABC, but a backend may still
+    reject a specific call (unsupported dialect feature, missing
+    migration) with ``NotImplementedError``.
+    The route-level symptom is unchanged from the pre-ABC
+    ``require_postgres_pool_or_503``: HTTP 503, never a silent 500.
+    """
+    return HTTPException(
+        status_code=503,
+        detail=(
+            f"{route_label} requires a backend with version-history support; "
+            "this deployment's backend does not implement it yet."
+        ),
+    )
+
+
 @router.get("/memories/{memory_id}/versions", response_model=List[VersionSummary])
 async def list_versions(
     memory_id: str,
@@ -184,36 +246,19 @@ async def list_versions(
 
     Query parameter branch defaults to 'main'. For feature branches, specify branch=name.
     """
-    require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/versions")
-    async with _lc.get_pool_manager().acquire() as conn:
-        await _assert_memory_readable(conn, memory_id, user)
-        # Per-snapshot tenancy: filter the version rows by THEIR own
-        # owner/namespace/permission_mode, not the live memory's.
-        # A memory that was private at v1 and made public at v2 must
-        # NOT expose v1 to readers who only became authorized after
-        # the permission flip.
-        if is_root(user):
-            rows = await conn.fetch(
-                "SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
-                "FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
-                "AND deleted_at IS NULL ORDER BY version_num ASC",
-                memory_id,
-                branch,
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        await maybe_set_pg_rls(tx, user)
+        try:
+            await backend.memories.assert_memory_readable(tx, memory_id, user)
+        except PermissionError:
+            raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+        try:
+            rows = await backend.memory_versions.list_memory_versions(
+                tx, memory_id, branch, _history_visibility(user)
             )
-        else:
-            # Shared snapshot visibility includes group mode and ACL grants.
-            from mnemos.core.visibility import version_visibility_predicate
-            vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, user.group_ids, start_param_idx=3,
-            )
-            ns_ph = f"${len(vis_params) + 3}"
-            rows = await conn.fetch(
-                f"SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
-                f"FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
-                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph} "
-                f"ORDER BY version_num ASC",
-                memory_id, branch, *vis_params, user.namespace,
-            )
+        except NotImplementedError:
+            raise _version_backend_503("GET /v1/memories/{memory_id}/versions")
     # M2: the preview is the first 120 chars of the SAME snapshot text, so it
     # has to be masked like every other history read (a short credential near
     # the top of the row fits entirely in a raw preview).
@@ -228,7 +273,7 @@ async def list_versions(
         summaries.append(
             VersionSummary(
                 version_num=r["version_num"],
-                snapshot_at=r["snapshot_at"].isoformat(),
+                snapshot_at=_snapshot_at_str(r["snapshot_at"]),
                 snapshot_by=r.get("snapshot_by"),
                 change_type=r["change_type"],
                 content_preview=preview[:120],
@@ -246,35 +291,19 @@ async def get_version(
     user: UserContext = Depends(get_current_user),
 ):
     """Retrieve memory content at a specific version on a branch."""
-    require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/versions/{version_num}")
-    async with _lc.get_pool_manager().acquire() as conn:
-        await _assert_memory_readable(conn, memory_id, user)
-        if is_root(user):
-            row = await conn.fetchrow(
-                "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
-                "verbatim_content, owner_id, namespace, permission_mode, "
-                "source_model, source_provider, source_session, source_agent, "
-                "snapshot_at, snapshot_by, change_type "
-                "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 "
-                "AND branch = $3 AND deleted_at IS NULL",
-                memory_id, version_num, branch,
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        await maybe_set_pg_rls(tx, user)
+        try:
+            await backend.memories.assert_memory_readable(tx, memory_id, user)
+        except PermissionError:
+            raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+        try:
+            row = await backend.memory_versions.get_memory_version(
+                tx, memory_id, version_num, branch, _history_visibility(user)
             )
-        else:
-            # Per-snapshot tenancy on the row itself.
-            from mnemos.core.visibility import version_visibility_predicate
-            vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, user.group_ids, start_param_idx=4,
-            )
-            ns_ph = f"${len(vis_params) + 4}"
-            row = await conn.fetchrow(
-                "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
-                "verbatim_content, owner_id, namespace, permission_mode, "
-                "source_model, source_provider, source_session, source_agent, "
-                "snapshot_at, snapshot_by, change_type "
-                f"FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3 "
-                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
-                memory_id, version_num, branch, *vis_params, user.namespace,
-            )
+        except NotImplementedError:
+            raise _version_backend_503("GET /v1/memories/{memory_id}/versions/{version_num}")
     if not row:
         raise HTTPException(
             status_code=404,
@@ -300,29 +329,19 @@ async def diff_versions(
 
     Both versions must exist on the specified branch.
     """
-    require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/diff")
-    async with _lc.get_pool_manager().acquire() as conn:
-        await _assert_memory_readable(conn, memory_id, user)
-        if is_root(user):
-            rows = await conn.fetch(
-                "SELECT version_num, content FROM memory_versions "
-                "WHERE memory_id = $1 AND version_num = ANY($2::int[]) "
-                "AND branch = $3 AND deleted_at IS NULL",
-                memory_id, [from_version, to_version], branch,
+    backend = backend_or_503()
+    async with backend.transactional() as tx:
+        await maybe_set_pg_rls(tx, user)
+        try:
+            await backend.memories.assert_memory_readable(tx, memory_id, user)
+        except PermissionError:
+            raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+        try:
+            rows = await backend.memory_versions.fetch_version_contents(
+                tx, memory_id, [from_version, to_version], branch, _history_visibility(user)
             )
-        else:
-            from mnemos.core.visibility import version_visibility_predicate
-            vis_clause, vis_params = version_visibility_predicate(
-                user.user_id, user.group_ids, start_param_idx=4,
-            )
-            ns_ph = f"${len(vis_params) + 4}"
-            rows = await conn.fetch(
-                f"SELECT version_num, content FROM memory_versions "
-                f"WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3 "
-                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
-                memory_id, [from_version, to_version], branch,
-                *vis_params, user.namespace,
-            )
+        except NotImplementedError:
+            raise _version_backend_503("GET /v1/memories/{memory_id}/diff")
     # M2: diff the MASKED text, not the raw snapshots. Diffing raw content
     # leaked the credential in the "+ lines" of the diff even though the
     # caller could not read it via get_version.
@@ -365,6 +384,9 @@ async def revert_memory(
     Creates a new version snapshot on the same branch so the revert itself
     is part of the audit trail. Updates the live memory record.
     """
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     require_postgres_pool_or_503(route_label="POST /v1/memories/{memory_id}/revert/{version_num}")
     async with _lc.get_pool_manager().acquire() as conn:
         # Tenancy gate first — fail-closed before any version SELECT.

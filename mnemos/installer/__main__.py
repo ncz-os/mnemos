@@ -45,6 +45,18 @@ def _profile_uses_sqlite(profile: str) -> bool:
     return profile in {"edge", "dev"}
 
 
+def _resolved_path_within_base(path: str | os.PathLike, base: str | os.PathLike):
+    from pathlib import Path
+
+    resolved_base = Path(base).resolve(strict=False)
+    resolved_path = Path(path).resolve(strict=False)
+    try:
+        resolved_path.relative_to(resolved_base)
+    except ValueError:
+        return None
+    return resolved_path
+
+
 def _read_existing_internal_audit_token(content: str | None) -> str | None:
     """Parse ``[server].internal_audit_token`` from a TOML string.
 
@@ -181,12 +193,11 @@ def _has_dsn_config(repo_path: str | None = None) -> bool:
 def _resolve_repo_path() -> str | None:
     """Find the installed mnemos repo path (where config.toml lives)."""
     import os
+
     # Same shape as the upgrade path uses: __file__'s grandparent's
     # grandparent (mnemos/installer/__main__.py → repo root).
     try:
-        return os.path.abspath(
-            os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)
-        )
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
     except Exception:
         return None
 
@@ -298,12 +309,18 @@ def _resolve_runtime_backend(cfg, repo_path: str | None = None) -> str:
     # before passing to _DatabaseSettings(**db_section), so empty
     # placeholders fall through to env/defaults at runtime too.
     _DB_SANITIZE_KEYS = {
-        "backend", "dsn", "url", "host", "port", "database",
-        "user", "password", "sqlite_path",
+        "backend",
+        "dsn",
+        "url",
+        "host",
+        "port",
+        "database",
+        "user",
+        "password",
+        "sqlite_path",
     }
     db_toml = {
-        k: v for k, v in raw_db_toml.items()
-        if k not in _DB_SANITIZE_KEYS or not (isinstance(v, str) and v == "")
+        k: v for k, v in raw_db_toml.items() if k not in _DB_SANITIZE_KEYS or not (isinstance(v, str) and v == "")
     }
 
     # Round-44 HIGH: BACKEND is a SPECIAL case.
@@ -395,12 +412,7 @@ def _resolve_runtime_backend(cfg, repo_path: str | None = None) -> str:
         # `backend_toml == ""` after stripping — distinguish via
         # `backend_toml_present` and the raw_db_toml entry surviving
         # the sanitize filter (whitespace strings aren't `== ""`).
-        if (
-            backend_toml_present
-            and isinstance(backend_toml_raw, str)
-            and backend_toml_raw != ""
-            and backend_toml == ""
-        ):
+        if backend_toml_present and isinstance(backend_toml_raw, str) and backend_toml_raw != "" and backend_toml == "":
             raise ValueError(
                 f"Unsupported [database].backend = {backend_toml_raw!r} "
                 f"in config.toml (resolves to empty after strip); "
@@ -409,13 +421,17 @@ def _resolve_runtime_backend(cfg, repo_path: str | None = None) -> str:
             )
 
     # 3. DSN/url — non-empty TOML wins over env.
-    if (db_toml.get("url") or db_toml.get("dsn")):
+    if db_toml.get("url") or db_toml.get("dsn"):
         return "postgres"
     dsn_env = any(
         os.environ.get(k)
         for k in (
-            "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-            "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+            "MNEMOS_DATABASE_URL",
+            "DATABASE_URL",
+            "PG_URL",
+            "MNEMOS_DATABASE_DSN",
+            "DATABASE_DSN",
+            "PG_DSN",
         )
     )
     if dsn_env:
@@ -430,16 +446,11 @@ def _resolve_runtime_backend(cfg, repo_path: str | None = None) -> str:
     #    "PG_" exclusively for these fields.
     #
     # First check sanitized TOML (non-empty wins).
-    has_pg_toml_signal_first = any(
-        field in db_toml for field in ("host", "port", "database", "user")
-    )
+    has_pg_toml_signal_first = any(field in db_toml for field in ("host", "port", "database", "user"))
     if has_pg_toml_signal_first:
         return "postgres"
     # Then env (any present PG_HOST/PG_PORT/PG_DATABASE/PG_USER).
-    pg_conn_env = any(
-        os.environ.get(k)
-        for k in ("PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER")
-    )
+    pg_conn_env = any(os.environ.get(k) for k in ("PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER"))
     if pg_conn_env:
         return "postgres"
 
@@ -554,8 +565,7 @@ def _patch_config_toml_embedding_dim(config_path: str, new_dim: int) -> bool:
         parsed = tomllib.loads(text)
     except Exception as exc:
         print(
-            f"[installer] ERROR config.toml is not parseable TOML: {exc}. "
-            f"Refusing to patch a malformed file.",
+            f"[installer] ERROR config.toml is not parseable TOML: {exc}. " f"Refusing to patch a malformed file.",
             file=sys.stderr,
         )
         return False
@@ -564,9 +574,7 @@ def _patch_config_toml_embedding_dim(config_path: str, new_dim: int) -> bool:
     # Header-line regex tolerates leading whitespace and trailing inline
     # comments — both are valid TOML. Match must be a proper section
     # header, not (e.g.) `[database]` inside a string value.
-    db_section_re = re.compile(
-        r"^[ \t]*\[database\][ \t]*(?:#[^\n]*)?$", re.MULTILINE
-    )
+    db_section_re = re.compile(r"^[ \t]*\[database\][ \t]*(?:#[^\n]*)?$", re.MULTILINE)
     # Boundary: ANY new section header ends the [database] body, including
     # array-of-tables `[[...]]`. The previous `(?!\[)` rejected `[[` and
     # let the body over-extend across providers/etc; embedding_re.sub
@@ -603,9 +611,7 @@ def _patch_config_toml_embedding_dim(config_path: str, new_dim: int) -> bool:
         # Replace existing embedding_dim line, or append before the next section.
         embedding_re = re.compile(r"^[ \t]*embedding_dim\s*=\s*[^\n]*$", re.MULTILINE)
         if embedding_re.search(section_body):
-            new_section_body = embedding_re.sub(
-                f"embedding_dim = {int(new_dim)}", section_body
-            )
+            new_section_body = embedding_re.sub(f"embedding_dim = {int(new_dim)}", section_body)
         else:
             # Append at the end of the [database] block (before next section).
             trail = section_body.rstrip("\n")
@@ -653,6 +659,7 @@ def _patch_config_toml_embedding_dim(config_path: str, new_dim: int) -> bool:
     # 0600, locking the service out of its own config after the DB
     # had already been ALTERed.
     import tempfile
+
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=".toml.tmp")
     except Exception as exc:
@@ -687,12 +694,17 @@ def _patch_config_toml_embedding_dim(config_path: str, new_dim: int) -> bool:
         target_gid = 0
 
     from .db import _run
+
     install_args = [
         "install",
-        "-m", oct(target_mode)[2:].zfill(3),
-        "-o", str(target_uid),
-        "-g", str(target_gid),
-        tmp_path, config_path,
+        "-m",
+        oct(target_mode)[2:].zfill(3),
+        "-o",
+        str(target_uid),
+        "-g",
+        str(target_gid),
+        tmp_path,
+        config_path,
     ]
     rc, _out, err = _run(install_args)
     if rc != 0:
@@ -703,8 +715,7 @@ def _patch_config_toml_embedding_dim(config_path: str, new_dim: int) -> bool:
         pass
     if rc != 0:
         print(
-            f"[installer] ERROR install of config.toml failed: "
-            f"{err.strip() or '(no detail)'}",
+            f"[installer] ERROR install of config.toml failed: " f"{err.strip() or '(no detail)'}",
             file=sys.stderr,
         )
         return False
@@ -743,8 +754,7 @@ def _patch_config_toml_internal_audit_token(config_path: str) -> bool:
             text = fh.read()
     except Exception as exc:
         print(
-            f"[installer] WARNING could not read {config_path} for audit "
-            f"token patch: {exc}",
+            f"[installer] WARNING could not read {config_path} for audit " f"token patch: {exc}",
             file=sys.stderr,
         )
         return False
@@ -780,9 +790,7 @@ def _patch_config_toml_internal_audit_token(config_path: str) -> bool:
 
     # Surgical patch into [server] section. Mirrors the embedding_dim
     # helper but the target is internal_audit_token.
-    server_section_re = re.compile(
-        r"^[ \t]*\[server\][ \t]*(?:#[^\n]*)?$", re.MULTILINE
-    )
+    server_section_re = re.compile(r"^[ \t]*\[server\][ \t]*(?:#[^\n]*)?$", re.MULTILINE)
     next_section_re = re.compile(r"^[ \t]*\[", re.MULTILINE)
     server_match = server_section_re.search(text)
 
@@ -807,14 +815,11 @@ def _patch_config_toml_internal_audit_token(config_path: str) -> bool:
         # /v1/internal/mcp_audit in legacy mode despite an apparent
         # placeholder ready to fill in.
         empty_re = re.compile(
-            r"^[ \t]*internal_audit_token\s*=\s*[\"']\s*[\"'][ \t]*"
-            r"(?:#[^\n]*)?$",
+            r"^[ \t]*internal_audit_token\s*=\s*[\"']\s*[\"'][ \t]*" r"(?:#[^\n]*)?$",
             re.MULTILINE,
         )
         if empty_re.search(section_body):
-            new_section_body = empty_re.sub(
-                f"internal_audit_token = {quoted}", section_body
-            )
+            new_section_body = empty_re.sub(f"internal_audit_token = {quoted}", section_body)
         else:
             trail = section_body.rstrip("\n")
             new_section_body = f"{trail}\ninternal_audit_token = {quoted}\n"
@@ -848,12 +853,12 @@ def _patch_config_toml_internal_audit_token(config_path: str) -> bool:
 
     # Atomic install -m preserving owner/group/mode (mirrors embedding-dim helper).
     import tempfile
+
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=".toml.tmp")
     except Exception as exc:
         print(
-            f"[installer] WARNING could not create temp file for audit-token "
-            f"patch: {exc}",
+            f"[installer] WARNING could not create temp file for audit-token " f"patch: {exc}",
             file=sys.stderr,
         )
         return False
@@ -883,12 +888,17 @@ def _patch_config_toml_internal_audit_token(config_path: str) -> bool:
         target_gid = 0
 
     from .db import _run
+
     install_args = [
         "install",
-        "-m", oct(target_mode)[2:].zfill(3),
-        "-o", str(target_uid),
-        "-g", str(target_gid),
-        tmp_path, config_path,
+        "-m",
+        oct(target_mode)[2:].zfill(3),
+        "-o",
+        str(target_uid),
+        "-g",
+        str(target_gid),
+        tmp_path,
+        config_path,
     ]
     rc, _out, err = _run(install_args)
     if rc != 0:
@@ -907,7 +917,7 @@ def _patch_config_toml_internal_audit_token(config_path: str) -> bool:
     return True
 
 
-def _patch_service_env_embedding_dim(env_path: str, new_dim: int) -> bool:
+def _patch_service_env_embedding_dim(env_path: str, new_dim: int, *, expected_base: str = "/etc/mnemos") -> bool:
     """Surgically update MNEMOS_EMBEDDING_DIM in the systemd EnvironmentFile.
 
     Used by --upgrade so we don't accidentally drop provider API keys or
@@ -924,6 +934,11 @@ def _patch_service_env_embedding_dim(env_path: str, new_dim: int) -> bool:
     import os
     import re
 
+    resolved_env_path = _resolved_path_within_base(env_path, expected_base)
+    if resolved_env_path is None:
+        return False
+    env_path = str(resolved_env_path)
+
     if not os.path.exists(env_path):
         # Service env file not present — nothing to patch. Caller will
         # treat this as a hard failure since we expect it to exist when
@@ -936,11 +951,11 @@ def _patch_service_env_embedding_dim(env_path: str, new_dim: int) -> bool:
     except PermissionError:
         # Try sudo cat as a fallback for root-owned files.
         from .db import _run
+
         rc, out, _err = _run(["sudo", "cat", env_path])
         if rc != 0:
             print(
-                f"[installer] ERROR could not read {env_path}: permission "
-                f"denied and sudo cat failed too.",
+                f"[installer] ERROR could not read {env_path}: permission " f"denied and sudo cat failed too.",
                 file=sys.stderr,
             )
             return False
@@ -963,6 +978,7 @@ def _patch_service_env_embedding_dim(env_path: str, new_dim: int) -> bool:
     # root-owned and tempfile.mkstemp would PermissionError there before
     # any sudo fallback could run).
     import tempfile
+
     try:
         fd, tmp_path = tempfile.mkstemp(suffix=".mnemos.env.tmp")
     except Exception as exc:
@@ -1004,12 +1020,17 @@ def _patch_service_env_embedding_dim(env_path: str, new_dim: int) -> bool:
         target_gid = 0
 
     from .db import _run
+
     install_args = [
         "install",
-        "-m", oct(target_mode)[2:].zfill(3),
-        "-o", str(target_uid),
-        "-g", str(target_gid),
-        tmp_path, env_path,
+        "-m",
+        oct(target_mode)[2:].zfill(3),
+        "-o",
+        str(target_uid),
+        "-g",
+        str(target_gid),
+        tmp_path,
+        env_path,
     ]
     # Try without sudo first (works when the operator owns the file or
     # is root). Fall back to sudo install when permission denied.
@@ -1139,25 +1160,20 @@ def _config_from_env_runtime_parity() -> "Config":
     # no config.toml would have the runtime-parity loader resolve to
     # edge while runtime resolved to server, dispatching --upgrade to
     # sqlite migrations while the service started on postgres.
-    explicit_profile = (
-        os.environ.get("MNEMOS_PROFILE_OVERRIDE")
-        or os.environ.get("MNEMOS_PROFILE")
-    )
+    explicit_profile = os.environ.get("MNEMOS_PROFILE_OVERRIDE") or os.environ.get("MNEMOS_PROFILE")
     # Round-42 HIGH: presence-based PG signal check, matching round-41.
     # Treat PG_HOST/PG_DATABASE/PG_USER as a postgres signal whenever
     # they are PRESENT in env (even empty) — runtime keeps the
     # explicit empty values as postgres-distinguishing fields.
-    has_pg_env_signal = (
-        any(
-            k in os.environ
-            for k in ("PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER")
-        )
-        or any(
-            os.environ.get(k)
-            for k in (
-                "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-                "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
-            )
+    has_pg_env_signal = any(k in os.environ for k in ("PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER")) or any(
+        os.environ.get(k)
+        for k in (
+            "MNEMOS_DATABASE_URL",
+            "DATABASE_URL",
+            "PG_URL",
+            "MNEMOS_DATABASE_DSN",
+            "DATABASE_DSN",
+            "PG_DSN",
         )
     )
     if explicit_profile:
@@ -1210,8 +1226,7 @@ def _config_from_env_runtime_parity() -> "Config":
             cfg.db_port = int(raw_port)
         except (TypeError, ValueError) as exc:
             raise ValueError(
-                f"Invalid Postgres port {raw_port!r}: {exc}. Set "
-                f"PG_PORT to a valid integer or unset to default."
+                f"Invalid Postgres port {raw_port!r}: {exc}. Set " f"PG_PORT to a valid integer or unset to default."
             )
     else:
         cfg.db_port = 5432
@@ -1221,9 +1236,7 @@ def _config_from_env_runtime_parity() -> "Config":
     # Password: documented exception — both names map to PG_PASSWORD
     # in the production env file, so accepting either is parity-
     # preserving. Empty allowed (peer auth / sudo psql shapes).
-    cfg.db_password = os.environ.get("MNEMOS_DB_PASSWORD") or os.environ.get(
-        "PG_PASSWORD", ""
-    )
+    cfg.db_password = os.environ.get("MNEMOS_DB_PASSWORD") or os.environ.get("PG_PASSWORD", "")
 
     cfg.sqlite_path = os.environ.get("MNEMOS_SQLITE_PATH", "~/.mnemos/mnemos.db")
     _apply_embedding_dim_from_env(cfg)
@@ -1280,9 +1293,16 @@ def _config_from_env() -> "Config":
     has_pg_env_signal = any(
         os.environ.get(k)
         for k in (
-            "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
-            "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-            "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+            "PG_HOST",
+            "PG_PORT",
+            "PG_DATABASE",
+            "PG_USER",
+            "PG_PASSWORD",
+            "MNEMOS_DB_HOST",
+            "MNEMOS_DB_PORT",
+            "MNEMOS_DB_NAME",
+            "MNEMOS_DB_USER",
+            "MNEMOS_DB_PASSWORD",
         )
     )
     if explicit_profile:
@@ -1292,14 +1312,10 @@ def _config_from_env() -> "Config":
     else:
         cfg.profile = _canonical_profile("personal")
     cfg.db_host = os.environ.get("MNEMOS_DB_HOST") or os.environ.get("PG_HOST", "localhost")
-    cfg.db_port = int(
-        os.environ.get("MNEMOS_DB_PORT") or os.environ.get("PG_PORT", "5432")
-    )
+    cfg.db_port = int(os.environ.get("MNEMOS_DB_PORT") or os.environ.get("PG_PORT", "5432"))
     cfg.db_name = os.environ.get("MNEMOS_DB_NAME") or os.environ.get("PG_DATABASE", "mnemos")
     cfg.db_user = os.environ.get("MNEMOS_DB_USER") or os.environ.get("PG_USER", "mnemos_user")
-    cfg.db_password = os.environ.get("MNEMOS_DB_PASSWORD") or os.environ.get(
-        "PG_PASSWORD", ""
-    )
+    cfg.db_password = os.environ.get("MNEMOS_DB_PASSWORD") or os.environ.get("PG_PASSWORD", "")
     cfg.sqlite_path = os.environ.get("MNEMOS_SQLITE_PATH", "~/.mnemos/mnemos.db")
     _apply_embedding_dim_from_env(cfg)
     cfg.listen_port = int(os.environ.get("MNEMOS_LISTEN_PORT", "5002"))
@@ -1315,9 +1331,7 @@ def _config_from_env() -> "Config":
                 os.environ.setdefault(key, "true" if value else "false")
     cfg.install_docling = os.environ.get("MNEMOS_INSTALL_DOCLING", "true").lower() == "true"
     cfg.create_service = os.environ.get("MNEMOS_CREATE_SERVICE", "true").lower() == "true"
-    cfg.inference_embed_host = os.environ.get(
-        "INFERENCE_EMBED_HOST", "http://localhost:11434"
-    )
+    cfg.inference_embed_host = os.environ.get("INFERENCE_EMBED_HOST", "http://localhost:11434")
 
     # Provider keys from env
     providers = ["openai", "anthropic", "xai", "groq", "perplexity", "gemini", "nvidia", "together"]
@@ -1334,7 +1348,6 @@ def _config_from_env() -> "Config":
         sys.exit(1)
 
     return cfg
-
 
 
 def _resolve_config_write_target(repo_path: str) -> str:
@@ -1373,12 +1386,14 @@ def _write_config_toml(cfg, repo_path: str) -> None:
     runtime config gets patched in place (see ``_resolve_config_write_target``).
     """
     import re
+
     config_path = _resolve_config_write_target(repo_path)
     example_path = os.path.join(repo_path, "config.toml.example")
 
     # Start from example if config.toml doesn't exist yet
     if not os.path.exists(config_path) and os.path.exists(example_path):
         import shutil
+
         shutil.copy(example_path, config_path)
 
     profile_defaults = {
@@ -1410,6 +1425,7 @@ def _write_config_toml(cfg, repo_path: str) -> None:
         content = _render_minimal_config(cfg, profile_defaults)
         # Write with restricted permissions (contains DB password)
         import tempfile as _tf
+
         dir_ = os.path.dirname(config_path) or "."
         fd, tmp_path = _tf.mkstemp(dir=dir_, suffix=".toml.tmp")
         try:
@@ -1483,10 +1499,10 @@ def _write_config_toml(cfg, repo_path: str) -> None:
         # that way the lazy span can be empty and `\n[ \t]*key` can
         # still match the very first key right after the header.
         pattern = (
-            rf'((?:^|\n)\[{section_active}\][^\n]*'
-            rf'(?:(?!\n\[).)*?'
-            rf'\n[ \t]*)'
-            rf'({re.escape(key)}\s*=\s*[^\n]*)'
+            rf"((?:^|\n)\[{section_active}\][^\n]*"
+            rf"(?:(?!\n\[).)*?"
+            rf"\n[ \t]*)"
+            rf"({re.escape(key)}\s*=\s*[^\n]*)"
         )
         content, n = re.subn(
             pattern,
@@ -1497,7 +1513,7 @@ def _write_config_toml(cfg, repo_path: str) -> None:
         if n == 0:
             # Section header must appear at line start (defensive: don't
             # treat `something[server]something` mid-line as a section).
-            section_header_pattern = rf'(?:^|\n)\[{section_active}\]'
+            section_header_pattern = rf"(?:^|\n)\[{section_active}\]"
             if not re.search(section_header_pattern, content):
                 if not content.endswith("\n"):
                     content += "\n"
@@ -1505,10 +1521,7 @@ def _write_config_toml(cfg, repo_path: str) -> None:
                 return
             # Append the key+value at the end of the section: insert
             # before the next line-start `[` (or at the end of file).
-            append_pattern = (
-                rf'((?:^|\n)\[{section_active}\][^\n]*\n'
-                rf'(?:(?!\n\[).)*)'
-            )
+            append_pattern = rf"((?:^|\n)\[{section_active}\][^\n]*\n" rf"(?:(?!\n\[).)*)"
             content = re.sub(
                 append_pattern,
                 lambda match: f"{match.group(1).rstrip()}\n{key} = {quoted}",
@@ -1568,9 +1581,7 @@ def _write_config_toml(cfg, repo_path: str) -> None:
     # /v1/internal/mcp_audit would stay in legacy mode despite a
     # "successful" install.
     server_table = parsed.get("server", {}) if isinstance(parsed, dict) else {}
-    if not isinstance(server_table, dict) or not server_table.get(
-        "internal_audit_token"
-    ):
+    if not isinstance(server_table, dict) or not server_table.get("internal_audit_token"):
         raise RuntimeError(
             f"[installer] ERROR: patched config.toml has no live "
             f"[server].internal_audit_token (only a comment, perhaps?). "
@@ -1579,6 +1590,7 @@ def _write_config_toml(cfg, repo_path: str) -> None:
         )
 
     import tempfile as _tf
+
     _dir = os.path.dirname(config_path) or "."
     _fd, _tmp = _tf.mkstemp(dir=_dir, suffix=".toml.tmp")
     try:
@@ -1729,6 +1741,7 @@ def main() -> int:
 
     # Determine repo path (directory containing this package)
     import pathlib
+
     repo_path = str(pathlib.Path(__file__).resolve().parents[2])
 
     # ------------------------------------------------------------------ #
@@ -1741,8 +1754,7 @@ def main() -> int:
         cfg = _load_existing_config(repo_path)
         if cfg is None:
             print(
-                "ERROR: --upgrade requires existing config. "
-                "Set MNEMOS_DB_* env vars or ensure config.toml exists.",
+                "ERROR: --upgrade requires existing config. " "Set MNEMOS_DB_* env vars or ensure config.toml exists.",
                 file=sys.stderr,
             )
             return 1
@@ -1816,10 +1828,7 @@ def main() -> int:
         # service continues reading the production MNEMOS_CONFIG_PATH
         # config with the old embedding_dim → runtime/schema dim
         # mismatch.
-        config_toml_path = (
-            _resolve_runtime_config_path(repo_path)
-            or os.path.join(repo_path, "config.toml")
-        )
+        config_toml_path = _resolve_runtime_config_path(repo_path) or os.path.join(repo_path, "config.toml")
         if os.path.exists(config_toml_path):
             if not _patch_config_toml_embedding_dim(config_toml_path, cfg.embedding_dim):
                 print(
@@ -1878,9 +1887,7 @@ def main() -> int:
             # operator hadn't redundantly set MNEMOS_EMBEDDING_DIM=768.
             # That left automation seeing a failure after DB changes
             # had already run.
-            env_dim_raw = os.environ.get("MNEMOS_EMBEDDING_DIM") or os.environ.get(
-                "PG_EMBEDDING_DIM"
-            )
+            env_dim_raw = os.environ.get("MNEMOS_EMBEDDING_DIM") or os.environ.get("PG_EMBEDDING_DIM")
             try:
                 env_dim = int(env_dim_raw) if env_dim_raw else None
             except (TypeError, ValueError):
@@ -1889,9 +1896,7 @@ def main() -> int:
             # Default dim (768) is fine without an explicit env var —
             # runtime falls back to the same default.
             DEFAULT_EMBEDDING_DIM = 768
-            implicit_default_ok = (
-                env_dim is None and cfg.embedding_dim == DEFAULT_EMBEDDING_DIM
-            )
+            implicit_default_ok = env_dim is None and cfg.embedding_dim == DEFAULT_EMBEDDING_DIM
             if env_dim is not None and env_dim != cfg.embedding_dim:
                 print(
                     f"[installer] ERROR no config.toml at {config_toml_path} and "
@@ -1937,13 +1942,12 @@ def main() -> int:
         # for known no-service deployments.
         env_path = "/etc/mnemos/mnemos.env"
         skip_env = os.environ.get("MNEMOS_NO_SERVICE_ENV", "").strip().lower() in {
-            "1", "true", "yes",
+            "1",
+            "true",
+            "yes",
         }
         if skip_env:
-            print(
-                "[installer] Skipping systemd env file patch "
-                "(MNEMOS_NO_SERVICE_ENV set)."
-            )
+            print("[installer] Skipping systemd env file patch " "(MNEMOS_NO_SERVICE_ENV set).")
         elif not os.path.exists(env_path):
             print(
                 f"[installer] No systemd env file at {env_path}; skipping "
@@ -2000,6 +2004,7 @@ def main() -> int:
 
     elif args.wizard:
         from .wizard import run_wizard
+
         cfg = run_wizard(info, selected_profile=args.profile, selected_components=selected_components)
         _apply_embedding_dim_from_env(cfg)
 
@@ -2007,6 +2012,7 @@ def main() -> int:
         # Default: --agent (try LLM-guided, fall back to wizard)
         try:
             from .agent import run_agent
+
             cfg = run_agent(info)
             if args.profile:
                 cfg.profile = args.profile
@@ -2022,11 +2028,13 @@ def main() -> int:
         except (ImportError, ModuleNotFoundError):
             print("[installer] agent module not available — falling back to wizard.")
             from .wizard import run_wizard
+
             cfg = run_wizard(info, selected_profile=args.profile, selected_components=selected_components)
             _apply_embedding_dim_from_env(cfg)
         except Exception as exc:
             print(f"[installer] Agent error ({exc}) — falling back to wizard.")
             from .wizard import run_wizard
+
             cfg = run_wizard(info, selected_profile=args.profile, selected_components=selected_components)
             _apply_embedding_dim_from_env(cfg)
 
@@ -2218,14 +2226,25 @@ def _load_existing_config(repo_path: str):
         # for those passwordless shapes.
         runtime_upgrade_signals = (
             # Profile signals (any non-empty value triggers).
-            "MNEMOS_PROFILE_OVERRIDE", "MNEMOS_PROFILE",
+            "MNEMOS_PROFILE_OVERRIDE",
+            "MNEMOS_PROFILE",
             # Backend env aliases.
-            "MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND",
+            "MNEMOS_PERSISTENCE_BACKEND",
+            "PERSISTENCE_BACKEND",
+            "PG_BACKEND",
             # DSN/url.
-            "MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL",
-            "MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN",
+            "MNEMOS_DATABASE_URL",
+            "DATABASE_URL",
+            "PG_URL",
+            "MNEMOS_DATABASE_DSN",
+            "DATABASE_DSN",
+            "PG_DSN",
             # PG_* connection fields (runtime-recognized aliases).
-            "PG_HOST", "PG_PORT", "PG_DATABASE", "PG_USER", "PG_PASSWORD",
+            "PG_HOST",
+            "PG_PORT",
+            "PG_DATABASE",
+            "PG_USER",
+            "PG_PASSWORD",
             # MNEMOS_DB_PASSWORD (installer alias for PG_PASSWORD).
             "MNEMOS_DB_PASSWORD",
         )
@@ -2270,11 +2289,7 @@ def _load_existing_config(repo_path: str):
     # resolve to edge, dispatching to setup_sqlite_database while
     # runtime correctly selected server/postgres.
     profile_override = os.environ.get("MNEMOS_PROFILE_OVERRIDE", "").strip()
-    raw_profile = (
-        profile_override
-        or server.get("profile")
-        or deployment.get("profile")
-    )
+    raw_profile = profile_override or server.get("profile") or deployment.get("profile")
     if not raw_profile:
         env_profile = os.environ.get("MNEMOS_PROFILE", "").strip()
         if env_profile:
@@ -2306,8 +2321,7 @@ def _load_existing_config(repo_path: str):
                 break
         if env_backend_present:
             # Env shadows TOML — even when 'auto' or empty.
-            if env_backend_value in ("postgres", "postgresql", "pg",
-                                     "sqlite", "sqlite3"):
+            if env_backend_value in ("postgres", "postgresql", "pg", "sqlite", "sqlite3"):
                 backend = env_backend_value
             else:
                 # 'auto' or '' → no backend signal from this layer.
@@ -2332,6 +2346,7 @@ def _load_existing_config(repo_path: str):
         else:
             cfg.profile = _canonical_profile("personal")  # legacy default → edge
     cfg.sqlite_path = db.get("sqlite_path", "~/.mnemos/mnemos.db")
+
     # Empty-string TOML fields fall through to env (mirrors the runtime
     # contract in _build_settings: documented production shape is
     # `field = ""` with the actual value supplied via PG_* env). Without
@@ -2372,7 +2387,10 @@ def _load_existing_config(repo_path: str):
     # via _config_from_env), so operators rotating creds via either
     # name still work.
     def _resolve_db_field_strict(
-        toml_value, env_keys: tuple[str, ...], default: str, field_name: str,
+        toml_value,
+        env_keys: tuple[str, ...],
+        default: str,
+        field_name: str,
     ) -> str:
         """Resolve a DB connection field mirroring runtime priority.
 
@@ -2450,9 +2468,7 @@ def _load_existing_config(repo_path: str):
                 return v
         return default
 
-    cfg.db_host = _resolve_db_field_strict(
-        db.get("host"), ("PG_HOST",), "localhost", "Postgres host"
-    )
+    cfg.db_host = _resolve_db_field_strict(db.get("host"), ("PG_HOST",), "localhost", "Postgres host")
     # Round-43 HIGH: TOML wins over env (matches runtime init-kwargs
     # > env order). Non-empty TOML port wins; only when TOML port is
     # missing/empty does PG_PORT take over. Round-40 fail-closed
@@ -2460,9 +2476,7 @@ def _load_existing_config(repo_path: str):
     # value raises ValueError.
     raw_port: str | None = None
     toml_port = db.get("port")
-    if toml_port is not None and not (
-        isinstance(toml_port, str) and toml_port == ""
-    ):
+    if toml_port is not None and not (isinstance(toml_port, str) and toml_port == ""):
         raw_port = str(toml_port)
     elif "PG_PORT" in os.environ:
         # No explicit TOML port — env wins (presence-based, empty fails).
@@ -2490,17 +2504,13 @@ def _load_existing_config(repo_path: str):
         "mnemos",
         "Postgres database name",
     )
-    cfg.db_user = _resolve_db_field_strict(
-        db.get("user"), ("PG_USER",), "mnemos_user", "Postgres user"
-    )
+    cfg.db_user = _resolve_db_field_strict(db.get("user"), ("PG_USER",), "mnemos_user", "Postgres user")
     # Password overlay accepts both MNEMOS_DB_PASSWORD installer convention
     # and PG_PASSWORD (documented production shape with `password = ""`).
     # Both set the same runtime password (MNEMOS_DB_PASSWORD is mapped
     # to PG_PASSWORD by the installer's env writer), so accepting both
     # here is parity-preserving.
-    cfg.db_password = _config_or_env(
-        db.get("password"), ("MNEMOS_DB_PASSWORD", "PG_PASSWORD"), ""
-    )
+    cfg.db_password = _config_or_env(db.get("password"), ("MNEMOS_DB_PASSWORD", "PG_PASSWORD"), "")
     # embedding_dim must round-trip through --upgrade. Without this, an
     # existing 512-D install would lose its dim on `--upgrade`, default
     # back to 768, skip _alter_postgres_embedding_dim entirely, and

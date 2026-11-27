@@ -12,8 +12,6 @@ from types import SimpleNamespace
 import pytest
 from starlette.applications import Starlette
 
-from tests.oauth_backend_helpers import oauth_database as oauth_database
-from tests.test_mcp_oauth_integration import mcp_http_app as mcp_http_app
 
 
 class _Backend:
@@ -73,19 +71,21 @@ async def test_a_provider_cap_alone_also_needs_the_ledger(mcp_http_app, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_no_cap_opens_nothing(mcp_http_app, monkeypatch):
+async def test_no_cap_initializes_tool_backend(mcp_http_app, monkeypatch):
     from mnemos.core import lifecycle
 
     mcp_http = mcp_http_app.http
+    backend = _Backend()
 
     async def factory(_settings):
-        pytest.fail("no cap means the budget gate needs no ledger")
+        return "test", backend
 
     monkeypatch.setattr(lifecycle, "_persistence_backend", None)
     monkeypatch.setattr(lifecycle, "build_configured_persistence_backend", factory)
     monkeypatch.setattr(mcp_http, "get_settings", lambda: _settings())
     async with mcp_http._mcp_http_lifespan(Starlette()):
-        assert lifecycle._persistence_backend is None
+        assert lifecycle._persistence_backend is backend
+    assert backend.closed
 
 
 @pytest.mark.asyncio
@@ -109,7 +109,7 @@ async def test_an_existing_lifecycle_backend_is_left_alone(mcp_http_app, monkeyp
 
 
 @pytest.mark.asyncio
-async def test_a_ledger_that_cannot_open_does_not_abort_startup(mcp_http_app, monkeypatch):
+async def test_backend_open_failure_aborts_startup(mcp_http_app, monkeypatch):
     from mnemos.core import lifecycle
 
     mcp_http = mcp_http_app.http
@@ -120,5 +120,6 @@ async def test_a_ledger_that_cannot_open_does_not_abort_startup(mcp_http_app, mo
     monkeypatch.setattr(lifecycle, "_persistence_backend", None)
     monkeypatch.setattr(lifecycle, "build_configured_persistence_backend", factory)
     monkeypatch.setattr(mcp_http, "get_settings", lambda: _settings(weekly=200.0))
-    async with mcp_http._mcp_http_lifespan(Starlette()):
-        assert lifecycle._persistence_backend is None
+    with pytest.raises(RuntimeError, match="db down"):
+        async with mcp_http._mcp_http_lifespan(Starlette()):
+            pytest.fail("startup must require persistence")

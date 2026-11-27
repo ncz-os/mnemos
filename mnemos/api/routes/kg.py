@@ -48,6 +48,9 @@ def _row_to_triple(row) -> KGTriple:
 
 @router.post("/triples", response_model=KGTriple, status_code=201)
 async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_current_user)):
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     require_postgres_pool_or_503(route_label="POST /v1/kg/triples")
     triple_id = f"kg_{uuid.uuid4().hex[:12]}"
 
@@ -179,6 +182,9 @@ async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), use
 async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext = Depends(get_current_user)):
     """Partially update a KG triple. Non-owners see 404 to avoid
     leaking existence of triples they don't own."""
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     require_postgres_pool_or_503(route_label="PATCH /v1/kg/triples/{triple_id}")
     updates: dict = {}
     for field in ("subject", "predicate", "object", "subject_type", "object_type", "confidence"):
@@ -223,6 +229,9 @@ async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext =
 
 @router.delete("/triples/{triple_id}", status_code=204)
 async def delete_triple(triple_id: str, user: UserContext = Depends(get_current_user)):
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     require_postgres_pool_or_503(route_label="DELETE /v1/kg/triples/{triple_id}")
     async with _lc.get_pool_manager().transactional() as conn:
         row = await conn.fetchrow(

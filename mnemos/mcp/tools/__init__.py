@@ -10,7 +10,9 @@ from typing import Any
 import httpx
 
 from mnemos.core.auth_context import UserContext
+from mnemos.core.roles import MCP_ALLOWED_ROLES
 from mnemos.core.extras import is_extra_installed
+from mnemos.core.replica_error import mcp_replica_read_only
 
 from ._runtime import (
     _backend_headers,
@@ -41,6 +43,8 @@ from .dag import (
     tool_branch_memory,
     tool_checkout_memory,
     tool_diff_memory_commits,
+    tool_get_memory_version,
+    tool_list_memory_versions,
     tool_log_memory,
 )
 from .deletions import (
@@ -133,6 +137,8 @@ _TOOL_ORDER = [
     "branch_memory",
     "diff_memory_commits",
     "checkout_memory",
+    "list_memory_versions",
+    "get_memory_version",
     "recommend_model",
     "pantheon_list_models",
     "pantheon_route_explain",
@@ -172,7 +178,15 @@ _WRITE_TOOLS = {
     "delete_triple",
     "bulk_create_memories",
     "branch_memory",
+    "checkout_memory",
+    "log_memory",
+    "graeae_consult",
 }
+# NOTE: ``diff_memory_commits`` is deliberately NOT a write tool. Its
+# handler only reads two commit rows (``fetch_diff_commit_pair`` is two
+# SELECTs) and diffs them in-process with difflib — no INSERT/UPDATE on
+# any path. Listing it here used to 503 a pure read on a replica, which
+# contradicts "keep reads fully working" (replica-mode item 2).
 
 TOOL_REGISTRY: dict[str, dict[str, Any]] = {name: _DOMAIN_TOOLS[name] for name in _TOOL_ORDER}
 
@@ -213,6 +227,20 @@ async def execute_tool(
     context_caller_id = current_mcp_backend_user_id()
     caller_id = user.user_id if user is not None else context_caller_id
     caller_role = user.role if user is not None else current_mcp_backend_role()
+    if caller_role is not None and caller_role not in MCP_ALLOWED_ROLES:
+        # Deny explicit roles outside the MCP vocabulary (monitor and
+        # unknown roles). A None caller role means the transport is
+        # unauthenticated (local stdio / LAN path) — that predates the
+        # role gate and keeps its prior behaviour here.
+        _mcp_log_tool_audit(
+            caller_id=caller_id,
+            role=caller_role,
+            tool_name=tool_name,
+            parameters=audit_parameters,
+            outcome="denied",
+            error_class="RoleNotPermitted",
+        )
+        return {"success": False, "error": "Role not permitted"}
     if tool_name not in TOOL_REGISTRY:
         _mcp_log_tool_audit(
             caller_id=caller_id,
@@ -283,6 +311,22 @@ async def execute_tool(
 
     rate_kind = "write" if tool_name in _WRITE_TOOLS else "read"
     try:
+        # Replica mode: write tools are rejected with the machine-readable
+        # replica_read_only failure before any REST call or rate-limit
+        # consumption. Read tools continue unchanged.
+        if rate_kind == "write":
+            from mnemos.core.replica_mode import replica_mode_enabled
+
+            if replica_mode_enabled():
+                _mcp_log_tool_audit(
+                    caller_id=caller_id,
+                    role=caller_role,
+                    tool_name=tool_name,
+                    parameters=audit_parameters,
+                    outcome="failure",
+                    error_class="ReplicaReadOnly",
+                )
+                return mcp_replica_read_only()
         await _mcp_consult_rate_limit(
             tool_name=tool_name,
             user_id=caller_id,
@@ -436,6 +480,8 @@ __all__ = [
     "tool_branch_memory",
     "tool_bulk_create_memories",
     "tool_checkout_memory",
+    "tool_get_memory_version",
+    "tool_list_memory_versions",
     "tool_create_memory",
     "tool_delete_memory",
     "tool_delete_triple",

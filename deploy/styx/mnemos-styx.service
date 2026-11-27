@@ -1,4 +1,5 @@
 [Unit]
+OnFailure=mnemos-styx-alert@%n.service
 Description=STYX backup of this host's MNEMOS data to Google Drive
 After=network-online.target
 Wants=network-online.target
@@ -17,7 +18,6 @@ ExecStart=/opt/mnemos/venv/bin/python -m mnemos.tools.styx backup
 # Wire this to whatever this fleet uses for alerting. A backup that fails
 # quietly is the exact defect STYX was built to remove: the previous NFS
 # backup job reported success while writing nothing for five weeks.
-OnFailure=status-email@%n.service
 
 # Secrets. MNEMOS_STYX_AGE_RECIPIENT is the PUBLIC half only — the identity
 # that can decrypt these backups must never exist on a fleet host.
@@ -27,6 +27,9 @@ EnvironmentFile=/etc/mnemos/styx.env
 # credentials, for the few seconds between export and encryption. Keep it on
 # a private tmpfs so it never touches persistent storage.
 PrivateTmp=true
+StateDirectory=styx
+StateDirectoryMode=0700
+Environment=MNEMOS_STYX_RECEIPT_DIR=/var/lib/styx
 RuntimeDirectory=styx
 RuntimeDirectoryMode=0700
 Environment=MNEMOS_STYX_WORK_DIR=/run/styx

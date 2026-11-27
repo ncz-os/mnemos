@@ -26,6 +26,8 @@ source "$CONFIG"
 : "${BACKUP_TARGET:?BACKUP_TARGET must be set in $CONFIG}"
 : "${BACKUP_HOSTNAME:=$(hostname -s)}"
 : "${BACKUP_DIRECTORIES:=}"
+: "${OPTIONAL_BACKUP_DIRECTORIES:=}"
+COMPLETED=0
 : "${INCLUDE_PG:=false}"
 : "${PG_DATABASES:=}"
 : "${PG_CONTAINER:=}"     # if non-empty, dump via `docker exec <container>`
@@ -63,6 +65,8 @@ if [ "$INCLUDE_PG" = "true" ] && [ -n "$PG_DATABASES" ]; then
                 || fail 2 "pg_dump failed for $DB_TRIM"
         fi
 
+        [ -s "$OUT" ] || fail 2 "database output is empty"
+        COMPLETED=$((COMPLETED + 1))
         chmod 600 "$OUT"
         log "dump ok size=$(stat -c%s "$OUT" 2>/dev/null || echo ?) db=$DB_TRIM"
     done
@@ -70,16 +74,19 @@ fi
 
 # ---- rsync directories -----------------------------------------------------
 
-if [ -n "$BACKUP_DIRECTORIES" ]; then
+if [ -n "$BACKUP_DIRECTORIES$OPTIONAL_BACKUP_DIRECTORIES" ]; then
     FS_DIR="$TARGET_DIR/fs"
     mkdir -p "$FS_DIR" || fail 3 "cannot create $FS_DIR"
 
-    IFS=':' read -ra DIRS <<< "$BACKUP_DIRECTORIES"
+    IFS=':' read -ra DIRS <<< "$BACKUP_DIRECTORIES:$OPTIONAL_BACKUP_DIRECTORIES"
     for SRC in "${DIRS[@]}"; do
         SRC_TRIM=$(echo "$SRC" | xargs)
         [ -z "$SRC_TRIM" ] && continue
         if [ ! -e "$SRC_TRIM" ]; then
-            log "skip: $SRC_TRIM does not exist"
+            case ":$BACKUP_DIRECTORIES:" in
+                *":$SRC_TRIM:"*) fail 3 "required source is absent" ;;
+            esac
+            log "optional source is absent"
             continue
         fi
 
@@ -99,13 +106,18 @@ if [ -n "$BACKUP_DIRECTORIES" ]; then
             $RSYNC_EXTRA_OPTS \
             "$SRC_TRIM/" "$DEST/" \
             || fail 3 "rsync failed for $SRC_TRIM"
+        [ -d "$DEST" ] || fail 3 "directory output is absent"
+        COMPLETED=$((COMPLETED + 1))
     done
 fi
 
 # ---- write a manifest so retention.sh has something to walk ---------------
 
+[ "$COMPLETED" -gt 0 ] || fail 3 "no backup operations completed"
 MANIFEST="$TARGET_DIR/last-backup.json"
-cat > "$MANIFEST" <<EOF
+TEMP_MANIFEST=$(mktemp "$TARGET_DIR/.manifest.XXXXXX") || fail 3 "manifest allocation failed"
+trap 'rm -f "$TEMP_MANIFEST"' EXIT
+cat > "$TEMP_MANIFEST" <<EOF
 {
   "hostname": "$BACKUP_HOSTNAME",
   "stamp": "$STAMP",
@@ -115,5 +127,7 @@ cat > "$MANIFEST" <<EOF
   "directories": "$BACKUP_DIRECTORIES"
 }
 EOF
+
+mv "$TEMP_MANIFEST" "$MANIFEST" || fail 3 "manifest publication failed"
 
 log "backup done host=$BACKUP_HOSTNAME stamp=$STAMP"

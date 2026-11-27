@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from tests._route_helpers import flatten_routes
 
 
 @pytest.fixture(autouse=True)
@@ -371,7 +372,7 @@ class TestFederationWiring:
     def test_router_registered_in_app(self):
         import mnemos.api.main as api_server
 
-        paths = {r.path for r in api_server.app.routes}
+        paths = {r.path for r in flatten_routes(api_server.app.routes)}
         fed_paths = [p for p in paths if p.startswith("/v1/federation")]
         # peers CRUD (5) + sync (1) + log (1) + status (1) + feed (1) = 9 at minimum
         assert len(fed_paths) >= 5, f"expected federation routes, got: {fed_paths}"
@@ -379,13 +380,13 @@ class TestFederationWiring:
     def test_feed_route_exists(self):
         import mnemos.api.main as api_server
 
-        paths = {r.path for r in api_server.app.routes}
+        paths = {r.path for r in flatten_routes(api_server.app.routes)}
         assert "/v1/federation/feed" in paths
 
     def test_memory_route_exists(self):
         import mnemos.api.main as api_server
 
-        paths = {r.path for r in api_server.app.routes}
+        paths = {r.path for r in flatten_routes(api_server.app.routes)}
         assert "/v1/federation/memory/{memory_id}" in paths
 
 

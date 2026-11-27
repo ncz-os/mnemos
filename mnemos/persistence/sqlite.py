@@ -467,6 +467,32 @@ def _version_visibility_clause(
     *,
     table_alias: str = "",
 ) -> str:
+    """Per-snapshot tenancy predicate for ``memory_versions`` rows (SQLite).
+
+    Mirrors the Postgres ``version_visibility_predicate`` (``$N`` form) and
+    the MySQL / Oracle / Db2 ``_version_visibility_clause`` builders:
+    tenancy is evaluated against THE SNAPSHOT's own ``owner_id`` /
+    ``permission_mode`` / ``group_id`` columns, with the ACL escape hatch
+    joined on the parent ``memory_id`` (not the snapshot row id).
+
+    The namespace pin is rendered INSIDE this clause (``AND namespace = ?``
+    appended to ``params``) — exactly like the MySQL / Oracle / Db2
+    builders — so a call site renders one predicate and binds each value
+    exactly once. Call sites must not append a second ``namespace = ?``
+    after building the clause (that was a duplicated-bind defect caught in
+    review: two ``?`` placeholders bound to the same logical value, with
+    the trailing bind no longer aligned to the placeholder it was meant
+    for). NULL namespaces never reach this builder: every call site
+    fails closed (empty result / PermissionError) for namespace-None
+    non-root principals, so the bind is always a concrete value and the
+    pin never degenerates to a NULL comparison.
+
+    ``permission_mode`` comparisons are wrapped in ``COALESCE(..., 0)`` to
+    match the Db2 builder (and the MySQL / Oracle live-memory renderers):
+    a snapshot with NULL ``permission_mode`` evaluates the world/group
+    bits as 0, so it is reachable through the owner / ACL disjuncts but
+    never through a NULL arithmetic comparison.
+    """
     p = f"{table_alias}." if table_alias else ""
     params.append(user.user_id)
     group_ids = list(user.group_ids)
@@ -474,7 +500,7 @@ def _version_visibility_clause(
         group_clause = f"{p}group_id IN ({_placeholders(group_ids)})"
         params.extend(group_ids)
     else:
-        group_clause = "0"
+        group_clause = "0=1"
     # Unlike live-memory ACL matching, versions join by memory_id, not row id.
     principals = acl_principals(user.user_id, group_ids)
     acl_clause = ""
@@ -486,11 +512,38 @@ def _version_visibility_clause(
             f"AND macl.principal IN ({_placeholders(principals)}) "
             f"AND (macl.perm & {ACL_READ_BIT}) <> 0)"
         )
-    return (
-        f"({p}owner_id = ? OR ({p}permission_mode % 10) >= 4 "
-        f"OR ((({p}permission_mode / 10) % 10) >= 4 AND {p}group_id IS NOT NULL AND {group_clause})"
+    clause = (
+        f"({p}owner_id = ? OR COALESCE({p}permission_mode, 0) % 10 >= 4 "
+        f"OR (COALESCE({p}permission_mode, 0) / 10 % 10 >= 4 "
+        f"AND {p}group_id IS NOT NULL AND {group_clause})"
         f"{acl_clause})"
     )
+    # The namespace pin is part of this clause — appended here so the
+    # placeholder and its bind travel together (see docstring).
+    clause = f"{clause} AND {p}namespace = ?"
+    params.append(user.namespace)
+    return clause
+
+
+def _snapshot_vault_hidden(row: Row, user: UserContext) -> bool:
+    """Vault subtraction for SQLite history reads (NG2-MN-020).
+
+    The SQL ``_version_visibility_clause`` already covers owner /
+    world / group / ACL plus the namespace pin — exactly the
+    ``version_visibility_predicate`` the REST route applies. This
+    re-check adds only the vault subtraction
+    (``VisibilityFilter.exclude_namespaces``): a vault-namespace
+    snapshot row is never returned to a non-root caller even if it
+    carries a permissive permission_mode. Observable behaviour
+    matches REST everywhere (the tool-level assert gate and the
+    namespace pin already exclude vault rows for non-root callers),
+    so this is fail-closed defense in depth, not a behaviour split:
+    root callers always see the row, non-root callers never see a
+    vault row.
+    """
+    if _is_root(user):
+        return False
+    return row.get("namespace") == VAULT_NAMESPACE
 
 
 def _sqlite_memory_cols(table_alias: str = "") -> str:
@@ -698,6 +751,37 @@ def _content_hash_for_sqlite(content: Any) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _versioned_value_changed(old: Any, new: Any, column: str) -> bool:
+    """IS DISTINCT FROM for the eight versioned columns.
+
+    Mirrors the Postgres trigger's UPDATE guard: NULL is distinct from
+    any non-NULL, and for ``metadata`` (stored TEXT, callers pass dicts
+    or JSON strings) both sides are compared in canonical JSON form so
+    ``{"a": 1}`` vs ``'{"a": 1}'`` is not a phantom change. Everything
+    else compares as text, matching the trigger's row-type comparison.
+    """
+    if column == "metadata":
+        return _metadata_canonical(old) != _metadata_canonical(new)
+    if old is None or new is None:
+        return old is not new
+    return str(old) != str(new)
+
+
+def _metadata_canonical(value: Any) -> str:
+    """Canonical JSON for metadata comparison; unparseable stays raw."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        try:
+            return json.dumps(json.loads(value), sort_keys=True, separators=(",", ":"))
+        except (json.JSONDecodeError, ValueError):
+            return value
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return str(value)
+
+
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
@@ -778,6 +862,11 @@ class SqliteTransaction:
         self._conn = conn
         self._closed = False
         self._savepoint_seq = 0
+        # Import-scoped version-snapshot suppression (NG2-MN-019). Tx
+        # object scope == Postgres SET LOCAL scope: it dies with the
+        # transaction, so a CHARON import can never leak suppression
+        # into later writes on the shared connection.
+        self._suppress_version_snapshot = False
 
     @property
     def conn(self) -> Any:
@@ -818,15 +907,22 @@ class SqliteTransaction:
         self._savepoint_seq += 1
         name = f"mnemos_sp_{self._savepoint_seq}"
         await _execute(self._conn, f"SAVEPOINT {name}")
+        # Suppression is savepoint-scoped too: a seed helper can
+        # suppress-then-insert inside a savepoint and the RELEASE
+        # re-arms snapshots automatically, mirroring the Postgres
+        # SAVEPOINT + RESET pairing in the parity seed helper.
+        saved_suppress = self._suppress_version_snapshot
         try:
             yield self
         except BaseException:
+            self._suppress_version_snapshot = saved_suppress
             # ROLLBACK TO rewinds but leaves the savepoint on the stack;
             # RELEASE then pops it so the outer transaction stays clean.
             await _execute(self._conn, f"ROLLBACK TO {name}")
             await _execute(self._conn, f"RELEASE {name}")
             raise
         else:
+            self._suppress_version_snapshot = saved_suppress
             await _execute(self._conn, f"RELEASE {name}")
 
 
@@ -1001,18 +1097,17 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 await _fetch_one(conn, sql, (memory_id, commit_b)),
             )
         params_a: list[Any] = [memory_id, commit_a]
+        # Clause renders the namespace pin internally — no second bind.
         vis_clause = _version_visibility_clause(user, params_a)
-        params_a.append(user.namespace)
         sql = (
             "SELECT content, version_num FROM memory_versions "
-            f"WHERE memory_id = ? AND commit_hash = ? AND {vis_clause} AND namespace = ?"
+            f"WHERE memory_id = ? AND commit_hash = ? AND {vis_clause}"
         )
         params_b: list[Any] = [memory_id, commit_b]
         vis_clause_b = _version_visibility_clause(user, params_b)
-        params_b.append(user.namespace)
         sql_b = (
             "SELECT content, version_num FROM memory_versions "
-            f"WHERE memory_id = ? AND commit_hash = ? AND {vis_clause_b} AND namespace = ?"
+            f"WHERE memory_id = ? AND commit_hash = ? AND {vis_clause_b}"
         )
         return (await _fetch_one(conn, sql, params_a), await _fetch_one(conn, sql_b, params_b))
 
@@ -1032,13 +1127,95 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         if _is_root(user):
             return await _fetch_one(conn, select + "WHERE memory_id = ? AND commit_hash = ?", (memory_id, commit_hash))
         params: list[Any] = [memory_id, commit_hash]
+        # Clause renders the namespace pin internally — no second bind.
         vis_clause = _version_visibility_clause(user, params)
-        params.append(user.namespace)
         return await _fetch_one(
             conn,
-            select + f"WHERE memory_id = ? AND commit_hash = ? AND {vis_clause} AND namespace = ?",
+            select + f"WHERE memory_id = ? AND commit_hash = ? AND {vis_clause}",
             params,
         )
+
+    async def fetch_memory_versions(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        user: UserContext,
+    ) -> list[Row]:
+        # NG2-MN-020: mirror of GET /v1/memories/{id}/versions (oldest
+        # first). Root sees every non-deleted row; everyone else goes
+        # through the same SQL gate as fetch_checkout_commit (owner /
+        # world / group / ACL + namespace pin), with the vault
+        # subtraction applied as a Python re-check (see
+        # _snapshot_vault_hidden).
+        if _is_root(user):
+            return await _fetch_all(
+                self._conn(tx),
+                "SELECT version_num, snapshot_at, snapshot_by, change_type, "
+                "content, branch, commit_hash, owner_id, namespace, "
+                "permission_mode, group_id "
+                "FROM memory_versions "
+                "WHERE memory_id = ? AND branch = ? AND deleted_at IS NULL "
+                "ORDER BY version_num ASC",
+                (memory_id, branch),
+            )
+        params: list[Any] = [memory_id, branch]
+        # Clause renders the namespace pin internally — no second bind.
+        vis_clause = _version_visibility_clause(user, params)
+        rows = await _fetch_all(
+            self._conn(tx),
+            "SELECT version_num, snapshot_at, snapshot_by, change_type, "
+            "content, branch, commit_hash, owner_id, namespace, "
+            "permission_mode, group_id "
+            "FROM memory_versions "
+            "WHERE memory_id = ? AND branch = ? AND deleted_at IS NULL "
+            f"AND {vis_clause} "
+            "ORDER BY version_num ASC",
+            params,
+        )
+        return [row for row in rows if not _snapshot_vault_hidden(row, user)]
+
+    async def fetch_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        user: UserContext,
+    ) -> Row | None:
+        # NG2-MN-020: mirror of GET /v1/memories/{id}/versions/{n}.
+        # Prefer a SQL-side gate (same shape as fetch_checkout_commit)
+        # so cross-tenant rows never leave the DB; the Python-side
+        # _snapshot_vault_hidden re-check below closes the vault
+        # subtraction the SQL predicate cannot express.
+        conn = self._conn(tx)
+        select = (
+            "SELECT id, memory_id, version_num, content, category, "
+            "subcategory, metadata, verbatim_content, owner_id, "
+            "namespace, permission_mode, source_model, source_provider, "
+            "source_session, source_agent, snapshot_at, snapshot_by, "
+            "change_type, commit_hash, branch "
+            "FROM memory_versions "
+        )
+        if _is_root(user):
+            return await _fetch_one(
+                conn,
+                select + "WHERE memory_id = ? AND version_num = ? AND branch = ? "
+                "AND deleted_at IS NULL",
+                (memory_id, version_num, branch),
+            )
+        params: list[Any] = [memory_id, version_num, branch]
+        # Clause renders the namespace pin internally — no second bind.
+        vis_clause = _version_visibility_clause(user, params)
+        row = await _fetch_one(
+            conn,
+            select + "WHERE memory_id = ? AND version_num = ? AND branch = ? "
+            f"AND deleted_at IS NULL AND {vis_clause}",
+            params,
+        )
+        if row is None or _snapshot_vault_hidden(row, user):
+            return None
+        return row
 
     async def fetch_memory_export(
         self,
@@ -1273,7 +1450,166 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         )
         if inserted is None:
             raise DuplicateMemoryError(f"memory id already exists: {memory_id}")
+        await self._write_version_snapshot(
+            tx,
+            memory_id=memory_id,
+            branch="main",
+            change_type="create",
+            snapshot_by=None,
+        )
         return "INSERT 0 1"
+
+    async def _version_snapshot_suppressed(self, tx: Transaction) -> bool:
+        """Return True when the import path asked to skip snapshots this tx.
+
+        Mirrors the Postgres ``mnemos.suppress_version_snapshot`` GUC on
+        the transaction object: MPF imports restore authoritative history
+        via ``memory_versions`` rows of their own, so the synthesized
+        v1 row would collide on the natural key.
+
+        Defensive by design: only the expected shapes (a
+        non-SQLite transaction raising ``TypeError`` from ``_sqlite_tx``,
+        or a transaction object without the flag raising
+        ``AttributeError``) default to "not suppressed". Anything else
+        propagates — silently converting a genuine tx-object bug into a
+        snapshot write would hide it.
+        """
+        try:
+            return bool(_sqlite_tx(tx)._suppress_version_snapshot)
+        except (TypeError, AttributeError):
+            return False
+
+    async def _write_version_snapshot(
+        self,
+        tx: Transaction,
+        *,
+        memory_id: str,
+        branch: str,
+        change_type: str,
+        snapshot_by: str | None,
+    ) -> None:
+        """Write one ``memory_versions`` row + advance the branch HEAD.
+
+        SQLite analog of the Postgres ``mnemos_version_snapshot()``
+        trigger (INSERT/UPDATE branches): each version row captures the
+        post-write state (``NEW.*``), numbered one past the branch max,
+        parented to the previous HEAD.
+
+        Per-write cost (NG2-MN-019, pinned by
+        ``tests/test_ng2_mn_019_sqlite_versions.py``): a versioned-field
+        update emits 8 statements in the caller's transaction (1
+        pre-write SELECT for the IS DISTINCT FROM gate + 1 UPDATE + 4
+        SELECTs + 1 version INSERT + 1 branch UPSERT); a non-versioned
+        update emits 1 (no snapshot, same rule as the trigger's UPDATE
+        branch). The create path emits 7 — the same 4 snapshot SELECTs,
+        1 version INSERT and 1 branch UPSERT behind the caller's 1
+        INSERT, with no gate SELECT because the trigger's INSERT branch
+        snapshots unconditionally. Unlike Postgres, where the
+        trigger fires server-side, this cost is visible to any recorder
+        wrapping ``insert_memory``/``update_memory`` — seed helpers that
+        assert exact emitted SQL should suppress via
+        ``set_suppress_version_snapshot`` in a savepoint scope.
+        """
+        if await self._version_snapshot_suppressed(tx):
+            return
+        conn = self._conn(tx)
+        live = await _fetch_one(
+            conn,
+            "SELECT content, category, subcategory, metadata, verbatim_content, "
+            "owner_id, namespace, permission_mode, source_model, source_provider, "
+            "source_session, source_agent, group_id FROM memories WHERE id = ?",
+            (memory_id,),
+        )
+        if live is None:
+            return
+        next_num = await _fetch_val(
+            conn,
+            "SELECT COALESCE(MAX(version_num), 0) + 1 FROM memory_versions WHERE memory_id = ? AND branch = ?",
+            (memory_id, branch),
+        )
+        head = await _fetch_one(
+            conn,
+            "SELECT head_version_id FROM memory_branches WHERE memory_id = ? AND name = ?",
+            (memory_id, branch),
+        )
+        parent_id = head["head_version_id"] if head else None
+        if parent_id is None:
+            # Memories created before this snapshot path existed (or via
+            # a suppressed import) have history rows but no branch row:
+            # parent to the latest version on the branch so the DAG
+            # stays linked like the Postgres trigger's HEAD lookup.
+            parent_id = await _fetch_val(
+                conn,
+                "SELECT id FROM memory_versions WHERE memory_id = ? AND branch = ? "
+                "ORDER BY version_num DESC LIMIT 1",
+                (memory_id, branch),
+            )
+        version_id = f"mv_{uuid.uuid4().hex}"
+        # KNOWN LIMITATION (documented in KNOWN_LIMITATIONS.md): the
+        # ``MAX(version_num)`` read above and the INSERT below are two
+        # separate statements inside the caller's transaction, so two
+        # concurrent writers can both observe the same MAX and attempt the
+        # same ``version_num``; the conflict surfaces as a unique
+        # constraint error on ``(memory_id, branch, version_num)`` rather
+        # than a retry. The Postgres analog computes the number inside the
+        # trigger under the row lock; SQLite serializes writers only at
+        # commit granularity, so atomic derivation is not available here
+        # without a branch-level lock.
+        commit_hash = hashlib.sha256(f"{memory_id}|{next_num}|{live['content']}".encode("utf-8")).hexdigest()
+        # Explicit snapshot_at (Postgres trigger sets NOW()): the SQLite
+        # column has a CURRENT_TIMESTAMP default, but an explicit value
+        # keeps the row self-describing and never NULL to readers.
+        snapshot_at = _now_iso()
+        await _execute(
+            conn,
+            """
+            INSERT INTO memory_versions (
+                id, memory_id, version_num, content,
+                category, subcategory, metadata, verbatim_content,
+                owner_id, namespace, permission_mode,
+                source_model, source_provider, source_session, source_agent,
+                snapshot_at, snapshot_by, change_type, commit_hash, parent_version_id, branch, group_id
+            )
+            VALUES (
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?
+            )
+            """,
+            (
+                version_id,
+                memory_id,
+                next_num,
+                live["content"],
+                live["category"],
+                live["subcategory"],
+                live["metadata"],
+                live["verbatim_content"],
+                live["owner_id"],
+                live["namespace"],
+                live["permission_mode"],
+                live["source_model"],
+                live["source_provider"],
+                live["source_session"],
+                live["source_agent"],
+                snapshot_at,
+                snapshot_by,
+                change_type,
+                commit_hash,
+                parent_id,
+                branch,
+                live.get("group_id"),
+            ),
+        )
+        await _execute(
+            conn,
+            "INSERT INTO memory_branches (memory_id, name, head_version_id, created_by) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(memory_id, name) DO UPDATE SET head_version_id = excluded.head_version_id",
+            (memory_id, branch, version_id, snapshot_by),
+        )
 
     async def replace_memory_tags(
         self,
@@ -1344,10 +1680,11 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         )
 
     async def set_suppress_version_snapshot(self, tx: Transaction) -> None:
-        await _execute(self._conn(tx), "CREATE TEMP TABLE IF NOT EXISTS mnemos_tx_flags (key TEXT PRIMARY KEY)")
-        await _execute(
-            self._conn(tx), "INSERT OR IGNORE INTO mnemos_tx_flags(key) VALUES ('suppress_version_snapshot')"
-        )
+        # Tx-object scope (Postgres SET LOCAL semantics): dies with the
+        # transaction, so suppression can never leak into later writes
+        # on SQLite's shared connection. Savepoint-scoped too — see
+        # SqliteTransaction.savepoint.
+        _sqlite_tx(tx)._suppress_version_snapshot = True
 
     async def fetch_versioned_memory_ids(self, tx: Transaction, memory_ids: Sequence[str]) -> list[Row]:
         if not memory_ids:
@@ -2021,6 +2358,31 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         ]
         if not keys:
             return await self.get_memory(tx, memory_id, visibility=visibility)
+        # Pre-write image of the eight trigger-versioned columns, read
+        # inside the same transaction BEFORE the UPDATE (the trigger's
+        # OLD row). Needed for the IS DISTINCT FROM gate below; fetched
+        # only when a versioned column is touched so non-versioned
+        # writes stay single-statement.
+        versioned = (
+            "content",
+            "category",
+            "subcategory",
+            "metadata",
+            "verbatim_content",
+            "permission_mode",
+            "namespace",
+            "owner_id",
+        )
+        touched = [c for c in versioned if c in keys]
+        pre: Row | None = None
+        if touched:
+            pre = await _fetch_one(
+                conn,
+                "SELECT content, category, subcategory, metadata, "
+                "verbatim_content, permission_mode, namespace, owner_id "
+                "FROM memories WHERE id = ?",
+                (memory_id,),
+            )
         set_clauses = [f"{col} = ?" for col in keys if col != "updated"]
         values: list[Any] = [fields[k] for k in keys if k != "updated"]
         if "content" in fields:
@@ -2041,7 +2403,48 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             sql = f"UPDATE memories SET {set_sql} WHERE id = ? AND {vis_clause} RETURNING {_sqlite_memory_cols()}"
         else:
             sql = f"UPDATE memories SET {set_sql} WHERE id = ? RETURNING {_sqlite_memory_cols()}"
-        return await _fetch_one(conn, sql, params)
+        row = await _fetch_one(conn, sql, params)
+        # SQLite analog of the trigger's UPDATE branch: snapshot only
+        # when a versioned field's VALUE actually changes (content,
+        # category, subcategory, metadata, verbatim_content,
+        # permission_mode, namespace, owner_id) — the Postgres trigger
+        # guards every column with ``OLD.x IS DISTINCT FROM NEW.x``
+        # (migrations_v3_2_2_version_snapshot_new_values.sql:59-66), so
+        # gating on field PRESENCE diverges: a PATCH that resends
+        # unchanged content would mint a spurious version row on SQLite
+        # while Postgres writes nothing. Compare the RETURNING image
+        # against the pre-write row fetched inside the same transaction
+        # (same atomicity as the trigger's row lock). group_id is
+        # deliberately NOT in the set: the Postgres trigger's UPDATE
+        # branch does not list it either, so matching the trigger keeps
+        # the backends in parity. Recall bumps, re-embeds and tag edits
+        # leave history alone, exactly like the Postgres trigger.
+        # KEY-NAME CONTRACT: the Postgres trigger fires on a write to the
+        # COLUMNS named above, regardless of the client field alias, but
+        # this SQLite gate can only see the column via the exact alias
+        # used in ``fields``. Callers must therefore address metadata
+        # through ``fields["metadata"]`` (never via an alias such as
+        # ``metadata_json``); an aliased write would bypass the gate and
+        # skip history that the Postgres trigger records. The repository
+        # surface exposes only ``metadata``, so direct callers match;
+        # this contract is pinned by
+        # ``tests/test_ng2_mn_019_sqlite_versions.py``.
+        if row is not None and touched and not await self._version_snapshot_suppressed(tx):
+            # The UPDATE was RETURNING-matched (visibility passed), so
+            # the row still exists; if it vanished under us (pre is
+            # None), fail toward writing history rather than dropping it.
+            if pre is None or any(
+                _versioned_value_changed(pre.get(c), row.get(c), c)
+                for c in touched
+            ):
+                await self._write_version_snapshot(
+                    tx,
+                    memory_id=memory_id,
+                    branch="main",
+                    change_type="update",
+                    snapshot_by=None,
+                )
+        return row
 
     async def find_active_duplicate_by_content_hash(
         self,
@@ -2639,6 +3042,153 @@ class SqliteVersionRepository(_SqliteRepository, VersionRepository):
             (version_id,),
         )
 
+    async def list_memory_versions(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        """List version summaries for ``memory_id`` on ``branch`` (oldest first).
+
+        Mirrors the Postgres route query: per-snapshot tenancy on the row
+        itself — a memory that was private at v1 and public at v2 must not
+        expose v1 to readers authorized only after the permission flip.
+        """
+        conn = self._conn(tx)
+        cols = "version_num, snapshot_at, snapshot_by, change_type, content, branch"
+        if visibility.scope == VisibilityScope.ROOT_BYPASS:
+            return await _fetch_all(
+                conn,
+                f"SELECT {cols} FROM memory_versions WHERE memory_id = ? AND branch = ? "
+                "AND deleted_at IS NULL ORDER BY version_num ASC",
+                (memory_id, branch),
+            )
+        if visibility.namespace is None:
+            return []
+        user = UserContext(
+            user_id=visibility.user_id or "",
+            group_ids=list(visibility.group_ids),
+            role="user",
+            namespace=visibility.namespace,
+            authenticated=True,
+        )
+        params: list[Any] = [memory_id, branch]
+        # The clause builder renders the tenancy predicate INCLUDING the
+        # namespace pin (``AND namespace = ?`` with its bind appended) —
+        # no second pin at the call site (see the builder docstring).
+        vis_clause = _version_visibility_clause(user, params)
+        return await _fetch_all(
+            conn,
+            f"SELECT {cols} FROM memory_versions "
+            f"WHERE memory_id = ? AND branch = ? AND deleted_at IS NULL "
+            f"AND {vis_clause} "
+            "ORDER BY version_num ASC",
+            params,
+        )
+
+    async def get_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        """Fetch one version snapshot with per-snapshot tenancy applied."""
+        conn = self._conn(tx)
+        cols = (
+            "id, memory_id, version_num, content, category, subcategory, metadata, "
+            "verbatim_content, owner_id, namespace, permission_mode, "
+            "source_model, source_provider, source_session, source_agent, "
+            "snapshot_at, snapshot_by, change_type"
+        )
+        if visibility.scope == VisibilityScope.ROOT_BYPASS:
+            return await _fetch_one(
+                conn,
+                f"SELECT {cols} FROM memory_versions "
+                "WHERE memory_id = ? AND version_num = ? AND branch = ? AND deleted_at IS NULL",
+                (memory_id, version_num, branch),
+            )
+        if visibility.namespace is None:
+            return None
+        user = UserContext(
+            user_id=visibility.user_id or "",
+            group_ids=list(visibility.group_ids),
+            role="user",
+            namespace=visibility.namespace,
+            authenticated=True,
+        )
+        params: list[Any] = [memory_id, version_num, branch]
+        # The clause builder renders the tenancy predicate INCLUDING the
+        # namespace pin — no second pin at the call site.
+        vis_clause = _version_visibility_clause(user, params)
+        return await _fetch_one(
+            conn,
+            f"SELECT {cols} FROM memory_versions "
+            f"WHERE memory_id = ? AND version_num = ? AND branch = ? "
+            f"AND deleted_at IS NULL AND {vis_clause}",
+            params,
+        )
+
+    async def fetch_version_contents(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_nums: Sequence[int],
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        """Return ``(version_num, content)`` rows for ``version_nums``.
+
+        ABC-first delivery (was ``NotImplementedError`` -> route 503 on
+        non-Postgres backends): same per-snapshot tenancy as
+        :meth:`list_memory_versions` — root bypass, namespace-None
+        fail-closed, then the visibility clause plus the namespace pin.
+        """
+        conn = self._conn(tx)
+        nums = list(version_nums)
+        if not nums:
+            return []
+        cols = "version_num, content"
+        if visibility.scope == VisibilityScope.ROOT_BYPASS:
+            ph = ", ".join(["?"] * len(nums))
+            return await _fetch_all(
+                conn,
+                f"SELECT {cols} FROM memory_versions "
+                f"WHERE memory_id = ? AND branch = ? "
+                f"AND version_num IN ({ph}) AND deleted_at IS NULL "
+                "ORDER BY version_num ASC",
+                [memory_id, branch, *nums],
+            )
+        if visibility.namespace is None:
+            return []
+        user = UserContext(
+            user_id=visibility.user_id or "",
+            group_ids=list(visibility.group_ids),
+            role="user",
+            namespace=visibility.namespace,
+            authenticated=True,
+        )
+        ph = ", ".join(["?"] * len(nums))
+        # Parameter order must match placeholder order in the SQL exactly:
+        #   1. WHERE-base: (memory_id, branch, version_num IN (...))
+        #   2. vis_clause:  (owner, [groups...], [acl principals...], namespace)
+        # ``_version_visibility_clause`` appends clause params — INCLUDING
+        # the namespace pin — in order to the shared list, so the call
+        # site adds nothing after building the clause.
+        params: list[Any] = [memory_id, branch, *nums]
+        vis_clause = _version_visibility_clause(user, params)
+        return await _fetch_all(
+            conn,
+            f"SELECT {cols} FROM memory_versions "
+            f"WHERE memory_id = ? AND branch = ? "
+            f"AND version_num IN ({ph}) "
+            f"AND deleted_at IS NULL AND ({vis_clause}) "
+            "ORDER BY version_num ASC",
+            params,
+        )
+
 
 class SqliteBranchRepository(_SqliteRepository, BranchRepository):
     async def create_memory_branch(
@@ -2712,12 +3262,12 @@ class SqliteBranchRepository(_SqliteRepository, BranchRepository):
                 (memory_id, from_commit),
             )
         params: list[Any] = [memory_id, from_commit]
+        # Clause renders the namespace pin internally — no second bind.
         vis_clause = _version_visibility_clause(user, params)
-        params.append(user.namespace)
         return await _fetch_one(
             conn,
             "SELECT id, commit_hash FROM memory_versions "
-            f"WHERE memory_id = ? AND commit_hash = ? AND {vis_clause} AND namespace = ?",
+            f"WHERE memory_id = ? AND commit_hash = ? AND {vis_clause}",
             params,
         )
 
@@ -2731,13 +3281,13 @@ class SqliteBranchRepository(_SqliteRepository, BranchRepository):
                 (memory_id,),
             )
         params: list[Any] = [memory_id]
+        # Clause renders the namespace pin internally — no second bind.
         vis_clause = _version_visibility_clause(user, params, table_alias="mv")
-        params.append(user.namespace)
         return await _fetch_one(
             conn,
             "SELECT mv.id, mv.commit_hash FROM memory_versions mv "
             "INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id "
-            f"WHERE mv.memory_id = ? AND mb.name = 'main' AND {vis_clause} AND mv.namespace = ?",
+            f"WHERE mv.memory_id = ? AND mb.name = 'main' AND {vis_clause}",
             params,
         )
 
@@ -2757,15 +3307,19 @@ class SqliteBranchRepository(_SqliteRepository, BranchRepository):
                 (memory_id, name),
             )
         params: list[Any] = [memory_id, name]
+        # Clause renders the namespace pin internally — no second bind.
+        # Placeholder order in the SQL is: clause binds (owner, groups...,
+        # acl principals..., namespace), then the WHERE-base binds
+        # (memory_id, name).
         vis_clause = _version_visibility_clause(user, params, table_alias="mv")
-        params.append(user.namespace)
+        clause_params = params[2:]
         return await _fetch_one(
             conn,
             "SELECT mb.head_version_id, mv.commit_hash FROM memory_branches mb "
             "INNER JOIN memory_versions mv ON mv.id = mb.head_version_id AND mv.memory_id = mb.memory_id "
-            f"AND {vis_clause} AND mv.namespace = ? "
+            f"AND {vis_clause} "
             "WHERE mb.memory_id = ? AND mb.name = ?",
-            params[2:] + params[:2],
+            clause_params + params[:2],
         )
 
     async def delete_memory_branches_for_memories(self, tx: Transaction, memory_ids: Sequence[str]) -> None:
@@ -6060,35 +6614,9 @@ class SqliteConsultationsRepository(_SqliteRepository, ConsultationsRepository):
             "SELECT provider, model_id, input_cost_per_mtok, output_cost_per_mtok, graeae_weight, arena_rank "
             "FROM model_registry WHERE available=1 AND deprecated=0",
         )
-        if tier == "frontier":
-            rows = [
-                r
-                for r in rows
-                if (r.get("arena_rank") is not None and r["arena_rank"] <= 5) or (r["graeae_weight"] or 0) >= 0.95
-            ]
-        elif tier == "premium":
-            rows = [
-                r
-                for r in rows
-                if (r.get("arena_rank") is not None and 6 <= r["arena_rank"] <= 15)
-                or (0.85 <= (r["graeae_weight"] or 0) < 0.95)
-            ]
-        else:
-            rows = [
-                r
-                for r in rows
-                if (r["graeae_weight"] or 0) >= 0.75
-                and r["input_cost_per_mtok"] is not None
-                and r["output_cost_per_mtok"] is not None
-            ]
-            rows = sorted(rows, key=lambda r: (r["input_cost_per_mtok"] or 0) + (r["output_cost_per_mtok"] or 0))
-        seen: set[str] = set()
-        out: list[Row] = []
-        for row in sorted(rows, key=lambda r: (r["provider"], -(r["graeae_weight"] or 0))):
-            if row["provider"] not in seen:
-                out.append(row)
-                seen.add(row["provider"])
-        return out
+        from mnemos.persistence.consultation_selection import select_tier_lineup
+
+        return select_tier_lineup(rows, tier)
 
     async def resolve_models(self, tx: Transaction, model_ids: Sequence[str]) -> list[Row]:
         if not model_ids:
@@ -8551,6 +9079,7 @@ class SqliteBackend:
         )
 
     async def open(self) -> None:
+        self._validate_migration_manifest()
         if self._conn is not None:
             return
         if self._db_path != Path(":memory:"):
@@ -8630,12 +9159,18 @@ class SqliteBackend:
         except Exception as exc:  # pragma: no cover - optional path.
             logger.debug("sqlite-vec Python loader unavailable; using cosine UDF fallback: %s", exc)
 
-    async def _apply_migrations(self, conn: Any) -> None:
+    @staticmethod
+    def _validate_migration_manifest() -> Path:
         migrations_dir = Path(__file__).resolve().parents[2] / "mnemos" / "db_migrations" / "migrations_sqlite"
+        missing = [name for name in SQLITE_MIGRATION_FILES if not (migrations_dir / name).is_file()]
+        if missing:
+            raise RuntimeError("Missing SQLite migration artifacts: " + ", ".join(missing))
+        return migrations_dir
+
+    async def _apply_migrations(self, conn: Any) -> None:
+        migrations_dir = self._validate_migration_manifest()
         for migration_name in SQLITE_MIGRATION_FILES:
             migration_path = migrations_dir / migration_name
-            if not migration_path.exists():
-                continue
             # Item 11/11a: idempotency marker — destructive migrations
             # (e.g. ``migrations_v6_3_morpheus_runs_parity_sqlite.sql``
             # with its RENAME COLUMN + DROP COLUMN body) need a

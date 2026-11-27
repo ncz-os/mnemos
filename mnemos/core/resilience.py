@@ -1206,6 +1206,16 @@ class NatsVisibilityEpoch:
         except Exception:
             return None
 
+    def observed_epoch(self) -> int:
+        """High-water epoch this process has seen, with no I/O.
+
+        Synchronous by design: the epoch is already published after every
+        bump, and this is the value a cheap cache key embeds. Never reads
+        the shared store, so it cannot block or fail.
+        """
+        with self._floor_lock:
+            return self._floor
+
     async def current(self) -> int:
         """Read the epoch without bumping it."""
         kv = await self._kv()

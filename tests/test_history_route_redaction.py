@@ -148,11 +148,107 @@ class _PoolCtx:
 
 
 def _install_pool(monkeypatch, conn):
-    import mnemos.core.lifecycle as lc
+    """Point the versions routes at a fake backend facade (NG2-MN-018).
 
+    ``list_versions`` / ``get_version`` resolve the persistence backend
+    and call ``VersionRepository`` inside ``backend.transactional()``.
+    The fake backend serves the REAL Postgres repositories over the
+    stub asyncpg connection, so the SQL under test is the shipped SQL —
+    only the transport is fake.
+    """
+    import mnemos.core.lifecycle as lc
+    from mnemos.persistence.postgres import (
+        PostgresMemoryRepository,
+        PostgresTransaction,
+        PostgresVersionRepository,
+    )
+
+    tx = PostgresTransaction(conn, MagicMock())
+
+    class _Ctx:
+        async def __aenter__(self):
+            return tx
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class _VersionsBackend:
+        """Minimal facade exposing only what the ABC-routed history reads use.
+
+        Deliberately NOT a MagicMock: ``require_postgres_pool_or_503``
+        treats any backend with a truthy ``pool`` attribute as pool-backed,
+        which would hijack the still-raw revert/dag routes. A plain
+        object has no ``pool`` attribute, so those routes fall through to
+        the installed ``_pool`` exactly as before.
+        """
+
+        def __init__(self):
+            self.memories = PostgresMemoryRepository()
+            self.memory_versions = PostgresVersionRepository()
+
+        def transactional(self):
+            return _Ctx()
+
+    monkeypatch.setattr(lc, "_persistence_backend", _VersionsBackend())
+    # revert / dag routes still acquire the raw pool (their slices
+    # are pending); keep it installed so those tests exercise them.
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
+
+
+class _FakeVersionsTx:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _FakeVersionsBackend:
+    """Minimal backend double for the ABC-routed versions handlers.
+
+    list_versions/get_version go through ``backend.transactional()`` +
+    ``backend.memories.assert_memory_readable`` +
+    ``backend.memory_versions.list/fetch`` — never the raw pool — so the
+    double serves pre-filtered rows instead of SQL text.
+    """
+
+    def __init__(self, *, version_row=None, version_rows=None):
+        self._version_row = version_row
+        self._version_rows = (
+            version_rows if version_rows is not None else ([version_row] if version_row is not None else [])
+        )
+        self.memories = self
+        self.memory_versions = self
+        self.memory_branches = self
+
+    def transactional(self, **_kwargs):
+        return _FakeVersionsTx()
+
+    async def assert_memory_readable(self, tx, memory_id, user):
+        return None
+
+    async def list_memory_versions(self, tx, memory_id, branch, user):
+        return list(self._version_rows)
+
+    async def get_memory_version(self, tx, memory_id, version_num, branch, visibility):
+        return self._version_row
+
+    async def fetch_memory_branch_heads(self, tx, memory_ids, **_kwargs):
+        if self._version_rows:
+            return [{"memory_id": memory_ids[0], "branch": "main"}]
+        return []
+
+
+def _install_versions_backend(monkeypatch, *, version_row=None, version_rows=None):
+    import mnemos.core.lifecycle as lc
+
+    monkeypatch.setattr(
+        lc,
+        "_persistence_backend",
+        _FakeVersionsBackend(version_row=version_row, version_rows=version_rows),
+    )
 
 
 # ── versions.py: get_version ────────────────────────────────────────────────
@@ -182,13 +278,31 @@ class _VersionConn:
         if "SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch" in compact:
             return self.diff_rows
         if "SELECT version_num, content FROM memory_versions" in compact:
+            if "permission_mode % 10" in compact:
+                # NG2-MN-018 diff slice: repository path carries the
+                # per-snapshot visibility predicate + namespace pin
+                # (memory_id=$1, nums=$2, branch=$3, vis..., ns=last).
+                kept = []
+                for r in self.diff_rows:
+                    row = {"memory_id": "mem-1", "owner_id": "alice",
+                           "namespace": "alice-ns", "permission_mode": 600,
+                           **r}
+                    namespace = args[-1]
+                    caller = args[3]
+                    if row.get("namespace") != namespace:
+                        continue
+                    if row.get("owner_id") == caller:
+                        kept.append(r)
+                        continue
+                    if (row.get("permission_mode") or 0) % 10 >= 4:
+                        kept.append(r)
+                return kept
             return self.diff_rows
         raise AssertionError(f"unexpected fetch SQL: {sql}")
 
 
 def test_non_root_get_version_masks_secret_spans(monkeypatch):
-    conn = _VersionConn(version_row=_version_row())
-    _install_pool(monkeypatch, conn)
+    _install_versions_backend(monkeypatch, version_row=_version_row())
 
     version = asyncio.run(versions_handler.get_version("mem-1", 1, user=_alice()))
 
@@ -202,8 +316,7 @@ def test_non_root_get_version_masks_secret_spans(monkeypatch):
 
 def test_root_get_version_is_also_masked(monkeypatch):
     """No history route grants a plaintext read — not even to root."""
-    conn = _VersionConn(version_row=_version_row())
-    _install_pool(monkeypatch, conn)
+    _install_versions_backend(monkeypatch, version_row=_version_row())
 
     version = asyncio.run(versions_handler.get_version("mem-1", 1, user=_root()))
 
@@ -213,8 +326,7 @@ def test_root_get_version_is_also_masked(monkeypatch):
 
 def test_vault_namespace_version_is_not_found(monkeypatch):
     """A vault row is outside the visibility predicate: 404, never content."""
-    conn = _VersionConn(version_row=None)
-    _install_pool(monkeypatch, conn)
+    _install_versions_backend(monkeypatch, version_row=None)
 
     with pytest.raises(HTTPException) as exc:
         asyncio.run(versions_handler.get_version("mem-1", 1, user=_alice()))
@@ -224,8 +336,9 @@ def test_vault_namespace_version_is_not_found(monkeypatch):
 
 def test_list_versions_preview_is_masked(monkeypatch):
     """The 120-char content preview must not leak a short credential."""
-    conn = _VersionConn(
-        diff_rows=[
+    _install_versions_backend(
+        monkeypatch,
+        version_rows=[
             {
                 "version_num": 1,
                 "content": SECRET_TEXT,
@@ -234,9 +347,8 @@ def test_list_versions_preview_is_masked(monkeypatch):
                 "change_type": "create",
                 "branch": "main",
             }
-        ]
+        ],
     )
-    _install_pool(monkeypatch, conn)
 
     summaries = asyncio.run(versions_handler.list_versions("mem-1", user=_alice()))
 

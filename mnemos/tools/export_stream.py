@@ -129,6 +129,97 @@ def completion_count_matches(declared, *, unique, wire):
     return declared in (unique, wire)
 
 
+def stream_identity_spool(directory, *, page_commit_entries=1000):
+    """Disk-backed seen-identity set for stream validators.
+
+    Returns ``(add, finish)`` where ``add(surface, identity, serialized)``
+    is True on first sight, False on a byte-identical repeat, and raises
+    :class:`ExportValidationError` on a divergent repeat. Payloads live in
+    a SQLite spool file, never in a caller-side dict, so validators keep a
+    fixed working set regardless of corpus bytes. ``finish`` commits and
+    removes the spool directory; it is idempotent. All database access is
+    serialized through one lock so concurrent callers cannot double-create
+    the spool or share a half-initialized handle.
+    """
+    import tempfile as _tempfile
+    import threading as _threading
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    holder: dict = {}
+    # RLock: add() holds the guard while calling _open(), which also takes
+    # it. A plain Lock would deadlock on that nesting.
+    guard = _threading.RLock()
+
+    def _open():
+        with guard:
+            if holder.get("closed"):
+                raise ExportValidationError("identity spool is closed")
+            if "tmp" not in holder:
+                tmp = _tempfile.TemporaryDirectory(prefix=".mnemos-identity-spool-", dir=str(directory))
+                db = None
+                try:
+                    db = sqlite3.connect(Path(tmp.name) / "spool.db", check_same_thread=False)
+                    db.execute(
+                        "CREATE TABLE items (surface TEXT, identity TEXT, payload TEXT, PRIMARY KEY(surface,identity))"
+                    )
+                    db.commit()
+                except BaseException:
+                    if db is not None:
+                        try:
+                            db.close()
+                        except Exception:
+                            pass
+                    tmp.cleanup()
+                    raise
+                holder.update(tmp=tmp, db=db, pending=0, closed=False)
+            return holder["db"]
+
+    def add(surface, identity, serialized):
+        with guard:
+            db = _open()
+            prior = db.execute(
+                "SELECT payload FROM items WHERE surface=? AND identity=?",
+                (surface, identity),
+            ).fetchone()
+            if prior is not None:
+                if prior[0] != serialized:
+                    raise ExportValidationError(f"divergent duplicate {surface} identity: {identity}")
+                return False
+            db.execute("INSERT INTO items VALUES (?,?,?)", (surface, identity, serialized))
+            holder["pending"] += 1
+            if holder["pending"] >= page_commit_entries:
+                db.commit()
+                holder["pending"] = 0
+            return True
+
+    def finish():
+        with guard:
+            if holder.get("closed"):
+                return
+            holder["closed"] = True
+            db_obj = holder.get("db")
+            tmp_obj = holder.get("tmp")
+            # Commit first; propagate failures so a failed spool flush is not
+            # silently dropped (the caller needs to know the dedup state was
+            # not persisted).
+            if db_obj is not None:
+                try:
+                    db_obj.commit()
+                finally:
+                    db_obj.close()
+            # Remove the spool directory; only raise if the database cleanup
+            # above succeeded, so a commit failure is never masked by a
+            # separate cleanup error.
+            if tmp_obj is not None:
+                tmp_obj.cleanup()
+            holder.pop("db", None)
+            holder.pop("tmp", None)
+            holder.pop("pending", None)
+
+    return add, finish
+
+
 def _identity(surface, entry):
     if surface == "records":
         if not isinstance(entry.get("id"), str) or not entry["id"]:
@@ -146,7 +237,9 @@ def write_export(pages, output, *, jsonl=False, include_sidecars=True):
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".mnemos-export-", dir=output.parent) as temporary:
-        with sqlite3.connect(Path(temporary) / "spool.db") as db:
+        spool = Path(temporary) / "spool.db"
+        os.close(os.open(spool, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+        with sqlite3.connect(spool) as db:
             db.execute("CREATE TABLE items (surface TEXT, identity TEXT, payload TEXT, PRIMARY KEY(surface,identity))")
             metadata = None
             complete = False
@@ -223,7 +316,8 @@ def write_export(pages, output, *, jsonl=False, include_sidecars=True):
             db.commit()
             count = db.execute("SELECT COUNT(*) FROM items WHERE surface='records'").fetchone()[0]
             staged = Path(temporary) / "output"
-            with staged.open("w", encoding="utf-8") as target:
+            with open(staged, "w", encoding="utf-8",
+                      opener=lambda name, flags: os.open(name, flags, 0o600)) as target:
 
                 def array(surface):
                     target.write("[")

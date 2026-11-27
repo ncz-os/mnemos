@@ -31,10 +31,10 @@ jobs:
             os: ubuntu-24.04
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -57,7 +57,7 @@ jobs:
           ./target/${{ matrix.target }}/release/mnemosctl --help
 
       - name: artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mnemosctl-${{ matrix.target }}
           path: cli/mnemosctl/target/${{ matrix.target }}/release/mnemosctl*

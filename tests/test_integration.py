@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from mnemos._version import __version__
+from tests._route_helpers import flatten_routes
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -36,7 +37,7 @@ class TestOpenAIGatewayStructure:
         """OpenAI router is registered in app."""
         try:
             import mnemos.api.main as api_server
-            route_paths = {route.path for route in api_server.app.routes}
+            route_paths = {route.path for route in flatten_routes(api_server.app.routes)}
             # Should have /v1/chat/completions and /v1/models endpoints
             v1_routes = {r for r in route_paths if '/v1/' in r}
             assert len(v1_routes) > 0, "No /v1/* routes found"
@@ -76,7 +77,7 @@ class TestSessionManagementStructure:
         """Sessions router is registered in app."""
         try:
             import mnemos.api.main as api_server
-            route_paths = {route.path for route in api_server.app.routes}
+            route_paths = {route.path for route in flatten_routes(api_server.app.routes)}
             session_routes = {r for r in route_paths if '/sessions' in r}
             assert len(session_routes) > 0, "No /sessions routes found"
         except Exception as e:
@@ -118,7 +119,7 @@ class TestDAGImplementation:
         """DAG router is registered in app."""
         try:
             import mnemos.api.main as api_server
-            route_paths = {route.path for route in api_server.app.routes}
+            route_paths = {route.path for route in flatten_routes(api_server.app.routes)}
             dag_routes = {r for r in route_paths if '/branches' in r or '/commits' in r}
             assert len(dag_routes) > 0, "No DAG routes found"
         except Exception as e:
@@ -315,7 +316,7 @@ class TestV3Surface:
         """Core v3 routes are mounted on the app."""
         try:
             import mnemos.api.main as api_server
-            route_paths = {route.path for route in api_server.app.routes}
+            route_paths = {route.path for route in flatten_routes(api_server.app.routes)}
             expected_routes = {'/v1/memories', '/health'}
             for route in expected_routes:
                 matching = {r for r in route_paths if route in r}

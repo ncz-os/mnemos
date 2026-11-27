@@ -332,7 +332,7 @@ def test_create_session_stringifies_a_created_at_that_has_no_isoformat(
     assert client.post("/v1/sessions", json={}).json()["created_at"] == "2026-01-01T00:00:00"
 
 
-def test_create_session_turns_a_repository_error_into_a_500_that_echoes_it(
+def test_create_session_turns_a_repository_error_into_a_neutral_500(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = _Repo()
@@ -342,7 +342,7 @@ def test_create_session_turns_a_repository_error_into_a_500_that_echoes_it(
     response = client.post("/v1/sessions", json={})
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Session creation failed: boom"
+    assert response.json()["detail"] == "Session creation failed"
 
 
 def test_every_route_answers_503_when_no_backend_is_booted(
@@ -619,7 +619,7 @@ def test_add_message_survives_a_failed_memory_search_and_says_zero_injected(
     assert "add_memory_injections" not in repo.names()
 
 
-def test_add_message_turns_a_provider_failure_into_a_503_and_stores_no_reply(
+def test_add_message_turns_a_provider_failure_into_a_neutral_503_and_stores_no_reply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = _Repo()
@@ -630,7 +630,7 @@ def test_add_message_turns_a_provider_failure_into_a_503_and_stores_no_reply(
     response = client.post("/v1/sessions/sess_1/messages", json={"role": "user", "content": "q"})
 
     assert response.status_code == 503
-    assert response.json()["detail"] == "Provider unavailable: no route"
+    assert response.json()["detail"] == "Provider unavailable"
     # The user message was already committed before the provider was called;
     # the assistant message and the metric update never happened.
     assert repo.names() == ["get_session", "add_message", "fetch_provider_history"]

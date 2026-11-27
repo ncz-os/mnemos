@@ -12,6 +12,7 @@ from mnemos.core import config
 
 def _reset(monkeypatch, profile: str):
     monkeypatch.setenv("MNEMOS_PROFILE", profile)
+    monkeypatch.delenv("MNEMOS_PROFILE_OVERRIDE", raising=False)
     monkeypatch.delenv("MNEMOS_AUTH_ENABLED", raising=False)
     monkeypatch.setattr(config, "_settings", None)
     dependencies.configure_auth(None)
@@ -54,6 +55,9 @@ def _auth_backend(oauth: _FakeOAuthRepo) -> SimpleNamespace:
 
 def test_server_profile_defaults_auth_enabled_and_rejects_missing_credentials(monkeypatch):
     _reset(monkeypatch, "server")
+    # Adding a low-privilege role must not make the server profile fall back
+    # to the auth-disabled singleton path.
+    assert "monitor" in dependencies.KNOWN_ROLES
     oauth = _FakeOAuthRepo()
     app = FastAPI()
     app.state.persistence_backend = _auth_backend(oauth)

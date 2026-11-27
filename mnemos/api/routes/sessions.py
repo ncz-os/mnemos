@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_sessions_backend
+from mnemos.api.persistence_helpers import require_sessions_backend, require_write_allowed
 from mnemos.core.security import scope_namespace
 from mnemos.domain.openai_compat.router import search_memory_context as _search_mnemos_context
 from mnemos.domain.openai_compat.providers import _route_to_provider
@@ -36,6 +36,7 @@ async def create_session(
     user: UserContext = Depends(get_current_user),
 ):
     """Create a new session for multi-turn conversation."""
+    require_write_allowed()
     backend = require_sessions_backend()
 
     try:
@@ -58,9 +59,9 @@ async def create_session(
             model=row["model"],
         )
 
-    except Exception as e:
-        logger.error(f"[SESSIONS] Failed to create session: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Session creation failed: {str(e)}")
+    except Exception:
+        logger.error("Session creation failed")
+        raise HTTPException(status_code=500, detail="Session creation failed")
 
 
 @router.get("/{session_id}", response_model=SessionContext)
@@ -113,6 +114,7 @@ async def add_session_message(
     5. Stores assistant response in history
     6. Updates session metrics
     """
+    require_write_allowed()
     backend = require_sessions_backend()
     target_ns = scope_namespace(user, namespace)
 
@@ -187,8 +189,8 @@ async def add_session_message(
 
             logger.info(f"[SESSIONS] Injected {memories_injected} memories into session {session_id}")
 
-    except Exception as e:
-        logger.warning(f"[SESSIONS] Memory search failed: {e}, continuing without context")
+    except Exception:
+        logger.warning("Memory search unavailable; continuing without context")
 
     # Build messages for provider (include session history + injected context)
     messages = [{"role": msg["role"], "content": msg["content"]} for msg in history]
@@ -226,9 +228,9 @@ async def add_session_message(
         # Estimate tokens (rough approximation: ~4 chars per token)
         tokens_used = len(response_text) // 4
 
-    except Exception as e:
-        logger.error(f"[SESSIONS] Provider routing failed: {e}", exc_info=True)
-        raise HTTPException(status_code=503, detail=f"Provider unavailable: {str(e)}")
+    except Exception:
+        logger.error("Provider routing failed")
+        raise HTTPException(status_code=503, detail="Provider unavailable")
 
     # Store assistant response
     async with backend.transactional() as tx:
@@ -322,6 +324,7 @@ async def delete_session(
     user: UserContext = Depends(get_current_user),
 ):
     """Close and delete session."""
+    require_write_allowed()
     backend = require_sessions_backend()
     target_ns = scope_namespace(user, namespace)
 

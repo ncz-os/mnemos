@@ -5,4 +5,5 @@
 # Only install if you plan to run phi_server.py for local Intel GPU inference.
 
 openvino-genai>=2024.4.0
+pillow>=13.0.0
 fastembed>=0.3.0          # nomic-embed-text-v1.5, 768-dim; pulls onnxruntime transitively

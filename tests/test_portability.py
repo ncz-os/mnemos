@@ -49,6 +49,21 @@ def _root() -> UserContext:
     )
 
 
+@pytest.fixture(autouse=True)
+def available_deletion_scope(monkeypatch):
+    from mnemos.persistence import worker_lifecycle
+    from tests._charon_fake_backend import ConnBackedBackend
+
+    original_lookup = worker_lifecycle.active_deletion_for_scope
+
+    async def lookup(backend, **kwargs):
+        if isinstance(backend, ConnBackedBackend):
+            return None
+        return await original_lookup(backend, **kwargs)
+
+    monkeypatch.setattr(worker_lifecycle, "active_deletion_for_scope", lookup)
+
+
 class _Conn:
     def __init__(self, rows=None, *, routed_rows=None):
         """Mock asyncpg connection.

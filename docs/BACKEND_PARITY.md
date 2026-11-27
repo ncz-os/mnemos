@@ -28,11 +28,11 @@ mariadb, oracle, db2) and answers two questions for every cell:
    over the backend name or via a file named
    `test_<capability>_<backend>*.py`?
 
-Summary: **87/162** cells have a surface and a test candidate
-(◐ surface + test candidate), **37** cells expose a surface
-without a test candidate, **5** cells have a test candidate for a
-stub backend implementation, and **33** cells have neither
-implementation nor test. (Categories sum to 162: 87 + 37 + 5 + 33 = 162.)
+Summary: **89/162** cells have a surface and a test candidate
+(◐ surface + test candidate), **35** cells expose a surface
+without a test candidate, **6** cells have a test candidate for a
+stub backend implementation, and **32** cells have neither
+implementation nor test. (Categories sum to 162: 89 + 35 + 6 + 32 = 162.)
 
 ## Matrix
 
@@ -42,14 +42,14 @@ implementation nor test. (Categories sum to 162: 87 + 37 + 5 + 33 = 162.)
 | vector_search (semantic_search) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | fts_search (FTS5 / native FTS) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
 | kg (KGRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
-| versions (VersionRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
+| versions (VersionRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | branches (BranchRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | compression (CompressionRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
 | compression_queue (CompressionQueueRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface, no test candidate |
 | morpheus (MorpheusRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | webhooks (WebhookRepository: CRUD + delivery lifecycle) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | nats_dispatch_log (idempotency dedupe) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate |
-| consultations_audit (model recommendation) | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
+| consultations_audit (model recommendation) | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | oauth (OAuthRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | sessions (SessionsRepository) | ◐ surface, no test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
 | consultations (ConsultationsRepository) | ◐ surface, no test candidate | ◐ surface, no test candidate | ? test candidate, no surface | — no surface or test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
@@ -57,7 +57,7 @@ implementation nor test. (Categories sum to 162: 87 + 37 + 5 + 33 = 162.)
 | state (StateRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface + test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate | ◐ surface + test candidate |
 | audit_chain (AuditChainRepository) | ◐ surface + test candidate | ◐ surface + test candidate | ? test candidate, no surface | ? test candidate, no surface | ◐ surface + test candidate | ◐ surface + test candidate |
 | acl (AclRepository) | ? test candidate, no surface | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate |
-| journal (KNEMON journal entries) | ◐ surface, no test candidate | ◐ surface, no test candidate | ? test candidate, no surface | — no surface or test candidate | ◐ surface + test candidate | ◐ surface + test candidate |
+| journal (KNEMON journal entries) | ◐ surface, no test candidate | ◐ surface, no test candidate | ? test candidate, no surface | ? test candidate, no surface | ◐ surface + test candidate | ◐ surface + test candidate |
 | ledger (KNEMON usage_ledger) | ◐ surface + test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | ◐ surface, no test candidate | ◐ surface, no test candidate |
 | row_level_security (Postgres RLS) | — no surface or test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate |
 | listen_notify (Postgres LISTEN/NOTIFY) | — no surface or test candidate | ◐ surface, no test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate | — no surface or test candidate |
@@ -95,11 +95,11 @@ mariadb/oracle/db2 — all of which implement the ABC — read
 accessor. The two signals are now reconciled: the matrix
 reflects the surface; the flag still controls delivery.
 
-## 33 'no surface, no test' cells — hand-verified split
+## 32 'no surface, no test' cells — hand-verified split
 
-All 33 cells were hand-verified 2026-10-17. They fall into
+All 32 cells were hand-verified 2026-10-17. They fall into
 two disjoint classes: **correctly absent** (25) and **real
-backlog** (9). The split is recorded in the module-level
+backlog** (7). The split is recorded in the module-level
 constants ``_CORRECTLY_ABSENT_CELLS`` / ``_REAL_BACKLOG_CELLS``
 and is hard-asserted against the live matrix below, so any
 future change that moves a correctly-absent cell into the
@@ -125,7 +125,7 @@ backends that do not have them.
 
 (25 cells: 5 Postgres-only rows × 5 non-Postgres backends.)
 
-### Real backlog (9) — surface should exist but does not
+### Real backlog (7) — surface should exist but does not
 
 * ``sessions`` on mysql, mariadb — the ``.sessions`` facade
   property is missing; the ABC declares it. Add a

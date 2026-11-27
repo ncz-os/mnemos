@@ -5,9 +5,27 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=jasonperlow
-Environment=HOME=/home/jasonperlow
-WorkingDirectory=/home/jasonperlow
+User=graeae-shim
+Group=graeae-shim
+RootDirectory=/var/lib/graeae-shim/root
+Environment=HOME=/var/lib/graeae-shim
+EnvironmentFile=/etc/graeae-shim/service.env
+WorkingDirectory=/var/lib/graeae-shim
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/graeae-shim
+TasksMax=64
+MemoryMax=512M
+KillMode=control-group
+UMask=0077
 ExecStart=/usr/bin/python3 /opt/graeae-oauth-shim/shim.py
 Restart=on-failure
 RestartSec=3

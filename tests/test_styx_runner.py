@@ -19,7 +19,7 @@ import pytest
 
 from mnemos.tools.styx.config import StyxConfig
 from mnemos.tools.styx.errors import StyxIntegrityError
-from mnemos.tools.styx.retention import artifact_name
+from mnemos.tools.styx.retention import artifact_name, parse_artifact_time
 from mnemos.tools.styx.runner import run_backup
 from tests._styx_fakes import FakeDriveFolder
 
@@ -110,7 +110,8 @@ async def test_backup_end_to_end_is_complete_and_restorable(tmp_path, make_confi
     assert receipt.ok is True
     assert receipt.error is None
     assert receipt.record_count == 2, "both the vault and ordinary memory must be exported"
-    assert receipt.artifact_name == artifact_name("testhost", NOW)
+    assert receipt.artifact_name.startswith("mnemos-testhost-")
+    assert parse_artifact_time(receipt.artifact_name) == NOW
     assert receipt.md5 == receipt.remote_md5, "verified against Drive's own digest"
     assert len(drive.files) == 1
 
@@ -123,7 +124,7 @@ async def test_backup_end_to_end_is_complete_and_restorable(tmp_path, make_confi
 
     dry = make_config(work_dir=tmp_path / "dry", dry_run=True)
     dry_receipt = await run_backup(dry, drive=None, now=NOW, keep_workdir=True)
-    artifact = dry.work_dir / f"run-{NOW.strftime('%Y%m%dT%H%M%SZ')}" / dry_receipt.artifact_name
+    (artifact,) = dry.work_dir.glob(f"run-*/{dry_receipt.artifact_name}")
     blob = artifact.read_bytes()
 
     bundle = _decrypt_bundle(blob, identity, tmp_path / "restore")
@@ -275,12 +276,12 @@ async def test_receipt_is_written_on_success_and_on_failure(tmp_path, make_confi
 
     failing = FakeDriveFolder()
     failing.corrupt_md5 = True
-    with pytest.raises(StyxIntegrityError):
+    with pytest.raises(StyxIntegrityError, match="checksum mismatch"):
         await run_backup(config, drive=failing, now=NOW)
 
     recorded = json.loads(receipt_path.read_text())
     assert recorded["ok"] is False
-    assert "checksum mismatch" in recorded["error"]
+    assert recorded["error"] == "backup_failed"
 
 
 @pytest.mark.asyncio

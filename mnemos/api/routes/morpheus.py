@@ -284,6 +284,9 @@ async def trigger_run(
     Admission permits one outstanding run per namespace (an all-namespace
     run conflicts with every namespace), at most 16 queued/active runs.
     """
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     _require_morpheus_installed()
     pg_backend = _require_postgres_backend()
     from mnemos.persistence.morpheus_jobs import MorpheusQueueFull, MorpheusQueueUnavailable, PostgresMorpheusJobs
@@ -340,6 +343,9 @@ async def rollback(
     and leaves the run status at 'rolled_back'. Returns 404 if the
     run_id doesn't exist.
     """
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     _require_morpheus_installed()
     pg_backend = _require_postgres_backend()
     pool_handle = pg_backend._pool

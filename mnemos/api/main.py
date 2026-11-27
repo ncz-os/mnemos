@@ -111,41 +111,46 @@ class _BodySizeLimitASGI:
         self.max_bytes = max_bytes
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["method"] not in ("POST", "PATCH", "PUT"):
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        # Fast-path: trust a declared Content-Length.
         headers = dict(scope.get("headers") or [])
-        cl_bytes = headers.get(b"content-length")
-        if cl_bytes is not None:
-            try:
-                if int(cl_bytes) > self.max_bytes:
-                    await self._send_413(send)
-                    return
-            except ValueError:
-                pass  # malformed CL, fall through to streaming check
-
-        received = 0
-
-        async def limited_receive():
-            nonlocal received
-            message = await receive()
-            if message["type"] == "http.request":
-                body = message.get("body") or b""
-                received += len(body)
-                if received > self.max_bytes:
-                    # Drain any remaining body so the client doesn't hang,
-                    # then signal the app via a closed channel.
-                    while message.get("more_body"):
-                        message = await receive()
-                    raise _BodyTooLarge()
-            return message
-
         try:
-            await self.app(scope, limited_receive, send)
-        except _BodyTooLarge:
+            declared = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            declared = 0
+        if declared > self.max_bytes:
             await self._send_413(send)
+            return
+
+        # Validate the bounded body before invoking any parser or response writer.
+        buffered = bytearray()
+        received = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                return
+            received += len(message.get("body", b""))
+            if received > self.max_bytes:
+                await self._send_413(send)
+                return
+            if message.get("body"):
+                buffered.extend(message["body"])
+            if not message.get("more_body", False):
+                break
+        body = bytes(buffered)
+        del buffered
+        replayed = False
+
+        async def replay():
+            nonlocal replayed
+            if replayed:
+                return await receive()
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await self.app(scope, replay, send)
 
     async def _send_413(self, send):
         msg = f'{{"detail":"Request body exceeds {self.max_bytes // 1024 // 1024} MB limit"}}'
@@ -346,7 +351,7 @@ _cors_origins = [o.strip() for o in _cors_origins_raw.split(",")]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
     allow_credentials=_cors_origins != ["*"],
 )

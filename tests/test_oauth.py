@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from tests._route_helpers import flatten_routes
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -93,7 +94,7 @@ class TestOAuthWiring:
 
     def test_router_registered_in_app(self):
         import mnemos.api.main as api_server
-        paths = {r.path for r in api_server.app.routes}
+        paths = {r.path for r in flatten_routes(api_server.app.routes)}
         auth_paths = [p for p in paths if p.startswith("/auth/oauth")]
         assert len(auth_paths) >= 3, f"expected oauth routes, got: {auth_paths}"
         admin_oauth_paths = [p for p in paths if p.startswith("/admin/oauth")]
@@ -166,9 +167,10 @@ class TestOAuthHelpers:
         # When sub absent, falls to oid
         assert _extract_external_id("azure-ad", {"oid": "abc-def"}) == "abc-def"
 
-    def test_extract_external_id_email_last_resort(self):
+    def test_extract_external_id_requires_subject(self):
         from mnemos.core.oauth import _extract_external_id
-        assert _extract_external_id("custom", {"email": "x@y.com"}) == "email:x@y.com"
+        assert _extract_external_id("custom", {"email": "sample@example.test"}) is None
+        assert _extract_external_id("custom", {"email": "sample@example.test", "email_verified": True}) is None
 
     def test_extract_external_id_none(self):
         from mnemos.core.oauth import _extract_external_id

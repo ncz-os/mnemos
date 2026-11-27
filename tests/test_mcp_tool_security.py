@@ -36,6 +36,8 @@ EXPECTED_USER_TOOLS = [
     "branch_memory",
     "diff_memory_commits",
     "checkout_memory",
+    "list_memory_versions",
+    "get_memory_version",
     "recommend_model",
     "list_deletions",
     "kronos_anomalies",

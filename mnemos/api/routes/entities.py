@@ -53,6 +53,9 @@ async def create_entity(
     req: EntityCreateRequest,
     user: UserContext = Depends(get_current_user),
 ):
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     # #171: entity_type is now Literal[...] in the request model —
     # Pydantic auto-422s on invalid values before we get here.
     _require_entities_backend()
@@ -164,6 +167,9 @@ async def update_entity(
     req: EntityUpdateRequest,
     user: UserContext = Depends(get_current_user),
 ):
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     _require_entities_backend()
     updates = {}
     if req.description is not None:
@@ -221,6 +227,9 @@ async def link_entities(
 
     Both entities must be owned by the caller (or caller must be root).
     """
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     _require_entities_backend()
     try:
         async with _lc.get_pool_manager().transactional() as conn:
@@ -265,6 +274,9 @@ async def link_entities(
 
 @router.delete("/entities/{entity_id}", status_code=204)
 async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_user)):
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     _require_entities_backend()
     try:
         async with _lc.get_pool_manager().transactional() as conn:

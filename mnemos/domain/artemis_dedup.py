@@ -146,6 +146,8 @@ async def sweep_duplicate_content(
     auto_merge: bool = False,
 ) -> dict[str, Any]:
     """Find duplicate active memories and optionally consolidate them."""
+    delivery_ids = []
+    nats_intents = []
     async with backend.transactional() as tx:
         rows = await backend.memories.find_duplicate_content_groups(
             tx,
@@ -158,11 +160,19 @@ async def sweep_duplicate_content(
                 duplicate_ids = group["duplicate_ids"]
                 if not duplicate_ids:
                     continue
-                merged += await backend.memories.consolidate_duplicate_memories(
-                    tx,
-                    canonical_id=group["canonical_id"],
-                    duplicate_ids=duplicate_ids,
+                changed = await backend.memories.mutate_exact_duplicates(
+                    tx, canonical_id=group["canonical_id"], duplicate_ids=duplicate_ids,
+                    owner_id=group["owner_id"], namespace=group["namespace"],
+                    content_hash=group["content_hash"], consolidate=True,
                 )
+                from mnemos.domain.memory_dedup import _maybe_write_delete_audit, _dispatch_delete_side_effects
+
+                for row in changed:
+                    await _maybe_write_delete_audit(backend, tx, row, row["id"])
+                    deliveries, events = await _dispatch_delete_side_effects(backend, tx, row)
+                    delivery_ids.extend(deliveries)
+                    nats_intents.extend(events)
+                merged += len(changed)
         return {
             "namespace": namespace,
             "groups": groups,
@@ -170,4 +180,6 @@ async def sweep_duplicate_content(
             "duplicate_count": sum(len(group["duplicate_ids"]) for group in groups),
             "auto_merge": auto_merge,
             "merged_count": merged,
+            "delivery_ids": delivery_ids,
+            "nats_intents": nats_intents,
         }

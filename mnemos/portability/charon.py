@@ -56,6 +56,7 @@ ADR: MNEMOS ``mem_1782679514682_85c817`` (2026-06-28).
 from __future__ import annotations
 
 import array as _array
+import asyncio
 import json
 import tempfile
 import uuid
@@ -66,7 +67,7 @@ from time import time
 from typing import Any
 
 from mnemos.domain.deletion_fence import assert_no_active_deletion_for_scopes
-from mnemos.persistence.base import is_duplicate_memory_error
+from mnemos.persistence.base import is_duplicate_memory_error, memory_insert_succeeded
 from mnemos.portability import mif
 
 MANIFEST_NAME = "mif-manifest.json"
@@ -433,11 +434,16 @@ def _memory_metadata_json(memory: dict[str, Any]) -> str:
 def _read_jsonl(
     path: Path,
     *,
+    root: Path,
     required: bool = False,
     expected_count: int | None = None,
     label: str = "sidecar",
 ) -> list[dict[str, Any]]:
     """Read a JSONL file. Declared sidecars are required and count-checked."""
+    resolved_root = root.resolve(strict=False)
+    resolved_path = path.resolve(strict=False)
+    relative_path = resolved_path.relative_to(resolved_root)
+    path = _resolve_bundle_path(resolved_root, relative_path.as_posix())
     if not path.is_file():
         if required:
             raise ValueError(f"manifest declares {label} at {path}, but the file is missing")
@@ -470,7 +476,7 @@ def _sidecar_rows(
     rel = spec.get("path") or default_rel
     path = _resolve_bundle_path(src, str(rel))
     expected = None if spec.get("truncated") else int(spec.get("count", 0))
-    return _read_jsonl(path, required=True, expected_count=expected, label=name)
+    return _read_jsonl(path, root=src, required=True, expected_count=expected, label=name)
 
 
 def _declared_sidecars(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -482,15 +488,55 @@ def _declared_sidecars(manifest: dict[str, Any]) -> dict[str, Any]:
     return sidecars
 
 
+async def _fetch_and_write_sidecar_batch(
+    backend: Any,
+    fh: Any,
+    batch: tuple[str, ...],
+    first: bool,
+    remaining: int,
+    fetch_batch: Callable[[Any, tuple[str, ...], bool, int], Any],
+    include_vault: bool,
+) -> tuple[int, bool]:
+    """Fetch one memory-id batch and append its rows to ``fh``.
+
+    Returns ``(rows_written, truncated)``. Honours the caller's remaining
+    budget via the repos' ``hard_limit + 1`` sentinel convention, and
+    restores the historical exact-limit edge: when the budget is already
+    exhausted (``remaining <= 0``) this reports ``truncated=True`` without
+    issuing a zero-budget fetch.
+    """
+    produced = 0
+    if remaining <= 0:
+        return produced, True
+    async with backend.transactional() as tx:
+        rows = await fetch_batch(tx, batch, first, remaining)
+    if len(rows) > remaining:
+        rows = rows[:remaining]
+        truncated_tail = True
+    else:
+        truncated_tail = False
+    for row in rows:
+        plain = _plain_row(row)
+        if not include_vault and _is_vault_namespace(plain):
+            continue
+        if produced >= remaining:
+            return produced, True
+        fh.write(json.dumps(plain, ensure_ascii=False))
+        fh.write("\n")
+        produced += 1
+    return produced, truncated_tail
+
+
 async def _write_batched_sidecar(
     backend: Any,
     path: Path,
     *,
-    memory_ids: Sequence[str],
+    memory_ids: Sequence[str] | Path,
     batch_size: int,
     include_empty_batch: bool,
     fetch_batch: Callable[[Any, tuple[str, ...], bool, int], Any],
     include_vault: bool = False,
+    on_progress: Callable[[int], Any] | None = None,
 ) -> tuple[int, bool]:
     """Fetch sidecar rows in bounded memory-id chunks and stream JSONL.
 
@@ -504,33 +550,96 @@ async def _write_batched_sidecar(
     path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
     truncated = False
-    batches = list(_chunks(memory_ids, _safe_sidecar_batch_size(batch_size)))
-    if not batches and include_empty_batch:
-        batches = [()]
-
-    with path.open("w", encoding="utf-8") as fh:
-        for index, batch in enumerate(batches):
-            if count >= SIDECAR_HARD_LIMIT:
-                truncated = True
-                break
-            remaining = SIDECAR_HARD_LIMIT - count
-            async with backend.transactional() as tx:
-                rows = await fetch_batch(tx, batch, index == 0, remaining)
-            if len(rows) > remaining:
-                truncated = True
-                rows = rows[:remaining]
-            for row in rows:
-                plain = _plain_row(row)
-                if not include_vault and _is_vault_namespace(plain):
-                    continue
-                if count >= SIDECAR_HARD_LIMIT:
-                    truncated = True
-                    break
-                fh.write(json.dumps(plain, ensure_ascii=False))
-                fh.write("\n")
-                count += 1
-            if truncated:
-                break
+    size = _safe_sidecar_batch_size(batch_size)
+    try:
+        with _private_export_open(path, encoding="utf-8") as fh:
+            if isinstance(memory_ids, Path):
+                # Disk-spooled ID index: read back in ``size`` chunks so the
+                # full id list never materialises in memory. Batched fetches
+                # already yield ``await`` points for the event loop, but a
+                # stall between them is silent; ``await asyncio.sleep(0)``
+                # after each chunk guarantees the loop still runs callbacks
+                # (an operator heartbeat) on an otherwise synchronous-looking
+                # file write.
+                first = True
+                batch: list[str] = []
+                with memory_ids.open("r", encoding="utf-8") as index:
+                    for line in index:
+                        line = line.strip()
+                        if line:
+                            batch.append(line)
+                        if len(batch) >= size:
+                            produced, done = await _fetch_and_write_sidecar_batch(
+                                backend,
+                                fh,
+                                tuple(batch),
+                                first,
+                                SIDECAR_HARD_LIMIT - count,
+                                fetch_batch,
+                                include_vault,
+                            )
+                            count += produced
+                            if done:
+                                truncated = True
+                                return count, truncated
+                            first = False
+                            batch = []
+                            if on_progress is not None:
+                                maybe = on_progress(count)
+                                if asyncio.iscoroutine(maybe):
+                                    await maybe
+                            await asyncio.sleep(0)
+                    if batch or (first and include_empty_batch):
+                        _batch = tuple(batch)
+                        if _batch or first:
+                            produced, done = await _fetch_and_write_sidecar_batch(
+                                backend,
+                                fh,
+                                _batch,
+                                first,
+                                SIDECAR_HARD_LIMIT - count,
+                                fetch_batch,
+                                include_vault,
+                            )
+                            count += produced
+                            if done:
+                                truncated = True
+                            if on_progress is not None:
+                                maybe = on_progress(count)
+                                if asyncio.iscoroutine(maybe):
+                                    await maybe
+                            await asyncio.sleep(0)
+            else:
+                batches = _chunks(memory_ids, size)
+                if not memory_ids and include_empty_batch:
+                    batches = ((),)
+                for index, id_batch in enumerate(batches):
+                    if count >= SIDECAR_HARD_LIMIT:
+                        truncated = True
+                        break
+                    produced, done = await _fetch_and_write_sidecar_batch(
+                        backend,
+                        fh,
+                        id_batch,
+                        index == 0,
+                        SIDECAR_HARD_LIMIT - count,
+                        fetch_batch,
+                        include_vault,
+                    )
+                    count += produced
+                    if done:
+                        truncated = True
+                        break
+                    if on_progress is not None:
+                        maybe = on_progress(count)
+                        if asyncio.iscoroutine(maybe):
+                            await maybe
+                    await asyncio.sleep(0)
+    except (asyncio.CancelledError, GeneratorExit):
+        # A cancelled export must not leave a half-written sidecar that a
+        # later import would mistake for complete.
+        path.unlink(missing_ok=True)
+        raise
     return count, truncated
 
 
@@ -568,7 +677,7 @@ def export_bundle(
             rel = f"{ctype}/{uuid}.md"
             path = out / rel
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(mif.concept_to_markdown(concept), encoding="utf-8")
+            _private_export_text(path, mif.concept_to_markdown(concept), encoding="utf-8")
             entry = {
                 "@id": concept["@id"],
                 "conceptType": ctype,
@@ -590,7 +699,7 @@ def export_bundle(
         if stream_manifest:
             # Keep the on-disk schema identical without constructing concepts[].
             index.seek(0)
-            with (out / MANIFEST_NAME).open("w", encoding="utf-8") as target:
+            with _private_export_open(out / MANIFEST_NAME, encoding="utf-8") as target:
                 target.write(json.dumps(manifest, ensure_ascii=False)[:-1] + ',"concepts":[')
                 separator = ""
                 for entry in index:
@@ -599,7 +708,9 @@ def export_bundle(
                 target.write("]}\n")
         else:
             manifest["concepts"] = entries
-            (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+            _private_export_text(
+                out / MANIFEST_NAME, json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
     return manifest
 
 
@@ -753,11 +864,32 @@ def _concept_to_memory_row(concept: dict[str, Any], base: dict[str, Any] | None 
     return memory
 
 
+def _private_export_open(path, mode="w", **kwargs):
+    import os
+
+    def open_private(name, flags):
+        fd = os.open(name, flags | os.O_NOFOLLOW, 0o600)
+        try:
+            # The creation mode has no effect when overwriting an existing file.
+            os.fchmod(fd, 0o600)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    return open(path, mode, opener=open_private, **kwargs)
+
+
+def _private_export_text(path, text, **kwargs):
+    with _private_export_open(path, **kwargs) as handle:
+        return handle.write(text)
+
+
 def _write_jsonl(rows: Iterable[Any], path: Path) -> int:
     """Write one JSON object per row to ``path``. Returns the count written."""
     path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
-    with path.open("w", encoding="utf-8") as fh:
+    with _private_export_open(path, encoding="utf-8") as fh:
         for row in rows:
             fh.write(json.dumps(_jsonable(row), ensure_ascii=False))
             fh.write("\n")
@@ -777,15 +909,29 @@ async def export_bundle_from_backend(
     page_size: int = DEFAULT_PAGE_SIZE,
     sidecar_batch_size: int = DEFAULT_SIDECAR_BATCH_SIZE,
     include_archived: bool = False,
+    on_progress: Callable[[int], Any] | None = None,
 ) -> dict[str, Any]:
     """Export every visible memory from ``backend`` as a MIF bundle under
-    ``out_dir``, optionally with KG / version / compression sidecars.
 
-    The export is backend-agnostic: it walks full memory rows via
+    The export is backend-agnostic: it walks memory rows page by page via
     ``backend.memories.fetch_memory_export`` and applies CHARON's vault /
     archive policy in this orchestration layer, then pulls each sidecar
     slice via the corresponding repo's ``fetch_*_for_export`` method. No
     backend-specific SQL appears in this module.
+
+    Streaming behaviour: the core MIF concept layer and the full-row
+    ``memories.jsonl`` sidecar are written one row at a time — neither the
+    full-row list nor the full concept entry list is ever retained. The
+    memory-id index is spooled to a temporary file under ``out_dir`` and
+    re-read in batches for the id-bound sidecars (versions / compression),
+    so peak memory scales with ``page_size`` / ``sidecar_batch_size``, not
+    with corpus size.
+
+    Keyset paging: the walk starts at the beginning of the ordered row
+    set (``offset=0``) and every later page resumes strictly after the
+    last raw row via the repo's ``record_cursor`` (``(created, id)`` is a
+    total order), so OFFSET row visits stay O(N) and cannot skip or repeat
+    rows the way a growing OFFSET would.
 
     Parameters
     ----------
@@ -843,8 +989,9 @@ async def export_bundle_from_backend(
         secret material.
     page_size:
         Page size for the ``fetch_memory_export`` walk. Bounded so peak memory
-        stays sane on multi-million-row stores; the repo already does
-        LIMIT/OFFSET pagination.
+        scales with the page, not the corpus. The walk uses LIMIT plus a
+        ``(created, id)`` keyset cursor (``offset`` is always 0 on this entry
+        point), so later pages never re-visit earlier rows.
     sidecar_batch_size:
         Maximum memory ids per sidecar repository fetch. Capped at 500 to
         stay below Oracle's IN-list limit and to keep bind arrays bounded.
@@ -852,9 +999,29 @@ async def export_bundle_from_backend(
         Defaults to ``False`` to mirror the existing memory list semantics
         — archived memories are operator-visible, but the default CHARON
         export is the live set.
+    on_progress:
+        Optional per-page callback receiving a progress count so far: the
+        exported concept count during the memory walk, and sidecar row
+        counts while the kg/ver/comp/memories sidecars stream. May be sync
+        or async. Awaiting it after every page keeps the event loop
+        responsive (an async heartbeat progresses) during large file
+        writes. Cancellation from inside the callback propagates and
+        removes partial outputs (see below).
 
-    Returns the bundle manifest (``mif-manifest.json`` shape, with an
-    added ``sidecars`` block when ``include_sidecars`` is true).
+    Cancellation removes the spooled indexes, the concept manifest (if
+    written), and the sidecar file currently being written, so a later
+    import never mistakes a half-written bundle for complete. Concept
+    ``.md`` files already written, and sidecar files completed before the
+    cancel, are NOT removed — retry into a clean ``out_dir``.
+
+    Returns a small manifest dict (``count``, ``backend``,
+    ``sidecars``/``sidecars_included``, vault flags) plus the generator
+    metadata. Unlike the sync :func:`export_bundle`, the returned dict
+    carries NO ``"concepts"`` list — that list is O(N) and would defeat
+    the streaming bound. The on-disk ``mif-manifest.json`` DOES contain
+    the full ``"concepts"`` array (streamed back from the spool), and
+    :func:`import_bundle` reads concepts from disk, so round-trips are
+    unaffected.
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -864,164 +1031,355 @@ async def export_bundle_from_backend(
     # redaction they are dropped — see _write_batched_sidecar's docstring.
     sidecar_vault = include_vault and not redact_vault
 
-    memories_for_concept: list[dict[str, Any]] = []
-    memory_ids: list[str] = []
-    offset = 0
-    while True:
-        async with backend.transactional() as tx:
-            rows = await backend.memories.fetch_memory_export(
-                tx,
-                effective_owner=owner_id,
-                effective_ns=namespace,
-                category=None,
-                limit=page_size,
-                offset=offset,
-                include_secrets=include_vault,
-            )
-        if not rows:
-            break
-        for row in rows:
-            memory = _row_to_memory_dict(row)
-            if _is_vault_namespace(memory):
-                if not include_vault:
-                    continue
-                if redact_vault:
-                    memory = _redact_vault_row(memory)
-            if not include_archived and memory.get("archived_at") is not None:
-                continue
-            memories_for_concept.append(memory)
-            mid = memory.get("id")
-            if mid is not None:
-                memory_ids.append(str(mid))
-        offset += len(rows)
-        if len(rows) < page_size:
-            break
-
-    # Reuse the pure ``export_bundle`` for the concept layer — keeps the
-    # existing MIF-side behaviour (validation, vault redaction, manifest
-    # shape) byte-identical.
-    manifest = export_bundle(
-        memories_for_concept,
-        out,
-        redact_vault=redact_vault,
-        validate=True,
+    page_size = max(1, int(page_size))
+    # Disk-spooled memory-id index: the id-bound sidecars (versions /
+    # compression) need every exported id, but the full list must not be
+    # retained in memory. Spooled under ``out_dir`` so it lives on the same
+    # filesystem as the bundle (no /tmp dependency).
+    id_index = tempfile.NamedTemporaryFile(
+        mode="w+", encoding="utf-8", dir=out, prefix=".charon-ids-", suffix=".tmp", delete=False
     )
+    id_index_path = Path(id_index.name)
+    # Manifest concept entries are spooled the same way so the in-memory
+    # entry list never grows with the corpus.
+    entry_index = tempfile.NamedTemporaryFile(
+        mode="w+", encoding="utf-8", dir=out, prefix=".charon-entries-", suffix=".tmp", delete=False
+    )
+    entry_index_path = Path(entry_index.name)
+    try:
+        await _stream_concepts_and_memories_sidecar(
+            backend,
+            out,
+            id_index=id_index,
+            entry_index=entry_index,
+            owner_id=owner_id,
+            namespace=namespace,
+            include_vault=include_vault,
+            redact_vault=redact_vault,
+            page_size=page_size,
+            include_archived=include_archived,
+            include_memories_sidecar=include_sidecars,
+            on_progress=on_progress,
+        )
+    except (asyncio.CancelledError, GeneratorExit, BaseException):
+        # Close the spool handles before unlinking: on Windows a file with
+        # open handles cannot be removed, and the finally below would only
+        # run after this block. close() is idempotent, so the finally
+        # retries harmlessly.
+        for handle in (id_index, entry_index):
+            try:
+                handle.close()
+            except OSError:
+                pass
+        for partial in (
+            out / MANIFEST_NAME,
+            out / SIDECAR_DIR / MEMORIES_SIDECAR,
+            id_index_path,
+            entry_index_path,
+        ):
+            partial.unlink(missing_ok=True)
+        raise
+    finally:
+        try:
+            id_index.close()
+        except OSError:
+            pass
+        try:
+            entry_index.close()
+        except OSError:
+            pass
+    count = _count_index_lines(entry_index_path)
+
+    manifest: dict[str, Any] = {
+        "mif_version": MIF_VERSION,
+        "schema": MIF_SCHEMA_ID,
+        "context": mif.MIF_CONTEXT_URI,
+        "generator": "mnemos-core",
+        "count": count,
+    }
 
     sidecar_block: dict[str, Any] = {}
-    if include_sidecars:
-        sidecar_dir = out / SIDECAR_DIR
-        sidecar_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if include_sidecars:
+            sidecar_dir = out / SIDECAR_DIR
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
 
-        memory_count = _write_jsonl(memories_for_concept, sidecar_dir / MEMORIES_SIDECAR)
-        sidecar_block["memories"] = {
-            "path": f"{SIDECAR_DIR}/{MEMORIES_SIDECAR}",
-            "count": memory_count,
-            "truncated": False,
-        }
+            memory_count = count
+            sidecar_block["memories"] = {
+                "path": f"{SIDECAR_DIR}/{MEMORIES_SIDECAR}",
+                "count": memory_count,
+                "truncated": False,
+            }
 
-        # KG triples: include_unattached=True so cross-entity facts (no
-        # backing memory) survive a round-trip. Only the first batch asks
-        # for unattached rows, preventing duplicates across chunks.
-        async def _fetch_kg_batch(tx: Any, batch: tuple[str, ...], first: bool, hard_limit: int) -> list[Any]:
-            return await backend.kg_triples.fetch_kg_triples_for_export(
-                tx,
-                memory_ids=batch,
-                effective_owner=owner_id,
-                effective_ns=namespace,
-                include_unattached=first,
-                hard_limit=hard_limit,
-                include_secrets=sidecar_vault,
+            # The spooled id index is read back in batches by the
+            # id-bound sidecars, so it is never materialised in memory.
+
+            # KG triples: include_unattached=True so cross-entity facts (no
+            # backing memory) survive a round-trip. Only the first batch asks
+            # for unattached rows, preventing duplicates across chunks.
+            async def _fetch_kg_batch(tx: Any, batch: tuple[str, ...], first: bool, hard_limit: int) -> list[Any]:
+                return await backend.kg_triples.fetch_kg_triples_for_export(
+                    tx,
+                    memory_ids=batch,
+                    effective_owner=owner_id,
+                    effective_ns=namespace,
+                    include_unattached=first,
+                    hard_limit=hard_limit,
+                    include_secrets=sidecar_vault,
+                )
+
+            kg_count, kg_truncated = await _write_batched_sidecar(
+                backend,
+                sidecar_dir / KG_TRIPLES_SIDECAR,
+                memory_ids=id_index_path,
+                batch_size=sidecar_batch_size,
+                include_empty_batch=True,
+                fetch_batch=_fetch_kg_batch,
+                include_vault=sidecar_vault,
+                on_progress=on_progress,
             )
+            sidecar_block["kg_triples"] = {
+                "path": f"{SIDECAR_DIR}/{KG_TRIPLES_SIDECAR}",
+                "count": kg_count,
+                "truncated": kg_truncated,
+            }
 
-        kg_count, kg_truncated = await _write_batched_sidecar(
-            backend,
-            sidecar_dir / KG_TRIPLES_SIDECAR,
-            memory_ids=memory_ids,
-            batch_size=sidecar_batch_size,
-            include_empty_batch=True,
-            fetch_batch=_fetch_kg_batch,
-            include_vault=sidecar_vault,
-        )
-        sidecar_block["kg_triples"] = {
-            "path": f"{SIDECAR_DIR}/{KG_TRIPLES_SIDECAR}",
-            "count": kg_count,
-            "truncated": kg_truncated,
-        }
+            # Memory versions: bound to a known memory set (an unattached
+            # version row is not a thing — versions always hang off a memory).
+            async def _fetch_version_batch(tx: Any, batch: tuple[str, ...], _first: bool, hard_limit: int) -> list[Any]:
+                if not batch:
+                    return []
+                return await backend.memory_versions.fetch_memory_versions_for_export(
+                    tx,
+                    memory_ids=batch,
+                    effective_owner=owner_id,
+                    effective_ns=namespace,
+                    hard_limit=hard_limit,
+                    include_secrets=sidecar_vault,
+                )
 
-        # Memory versions: bound to a known memory set (an unattached
-        # version row is not a thing — versions always hang off a memory).
-        async def _fetch_version_batch(tx: Any, batch: tuple[str, ...], _first: bool, hard_limit: int) -> list[Any]:
-            if not batch:
-                return []
-            return await backend.memory_versions.fetch_memory_versions_for_export(
-                tx,
-                memory_ids=batch,
-                effective_owner=owner_id,
-                effective_ns=namespace,
-                hard_limit=hard_limit,
-                include_secrets=sidecar_vault,
+            ver_count, ver_truncated = await _write_batched_sidecar(
+                backend,
+                sidecar_dir / MEMORY_VERSIONS_SIDECAR,
+                memory_ids=id_index_path,
+                batch_size=sidecar_batch_size,
+                include_empty_batch=False,
+                fetch_batch=_fetch_version_batch,
+                include_vault=sidecar_vault,
+                on_progress=on_progress,
             )
+            sidecar_block["memory_versions"] = {
+                "path": f"{SIDECAR_DIR}/{MEMORY_VERSIONS_SIDECAR}",
+                "count": ver_count,
+                "truncated": ver_truncated,
+            }
 
-        ver_count, ver_truncated = await _write_batched_sidecar(
-            backend,
-            sidecar_dir / MEMORY_VERSIONS_SIDECAR,
-            memory_ids=memory_ids,
-            batch_size=sidecar_batch_size,
-            include_empty_batch=False,
-            fetch_batch=_fetch_version_batch,
-            include_vault=sidecar_vault,
-        )
-        sidecar_block["memory_versions"] = {
-            "path": f"{SIDECAR_DIR}/{MEMORY_VERSIONS_SIDECAR}",
-            "count": ver_count,
-            "truncated": ver_truncated,
-        }
+            # Compressed variants: also memory-bound.
+            async def _fetch_compression_batch(
+                tx: Any, batch: tuple[str, ...], _first: bool, hard_limit: int
+            ) -> list[Any]:
+                if not batch:
+                    return []
+                return await backend.compression.fetch_compressed_variants_for_export(
+                    tx,
+                    memory_ids=batch,
+                    effective_owner=owner_id,
+                    hard_limit=hard_limit,
+                )
 
-        # Compressed variants: also memory-bound.
-        async def _fetch_compression_batch(tx: Any, batch: tuple[str, ...], _first: bool, hard_limit: int) -> list[Any]:
-            if not batch:
-                return []
-            return await backend.compression.fetch_compressed_variants_for_export(
-                tx,
-                memory_ids=batch,
-                effective_owner=owner_id,
-                hard_limit=hard_limit,
+            comp_count, comp_truncated = await _write_batched_sidecar(
+                backend,
+                sidecar_dir / COMPRESSION_SIDECAR,
+                memory_ids=id_index_path,
+                batch_size=sidecar_batch_size,
+                include_empty_batch=False,
+                fetch_batch=_fetch_compression_batch,
+                include_vault=sidecar_vault,
+                on_progress=on_progress,
             )
+            sidecar_block["compression"] = {
+                "path": f"{SIDECAR_DIR}/{COMPRESSION_SIDECAR}",
+                "count": comp_count,
+                "truncated": comp_truncated,
+            }
 
-        comp_count, comp_truncated = await _write_batched_sidecar(
-            backend,
-            sidecar_dir / COMPRESSION_SIDECAR,
-            memory_ids=memory_ids,
-            batch_size=sidecar_batch_size,
-            include_empty_batch=False,
-            fetch_batch=_fetch_compression_batch,
-            include_vault=sidecar_vault,
-        )
-        sidecar_block["compression"] = {
-            "path": f"{SIDECAR_DIR}/{COMPRESSION_SIDECAR}",
-            "count": comp_count,
-            "truncated": comp_truncated,
-        }
+            manifest["sidecars"] = sidecar_block
+            manifest["sidecars_included"] = True
+            manifest["backend"] = type(backend).__name__
+        else:
+            manifest["sidecars_included"] = False
+            manifest["backend"] = type(backend).__name__
 
-        manifest["sidecars"] = sidecar_block
-        manifest["sidecars_included"] = True
-        manifest["backend"] = type(backend).__name__
-    else:
-        manifest["sidecars_included"] = False
-        manifest["backend"] = type(backend).__name__
+        # Additive, and only in the new mode, so a default export's manifest is
+        # byte-identical to what it was before this parameter existed. A restorer
+        # (and STYX's own integrity gate) needs to be able to tell a complete
+        # backup from one that silently dropped the vault.
+        if include_vault:
+            manifest["vault_included"] = True
+            manifest["vault_redacted"] = bool(redact_vault)
 
-    # Additive, and only in the new mode, so a default export's manifest is
-    # byte-identical to what it was before this parameter existed. A restorer
-    # (and STYX's own integrity gate) needs to be able to tell a complete
-    # backup from one that silently dropped the vault.
-    if include_vault:
-        manifest["vault_included"] = True
-        manifest["vault_redacted"] = bool(redact_vault)
+        # The manifest is written last, streaming the spooled entries back from
+        # disk into the on-disk ``"concepts"`` array, then the spool is removed.
+        # The RETURNED manifest carries no ``"concepts"`` list: that list is
+        # O(N) and would defeat the streaming bound for any caller holding the
+        # return value. Import reads concepts from disk
+        # (:func:`import_bundle` prefers the on-disk manifest), and every
+        # in-repo consumer only needs ``count`` / ``sidecars`` / vault keys.
+        _write_spooled_manifest(out / MANIFEST_NAME, manifest, entry_index_path)
+        return manifest
+    finally:
+        for spool in (id_index_path, entry_index_path):
+            try:
+                spool.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    # Re-emit with the new keys merged in (export_bundle wrote its own
-    # manifest; we re-write to preserve the same on-disk shape).
-    (out / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-    return manifest
+
+def _write_spooled_manifest(manifest_path: Path, manifest: dict[str, Any], entry_index_path: Path) -> None:
+    """Write the manifest without building a concepts list in memory.
+
+    Entries spooled by the concept walk are streamed back from disk into
+    the on-disk ``"concepts"`` array, keeping the on-disk schema identical.
+    """
+    full = dict(manifest)
+    full["concepts"] = []
+    prefix, _suffix = json.dumps(full, indent=2, ensure_ascii=False).rsplit("]", 1)
+    with _private_export_open(manifest_path, encoding="utf-8") as target:
+        target.write(prefix)
+        with entry_index_path.open("r", encoding="utf-8") as index:
+            first = True
+            for entry in index:
+                line = entry.strip()
+                if not line:
+                    continue
+                if not first:
+                    target.write(",")
+                target.write("\n    " + line)
+                first = False
+        target.write("\n  ]\n}\n")
+
+
+def _count_index_lines(path: Path) -> int:
+    count = 0
+    with path.open("r", encoding="utf-8") as fh:
+        for _ in fh:
+            count += 1
+    return count
+
+
+async def _stream_concepts_and_memories_sidecar(
+    backend: Any,
+    out: Path,
+    *,
+    id_index: Any,
+    entry_index: Any,
+    owner_id: str | None,
+    namespace: str | None,
+    include_vault: bool,
+    redact_vault: bool,
+    page_size: int,
+    include_archived: bool,
+    include_memories_sidecar: bool,
+    on_progress: Callable[[int], Any] | None,
+) -> int:
+    """Walk pages, writing concept files, a spooled index and the sidecar.
+
+    Each fetched row is converted, validated and written, then dropped —
+    only one page of rows is ever retained. Concept files, the
+    ``memories.jsonl`` sidecar row, the spooled manifest entry and the
+    spooled memory id are all emitted per row so a fixed-size page bounds
+    peak memory regardless of corpus size. Returns the exported count.
+    """
+    count = 0
+    sidecar_path: Path | None = None
+    sidecar_fh: Any = None
+    try:
+        if include_memories_sidecar:
+            sidecar_dir = out / SIDECAR_DIR
+            sidecar_dir.mkdir(parents=True, exist_ok=True)
+            sidecar_path = sidecar_dir / MEMORIES_SIDECAR
+            sidecar_fh = _private_export_open(sidecar_path, encoding="utf-8")
+        # Keyset walk: the first page starts at offset 0 and every later
+        # page resumes strictly after the last raw row via the cursor.
+        # Re-applying OFFSET after a cursor would skip rows a second time
+        # (and a growing OFFSET makes the DB revisit O(N^2/page) rows).
+        cursor: tuple[Any, str] | None = None
+        while True:
+            async with backend.transactional() as tx:
+                rows = await backend.memories.fetch_memory_export(
+                    tx,
+                    effective_owner=owner_id,
+                    effective_ns=namespace,
+                    category=None,
+                    limit=page_size,
+                    offset=0,
+                    include_secrets=include_vault,
+                    record_cursor=cursor,
+                )
+            if not rows:
+                break
+            for row in rows:
+                memory = _row_to_memory_dict(row)
+                if _is_vault_namespace(memory):
+                    if not include_vault:
+                        continue
+                    if redact_vault:
+                        memory = _redact_vault_row(memory)
+                if not include_archived and memory.get("archived_at") is not None:
+                    continue
+                concept = mif.memory_to_concept(memory, redact_vault=redact_vault)
+                errors = mif.validate_concept(concept)
+                if errors:
+                    raise ValueError(
+                        f"memory {memory.get('id')!r} produced a non-conformant MIF concept: " + "; ".join(errors)
+                    )
+                uuid = _concept_uuid(concept)
+                ctype = concept["conceptType"]
+                rel = f"{ctype}/{uuid}.md"
+                concept_path = out / rel
+                concept_path.parent.mkdir(parents=True, exist_ok=True)
+                _private_export_text(concept_path, mif.concept_to_markdown(concept), encoding="utf-8")
+                entry = {
+                    "@id": concept["@id"],
+                    "conceptType": ctype,
+                    "path": rel,
+                    "mnemos_id": (concept.get("properties") or {}).get("mnemos:id"),
+                }
+                entry_index.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                mid = memory.get("id")
+                if mid is not None:
+                    id_index.write(str(mid) + "\n")
+                if sidecar_fh is not None:
+                    sidecar_fh.write(json.dumps(_jsonable(memory), ensure_ascii=False) + "\n")
+                count += 1
+            # Advance the keyset from the raw row, not the filtered memory:
+            # filtered-out rows (vault / archived) still occupy keyset space
+            # and must not be re-fetched.
+            raw_last = rows[-1]
+            try:
+                cursor = (raw_last["created"], raw_last["id"])
+            except (KeyError, IndexError, TypeError):
+                cursor = (_row_get(raw_last, "created"), _row_get(raw_last, "id"))
+            if on_progress is not None:
+                maybe = on_progress(count)
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+            # Yield to the event loop after every page so an async
+            # heartbeat progresses during large file writes.
+            await asyncio.sleep(0)
+            if len(rows) < page_size:
+                break
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    finally:
+        if sidecar_fh is not None:
+            try:
+                sidecar_fh.close()
+            except OSError:
+                pass
+    id_index.flush()
+    entry_index.flush()
+    return count
 
 
 async def import_bundle_to_backend(
@@ -1177,8 +1535,6 @@ async def import_bundle_to_backend(
                 # fresh ``mem_<ts>_<hex>`` so we stay schema-conformant.
                 mid = _new_memory_id()
                 memory["id"] = mid
-            if old_mid is not None:
-                memory_id_map[str(old_mid)] = str(mid)
 
             # The concept mapping may have left ``embedding_model`` /
             # ``embedding_dim`` keys behind (it strips them in
@@ -1192,7 +1548,7 @@ async def import_bundle_to_backend(
             memory.setdefault("permission_mode", 0)
             memory.setdefault("quality_rating", 50)
             try:
-                await backend.memories.insert_memory(
+                insert_result = await backend.memories.insert_memory(
                     tx,
                     memory_id=mid,
                     content=memory.get("content") or "",
@@ -1212,6 +1568,11 @@ async def import_bundle_to_backend(
                     created=_parse_datetime(memory.get("created"), field="created"),
                     updated=_parse_datetime(memory.get("updated"), field="updated"),
                 )
+                if not memory_insert_succeeded(insert_result):
+                    memories_skipped += 1
+                    continue
+                if old_mid is not None:
+                    memory_id_map[str(old_mid)] = str(mid)
                 update_fields = {
                     key: memory[key]
                     for key in _MEMORY_POST_INSERT_UPDATE_KEYS

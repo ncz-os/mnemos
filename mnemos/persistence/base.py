@@ -237,6 +237,11 @@ class ModelRegistryHealth:
     last_sync_at: str | None
 
 
+def memory_insert_succeeded(result: str) -> bool:
+    """Normalize the insert status shared by all six repositories."""
+    return result != "INSERT 0 0"
+
+
 def is_duplicate_memory_error(exc: BaseException) -> bool:
     """Best-effort "this row already exists" detection across backends.
 
@@ -567,6 +572,40 @@ class MemoryRepository(ABC):
     ) -> Row | None: ...
 
     @abstractmethod
+    async def fetch_memory_versions(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        user: UserContext,
+    ) -> list[Row]:
+        """Return version snapshots for ``memory_id`` on ``branch`` (oldest first).
+
+        Same visibility contract as the other history reads: non-root
+        callers must pass ``assert_memory_readable`` first (the MCP tools
+        do) and only see rows their own ``owner_id`` / group / world /
+        ACL grants plus namespace pin entitle them to; the vault
+        namespace never surfaces on the default path. Root sees every
+        non-deleted row.
+        """
+        ...
+
+    @abstractmethod
+    async def fetch_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        user: UserContext,
+    ) -> Row | None:
+        """Return one version snapshot by ``(memory_id, version_num, branch)``.
+
+        Same visibility contract as :meth:`fetch_memory_versions`.
+        """
+        ...
+
+    @abstractmethod
     async def fetch_memory_export(
         self,
         tx: Transaction,
@@ -705,7 +744,12 @@ class MemoryRepository(ABC):
         embedding: Sequence[float] | None = None,
         created: Any,
         updated: Any,
-    ) -> str: ...
+    ) -> str:
+        """Return INSERT 0 1 for insertion or INSERT 0 0 for an unchanged conflict.
+
+        SQLite may instead raise DuplicateMemoryError for a conflict.
+        """
+        ...
 
     @abstractmethod
     async def replace_memory_tags(
@@ -806,6 +850,26 @@ class MemoryRepository(ABC):
         narrow the ``COUNT(*)`` as well.
         """
         ...
+
+    async def get_memory_by_audit_key(
+        self, tx: Transaction, audit_key: bytes, *, visibility: VisibilityFilter,
+        include_archived: bool = False,
+    ) -> Row | None:
+        """Resolve a stored audit key through each backend's visible memory listing."""
+        import hashlib
+
+        offset = 0
+        while True:
+            rows, total = await self.list_memories(
+                tx, visibility=visibility, include_archived=include_archived,
+                limit=200, offset=offset,
+            )
+            for row in rows:
+                if hashlib.sha256(str(row["id"]).encode("utf-8")).digest()[:16] == bytes(audit_key):
+                    return row
+            offset += len(rows)
+            if not rows or offset >= total:
+                return None
 
     @abstractmethod
     async def get_memory(
@@ -957,6 +1021,29 @@ class MemoryRepository(ABC):
     ) -> list[Row]:
         """Return active duplicate-content groups for ARTEMIS sweeps."""
         ...
+
+    async def fetch_daily_recall_counts(self, tx: Transaction, *, namespace: str, start: Any, end: Any) -> list[Row]:
+        """Read UTC daily counts in the complete half-open interval."""
+        from mnemos.persistence.recall_observations import fetch_daily_recall_counts
+
+        return await fetch_daily_recall_counts(tx, namespace=namespace, start=start, end=end)
+
+    async def mutate_exact_duplicates(
+        self, tx: Transaction, *, canonical_id: str, duplicate_ids: Sequence[str],
+        owner_id: str, namespace: str, content_hash: str, consolidate: bool = False,
+    ) -> list[Row]:
+        """Lock and validate an exact group; return only changed rows.
+
+        All six backends use their transaction dialect through the shared
+        persistence implementation. Locks remain held until the caller commits.
+        """
+        from mnemos.persistence.exact_groups import mutate_exact_duplicates
+
+        return await mutate_exact_duplicates(
+            tx, canonical_id=canonical_id, duplicate_ids=duplicate_ids,
+            owner_id=owner_id, namespace=namespace, content_hash=content_hash,
+            consolidate=consolidate,
+        )
 
     @abstractmethod
     async def consolidate_duplicate_memories(
@@ -1193,6 +1280,60 @@ class VersionRepository(ABC):
 
     @abstractmethod
     async def fetch_memory_version_by_id(self, tx: Transaction, version_id: str) -> Row | None: ...
+
+    @abstractmethod
+    async def list_memory_versions(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        """Return version-history summaries for ``memory_id``/``branch``, oldest first.
+
+        ``visibility`` carries the caller's tenancy envelope
+        (``ROOT_BYPASS`` for root, otherwise ``READABLE`` pinned to the
+        caller's namespace). Implementations MUST filter on the
+        *snapshot's own* tenancy columns (``owner_id`` / ``namespace`` /
+        ``permission_mode`` / ``group_id`` plus the ACL escape hatch on
+        the parent ``memory_id``), never the live memory's: a snapshot
+        that was private at v1 stays hidden after a later public flip.
+        """
+        ...
+
+    @abstractmethod
+    async def get_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        """Return the full version row for ``version_num`` or ``None``.
+
+        Same per-snapshot visibility contract as
+        :meth:`list_memory_versions`.
+        """
+        ...
+
+    @abstractmethod
+    async def fetch_version_contents(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_nums: Sequence[int],
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        """Return ``(version_num, content)`` rows for ``version_nums``.
+
+        Powers ``GET .../diff``. Same per-snapshot visibility contract
+        as :meth:`list_memory_versions`: snapshots the caller could not
+        read directly are omitted, so the route 404s instead of
+        diffing text the caller must never see.
+        """
+        ...
 
 
 class BranchRepository(ABC):
@@ -1643,7 +1784,8 @@ class ModelRegistryRepository(ABC):
       ``pricing_model`` is one of :data:`PRICING_MODELS`; ``band`` is one of
       :data:`PRICE_BANDS`. Both round-trip verbatim.
     * **Aliases never collide with real ids.** ``set_alias`` is the only write
-      path. ``alias_of`` is unique per provider, an alias may not point at
+      path. Alias IDs are unique per provider. SQLite allows one alias per
+      target, while PostgreSQL allows multiple. An alias may not point at
       itself or at another alias (one hop only), and a lookalike id that
       differs only in case/separators is rejected rather than silently
       inserted. ``list_models`` never surfaces alias rows.
@@ -4307,6 +4449,9 @@ class PersistenceCapabilityBase(Protocol):
     ) -> AsyncContextManager[Transaction]:
         """Open a backend-neutral transaction context.
 
+        ``readonly=True`` must reject writes or fail before yielding.
+        Unsupported combinations raise ValueError.
+
         ``isolation=None`` keeps each backend's existing default, so every
         pre-existing call site is unchanged. A non-None value is a REAL
         request that the backend must honor or refuse — never silently ignore.
@@ -4325,10 +4470,9 @@ class PersistenceCapabilityBase(Protocol):
                      REPEATABLE READ keyword; read-only transactions give
                      statement-set read consistency from a single SCN,
                      which is the guarantee REPEATABLE READ names
-                     elsewhere. SERIALIZABLE maps to
+                     elsewhere. Read-write SERIALIZABLE maps to
                      ``ISOLATION LEVEL SERIALIZABLE``.
-        Db2          ``SET CURRENT ISOLATION = RR`` (Repeatable Read is
-                     Db2's literal name for it) before BEGIN.
+        Db2          Read-only requests raise ValueError before checkout.
         SQLite       **Different mechanism, equivalent guarantee — see
                      below.** This is the one row that is NOT the same
                      thing under a different name. ``readonly`` is

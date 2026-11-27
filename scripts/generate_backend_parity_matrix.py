@@ -127,7 +127,7 @@ BACKEND_CLASSES: dict[str, tuple[str, str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Hand-verified split of the 33 "no surface, no test" cells (backlog section
+# Hand-verified split of the 32 "no surface, no test" cells (backlog section
 # 6, 2026-10-17). These two frozensets are the *authoritative* enumeration
 # and are hard-asserted against the live matrix in :func:`_render_markdown`,
 # so any future change that moves a correctly-absent cell into the surface
@@ -160,7 +160,6 @@ _REAL_BACKLOG_CELLS: frozenset[tuple[str, str]] = frozenset(
         ("consultations", "mariadb"),
         ("acl", "mysql"),
         ("acl", "mariadb"),
-        ("journal", "mariadb"),
         ("ledger", "mysql"),
         ("ledger", "mariadb"),
     }
@@ -169,8 +168,8 @@ _REAL_BACKLOG_CELLS: frozenset[tuple[str, str]] = frozenset(
 assert not (_CORRECTLY_ABSENT_CELLS & _REAL_BACKLOG_CELLS), (
     "correctly-absent and real-backlog cells must be disjoint"
 )
-assert len(_CORRECTLY_ABSENT_CELLS) + len(_REAL_BACKLOG_CELLS) == 33, (
-    f"33-cell split must sum to 33, got "
+assert len(_CORRECTLY_ABSENT_CELLS) + len(_REAL_BACKLOG_CELLS) == 32, (
+    f"32-cell split must sum to 32, got "
     f"{len(_CORRECTLY_ABSENT_CELLS)} + {len(_REAL_BACKLOG_CELLS)}"
 )
 
@@ -1999,7 +1998,7 @@ def _render_markdown(cells: list[Cell]) -> str:
     # so the matrix never lies about itself.
     assert full_count + impl_only + stub_with_test + gaps == len(cells), f"category counts do not sum to {len(cells)}"
 
-    # Hand-verified 33-cell split (backlog section 6): every cell in
+    # Hand-verified 32-cell split (backlog section 6): every cell in
     # _CORRECTLY_ABSENT_CELLS / _REAL_BACKLOG_CELLS must be a live "neither"
     # cell right now. If the detector regresses (a Postgres-only cell gains
     # surface, or a real-backlog cell gets a facade) the count changes and
@@ -2092,18 +2091,18 @@ def _render_markdown(cells: list[Cell]) -> str:
         f"accessor. The two signals are now reconciled: the matrix\n"
         f"reflects the surface; the flag still controls delivery.\n"
         f"\n"
-        f"## 33 'no surface, no test' cells — hand-verified split\n"
+        f"## 32 'no surface, no test' cells — hand-verified split\n"
         f"\n"
-        f"All 33 cells were hand-verified 2026-10-17. They fall into\n"
-        f"two disjoint classes: **correctly absent** (25) and **real\n"
-        f"backlog** (9). The split is recorded in the module-level\n"
+        f"All 32 cells were hand-verified 2026-10-17. They fall into\n"
+        f"two disjoint classes: **correctly absent** ({len(_CORRECTLY_ABSENT_CELLS)}) and **real\n"
+        f"backlog** ({len(_REAL_BACKLOG_CELLS)}). The split is recorded in the module-level\n"
         f"constants ``_CORRECTLY_ABSENT_CELLS`` / ``_REAL_BACKLOG_CELLS``\n"
         f"and is hard-asserted against the live matrix below, so any\n"
         f"future change that moves a correctly-absent cell into the\n"
         f"surface fails the build. That assertion is what stops the\n"
         f"matrix from producing false work again.\n"
         f"\n"
-        f"### Correctly absent (25) — MUST stay absent\n"
+        f"### Correctly absent ({len(_CORRECTLY_ABSENT_CELLS)}) — MUST stay absent\n"
         f"\n"
         f"Postgres-only features that other backends cannot and must not\n"
         f"claim. RLS / LISTEN-NOTIFY / advisory locks are Postgres\n"
@@ -2122,7 +2121,7 @@ def _render_markdown(cells: list[Cell]) -> str:
         f"\n"
         f"(25 cells: 5 Postgres-only rows × 5 non-Postgres backends.)\n"
         f"\n"
-        f"### Real backlog (9) — surface should exist but does not\n"
+        f"### Real backlog ({len(_REAL_BACKLOG_CELLS)}) — surface should exist but does not\n"
         f"\n"
         f"* ``sessions`` on mysql, mariadb — the ``.sessions`` facade\n"
         f"  property is missing; the ABC declares it. Add a\n"

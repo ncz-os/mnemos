@@ -135,6 +135,14 @@ ENV MNEMOS_PERSISTENCE_BACKEND=oracle
 ENV MNEMOS_PROFILE=server
 ENV MNEMOS_AUTH_ENABLED=true
 
+RUN useradd --uid 10001 --gid 0 --no-create-home --home-dir /home/mnemos \
+      --shell /usr/sbin/nologin mnemos && \
+    mkdir -p /home/mnemos /data /opt/mnemos && \
+    chown -R 10001:0 /app /home/mnemos /data /opt/mnemos && \
+    chmod -R g=u /app /home/mnemos /data /opt/mnemos
+USER 10001:0
+ENV HOME=/home/mnemos
+
 EXPOSE 5002
 
 # Dockerfile.oracle has no ENTRYPOINT and no image-level HEALTHCHECK; this split

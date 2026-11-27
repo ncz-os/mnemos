@@ -30,8 +30,16 @@ whatever scope it is handed.
 from __future__ import annotations
 
 from collections.abc import Iterable
+import logging
 
 from fastapi import HTTPException
+
+
+class DeletionFenceUnavailable(HTTPException):
+    """The scope cannot be validated; callers may retry."""
+
+    def __init__(self):
+        super().__init__(status_code=503, detail="Deletion scope validation unavailable", headers={"Retry-After": "1"})
 
 
 def _active_deletion_detail(active: dict) -> str:
@@ -56,12 +64,9 @@ async def assert_no_active_deletion(
 
     try:
         active = await active_deletion_for_scope(backend, target_user_id=owner_id, target_namespace=namespace)
-    except Exception:
-        # If the fence itself errors (e.g. backend doesn't expose
-        # transactional), fall through. The hard-delete resweep+verify loop in
-        # deletion_request_worker.py is the second line of defence and refuses
-        # to mark the request complete on live rows.
-        return
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Deletion scope validation unavailable")
+        raise DeletionFenceUnavailable() from exc
     if active is not None:
         raise HTTPException(status_code=409, detail=_active_deletion_detail(active))
 

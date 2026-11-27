@@ -106,11 +106,27 @@ def _route_client():
 
 @pytest.fixture
 def edge_client(monkeypatch, tmp_path):
+    # MN-33: the client is context-managed so its whole lifetime runs on ONE
+    # portal thread. A bare ``TestClient(app)`` spins a fresh anyio portal
+    # per request; without aiosqlite the SQLite backend holds a raw
+    # ``sqlite3`` connection bound to the thread that opened it, so the
+    # round-trip only stayed green while the OS recycled the previous
+    # portal's thread id. That is an order-dependent flake, not a contract.
     backend = _backend(monkeypatch, tmp_path, "raw-route-sqlite")
     with _route_client() as client:
         yield client
     # Release the provisioned file handle before the next profile opens.
     asyncio.run(backend.close())
+
+
+def test_edge_client_is_context_managed_single_portal(edge_client):
+    # MN-33 regression guard: the fixture must yield a client entered via
+    # ``with TestClient(app)``, which provisions ONE anyio portal (and hence
+    # one portal thread) for its whole lifetime. A bare ``TestClient(app)``
+    # has ``portal is None`` until entered and then spins a fresh portal per
+    # request — which breaks the raw ``sqlite3`` connection's thread
+    # affinity in order-dependent ways.
+    assert edge_client.portal is not None
 
 
 def test_edge_profile_postgres_only_routes_return_503(edge_client):

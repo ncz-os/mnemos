@@ -98,9 +98,9 @@ services:
       - ./mnemos/db_migrations/migrations_v5_3_5_model_registry_capabilities_gin.sql:/docker-entrypoint-initdb.d/61-model-registry-capabilities-gin.sql
       - ./mnemos/db_migrations/migrations_v5_4_0_mcp_oauth.sql:/docker-entrypoint-initdb.d/61a-mcp-oauth.sql
       - ./mnemos/db_migrations/migrations_v5_4_1_morpheus_extract_failures.sql:/docker-entrypoint-initdb.d/61b-morpheus-extract-failures.sql
-      # hive_agents CREATE before 0036 ALTERs it. "61a" sorts after 61 and
+      # hive_agents CREATE before 0036 ALTERs it. "61c" sorts after 61b and
       # before 62 so it runs ahead of 66-hive-agents-subscription-pools.
-      - ./mnemos/db_migrations/migrations/0021_hive_agents.sql:/docker-entrypoint-initdb.d/61a-hive-agents.sql
+      - ./mnemos/db_migrations/migrations/0021_hive_agents.sql:/docker-entrypoint-initdb.d/61c-hive-agents.sql
       - ./mnemos/db_migrations/migrations/0032_usage_ledger.sql:/docker-entrypoint-initdb.d/62-usage-ledger.sql
       - ./mnemos/db_migrations/migrations/0033_subscription_plans.sql:/docker-entrypoint-initdb.d/63-subscription-plans.sql
       - ./mnemos/db_migrations/migrations/0034_usage_ledger_session_tracking.sql:/docker-entrypoint-initdb.d/64-usage-ledger-session-tracking.sql

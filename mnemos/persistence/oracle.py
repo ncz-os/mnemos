@@ -34,6 +34,7 @@ import inspect
 import json
 import logging
 import math
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -255,6 +256,108 @@ def _boosted_rank_score_sort_key(row: Row, *, today: date, recency_weight: float
 def _boosted_rank_supersession_sort_key(row: Row, *, today: date, recency_weight: float) -> tuple[bool, float]:
     superseded = isinstance(row, dict) and bool(row.get("superseded_by") or row.get("consolidated_into"))
     return superseded, _boosted_rank_score_sort_key(row, today=today, recency_weight=recency_weight)
+
+
+#: Strict identifier check for table aliases interpolated into rendered
+#: SQL fragments (``table_alias``). Only bare SQL identifiers are allowed;
+#: anything with spaces, quotes, or special characters is rejected with a
+#: ``ValueError`` rather than being spliced into a query string.
+_TABLE_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _version_visibility_clause(
+    user_id: str | None,
+    group_ids: Sequence[str],
+    *,
+    table_alias: str = "",
+    param_prefix: str = "vis",
+    namespace: str | None = None,
+    exclude_namespaces: Sequence[str] = (),
+) -> tuple[str, dict[str, Any]]:
+    """Per-snapshot tenancy predicate for ``memory_versions`` rows (Oracle).
+
+    Mirrors ``mnemos.core.visibility.version_visibility_predicate``
+    (Postgres ``$N`` form) and the SQLite ``_version_visibility_clause``
+    in named-bind form: tenancy is evaluated against THE SNAPSHOT's own
+    ``owner_id`` / ``namespace`` / ``permission_mode`` / ``group_id``
+    columns, with the ACL escape hatch joined on the parent
+    ``memory_id``. Deliberately NOT the generic ``_render_visibility``
+    live-memory predicate: ``memory_versions`` has no
+    ``federation_source`` column (a federation term would 500), and the
+    ACL join must use ``memory_id`` (not the snapshot row id), otherwise
+    per-principal grants on the parent memory would never match a
+    version row.
+    """
+    # Validate the table alias (bare SQL identifier) before interpolation.
+    if table_alias:
+        if not _TABLE_ALIAS_RE.match(table_alias):
+            raise ValueError(
+                f"Invalid table alias {table_alias!r}: must match "
+                "^[A-Za-z_][A-Za-z0-9_]*$ (bare SQL identifier only)"
+            )
+        p = f"{table_alias}."
+    else:
+        p = "memory_versions."
+    params: dict[str, Any] = {}
+    # Namespace exclusion comes from the caller filter (the vault for a
+    # default non-root read, plus any caller-supplied namespaces) — the
+    # same contract SQLite / MySQL / Db2 apply; vault is never baked in.
+    excl = tuple(exclude_namespaces or ())
+    if excl:
+        excl_placeholders = ",".join(
+            f":{param_prefix}_xns{i}" for i in range(len(excl))
+        )
+        for i, ns in enumerate(excl):
+            params[f"{param_prefix}_xns{i}"] = ns
+        excl_clause = (
+            f"({p}namespace IS NULL OR {p}namespace NOT IN ({excl_placeholders}))"
+        )
+    else:
+        excl_clause = ""
+    params[f"{param_prefix}_ns"] = namespace
+    ns_clause = f"{p}namespace = :{param_prefix}_ns"
+    if excl_clause:
+        ns_clause = f"{ns_clause} AND {excl_clause}"
+
+    params[f"{param_prefix}_owner"] = user_id
+    owner_clause = f"{p}owner_id = :{param_prefix}_owner"
+
+    group_list = list(group_ids or [])
+    if group_list:
+        group_placeholders, group_params = _in_placeholders(group_list, f"{param_prefix}_group")
+        group_clause = f"{p}group_id IN ({group_placeholders})"
+        params.update(group_params)
+    else:
+        group_clause = "0=1"
+
+    principals = acl_principals(user_id or "", group_list)
+    if principals:
+        acl_placeholders, acl_params = _in_placeholders(principals, f"{param_prefix}_acl")
+        params.update(acl_params)
+        acl_clause = (
+            " OR EXISTS (SELECT 1 FROM memory_acl macl "
+            f"WHERE macl.memory_id = {p}memory_id "
+            f"AND macl.principal IN ({acl_placeholders}) "
+            f"AND BITAND(macl.perm, {ACL_READ_BIT}) > 0)"
+        )
+    else:
+        acl_clause = ""
+
+    # ``permission_mode`` comparisons are wrapped in
+    # ``COALESCE(..., 0)`` to match the Db2 / MySQL / SQLite builders:
+    # a snapshot with NULL ``permission_mode`` evaluates the world/group
+    # bits as 0, so it is reachable through the owner / ACL disjuncts but
+    # never through a NULL arithmetic comparison.
+    clause = (
+        "("
+        f"{owner_clause}"
+        f" OR COALESCE({p}permission_mode, 0) % 10 >= 4"
+        f" OR (COALESCE({p}permission_mode, 0) / 10 % 10 >= 4 "
+        f"AND {p}group_id IS NOT NULL AND {group_clause})"
+        f"{acl_clause})"
+        f" AND {ns_clause}"
+    )
+    return clause, params
 
 
 def _render_visibility(
@@ -1055,6 +1158,149 @@ class OracleVersionRepository(VersionRepository):
         finally:
             await _call(cursor.close)
 
+    @staticmethod
+    def _visibility_to_user(visibility: VisibilityFilter) -> Any:
+        """Build the UserContext for an ABC version-read call.
+
+        Contract (matches Postgres / SQLite / MySQL / Db2):
+
+        * ``ROOT_BYPASS`` — the facade's root-bypass path fires (no SQL
+          visibility clause is rendered at all). ``visibility.namespace``
+          is carried through for API-shape consistency but is NOT used to
+          filter the root query; root access is cross-namespace by design.
+        * ``READABLE`` — the facade renders the per-snapshot clause using
+          the user's identity and ``visibility.exclude_namespaces``
+          (vault subtraction, plus any caller-supplied exclusions).
+
+        This helper is shared between :meth:`list_memory_versions` and
+        :meth:`get_memory_version` so the context construction cannot
+        diverge.
+        """
+        from mnemos.core.auth_context import UserContext
+
+        role = "root" if visibility.scope == VisibilityScope.ROOT_BYPASS else "user"
+        ns = visibility.namespace
+        if role != "root" and ns is None:
+            # Fail closed for namespace-less principals
+            raise PermissionError("Access denied: namespace required")
+        return UserContext(
+            user_id="" if visibility.scope == VisibilityScope.ROOT_BYPASS else (visibility.user_id or ""),
+            group_ids=[] if visibility.scope == VisibilityScope.ROOT_BYPASS else list(visibility.group_ids),
+            role=role,
+            namespace=ns,
+            authenticated=True,
+        )
+
+    async def list_memory_versions(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        """ABC surface: per-snapshot tenancy for version-history listing.
+
+        Delegates to the facade-level ``_list_memory_versions_facade`` which
+        renders ``_version_visibility_clause`` with ``exclude_namespaces``
+        applied from the caller filter (vault subtraction included for
+        non-root). Root callers bypass the clause entirely (global access).
+        """
+        user = self._visibility_to_user(visibility)
+        return await self._list_memory_versions_facade(
+            tx, memory_id, branch, user
+        )
+
+    async def get_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        """ABC surface: per-snapshot tenancy for a single version fetch.
+
+        Root callers bypass the clause entirely (global access); non-root
+        callers are filtered by the per-snapshot predicate with
+        ``exclude_namespaces`` applied.
+        """
+        user = self._visibility_to_user(visibility)
+        return await self._fetch_memory_version_facade(
+            tx, memory_id, version_num, branch, user
+        )
+
+    async def fetch_version_contents(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_nums: Sequence[int],
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        """Return ``(version_num, content)`` rows for ``version_nums``.
+
+        ABC-first delivery (was ``NotImplementedError`` -> route 503 on
+        Oracle / Db2): delegates to the facade with the shared
+        ``_version_visibility_clause`` (named binds), the namespace pin,
+        and ``exclude_namespaces`` subtraction — exactly the contract
+        :meth:`list_memory_versions` applies.
+        """
+        user = self._visibility_to_user(visibility)
+        from mnemos.core.auth_context import UserContext
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            cols = "version_num, content"
+            nums = list(version_nums)
+            if not nums:
+                return []
+            # Build the named-bind dict ONCE — base binds plus any clause
+            # params appended below — then render the final SQL in a single
+            # f-string. No incremental string concatenation of clause
+            # fragments into the WHERE structure; the clause is static SQL
+            # from ``_version_visibility_clause`` (all values travel
+            # through named binds in ``vis_params``).
+            params: dict[str, Any] = {"memory_id": memory_id, "branch": branch}
+            for i, n in enumerate(nums):
+                params[f"vn{i}"] = n
+            placeholders = ", ".join(f":vn{i}" for i in range(len(nums)))
+            clause = ""
+            vis_params: dict[str, Any] = {}
+            if isinstance(user, UserContext) and user.role == "root":
+                pass
+            else:
+                ns = getattr(user, "namespace", None)
+                if ns is None:
+                    # Uniform fail-closed contract (all six backends, every
+                    # version-read path): namespace-None non-root principals
+                    # never reach SQL — list/fetch return [], get returns None,
+                    # and PermissionError raises only at the shared facade
+                    # boundary (`_visibility_to_user`). No default-namespace
+                    # widening is ever applied.
+                    return []
+                vis = VisibilityFilter.for_read(user, namespace=ns)
+                clause, vis_params = _version_visibility_clause(
+                    vis.user_id,
+                    vis.group_ids,
+                    namespace=ns,
+                    exclude_namespaces=vis.exclude_namespaces,
+                )
+                if clause:
+                    params.update(vis_params)
+            await _call(
+                cursor.execute,
+                f"SELECT {cols} FROM memory_versions "
+                f"WHERE memory_id = :memory_id AND branch = :branch "
+                f"AND version_num IN ({placeholders}) AND deleted_at IS NULL"
+                + (f" AND ({clause})" if clause else "")
+                + " ORDER BY version_num ASC",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
     async def fetch_memory_versions_for_export(
         self,
         tx: Transaction,
@@ -1109,6 +1355,124 @@ class OracleVersionRepository(VersionRepository):
             )
             await _call(cursor.execute, sql, params)
             return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def _list_memory_versions_facade(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        user: Any,
+    ) -> list[Row]:
+        """List version summaries for ``memory_id`` on ``branch`` (oldest first)."""
+        from mnemos.core.auth_context import UserContext
+        from mnemos.persistence.visibility import VisibilityFilter
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            cols = "version_num, snapshot_at, snapshot_by, change_type, content, branch"
+            if isinstance(user, UserContext) and user.role == "root":
+                await _call(
+                    cursor.execute,
+                    f"SELECT {cols} FROM memory_versions "
+                    "WHERE memory_id = :memory_id AND branch = :branch "
+                    "AND deleted_at IS NULL ORDER BY version_num ASC",
+                    {"memory_id": memory_id, "branch": branch},
+                )
+                return await _fetch_all_dicts(cursor)
+            ns = getattr(user, "namespace", None)
+            if ns is None:
+                # Uniform fail-closed contract (all six backends, every
+                # version-read path): namespace-None non-root principals
+                # never reach SQL — list/fetch return [], get returns None,
+                # and PermissionError raises only at the shared facade
+                # boundary (`_visibility_to_user`). No default-namespace
+                # widening is ever applied.
+                return []
+            visibility = VisibilityFilter.for_read(user, namespace=ns)
+            clause, vis_params = _version_visibility_clause(
+                visibility.user_id,
+                visibility.group_ids,
+                namespace=ns,
+                exclude_namespaces=visibility.exclude_namespaces,
+            )
+            where = "memory_id = :memory_id AND branch = :branch AND deleted_at IS NULL"
+            params: dict[str, Any] = {"memory_id": memory_id, "branch": branch}
+            if clause:
+                where += f" AND ({clause})"
+                params.update(vis_params)
+            await _call(
+                cursor.execute,
+                f"SELECT {cols} FROM memory_versions WHERE {where} ORDER BY version_num ASC",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
+    async def _fetch_memory_version_facade(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        user: Any,
+    ) -> Row | None:
+        """Fetch one version snapshot with per-snapshot tenancy applied."""
+        from mnemos.core.auth_context import UserContext
+        from mnemos.persistence.visibility import VisibilityFilter
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            cols = (
+                "id, memory_id, version_num, content, category, subcategory, metadata, "
+                "verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type"
+            )
+            if isinstance(user, UserContext) and user.role == "root":
+                await _call(
+                    cursor.execute,
+                    f"SELECT {cols} FROM memory_versions "
+                    "WHERE memory_id = :memory_id AND version_num = :version_num "
+                    "AND branch = :branch AND deleted_at IS NULL",
+                    {"memory_id": memory_id, "version_num": version_num, "branch": branch},
+                )
+                return await _row_to_dict(cursor, await _call(cursor.fetchone))
+            ns = getattr(user, "namespace", None)
+            if ns is None:
+                # Uniform fail-closed contract (all six backends, every
+                # version-read path): namespace-None non-root principals
+                # never reach SQL — list/fetch return [], get returns None,
+                # and PermissionError raises only at the shared facade
+                # boundary (`_visibility_to_user`). No default-namespace
+                # widening is ever applied.
+                return None
+            visibility = VisibilityFilter.for_read(user, namespace=ns)
+            clause, vis_params = _version_visibility_clause(
+                visibility.user_id,
+                visibility.group_ids,
+                namespace=ns,
+                exclude_namespaces=visibility.exclude_namespaces,
+            )
+            where = "memory_id = :memory_id AND version_num = :version_num AND branch = :branch AND deleted_at IS NULL"
+            params: dict[str, Any] = {
+                "memory_id": memory_id,
+                "version_num": version_num,
+                "branch": branch,
+            }
+            if clause:
+                where += f" AND ({clause})"
+                params.update(vis_params)
+            await _call(
+                cursor.execute,
+                f"SELECT {cols} FROM memory_versions WHERE {where}",
+                params,
+            )
+            return await _row_to_dict(cursor, await _call(cursor.fetchone))
         finally:
             await _call(cursor.close)
 
@@ -1266,6 +1630,48 @@ def _in_placeholders(ids: Sequence[str], prefix: str = "id") -> tuple[str, dict[
     params = {f"{prefix}{i}": value for i, value in enumerate(ids)}
     return placeholders, params
 
+
+def _oracle_version_where_nonroot(user: Any) -> tuple[str, dict[str, Any]]:
+    """Per-version owner/world/group/ACL predicate for Oracle (NG2-MN-020).
+
+    Mirrors the Postgres ``version_visibility_predicate`` shape with
+    named binds: owner, world-readable, group-readable (``group_id``
+    exists via migration 0048), plus the ACL EXISTS disjunct joining
+    through ``memory_acl.memory_id`` (table exists via 0043). The
+    namespace pin and vault subtraction are applied by the caller
+    alongside this fragment.
+    """
+    from mnemos.core.visibility import ACL_READ_BIT, acl_principals
+
+    group_ids = list(getattr(user, "group_ids", []) or [])
+    params: dict[str, Any] = {"vis_owner": getattr(user, "user_id", None)}
+    if group_ids:
+        placeholders = ", ".join(f":vis_group{i}" for i in range(len(group_ids)))
+        for i, g in enumerate(group_ids):
+            params[f"vis_group{i}"] = g
+        group_clause = f"group_id IN ({placeholders})"
+    else:
+        group_clause = "0=1"
+    principals = acl_principals(getattr(user, "user_id", "") or "", group_ids)
+    acl_clause = ""
+    if principals:
+        placeholders = ", ".join(f":vis_acl{i}" for i in range(len(principals)))
+        for i, pr in enumerate(principals):
+            params[f"vis_acl{i}"] = pr
+        acl_clause = (
+            " OR EXISTS (SELECT 1 FROM memory_acl macl "
+            f"WHERE macl.memory_id = memory_versions.memory_id "
+            f"AND macl.principal IN ({placeholders}) "
+            f"AND BITAND(macl.perm, {ACL_READ_BIT}) > 0)"
+        )
+    clause = (
+        "(owner_id = :vis_owner"
+        " OR MOD(NVL(permission_mode, 0), 10) >= 4"
+        " OR (MOD(TRUNC(NVL(permission_mode, 0) / 10), 10) >= 4"
+        f" AND group_id IS NOT NULL AND {group_clause})"
+        f"{acl_clause})"
+    )
+    return clause, params
 
 class OracleMemoryRepository(MemoryRepository):
     """Oracle memories repo — ABC-conformant.
@@ -1927,7 +2333,15 @@ class OracleMemoryRepository(MemoryRepository):
         from mnemos.core.auth_context import UserContext
 
         if isinstance(user, UserContext):
-            ns = getattr(user, "namespace", None) or "default"
+            ns = getattr(user, "namespace", None)
+            if ns is None:
+                # Uniform fail-closed contract (all six backends, every
+                # version-read path): namespace-None non-root principals
+                # never reach SQL — list/fetch return [], get returns None,
+                # and PermissionError raises only at the shared facade
+                # boundary (`_visibility_to_user`). No default-namespace
+                # widening is ever applied.
+                raise PermissionError("Access denied: namespace required")
             visibility = VisibilityFilter.for_read(user, namespace=ns)
         else:
             visibility = VisibilityFilter(
@@ -1938,7 +2352,7 @@ class OracleMemoryRepository(MemoryRepository):
             )
         row = await self.get_memory(tx, memory_id, visibility=visibility, include_archived=True)
         if row is None:
-            raise PermissionError("Memory not found")
+            raise PermissionError("Access denied")
 
     async def fetch_memory_export(
         self,
@@ -2224,6 +2638,7 @@ class OracleMemoryRepository(MemoryRepository):
         finally:
             await _call(cursor.close)
 
+
     async def fetch_checkout_commit(
         self,
         tx: Transaction,
@@ -2250,6 +2665,136 @@ class OracleMemoryRepository(MemoryRepository):
             return await _row_to_dict(cursor, await _call(cursor.fetchone))
         finally:
             await _call(cursor.close)
+
+    async def fetch_memory_versions(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        user: Any,
+    ) -> list[Row]:
+        # NG2-MN-020: mirror of GET /v1/memories/{id}/versions (oldest
+        # first). Root sees every non-deleted row; everyone else goes
+        # through the owner/world/group/ACL + namespace-pin SQL gate
+        # (same shape as the REST route's version_visibility_predicate),
+        # with the vault subtraction as a Python re-check.
+        from mnemos.core.security import is_root
+        from mnemos.core.secret_detection import VAULT_NAMESPACE
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if is_root(user):
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT version_num, snapshot_at, snapshot_by, change_type,
+                           content, branch, commit_hash, owner_id, namespace,
+                           permission_mode, group_id
+                      FROM memory_versions
+                     WHERE memory_id = :memory_id
+                       AND branch = :branch
+                       AND deleted_at IS NULL
+                     ORDER BY version_num ASC
+                    """,
+                    {"memory_id": memory_id, "branch": branch},
+                )
+                return await _fetch_all_dicts(cursor)
+            vis_clause, vis_params = _oracle_version_where_nonroot(user)
+            params = {
+                "memory_id": memory_id,
+                "branch": branch,
+                "vis_ns": getattr(user, "namespace", None),
+                **vis_params,
+            }
+            await _call(
+                cursor.execute,
+                """
+                SELECT version_num, snapshot_at, snapshot_by, change_type,
+                       content, branch, commit_hash, owner_id, namespace,
+                       permission_mode, group_id
+                  FROM memory_versions
+                 WHERE memory_id = :memory_id
+                   AND branch = :branch
+                   AND deleted_at IS NULL
+                """
+                f"AND {vis_clause} AND namespace = :vis_ns "
+                """
+                 ORDER BY version_num ASC
+                """,
+                params,
+            )
+            rows = await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+        return [r for r in rows if r.get("namespace") != VAULT_NAMESPACE]
+
+    async def fetch_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        user: Any,
+    ) -> Row | None:
+        # NG2-MN-020: mirror of GET /v1/memories/{id}/versions/{n}.
+        from mnemos.core.security import is_root
+        from mnemos.core.secret_detection import VAULT_NAMESPACE
+
+        conn = _conn_from_tx(tx)
+        cursor = await _call(conn.cursor)
+        try:
+            if is_root(user):
+                await _call(
+                    cursor.execute,
+                    """
+                    SELECT id, memory_id, version_num, content, category,
+                           subcategory, metadata, verbatim_content, owner_id,
+                           namespace, permission_mode, source_model,
+                           source_provider, source_session, source_agent,
+                           snapshot_at, snapshot_by, change_type, commit_hash,
+                           branch, group_id
+                      FROM memory_versions
+                     WHERE memory_id = :memory_id
+                       AND version_num = :version_num
+                       AND branch = :branch
+                       AND deleted_at IS NULL
+                    """,
+                    {"memory_id": memory_id, "version_num": version_num, "branch": branch},
+                )
+                return await _row_to_dict(cursor, await _call(cursor.fetchone))
+            vis_clause, vis_params = _oracle_version_where_nonroot(user)
+            params = {
+                "memory_id": memory_id,
+                "version_num": version_num,
+                "branch": branch,
+                "vis_ns": getattr(user, "namespace", None),
+                **vis_params,
+            }
+            await _call(
+                cursor.execute,
+                """
+                SELECT id, memory_id, version_num, content, category,
+                       subcategory, metadata, verbatim_content, owner_id,
+                       namespace, permission_mode, source_model,
+                       source_provider, source_session, source_agent,
+                       snapshot_at, snapshot_by, change_type, commit_hash,
+                       branch, group_id
+                  FROM memory_versions
+                 WHERE memory_id = :memory_id
+                   AND version_num = :version_num
+                   AND branch = :branch
+                   AND deleted_at IS NULL
+                """
+                f"AND {vis_clause} AND namespace = :vis_ns",
+                params,
+            )
+            row = await _row_to_dict(cursor, await _call(cursor.fetchone))
+        finally:
+            await _call(cursor.close)
+        if row is None or row.get("namespace") == VAULT_NAMESPACE:
+            return None
+        return row
 
     async def bump_recall_and_get_memory(
         self,
@@ -6726,9 +7271,24 @@ class OracleSessionsRepository(SessionsRepository):
         finally:
             await _call(cursor.close)
 
+    async def _session_rows(self, tx: Transaction, sql: str, params: dict) -> list[Row]:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute, sql, params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
+
     async def list_injected_memory_ids(self, tx: Transaction, session_id: str, limit: int = 10) -> list[str]:
-        _ = (tx, session_id, limit)
-        return []
+        rows = await self._session_rows(
+            tx,
+            "SELECT memory_id FROM session_memory_injections WHERE session_id=:sid AND deleted_at IS NULL "
+            "AND EXISTS (SELECT 1 FROM sessions WHERE id=:sid AND deleted_at IS NULL) "
+            "GROUP BY memory_id ORDER BY MAX(injected_at) DESC, memory_id "
+            "FETCH FIRST :row_limit ROWS ONLY",
+            {"sid": session_id, "row_limit": max(0, limit)},
+        )
+        return [row["memory_id"] for row in rows]
 
     async def add_message(
         self,
@@ -6768,32 +7328,98 @@ class OracleSessionsRepository(SessionsRepository):
             await _call(cursor.close)
 
     async def fetch_provider_history(self, tx: Transaction, session_id: str) -> list[Row]:
-        _ = (tx, session_id)
-        return []
+        return await self._session_rows(
+            tx,
+            "WITH ranked AS (SELECT id, role, content, created_at, "
+            "ROW_NUMBER() OVER (PARTITION BY role ORDER BY created_at, id) AS first_rank, "
+            "ROW_NUMBER() OVER (PARTITION BY CASE WHEN role='system' THEN 0 ELSE 1 END "
+            "ORDER BY created_at DESC, id DESC) AS recent_rank FROM session_messages "
+            "WHERE session_id=:sid AND deleted_at IS NULL "
+            "AND EXISTS (SELECT 1 FROM sessions WHERE id=:sid AND deleted_at IS NULL)) "
+            "SELECT role, content FROM ranked WHERE "
+            "(role='system' AND (first_rank=1 OR recent_rank<=4)) OR "
+            "(role<>'system' AND recent_rank<=10) "
+            "ORDER BY CASE WHEN role='system' THEN 0 ELSE 1 END, created_at, id",
+            {"sid": session_id},
+        )
 
-    async def add_memory_injections(self, tx: Transaction, **kwargs: Any) -> None:
-        _ = (tx, kwargs)
+    async def add_memory_injections(
+        self, tx: Transaction, *, session_id: str, message_id: Any, memory_ids: Sequence[str]
+    ) -> None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            for index, memory_id in enumerate(memory_ids):
+                await _call(cursor.execute,
+                    "INSERT INTO session_memory_injections (id, session_id, memory_id, weight) "
+                    "SELECT CAST(:iid AS VARCHAR(36)), id, CAST(:mid AS VARCHAR(4000)), CAST(:weight AS FLOAT) "
+                    "FROM sessions WHERE id=:sid AND deleted_at IS NULL",
+                    {"iid": uuid.uuid4().hex, "sid": session_id, "mid": memory_id, "weight": 0.9 - index * 0.1})
+        finally:
+            await _call(cursor.close)
 
-    async def update_metrics(self, tx: Transaction, **kwargs: Any) -> None:
-        _ = (tx, kwargs)
+    async def update_metrics(self, tx: Transaction, *, session_id: str, user_id: str, namespace: str, tokens_used: int) -> None:
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute,
+                "UPDATE sessions SET message_count=message_count+2, total_tokens=total_tokens+:tokens, "
+                "last_activity=SYSTIMESTAMP WHERE id=:sid AND user_id=:session_user AND namespace=:ns AND deleted_at IS NULL",
+                {"tokens": tokens_used, "sid": session_id, "session_user": user_id, "ns": namespace})
+        finally:
+            await _call(cursor.close)
 
     async def fetch_history(self, tx: Transaction, session_id: str, limit: int, offset: int) -> tuple[list[Row], int]:
-        _ = (tx, session_id, limit, offset)
-        return [], 0
+        where = (" FROM session_messages WHERE session_id=:sid AND deleted_at IS NULL "
+                 "AND EXISTS (SELECT 1 FROM sessions WHERE id=:sid AND deleted_at IS NULL)")
+        totals = await self._session_rows(tx, "SELECT COUNT(*) AS total" + where, {"sid": session_id})
+        rows = await self._session_rows(tx,
+            "SELECT role, content, created_at AS timestamp, model" + where +
+            " ORDER BY created_at, id OFFSET :row_offset ROWS FETCH NEXT :row_limit ROWS ONLY",
+            {"sid": session_id, "row_offset": max(0, offset), "row_limit": max(0, limit)})
+        return rows, int(totals[0]["total"])
 
     async def delete_session(self, tx: Transaction, session_id: str, user_id: str, namespace: str) -> bool:
-        _ = (tx, session_id, user_id, namespace)
-        return False
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            # Scope and lock the session by marking it deleted before purging its children.
+            await _call(cursor.execute,
+                "UPDATE sessions SET deleted_at=SYSTIMESTAMP WHERE id=:sid AND user_id=:session_user "
+                "AND namespace=:ns AND deleted_at IS NULL",
+                {"sid": session_id, "session_user": user_id, "ns": namespace})
+            if cursor.rowcount <= 0:
+                return False
+            for table in ("session_memory_injections", "session_messages"):
+                await _call(cursor.execute, f"DELETE FROM {table} WHERE session_id=:sid", {"sid": session_id})
+            return True
+        finally:
+            await _call(cursor.close)
 
 
 class OracleConsultationsRepository(ConsultationsRepository):
     async def resolve_tier_lineup(self, tx: Transaction, tier: str) -> list[Row]:
-        _ = (tx, tier)
-        return []
+        from mnemos.persistence.consultation_selection import select_tier_lineup
+
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute,
+                "SELECT provider, model_id, input_cost_per_mtok, output_cost_per_mtok, graeae_weight, arena_rank "
+                "FROM model_registry WHERE available=1 AND deprecated=0")
+            return select_tier_lineup(await _fetch_all_dicts(cursor), tier)
+        finally:
+            await _call(cursor.close)
 
     async def resolve_models(self, tx: Transaction, model_ids: Sequence[str]) -> list[Row]:
-        _ = (tx, model_ids)
-        return []
+        if not model_ids:
+            return []
+        params = {f"model_{i}": mid for i, mid in enumerate(model_ids)}
+        placeholders = ", ".join(":" + key for key in params)
+        cursor = await _call(_conn_from_tx(tx).cursor)
+        try:
+            await _call(cursor.execute,
+                f"SELECT provider, model_id FROM model_registry WHERE model_id IN ({placeholders}) "
+                "AND available=1 AND deprecated=0 ORDER BY provider, model_id", params)
+            return await _fetch_all_dicts(cursor)
+        finally:
+            await _call(cursor.close)
 
     async def create_consultation_with_audit(self, tx: Transaction, **kwargs: Any) -> Any:
         """Insert a consultation + audit-chain link + memory refs in one tx.
@@ -8960,9 +9586,13 @@ class OracleBackend(OracleAuditJournalMixin):
         ``SET TRANSACTION`` must be the FIRST statement of the transaction,
         so it is issued before anything else touches the connection.
         """
+        if isolation not in (None, "read_committed", "repeatable_read", "serializable"):
+            raise ValueError(f"unsupported isolation level for Oracle: {isolation!r}")
         async with self._pool.acquire() as conn:
             if isolation is not None or readonly:
-                if isolation == "read_committed":
+                if readonly:
+                    stmt = "SET TRANSACTION READ ONLY"
+                elif isolation == "read_committed":
                     stmt = "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
                 elif isolation == "serializable":
                     stmt = "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"

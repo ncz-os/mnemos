@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from mnemos.persistence.base import ACL_CAPABILITY, ALL_CAPABILITIES
-from mnemos.persistence.oracle import OracleBackend
+from mnemos.persistence.oracle import OracleBackend, OracleConsultationsRepository
 from mnemos.persistence.sqlite import SqliteBackend
 
 
@@ -126,6 +127,29 @@ def test_oracle_backend_advertises_protocols_and_methods() -> None:
         "list_consultations",
     ):
         assert callable(getattr(backend, name))
+
+
+@pytest.mark.asyncio
+async def test_oracle_get_consultation_binds_every_owner_scope_placeholder() -> None:
+    class Cursor:
+        async def execute(self, sql: str, binds: dict[str, object]) -> None:
+            required = set(re.findall(r":([a-zA-Z_]\w*)", sql))
+            assert required == set(binds), f"bind mismatch: SQL needs {required}, got {set(binds)}"
+
+        async def fetchone(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    class Conn:
+        def cursor(self) -> Cursor:
+            return Cursor()
+
+    tx = SimpleNamespace(conn=Conn())
+    assert await OracleConsultationsRepository().get_consultation(
+        tx, consultation_id="consult-1", root=False, user_id="alice", namespace="research"
+    ) is None
 
 
 def test_oracle_0038_migration_contains_requested_tables() -> None:

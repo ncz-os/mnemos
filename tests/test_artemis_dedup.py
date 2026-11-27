@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from contextlib import closing
 import pytest
 from typer.testing import CliRunner
 
 from mnemos.core import config as core_config
+from mnemos.persistence.sqlite import _execute
+
 
 @pytest.fixture(autouse=True)
 def _reset_artemis_dedup_settings(monkeypatch):
@@ -375,136 +379,81 @@ def test_hash_backfill_apply_computes_normalized_hash(monkeypatch):
     assert state["memories"]["missing"]["content_hash"] == content_sha256("line1\nline2")
 
 
-def test_memory_dedup_cli_apply_soft_deletes_reversibly(monkeypatch):
+@pytest.fixture
+def duplicate_store(tmp_path):
+    """Fresh SQLite path per test.
+
+    The CLI command under test runs ``asyncio.run(...)`` inside its own event
+    loop. Seeding or closing a ``SqliteBackend`` with an ``asyncio.run`` call
+    from the fixture would bind its connection to a dead loop (SQLite
+    connections must be opened and closed on the same loop). Each test
+    therefore creates its own backend and overrides
+    ``cli_main._open_cli_persistence_backend`` so that opening, seeding, and
+    (for the CLI-owned instance) closing all happen inside the CLI's loop.
+    """
+    yield tmp_path / "duplicates.db"
+
+
+def test_memory_dedup_cli_apply_soft_deletes_reversibly(duplicate_store, monkeypatch):
     from mnemos.cli import main as cli_main
-    from mnemos.domain.artemis_dedup import content_sha256
-    from tests._fake_backend import FakePoolBackedBackend
+    from mnemos.persistence.sqlite import SqliteBackend
 
-    state = {"memories": {}}
+    backend = SqliteBackend(duplicate_store, core_config.get_settings())
+    seeded = {"done": False}
 
-    class _Acquire:
-        async def __aenter__(self):
-            return object()
+    async def open_backend():
+        await backend.open()
+        async with backend.transactional() as tx:
+            await _execute(
+                tx.conn,
+                """INSERT INTO memories (id, content, category, owner_id, namespace, created, quality_rating)
+                   VALUES ('mem_new', 'same', 'facts', 'alice', 'lab', '2026-01-02', 10),
+                          ('mem_old', 'same', 'facts', 'alice', 'lab', '2026-01-01', 100)""",
+            )
+        seeded["done"] = True
+        return backend, True
 
-        async def __aexit__(self, *args):
-            return None
-
-    class _Pool:
-        def __init__(self, state):
-            self.state = state
-
-        def acquire(self):
-            return _Acquire()
-
-    digest = content_sha256("same")
-    state["memories"] = {
-        "mem_keep": {
-            "id": "mem_keep",
-            "owner_id": "alice",
-            "namespace": "lab",
-            "content_hash": digest,
-            "content": "same",
-            "category": "facts",
-            "created": "2026-01-02T00:00:00",
-            "quality_rating": 10,
-            "deleted_at": None,
-            "archived_at": None,
-            "consolidated_into": None,
-        },
-        "mem_dup": {
-            "id": "mem_dup",
-            "owner_id": "alice",
-            "namespace": "lab",
-            "content_hash": digest,
-            "content": "same",
-            "category": "facts",
-            "created": "2026-01-01T00:00:00",
-            "quality_rating": 100,
-            "deleted_at": None,
-            "archived_at": None,
-            "consolidated_into": None,
-        },
-    }
-    backend = FakePoolBackedBackend(_Pool(state))
-
-    async def _open_backend():
-        return backend, False
-
-    monkeypatch.setattr(cli_main, "_open_cli_persistence_backend", _open_backend)
-    result = CliRunner().invoke(
-        cli_main.app,
-        ["artemis", "memory-dedup", "--apply", "--json"],
-    )
-
+    monkeypatch.setattr(cli_main, "_open_cli_persistence_backend", open_backend)
+    result = CliRunner().invoke(cli_main.app, ["artemis", "memory-dedup", "--apply", "--json"])
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["deleted_count"] == 1
-    assert state["memories"]["mem_keep"]["deleted_at"] is None
-    assert state["memories"]["mem_dup"]["deleted_at"] is not None
-    # Reversible soft delete: clearing deleted_at restores the row content.
-    state["memories"]["mem_dup"]["deleted_at"] = None
-    assert state["memories"]["mem_dup"]["content"] == "same"
+    assert seeded["done"], "CLI loop must have opened and seeded the backend"
+    assert json.loads(result.output)["deleted_count"] == 1
+    with closing(sqlite3.connect(duplicate_store)) as conn:
+        rows = dict(conn.execute("SELECT id, deleted_at FROM memories"))
+        assert rows["mem_new"] is None
+        assert rows["mem_old"] is not None
+        conn.execute("UPDATE memories SET deleted_at = NULL WHERE id = 'mem_old'")
+        restored = conn.execute("SELECT content FROM memories WHERE id = 'mem_old' AND deleted_at IS NULL")
+        assert restored.fetchone() == ("same",)
 
 
-def test_dedup_sweep_cli_auto_merge_consolidates(monkeypatch):
+def test_dedup_sweep_cli_auto_merge_consolidates(duplicate_store, monkeypatch):
     from mnemos.cli import main as cli_main
-    from mnemos.domain.artemis_dedup import content_sha256
-    from tests._fake_backend import FakePoolBackedBackend
+    from mnemos.persistence.sqlite import SqliteBackend
 
-    state = {"memories": {}}
+    backend = SqliteBackend(duplicate_store, core_config.get_settings())
+    seeded = {"done": False}
 
-    class _Acquire:
-        async def __aenter__(self):
-            return object()
+    async def open_backend():
+        await backend.open()
+        async with backend.transactional() as tx:
+            await _execute(
+                tx.conn,
+                """INSERT INTO memories (id, content, category, owner_id, namespace, created, quality_rating)
+                   VALUES ('mem_new', 'same', 'facts', 'alice', 'lab', '2026-01-02', 10),
+                          ('mem_old', 'same', 'facts', 'alice', 'lab', '2026-01-01', 100)""",
+            )
+        seeded["done"] = True
+        return backend, True
 
-        async def __aexit__(self, *args):
-            return None
-
-    class _Pool:
-        def __init__(self, state):
-            self.state = state
-
-        def acquire(self):
-            return _Acquire()
-
-    backend = FakePoolBackedBackend(_Pool(state))
-    digest = content_sha256("same")
-    state["memories"] = {
-        "mem_old": {
-            "id": "mem_old",
-            "owner_id": "alice",
-            "namespace": "lab",
-            "content_hash": digest,
-            "content": "same",
-            "created": "2026-01-01T00:00:00",
-            "deleted_at": None,
-            "archived_at": None,
-            "consolidated_into": None,
-        },
-        "mem_new": {
-            "id": "mem_new",
-            "owner_id": "alice",
-            "namespace": "lab",
-            "content_hash": digest,
-            "content": "same",
-            "created": "2026-01-02T00:00:00",
-            "deleted_at": None,
-            "archived_at": None,
-            "consolidated_into": None,
-        },
-    }
-
-    async def _open_backend():
-        return backend, False
-
-    monkeypatch.setattr(cli_main, "_open_cli_persistence_backend", _open_backend)
-    result = CliRunner().invoke(
-        cli_main.app,
-        ["artemis", "dedup-sweep", "--auto-merge", "--json"],
-    )
-
+    monkeypatch.setattr(cli_main, "_open_cli_persistence_backend", open_backend)
+    result = CliRunner().invoke(cli_main.app, ["artemis", "dedup-sweep", "--auto-merge", "--json"])
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
-    assert payload["merged_count"] == 1
-    assert state["memories"]["mem_old"]["consolidated_into"] == "mem_new"
-    assert state["memories"]["mem_old"]["deleted_at"] is not None
+    assert seeded["done"], "CLI loop must have opened and seeded the backend"
+    assert json.loads(result.output)["merged_count"] == 1
+    with closing(sqlite3.connect(duplicate_store)) as conn:
+        canonical, deleted = conn.execute(
+            "SELECT consolidated_into, deleted_at FROM memories WHERE id = 'mem_old'"
+        ).fetchone()
+        assert canonical == "mem_new"
+        assert deleted is not None

@@ -9,8 +9,6 @@ import sys
 import pytest
 from starlette.applications import Starlette
 
-from tests.oauth_backend_helpers import oauth_database as oauth_database
-from tests.test_mcp_oauth_integration import mcp_http_app as mcp_http_app
 
 
 @pytest.mark.asyncio

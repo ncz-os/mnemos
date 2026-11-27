@@ -76,11 +76,17 @@ def is_db_disconnect(exc: BaseException) -> bool:
 
 def database_disconnected_detail(exc: BaseException) -> dict:
     """Body for a 503 caused by a lost backend connection."""
+    import uuid
+    from mnemos.core.observability import current_request_id
+
+    request_id = current_request_id() or uuid.uuid4().hex
+    logger.warning("database_disconnected request_id=%s", request_id)
     return {
         "error": "database_disconnected",
-        "exception_type": type(exc).__name__,
-        "message": str(exc),
+        "message": "Database temporarily unavailable",
+        "request_id": request_id,
     }
+
 
 
 def translate_persistence_error(exc: BaseException) -> HTTPException:
@@ -95,7 +101,7 @@ def translate_persistence_error(exc: BaseException) -> HTTPException:
     if isinstance(exc, HTTPException):
         return exc
     if isinstance(exc, NotImplementedError):
-        return HTTPException(status_code=503, detail=str(exc))
+        return HTTPException(status_code=503, detail="Capability temporarily unavailable")
     if is_db_disconnect(exc):
         return HTTPException(status_code=503, detail=database_disconnected_detail(exc))
     return HTTPException(status_code=500, detail="Internal server error")

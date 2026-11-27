@@ -3,10 +3,18 @@ namespace: /mnemos/patroni/
 name: pythia
 
 restapi:
-  listen: 0.0.0.0:8008
+  listen: 192.0.2.67:8008
+  certfile: /etc/mnemos/tls/server.crt
+  keyfile: /etc/mnemos/tls/server.key
+  cafile: /etc/mnemos/tls/ca.crt
+  verify_client: required
   connect_address: 192.0.2.67:8008
 
 etcd3:
+  protocol: https
+  cacert: /etc/mnemos/tls/ca.crt
+  cert: /etc/mnemos/tls/client.crt
+  key: /etc/mnemos/tls/client.key
   hosts: "192.0.2.67:2379,192.0.2.96:2379,192.0.2.25:2379"
 
 bootstrap:
@@ -44,10 +52,11 @@ bootstrap:
     - data-checksums
   users:
     mnemos_user:
-      password: mnemos_local
+      password: null
       options:
-        - createrole
-        - createdb
+        - nocreaterole
+        - nocreatedb
+        - nosuperuser
 
 postgresql:
   listen: 0.0.0.0:5433
@@ -58,10 +67,10 @@ postgresql:
   authentication:
     superuser:
       username: postgres
-      password: postgres_local
+      password: null
     replication:
       username: replicator
-      password: replicator_local
+      password: null
   parameters:
     unix_socket_directories: /var/run/postgresql
   create_replica_methods:

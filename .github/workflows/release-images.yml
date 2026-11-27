@@ -184,6 +184,9 @@ jobs:
           echo "── addon provenance (one SHA per overlay) ──"
           cat addon-provenance.txt
 
+      - name: Validate staged core requirements
+        run: python scripts/validate_release_wheels.py wheelhouse
+
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
@@ -341,6 +344,9 @@ jobs:
           digest="$(jq -er '.enterprise["containerimage.digest"]' /tmp/bake-metadata.json)"
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
+      - name: Validate native image runtime
+        run: bash scripts/smoke_release_image.sh '${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}' '${{ matrix.slug }}'
+
       # Artifact filenames omit the sha256: prefix because colons are invalid.
       - name: Export digest
         run: |
@@ -373,7 +379,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: /tmp/digests
           pattern: enterprise-digest-*
@@ -397,6 +403,15 @@ jobs:
             type=semver,pattern={{major}}
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Validate platform count
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 2
+          for digest in *; do
+            docker buildx imagetools inspect '${{ env.IMAGE_NAME }}@sha256:'"$digest" --raw
+          done
 
       - name: Create tagged manifest list
         working-directory: /tmp/digests

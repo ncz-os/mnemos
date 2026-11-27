@@ -229,14 +229,14 @@ async def start_tunnel(
     _require_enabled()
 
     # Order is deliberate and each step is load-bearing:
-    #   1. host opt-in gate     -- a disabled host mints nothing at all
+    #   1. host opt-in gate     -- a disabled host mints nothing at all (403)
     #   2. backend resolution   -- an unknown backend 422s before any token
     #   3. single-tunnel guard  -- a start that will 409 mints no credential
-    #   4. credential resolution -- before the spawn, so a tunnel is never
-    #      opened for an operator we cannot give a working credential to
+    #   4. credential resolution -- 503 if no bearer credential is available;
+    #      the spawn never runs for an operator we cannot give a token to
     #   5. bridge construction and start
-    # Steps 1-3 exist so no live credential is minted for a request that is
-    # going to be refused anyway.
+    # Steps 1-4 exist so no live credential is minted and no tunnel spawned
+    # for a request that is going to be refused anyway.
     try:
         bridge_cls = get_bridge_class(request.backend)
     except KeyError:

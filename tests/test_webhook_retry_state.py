@@ -1,4 +1,5 @@
 """Regression tests for webhook retry row terminalization."""
+
 from __future__ import annotations
 
 import asyncio
@@ -17,8 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 def _webhook_module_source(*module_names: str) -> str:
     repo_root = Path(__file__).resolve().parents[1]
     return "\n".join(
-        (repo_root / "mnemos" / "webhooks" / f"{module_name}.py").read_text()
-        for module_name in module_names
+        (repo_root / "mnemos" / "webhooks" / f"{module_name}.py").read_text() for module_name in module_names
     )
 
 
@@ -117,18 +117,13 @@ class _FakeWebhookStore:
             and (
                 other.get("lease_token") is None
                 or (
-                    other.get("lease_expires_at") is not None
-                    and other["lease_expires_at"] < datetime.now(timezone.utc)
+                    other.get("lease_expires_at") is not None and other["lease_expires_at"] < datetime.now(timezone.utc)
                 )
             )
         ]
 
     def release_locks(self, conn_id: int) -> None:
-        self.locked_by = {
-            row_id: owner
-            for row_id, owner in self.locked_by.items()
-            if owner != conn_id
-        }
+        self.locked_by = {row_id: owner for row_id, owner in self.locked_by.items() if owner != conn_id}
 
     def advisory_lock(self, key: int) -> asyncio.Lock:
         lock = self.advisory_locks.get(key)
@@ -269,7 +264,10 @@ class _FakeWebhookConn:
 
     async def fetch(self, sql: str, *args):
         compact = " ".join(sql.split())
-        if compact.startswith("WITH claim_clock AS") and "UPDATE webhook_deliveries d SET lease_token=$2::uuid" in compact:
+        if (
+            compact.startswith("WITH claim_clock AS")
+            and "UPDATE webhook_deliveries d SET lease_token=$2::uuid" in compact
+        ):
             max_attempts = args[0]
             lease_token = str(args[1])
             limit = args[2]
@@ -379,10 +377,7 @@ class _FakeWebhookConn:
             if self.store.claim_update_stall is not None:
                 await self.store.claim_update_stall()
             claim_db_now = datetime.now(timezone.utc)
-            if (
-                row["status"] in {"pending", "retrying"}
-                and row.get("writer_revision") != current_revision
-            ):
+            if row["status"] in {"pending", "retrying"} and row.get("writer_revision") != current_revision:
                 return None
             self._record_row_change(row)
             row["lease_token"] = str(args[1])
@@ -415,18 +410,11 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             if row is None or not self._owns_lease_token(row, args[1]):
                 return None
-            if (
-                "lease_expires_at >= clock_timestamp()" in compact
-                and not self._lease_unexpired(row)
-            ):
+            if "lease_expires_at >= clock_timestamp()" in compact and not self._lease_unexpired(row):
                 return None
             self.store.succeeded_update_attempts += 1
-            if (
-                "AND status IN ('pending', 'retrying')" in compact
-                and (
-                    row["status"] not in {"pending", "retrying"}
-                    or row.get("superseded", False)
-                )
+            if "AND status IN ('pending', 'retrying')" in compact and (
+                row["status"] not in {"pending", "retrying"} or row.get("superseded", False)
             ):
                 return None
             if self.store.enforce_succeeded_unique and self.store.has_succeeded_chain_peer(row):
@@ -463,17 +451,10 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             if row is None or not self._owns_lease_token(row, args[1]):
                 return None
-            if (
-                "lease_expires_at >= clock_timestamp()" in compact
-                and not self._lease_unexpired(row)
-            ):
+            if "lease_expires_at >= clock_timestamp()" in compact and not self._lease_unexpired(row):
                 return None
-            if (
-                "AND status IN ('pending', 'retrying')" in compact
-                and (
-                    row["status"] not in {"pending", "retrying"}
-                    or row.get("superseded", False)
-                )
+            if "AND status IN ('pending', 'retrying')" in compact and (
+                row["status"] not in {"pending", "retrying"} or row.get("superseded", False)
             ):
                 return None
             self._set_status(row, "abandoned")
@@ -569,10 +550,7 @@ class _FakeWebhookConn:
                 if (
                     row["status"] in {"pending", "retrying"}
                     and self._lease_available(row)
-                    and (
-                        self._has_successor(row)
-                        or self._has_succeeded_chain_peer(row)
-                    )
+                    and (self._has_successor(row) or self._has_succeeded_chain_peer(row))
                 ):
                     self._set_status(row, "abandoned")
                     row["superseded"] = True
@@ -580,8 +558,7 @@ class _FakeWebhookConn:
                     updated += 1
             return f"UPDATE {updated}"
         if compact.startswith(
-            "UPDATE webhook_deliveries SET status='abandoned', superseded=TRUE, "
-            "status_updated_at=clock_timestamp()"
+            "UPDATE webhook_deliveries SET status='abandoned', superseded=TRUE, " "status_updated_at=clock_timestamp()"
         ):
             self.store.successor_cleanup_updates += 1
             row = self._row(args[0])
@@ -672,9 +649,7 @@ class _FakeWebhookConn:
 
     def _lease_available(self, row: dict[str, Any]) -> bool:
         expires_at = row.get("lease_expires_at")
-        return row.get("lease_token") is None or (
-            expires_at is not None and expires_at < datetime.now(timezone.utc)
-        )
+        return row.get("lease_token") is None or (expires_at is not None and expires_at < datetime.now(timezone.utc))
 
     def _owns_live_lease(self, row: dict[str, Any], lease_token: str) -> bool:
         return self._owns_lease_token(row, lease_token) and self._lease_unexpired(row)
@@ -698,11 +673,7 @@ class _FakeWebhookConn:
         *,
         changed_at: datetime | None = None,
     ) -> None:
-        if (
-            self.store.enforce_succeeded_terminal
-            and row.get("status") == "succeeded"
-            and status != "succeeded"
-        ):
+        if self.store.enforce_succeeded_terminal and row.get("status") == "succeeded" and status != "succeeded":
             raise self.store.check_violation_cls(
                 "webhook_deliveries: cannot transition status away from "
                 f"succeeded (id={row['id']}, attempted new status={status})"
@@ -851,11 +822,7 @@ class _FakeHTTPStream:
         except asyncio.CancelledError:
             self.factory.stream_exit_cancelled = True
             raise
-        exit_error = (
-            self.factory.stream_exit_errors.pop(0)
-            if self.factory.stream_exit_errors
-            else None
-        )
+        exit_error = self.factory.stream_exit_errors.pop(0) if self.factory.stream_exit_errors else None
         if exit_error is not None:
             raise exit_error
         return False
@@ -875,11 +842,7 @@ class _FakeHTTPClient:
         except asyncio.CancelledError:
             self.factory.client_exit_cancelled = True
             raise
-        exit_error = (
-            self.factory.client_exit_errors.pop(0)
-            if self.factory.client_exit_errors
-            else None
-        )
+        exit_error = self.factory.client_exit_errors.pop(0) if self.factory.client_exit_errors else None
         if exit_error is not None:
             raise exit_error
         return False
@@ -970,20 +933,20 @@ def _make_due(row: dict[str, Any]) -> None:
 
 def _successor_for(row: dict[str, Any]) -> dict[str, Any]:
     successor = _attempt(attempt_num=row["attempt_num"] + 1)
-    successor.update({
-        "subscription_id": row["subscription_id"],
-        "event_type": row["event_type"],
-        "payload": row["payload"],
-        "payload_hash": row["payload_hash"],
-    })
+    successor.update(
+        {
+            "subscription_id": row["subscription_id"],
+            "event_type": row["event_type"],
+            "payload": row["payload"],
+            "payload_hash": row["payload_hash"],
+        }
+    )
     return successor
 
 
 def _old_v35_succeeded_peer_replay_candidates(rows: list[dict[str, Any]]) -> list[str]:
     succeeded_chains = {
-        (row["subscription_id"], row["event_type"], row["payload_hash"])
-        for row in rows
-        if row["status"] == "succeeded"
+        (row["subscription_id"], row["event_type"], row["payload_hash"]) for row in rows if row["status"] == "succeeded"
     }
     return [
         row["id"]
@@ -1117,14 +1080,21 @@ def test_successor_insert_uses_live_chain_attempt_uniqueness(monkeypatch):
         next_attempt = parent["attempt_num"] + 1
 
         first = await dispatcher._insert_successor_delivery(
-            conn, delivery, next_attempt, scheduled_at,
+            conn,
+            delivery,
+            next_attempt,
+            scheduled_at,
         )
         second = await dispatcher._insert_successor_delivery(
-            conn, delivery, next_attempt, scheduled_at,
+            conn,
+            delivery,
+            next_attempt,
+            scheduled_at,
         )
 
         live_successors = [
-            row for row in conn.rows
+            row
+            for row in conn.rows
             if row["subscription_id"] == parent["subscription_id"]
             and row["event_type"] == parent["event_type"]
             and row["payload_hash"] == parent["payload_hash"]
@@ -1148,7 +1118,7 @@ def test_recovery_dequeue_uses_skip_locked_claim():
     assert "WITH claim_clock AS" in compact
     assert "FOR UPDATE SKIP LOCKED" in compact
     assert "UPDATE webhook_deliveries d SET lease_token=$2::uuid" in compact
-    assert "_attempt_delivery(str(claimed.delivery[\"id\"]), pool=pool, claimed=claimed)" in compact
+    assert '_attempt_delivery(str(claimed.delivery["id"]), pool=pool, claimed=claimed)' in compact
     assert "min(50, limit, _semaphore_available())" in compact
     assert "max(0, _get_send_semaphore()._value)" in compact
     assert "pre_claim_monotonic = time.monotonic()" in compact
@@ -1365,7 +1335,8 @@ def test_recovery_backpressure_does_not_burn_retries(monkeypatch):
         assert len(http.delivery_ids) == expected_delivery_count
         for original in original_rows:
             chain = [
-                row for row in conn.rows
+                row
+                for row in conn.rows
                 if row["subscription_id"] == original["subscription_id"]
                 and row["event_type"] == original["event_type"]
                 and row["payload_hash"] == original["payload_hash"]
@@ -1560,8 +1531,7 @@ def test_failure_finalize_does_not_clobber_same_row_prior_success(monkeypatch):
         assert len(conn.rows) == 1
         assert sum(candidate["status"] == "succeeded" for candidate in conn.rows) == 1
         assert not any(
-            candidate["status"] in {"pending", "retrying"}
-            and candidate["attempt_num"] > row["attempt_num"]
+            candidate["status"] in {"pending", "retrying"} and candidate["attempt_num"] > row["attempt_num"]
             for candidate in conn.rows
         )
         assert row["status"] == "succeeded"
@@ -1607,8 +1577,7 @@ def test_failure_finalize_does_not_clobber_same_row_prior_abandon(monkeypatch):
         assert not finalized
         assert len(conn.rows) == 1
         assert not any(
-            candidate["status"] in {"pending", "retrying"}
-            and candidate["attempt_num"] > row["attempt_num"]
+            candidate["status"] in {"pending", "retrying"} and candidate["attempt_num"] > row["attempt_num"]
             for candidate in conn.rows
         )
         assert row["status"] == "abandoned"
@@ -1754,9 +1723,7 @@ def test_mixed_version_cleanup_error_leaves_no_succeeded_predecessor_for_old_wor
 
         pre_fix_parent = dict(parent)
         pre_fix_parent["status"] = "succeeded"
-        assert _old_v35_succeeded_peer_replay_candidates(
-            [pre_fix_parent, dict(successor)]
-        ) == [successor["id"]]
+        assert _old_v35_succeeded_peer_replay_candidates([pre_fix_parent, dict(successor)]) == [successor["id"]]
 
         async def _fail_successor_cleanup_after_update(cleanup_conn, successor_id):
             await real_abandon(cleanup_conn, successor_id)
@@ -2849,7 +2816,7 @@ def test_webhook_response_body_cap_bounds_ignored_gzip_body(monkeypatch):
             async def aiter_raw(self):
                 for i in range(0, len(self.raw), 7):
                     self.chunks_yielded += 1
-                    yield self.raw[i:i + 7]
+                    yield self.raw[i : i + 7]
 
             async def aiter_bytes(self):
                 raise AssertionError("transparent decompression path must not be used")
@@ -2899,12 +2866,14 @@ def test_rolling_upgrade_interleaving_waits_for_chain_advisory_lock_before_no_su
             assert http.delivery_ids == []
 
             successor = _attempt(attempt_num=parent["attempt_num"] + 1)
-            successor.update({
-                "subscription_id": parent["subscription_id"],
-                "event_type": parent["event_type"],
-                "payload": parent["payload"],
-                "payload_hash": parent["payload_hash"],
-            })
+            successor.update(
+                {
+                    "subscription_id": parent["subscription_id"],
+                    "event_type": parent["event_type"],
+                    "payload": parent["payload"],
+                    "payload_hash": parent["payload_hash"],
+                }
+            )
             conn.rows.append(successor)
 
         sent = await task
@@ -2929,12 +2898,14 @@ def test_startup_repair_sweep_closes_upgrade_race(monkeypatch):
         assert parent["status"] == "retrying"
 
         successor = _attempt(attempt_num=parent["attempt_num"] + 1)
-        successor.update({
-            "subscription_id": parent["subscription_id"],
-            "event_type": parent["event_type"],
-            "payload": parent["payload"],
-            "payload_hash": parent["payload_hash"],
-        })
+        successor.update(
+            {
+                "subscription_id": parent["subscription_id"],
+                "event_type": parent["event_type"],
+                "payload": parent["payload"],
+                "payload_hash": parent["payload_hash"],
+            }
+        )
         conn.rows.append(successor)
 
         result = await dispatcher.repair_superseded_retrying_deliveries(conn.pool)
@@ -3047,10 +3018,7 @@ def test_lifecycle_runs_webhook_retry_repair_on_startup():
     assert "UPDATE webhook_deliveries d SET status = 'abandoned', superseded = TRUE" in compact_dispatcher
     assert "status_updated_at = clock_timestamp()" in compact_dispatcher
     assert "WHERE d.status IN ('pending', 'retrying')" in compact_dispatcher
-    assert (
-        "AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())"
-        in compact_dispatcher
-    )
+    assert "AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())" in compact_dispatcher
     assert "WHERE d.status = 'retrying' AND NOT d.superseded" not in compact_dispatcher
     assert "newer.attempt_num > d.attempt_num" in compact_dispatcher
     assert "peer.status = 'succeeded'" in compact_dispatcher
@@ -3095,18 +3063,20 @@ def test_failure_finalize_source_shape_requires_live_owned_attempt():
     finalize_source = _webhook_module_source("finalize")
     compact = " ".join(finalize_source.split())
     success_update = compact[
-        compact.index("SET status='succeeded'"):
-        compact.index("except asyncpg.exceptions.UniqueViolationError")
+        compact.index("SET status='succeeded'") : compact.index("except asyncpg.exceptions.UniqueViolationError")
     ]
 
     assert "SET status='succeeded'" in compact
     assert "AND lease_token=$2::uuid AND status IN ('pending', 'retrying')" in success_update
     assert "lease_expires_at >= clock_timestamp()" not in success_update
-    assert compact.count(
-        "AND lease_expires_at >= clock_timestamp() "
-        "AND status IN ('pending', 'retrying') "
-        "AND NOT superseded RETURNING id"
-    ) == 3
+    assert (
+        compact.count(
+            "AND lease_expires_at >= clock_timestamp() "
+            "AND status IN ('pending', 'retrying') "
+            "AND NOT superseded RETURNING id"
+        )
+        == 3
+    )
 
 
 def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
@@ -3115,8 +3085,9 @@ def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
     dispatcher_source = _webhook_module_source("dispatcher", "outbox", "workers")
     workers_source = _webhook_module_source("workers")
     recover_source = workers_source[
-        workers_source.index("async def _recover_due_deliveries"):
-        workers_source.index("async def _recoverable_delivery_ids")
+        workers_source.index("async def _recover_due_deliveries") : workers_source.index(
+            "async def _recoverable_delivery_ids"
+        )
     ]
 
     assert "_worker_tasks: set = set()" in lifecycle_source
@@ -3124,15 +3095,14 @@ def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
     assert "def _schedule_worker" in lifecycle_source
     assert "def _schedule_delivery_attempt" in lifecycle_source
     assert "WEBHOOK_SHUTDOWN_DRAIN_SECONDS" in lifecycle_source
-    assert "await _cancel_tracked_tasks(\n        _worker_tasks" in lifecycle_source
-    assert "await _drain_delivery_attempt_tasks()" in lifecycle_source
+    assert '"workers", lambda: _cancel_tracked_tasks(' in lifecycle_source
+    assert 'await close_one("delivery", _drain_delivery_attempt_tasks)' in lifecycle_source
     assert "_schedule_delivery_attempt(_attempt_delivery(str(delivery_id)))" in dispatcher_source
     assert "_schedule_delivery_attempt" in recover_source
     assert "await _attempt_delivery" not in recover_source
     assert "may replay on restart" in lifecycle_source
-    assert (
-        lifecycle_source.index("await _cancel_tracked_tasks(\n        _worker_tasks")
-        < lifecycle_source.index("await _drain_delivery_attempt_tasks()")
+    assert lifecycle_source.index('"workers", lambda: _cancel_tracked_tasks(') < lifecycle_source.index(
+        'await close_one("delivery", _drain_delivery_attempt_tasks)'
     )
 
 
@@ -3333,9 +3303,7 @@ def test_slow_delivery_loop_does_not_starve_repair_worker(monkeypatch):
 
 def test_retry_terminal_state_migration_repairs_existing_superseded_rows():
     repo_root = Path(__file__).resolve().parents[1]
-    sql = (
-        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_retry_terminal_state.sql"
-    ).read_text()
+    sql = (repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_retry_terminal_state.sql").read_text()
     compact = " ".join(sql.split())
 
     assert "retry_scheduled" not in sql
@@ -3350,9 +3318,7 @@ def test_retry_terminal_state_migration_repairs_existing_superseded_rows():
 
 def test_webhook_attempt_lease_migration_adds_claim_columns():
     repo_root = Path(__file__).resolve().parents[1]
-    sql = (
-        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_attempt_lease.sql"
-    ).read_text()
+    sql = (repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_attempt_lease.sql").read_text()
     compact = " ".join(sql.split())
 
     assert "ADD COLUMN IF NOT EXISTS lease_token UUID NULL" in compact
@@ -3363,9 +3329,7 @@ def test_webhook_attempt_lease_migration_adds_claim_columns():
 
 def test_webhook_writer_revision_migration_adds_legacy_marker():
     repo_root = Path(__file__).resolve().parents[1]
-    sql = (
-        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_writer_revision.sql"
-    ).read_text()
+    sql = (repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_writer_revision.sql").read_text()
     compact = " ".join(sql.split())
 
     assert "ADD COLUMN IF NOT EXISTS writer_revision INTEGER DEFAULT 0" in compact
@@ -3375,9 +3339,7 @@ def test_webhook_writer_revision_migration_adds_legacy_marker():
 
 def test_webhook_status_updated_at_migration_adds_triggered_transition_clock():
     repo_root = Path(__file__).resolve().parents[1]
-    sql = (
-        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_status_updated_at.sql"
-    ).read_text()
+    sql = (repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_status_updated_at.sql").read_text()
     compact = " ".join(sql.split())
 
     assert "ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ" in compact
@@ -3397,9 +3359,7 @@ def test_webhook_status_updated_at_migration_adds_triggered_transition_clock():
 
 def test_webhook_superseded_marker_migration_adds_old_compatible_audit_marker():
     repo_root = Path(__file__).resolve().parents[1]
-    sql = (
-        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_superseded_marker.sql"
-    ).read_text()
+    sql = (repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_superseded_marker.sql").read_text()
     compact = " ".join(sql.split())
 
     assert "ADD COLUMN IF NOT EXISTS superseded BOOLEAN NOT NULL DEFAULT FALSE" in compact
@@ -3412,9 +3372,7 @@ def test_webhook_superseded_marker_migration_adds_old_compatible_audit_marker():
 
 def test_webhook_attempt_unique_migration_adds_live_chain_attempt_invariant():
     repo_root = Path(__file__).resolve().parents[1]
-    sql = (
-        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_attempt_unique.sql"
-    ).read_text()
+    sql = (repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_attempt_unique.sql").read_text()
     compact = " ".join(sql.split())
 
     assert "PARTITION BY subscription_id, event_type, payload_hash, attempt_num" in compact
@@ -3429,19 +3387,14 @@ def test_webhook_attempt_unique_migration_adds_live_chain_attempt_invariant():
 
 def test_webhook_succeeded_unique_migration_deduplicates_existing_succeeded_rows():
     repo_root = Path(__file__).resolve().parents[1]
-    sql = (
-        repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_succeeded_unique.sql"
-    ).read_text()
+    sql = (repo_root / "mnemos" / "db_migrations" / "migrations_v3_5_webhook_succeeded_unique.sql").read_text()
     compact = " ".join(sql.split())
 
     assert "PARTITION BY subscription_id, event_type, payload_hash" in compact
     assert "ORDER BY attempt_num ASC, created ASC, id ASC" in compact
     assert "SET status = 'abandoned', superseded = TRUE" in compact
     assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_succeeded_chain" in compact
-    assert (
-        "ON webhook_deliveries(subscription_id, event_type, payload_hash) "
-        "WHERE status = 'succeeded'"
-    ) in compact
+    assert ("ON webhook_deliveries(subscription_id, event_type, payload_hash) " "WHERE status = 'succeeded'") in compact
 
     db = sqlite3.connect(":memory:")
     db.executescript(

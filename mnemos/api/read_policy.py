@@ -75,12 +75,11 @@ def _content_redacted_for_embedding(content: str, classified) -> str:
     consistently with what was classified. Content with no spans is
     returned unchanged (no recall cost for clean memories).
     """
-    from mnemos.core.secret_detection import redact
+    from mnemos.core.secret_detection import private_key_spans, redact
 
     spans = (getattr(classified, "redact_fields", None) or {}).get("content") or []
-    if not spans:
-        return content
-    return redact(content, spans)
+    return redact(content, list(spans) + private_key_spans(content))
+
 
 
 def _redacted_for_webhook(content: str, metadata) -> str:

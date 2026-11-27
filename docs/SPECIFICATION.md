@@ -1,6 +1,6 @@
 # MNEMOS Specification
 
-**Version**: v7.2.0 current (major release; continues the v6.0.0
+**Version**: v7.3.0 current (major release; continues the v6.0.0
 split-distribution line and supersedes the v5.0.1 / v5.0.0 GA line from
 2026-05-02). Oracle AI Database 26ai, IBM Db2 12.1.5, MySQL and MariaDB
 backends sit behind the EPIMONE `PersistenceBackend` ABC alongside PostgreSQL and SQLite.
@@ -264,7 +264,7 @@ warns when it is missing.
 |---|---|---|
 | API | `mnemos.api.main:app` via `mnemos serve` | REST service on port 5002 |
 | CLI | `mnemos.cli.main:app` | `serve`, `install`, `worker`, `export`, `import`, `consult`, `health`, `version` |
-| MCP | `mnemos.mcp.stdio`, `mnemos.mcp.http` | 25 tools from `mnemos/mcp/tools/` |
+| MCP | `mnemos.mcp.stdio`, `mnemos.mcp.http` | 27 tools from `mnemos/mcp/tools/` |
 | Distillation worker | `mnemos/workers/distillation.py` | Drains `memory_compression_queue`; runs APOLLO + ARTEMIS contests |
 | Registry sync | `scripts/sync_provider_models.py` | Scheduled provider + Arena/LMArena sync |
 
@@ -499,7 +499,7 @@ Rate limiting: SlowAPI, on by default (300/minute); disable with `RATE_LIMIT_ENA
 Body size: default 5 MB, `MAX_BODY_BYTES` override. Chunked-transfer
 aware streaming limiter (not just Content-Length check).
 
-### 5.2 MCP (stdio and HTTP/SSE, 25 tools)
+### 5.2 MCP (stdio and HTTP/SSE, 27 tools)
 
 Entry points: `mnemos.mcp.stdio` and `mnemos.mcp.http`. Both use
 the shared tool registry under `mnemos/mcp/tools/`. Tool manifest:
@@ -981,7 +981,7 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
   application visibility after
   `mnemos/db_migrations/migrations_v3_5_rls_group_select_unix_bits.sql`.
 
-### 10.4 Known gaps (as of v7.2.0)
+### 10.4 Known gaps (as of v7.3.0)
 
 - GDPR deletion requests can still hit the documented final-verify race or
   sweep-verifying exhaustion under sustained target writes; see

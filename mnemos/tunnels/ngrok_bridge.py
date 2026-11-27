@@ -127,7 +127,8 @@ class NgrokBridge(TunnelBridge):
         # user, and this token controls the operator's whole ngrok account.
         # child_env() also withholds MNEMOS's own environment (DSN, MCP
         # token, OAuth signing key) from the vendor binary.
-        extra = {"NGROK_AUTHTOKEN": authtoken} if authtoken else None
+        resolved_token = authtoken or raw_env("NGROK_AUTHTOKEN").strip()
+        extra = {"NGROK_AUTHTOKEN": resolved_token} if resolved_token else None
         return argv, child_env(extra)
 
     # ── URL discovery ────────────────────────────────────────────────
@@ -183,14 +184,17 @@ def _pick_public_url(payload: Any) -> Optional[str]:
     tunnels = payload.get("tunnels")
     if not isinstance(tunnels, list):
         return None
-    fallback: Optional[str] = None
     for tunnel in tunnels:
         if not isinstance(tunnel, dict):
             continue
         url = tunnel.get("public_url")
         if not isinstance(url, str) or not url:
             continue
-        if url.startswith("https://"):
-            return url
-        fallback = fallback or url
-    return fallback
+        from urllib.parse import urlsplit
+        try:
+            parsed = urlsplit(url)
+            if parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password:
+                return url
+        except ValueError:
+            continue
+    return None

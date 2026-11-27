@@ -47,7 +47,7 @@ service; everything stays in your MNEMOS.
 ```
 
 The MCP HTTP/SSE bridge (`mnemos serve mcp-http`) shares the exact same
-25 tool definitions as the stdio MCP server. A memory written from Claude
+27 tool definitions as the stdio MCP server. A memory written from Claude
 Desktop is queryable from ChatGPT and vice versa.
 
 ## Setup — OAuth 2.1 path
@@ -93,7 +93,7 @@ Add to your `docker-compose.override.yml` (<pg-host> prod example):
 ```yaml
 services:
   mnemos-mcp-http:
-    image: ghcr.io/ncz-os/mnemos-enterprise:7.2.0
+    image: ghcr.io/ncz-os/mnemos-enterprise:7.3.0
     depends_on:
       - mnemos
     restart: unless-stopped

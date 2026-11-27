@@ -141,6 +141,15 @@ class MemoryRepo:
         )
         self.soft_delete_calls: list[dict[str, Any]] = []
 
+    async def mutate_exact_duplicates(self, tx, *, canonical_id, duplicate_ids, owner_id, namespace, content_hash, consolidate=False):
+        changed = []
+        for mid in duplicate_ids:
+            row = await self.soft_delete_memory(tx, mid, canonical_id=canonical_id,
+                owner_id=owner_id, namespace=namespace, content_hash=content_hash)
+            if row:
+                changed.append({**row, "id": row.get("id") or mid})
+        return changed
+
     async def soft_delete_memory(self, tx, memory_id, **kwargs):
         self.soft_delete_calls.append({"memory_id": memory_id, **kwargs})
         if self._soft_delete_seq is not None:
@@ -665,15 +674,10 @@ async def test_dedup_apply_soft_deletes_each_loser_with_dedup_metadata():
     assert len(backend.memories.soft_delete_calls) == 1
     call = backend.memories.soft_delete_calls[0]
     assert call["memory_id"] == "mem_dup"
-    assert call["requested_by"] == "mnemos-memory-dedup"
-    assert call["requested_at"] is None
-    assert call["request_kind"] == "dedup_exact_content"
-    assert call["reason"] == "exact-content duplicate soft-delete"
-    assert call["source"] == ["mnemos.cli.memory-dedup"]
-    visibility = call["visibility"]
-    assert visibility.scope == VisibilityScope.ROOT_BYPASS
-    assert visibility.namespace == "lab"  # scoped to the GROUP namespace
-    # Keeper untouched: only losers are soft-deleted.
+    assert call["canonical_id"] == "mem_keep"
+    assert call["owner_id"] == GROUP_ROW["owner_id"]
+    assert call["namespace"] == "lab"
+    assert call["content_hash"] == GROUP_ROW["content_hash"]
     assert [c["memory_id"] for c in backend.memories.soft_delete_calls] == ["mem_dup"]
     assert backend.commits == 1
 

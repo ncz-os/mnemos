@@ -639,12 +639,14 @@ class TestPantheonToolsExtraMissing:
 
     @pytest.mark.asyncio
     async def test_list_models_not_installed(self, monkeypatch):
+        monkeypatch.setattr(mcp_models, "is_extra_installed", lambda name: False)
         assert mcp_models.is_extra_installed("pantheon") is False
         result = await mcp_models.tool_pantheon_list_models(filter_capabilities=["code"])
         assert result == {"success": False, "error": "PANTHEON not installed"}
 
     @pytest.mark.asyncio
     async def test_route_explain_not_installed(self, monkeypatch):
+        monkeypatch.setattr(mcp_models, "is_extra_installed", lambda name: False)
         assert mcp_models.is_extra_installed("pantheon") is False
         result = await mcp_models.tool_pantheon_route_explain([{"role": "user", "content": "hi"}], "auto:reasoning")
         assert result == {"success": False, "error": "PANTHEON not installed"}
@@ -653,6 +655,7 @@ class TestPantheonToolsExtraMissing:
     async def test_not_installed_returns_before_validation(self, monkeypatch):
         """The gate short-circuits: invalid inputs do not raise when the
         extra is absent (validation runs only after the gate)."""
+        monkeypatch.setattr(mcp_models, "is_extra_installed", lambda name: False)
         assert mcp_models.is_extra_installed("pantheon") is False
         # Would raise ValueError if validation ran first.
         result = await mcp_models.tool_pantheon_list_models(filter_capabilities=["bad cap!"])

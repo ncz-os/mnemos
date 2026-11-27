@@ -42,29 +42,6 @@ class NamespaceDrift:
     average_recall_count_delta: float
 
 
-_DAILY_RECALL_LOG_SQL = """
-SELECT memory_id,
-       date_trunc('day', recalled_at AT TIME ZONE 'UTC') AS bucket_day,
-       COUNT(*)::int AS recall_count
-  FROM memory_recall_log
- WHERE namespace = $1
-   AND recalled_at >= NOW() - ($2::int * INTERVAL '1 hour')
- GROUP BY memory_id, bucket_day
- ORDER BY memory_id, bucket_day
-"""
-
-_DAILY_MEMORIES_FALLBACK_SQL = """
-SELECT id AS memory_id,
-       date_trunc('day', last_recalled_at AT TIME ZONE 'UTC') AS bucket_day,
-       recall_count::int AS recall_count
-  FROM memories
- WHERE namespace = $1
-   AND last_recalled_at IS NOT NULL
-   AND last_recalled_at >= NOW() - ($2::int * INTERVAL '1 hour')
-   AND deleted_at IS NULL
- ORDER BY id
-"""
-
 _RECALL_LOG_EVENTS_SQL = """
 SELECT memory_id, recalled_at
   FROM memory_recall_log
@@ -86,6 +63,8 @@ async def detect_recall_anomalies(
     namespace: str,
     lookback_hours: int = 168,
     sensitivity: float = 2.5,
+    *,
+    now: datetime | None = None,
 ) -> list[RecallAnomaly]:
     """Detect per-memory recall spikes and drops over daily buckets."""
     if lookback_hours <= 0:
@@ -93,9 +72,12 @@ async def detect_recall_anomalies(
     if sensitivity <= 0:
         raise ValueError("sensitivity must be positive")
 
-    rows = await _fetch_daily_recall_counts(pool, namespace, lookback_hours)
-    current_day = datetime.now(timezone.utc).date()
+    anchor = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    end = anchor.replace(hour=0, minute=0, second=0, microsecond=0)
+    current_day = (end - timedelta(days=1)).date()
     baseline_days = max(1, int(np.ceil(lookback_hours / 24.0)))
+    start = end - timedelta(days=baseline_days + 1)
+    rows = await _fetch_daily_recall_counts(pool, namespace, start, end)
     baseline_range = [
         current_day - timedelta(days=offset)
         for offset in range(baseline_days, 0, -1)
@@ -216,12 +198,10 @@ async def detect_namespace_drift(
     )
 
 
-async def _fetch_daily_recall_counts(pool: Any, namespace: str, lookback_hours: int) -> list[Any]:
-    async with pool.acquire() as conn:
-        try:
-            return list(await conn.fetch(_DAILY_RECALL_LOG_SQL, namespace, lookback_hours))
-        except Exception:
-            return list(await conn.fetch(_DAILY_MEMORIES_FALLBACK_SQL, namespace, lookback_hours))
+async def _fetch_daily_recall_counts(pool: Any, namespace: str, start: datetime, end: datetime) -> list[Any]:
+    from mnemos.persistence.recall_observations import read_daily_recall_counts
+
+    return await read_daily_recall_counts(pool, namespace, start, end)
 
 
 async def _fetch_recall_events(pool: Any, namespace: str, baseline_days: int) -> list[Any]:
@@ -247,6 +227,11 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
 def _coerce_date(value: Any) -> date | None:
     if value is None:
         return None
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
     if isinstance(value, datetime):
         return _as_utc(value).date()
     if isinstance(value, date):

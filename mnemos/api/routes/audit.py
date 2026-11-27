@@ -280,9 +280,18 @@ async def audit_inclusion_proof(
         )
 
     async with backend.transactional() as tx:
-        # v6.2 protocol method (cleanup from inline SQL bridge).
+        await maybe_set_pg_rls(tx, user)
         target_row = await backend.audit_chain.get_audit_entry_by_id(tx, entry_id_bytes)
-        if target_row is None:
+        visibility = VisibilityFilter.for_read(
+            user, namespace=None if is_root(user) else user.namespace,
+            include_secrets=is_root(user),
+        )
+        memory_row = None
+        if target_row is not None:
+            memory_row = await backend.memories.get_memory_by_audit_key(
+                tx, target_row["memory_id"], visibility=visibility, include_archived=True,
+            )
+        if memory_row is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"audit entry {entry_id} not found",

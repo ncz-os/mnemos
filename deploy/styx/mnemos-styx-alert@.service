@@ -1,0 +1,10 @@
+[Unit]
+Description=STYX status notification for %i
+
+[Service]
+Type=oneshot
+User=mnemos
+ExecStart=/usr/bin/logger -p daemon.err STYX unit %i failed; inspect its journal and /var/lib/styx/styx-last-run.json
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true

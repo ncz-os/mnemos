@@ -147,9 +147,6 @@ def _extract_external_id(provider_name: str, claims: Dict[str, Any]) -> Optional
     # Azure: 'oid' (object ID) is more stable than sub across tenants
     if provider_name.startswith("azure") and claims.get("oid"):
         return str(claims["oid"])
-    # Generic email fallback (last resort)
-    if claims.get("email"):
-        return f"email:{claims['email']}"
     return None
 
 

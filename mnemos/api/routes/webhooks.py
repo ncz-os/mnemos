@@ -72,6 +72,9 @@ async def create_webhook(
     user: UserContext = Depends(get_current_user),
 ):
     """Create a webhook subscription. Returns the HMAC secret exactly once."""
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     backend = require_webhooks_backend()
 
     await _validate_url(request.url)
@@ -205,6 +208,9 @@ async def revoke_webhook(
     user: UserContext = Depends(get_current_user),
 ):
     """Soft-delete: marks the subscription revoked. Delivery log preserved."""
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     webhook_id = parse_uuid_or_404(webhook_id, "webhook")
     backend = require_webhooks_backend()
 

@@ -8,7 +8,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import backend_or_503
+from mnemos.api.persistence_helpers import backend_or_503, require_write_allowed
 
 from mnemos.domain.portability.export import (
     _EXPORT_HARD_LIMIT,
@@ -370,6 +370,7 @@ async def import_memories(
     # import path that then called asyncpg-only methods on it, so it would
     # have raised AttributeError on SQLite the moment the gate was lifted. It
     # looked like an escape hatch and was not one.
+    require_write_allowed()
     backend = backend_or_503()
     # CF-09 GDPR fence (MN-05): probe the import's target scopes BEFORE the
     # transaction is opened. The fence reads through a transaction of its own,

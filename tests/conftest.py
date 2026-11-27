@@ -13,6 +13,12 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+# Fixtures consumed by the MCP OAuth / budget-ledger test modules. They live in
+# helper modules so each test file does not redefine them; importing them here
+# puts them in the shared conftest namespace for discovery by pytest.
+from tests.oauth_backend_helpers import oauth_database  # noqa: F401
+from tests.test_mcp_oauth_integration import mcp_http_app  # noqa: F401
+
 
 def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)

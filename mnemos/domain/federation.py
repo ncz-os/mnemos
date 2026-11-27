@@ -1467,7 +1467,7 @@ async def pull_memory_by_id(
         _raise_for_peer_status("GET", url, status_code)
     if isinstance(body, dict) and body.get("id") == memory_id:
         return [body]
-    return []
+    raise RuntimeError("federation by-id response is invalid")
 
 
 async def _repair_locally_damaged_replica(

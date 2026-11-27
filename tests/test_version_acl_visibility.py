@@ -50,8 +50,39 @@ def test_version_predicate_honors_group_and_acl_by_memory_id():
 
 
 def test_version_routes_pass_resolved_groups_to_shared_predicate():
+    # NG2-MN-018 moved list/get-version/diff SQL into
+    # PostgresVersionRepository; only the revert route keeps its inline
+    # predicate (1 call site). The moved queries render the same shared
+    # predicate inside the repository — pinned by the test below.
     source = open("mnemos/api/routes/versions.py", encoding="utf-8").read()
-    assert source.count("user.user_id, user.group_ids, start_param_idx=") >= 4
+    # diff is still a raw-pool Postgres route, so it must keep calling the
+    # shared predicate with the caller's resolved groups (1 call site).
+    # list/get/diff are ABC-routed: the per-snapshot predicate lives in
+    # each backend's VersionRepository, reached via the facade.
+    assert source.count("user.user_id, user.group_ids, start_param_idx=") >= 1
+    assert "backend.memory_versions.list_memory_versions" in source
+    assert "backend.memory_versions.get_memory_version" in source
+    assert "backend.memory_versions.fetch_version_contents" in source
+
+
+def test_version_repository_renders_shared_predicate():
+    """The ABC-migrated history reads must use the shared group/ACL predicate.
+
+    list_versions / get_version no longer hand-roll SQL in the route; the
+    repository has to render ``version_visibility_predicate`` (group mode +
+    ACL grants), not a narrower owner/world-only filter, or ACL-granted
+    readers would lose history reads (see the ACL tests below).
+    """
+    import inspect
+
+    from mnemos.persistence.postgres import PostgresVersionRepository
+
+    src = inspect.getsource(PostgresVersionRepository.list_memory_versions)
+    assert "_core_version_visibility_predicate" in src
+    src = inspect.getsource(PostgresVersionRepository.get_memory_version)
+    assert "_core_version_visibility_predicate" in src
+    src = inspect.getsource(PostgresVersionRepository.fetch_version_contents)
+    assert "_core_version_visibility_predicate" in src
 
 
 def test_version_predicate_read_bit_uses_acl_read_bit_constant():
@@ -593,10 +624,91 @@ class _PoolCtx:
 
 def _install(monkeypatch, conn):
     import mnemos.core.lifecycle as lc
+    from mnemos.persistence.postgres import (
+        PostgresMemoryRepository,
+        PostgresTransaction,
+        PostgresVersionRepository,
+    )
+
+    # list/get-version routes resolve the backend facade (NG2-MN-018);
+    # the fake backend serves the REAL Postgres repositories over the
+    # stub connection. A plain object (not MagicMock) has no ``pool``
+    # attribute, so the still-raw diff/revert/dag routes keep falling
+    # through to the installed ``_pool``.
+    tx = PostgresTransaction(conn, MagicMock())
+
+    class _Ctx:
+        async def __aenter__(self):
+            return tx
+
+        async def __aexit__(self, *_a):
+            return False
+
+    class _VersionsBackend:
+        def __init__(self):
+            self.memories = PostgresMemoryRepository()
+            self.memory_versions = PostgresVersionRepository()
+
+        def transactional(self):
+            return _Ctx()
+
+    monkeypatch.setattr(lc, "_persistence_backend", _VersionsBackend())
 
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
+
+
+class _FakeVersionsTx:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return False
+
+
+class _FakeVersionsBackend:
+    """Backend double for the ABC-routed versions handlers.
+
+    Serves the rows the repository's SQL-level visibility predicate
+    would have returned, so the endpoint tests stay focused on the
+    handler's tenancy mapping (PermissionError -> 404) rather than
+    re-proving the predicate SQL the unit tests above already cover.
+    """
+
+    def __init__(self, *, versions, readable=True):
+        self._versions = list(versions)
+        self._readable = readable
+        self.memories = self
+        self.memory_versions = self
+        self.memory_branches = self
+
+    def transactional(self, **_kwargs):
+        return _FakeVersionsTx()
+
+    async def assert_memory_readable(self, tx, memory_id, user):
+        if not self._readable:
+            raise PermissionError(f"Memory {memory_id} not found")
+
+    async def list_memory_versions(self, tx, memory_id, branch, user):
+        return [v for v in self._versions if v.get("branch", "main") == branch]
+
+    async def fetch_memory_version(self, tx, memory_id, version_num, branch, user):
+        for v in self._versions:
+            if v["version_num"] == version_num and v.get("branch", "main") == branch:
+                return v
+        return None
+
+    async def fetch_memory_branch_heads(self, tx, memory_ids, **_kwargs):
+        if self._versions:
+            return [{"memory_id": memory_ids[0], "branch": "main"}]
+        return []
+
+
+def _install_versions_backend(monkeypatch, *, versions, readable=True):
+    import mnemos.core.lifecycle as lc
+
+    monkeypatch.setattr(lc, "_persistence_backend", _FakeVersionsBackend(versions=versions, readable=readable))
 
 
 def test_log_endpoint_acl_reader_sees_all_snapshots(monkeypatch):
@@ -731,13 +843,15 @@ def test_versions_endpoint_acl_reader_sees_all(monkeypatch):
     """ACL-granted reader hits /versions and sees every snapshot.
 
     This is the handler in mnemos/api/routes/versions.py::list_versions.
+    The handler is backend-neutral now: the fake backend stands in for
+    the repository layer, serving the rows the SQL-level ACL predicate
+    would have returned (all three, via the grant).
     """
     import asyncio as _asyncio
 
     from mnemos.api.routes import versions as versions_handler
 
-    conn = _MemVisibleConn()
-    _install(monkeypatch, conn)
+    _install_versions_backend(monkeypatch, versions=_MemVisibleConn()._versions)
 
     alice = _alice()
     versions = _asyncio.run(versions_handler.list_versions("mem-a", branch="main", user=alice))
@@ -746,32 +860,18 @@ def test_versions_endpoint_acl_reader_sees_all(monkeypatch):
 
 
 def test_versions_endpoint_non_granted_reader_sees_nothing(monkeypatch):
-    """A non-ACL, non-group reader gets an empty /versions list (the
-    visibility predicate filters every row out at SQL level)."""
+    """A non-ACL, non-group reader gets a 404 on /versions (the live
+    memory is unreadable, so the tenancy gate fires before the listing)."""
     import asyncio as _asyncio
 
     from fastapi import HTTPException
 
     from mnemos.api.routes import versions as versions_handler
 
-    class _StrangerConn(_MemVisibleConn):
-        def __init__(self):
-            super().__init__()
-            self.acl_visible = False
-
-        async def fetchrow(self, sql, *args):
-            compact = " ".join(sql.split())
-            if compact.startswith("SELECT owner_id, namespace FROM memories WHERE id = $1"):
-                return {"owner_id": "mallory", "namespace": "alice-ns"}
-            if "FROM memories WHERE id = $1" in compact and "owner_id" in compact:
-                return None
-            return await super().fetchrow(sql, *args)
-
-    conn = _StrangerConn()
-    _install(monkeypatch, conn)
+    _install_versions_backend(monkeypatch, versions=[], readable=False)
 
     # Mallory is unauthenticated to this memory; the live-memory
-    # _assert_memory_readable raises 404.
+    # assert_memory_readable raises PermissionError, mapped to 404.
     with pytest.raises(HTTPException) as excinfo:
         _asyncio.run(
             versions_handler.list_versions("mem-a", branch="main", user=_mallory())

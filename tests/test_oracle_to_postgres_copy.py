@@ -80,6 +80,13 @@ def test_identifiers_are_quoted_with_embedded_quotes_doubled():
     assert copy.qi('we"ird') == '"we""ird"'
 
 
+def test_sequence_sync_binds_database_returned_sequence_name():
+    sql = copy.sequence_sync_query('mem"ories', 'i"d')
+    assert "$1" in sql
+    assert "setval('" not in sql
+    assert 'max("i""d") from "mem""ories"' in sql
+
+
 # ── --drop-constraints validation ──────────────────────────────────────
 # The spec reaches ALTER TABLE as operator input. ``qi`` prevents identifier
 # injection, but it also quotes arbitrary junk as one legal identifier, so a

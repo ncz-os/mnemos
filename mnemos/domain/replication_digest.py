@@ -238,6 +238,31 @@ def _bucket_map(document: Any) -> dict[str, dict[str, Any]]:
     return index
 
 
+def complete_digest(document: Mapping[str, Any]) -> bool:
+    """Validate that every declared member is present in the document."""
+    if document.get("truncated") or not isinstance(document.get("row_count"), int):
+        return False
+    buckets = document.get("buckets")
+    if not isinstance(buckets, list):
+        return False
+    seen, labels = set(), set()
+    for bucket in buckets:
+        if not isinstance(bucket, Mapping):
+            return False
+        ids = bucket.get("ids")
+        label = bucket.get("bucket")
+        if not isinstance(label, str) or label in labels:
+            return False
+        labels.add(label)
+        if not isinstance(ids, list) or bucket.get("count") != len(ids) or not bucket.get("merkle_root"):
+            return False
+        for mid in ids:
+            if not isinstance(mid, str) or not mid or mid in seen:
+                return False
+            seen.add(mid)
+    return document["row_count"] == len(seen)
+
+
 def diff_digests(source: Mapping[str, Any], replica: Mapping[str, Any]) -> dict[str, Any]:
     """Compare two digest documents bucket by bucket.
 
@@ -282,6 +307,7 @@ def diff_digests(source: Mapping[str, Any], replica: Mapping[str, Any]) -> dict[
         repair_ids.extend(src_ids)
 
     return {
+        "source_complete": complete_digest(source),
         "differing_buckets": differing,
         "source_only_bucket_ids": source_only,
         "replica_only_bucket_ids": replica_only,

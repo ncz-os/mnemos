@@ -6,6 +6,7 @@ config.toml and the systemd EnvironmentFile, a service install at dim=512 could
 be followed by the service starting at dim=768 (no env var in scope) and hit
 the dim mismatch guard. These tests verify the full plumbing.
 """
+
 from __future__ import annotations
 
 import os
@@ -92,7 +93,7 @@ def test_minimal_config_emits_embedding_dim():
     # Guard against accidentally placing it outside the [database] block.
     db_section_start = rendered.index("[database]")
     db_section_end = rendered.find("[", db_section_start + len("[database]"))
-    db_section = rendered[db_section_start:db_section_end if db_section_end != -1 else None]
+    db_section = rendered[db_section_start : db_section_end if db_section_end != -1 else None]
     assert "embedding_dim = 512" in db_section
 
 
@@ -117,8 +118,7 @@ def test_service_env_file_contents_include_embedding_dim():
         "systemd env file or the dim won't survive service restart"
     )
     assert "config.embedding_dim" in source, (
-        "MNEMOS_EMBEDDING_DIM must be sourced from config.embedding_dim, "
-        "not a hardcoded literal"
+        "MNEMOS_EMBEDDING_DIM must be sourced from config.embedding_dim, " "not a hardcoded literal"
     )
     # Sanity: the expected formatted line is a substring of source after
     # f-string expansion. We can't run f-strings inside getsource, but we
@@ -227,23 +227,23 @@ def test_load_existing_config_round_trips_embedding_dim(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "personal"\n'
-        '\n'
-        '[deployment]\n'
+        "\n"
+        "[deployment]\n"
         'profile = "personal"\n'
-        '\n'
-        '[database]\n'
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
-        'port = 5432\n'
+        "port = 5432\n"
         'database = "mnemos"\n'
         'user = "mnemos_user"\n'
         'password = "test"\n'
-        'embedding_dim = 512\n'
-        '\n'
-        '[api]\n'
-        'port = 5002\n'
+        "embedding_dim = 512\n"
+        "\n"
+        "[api]\n"
+        "port = 5002\n"
     )
     cfg = _load_existing_config(str(tmp_path))
     assert cfg is not None
@@ -256,16 +256,16 @@ def test_load_existing_config_defaults_to_768_when_absent(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "personal"\n'
-        '\n'
-        '[deployment]\n'
+        "\n"
+        "[deployment]\n"
         'profile = "personal"\n'
-        '\n'
-        '[database]\n'
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
-        'port = 5432\n'
+        "port = 5432\n"
         'database = "mnemos"\n'
         'user = "mnemos_user"\n'
         'password = "test"\n'
@@ -284,17 +284,17 @@ def test_load_existing_config_password_only_env_does_not_bypass_config_toml(tmp_
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "personal"\n'
-        '\n'
-        '[database]\n'
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
-        'port = 5432\n'
+        "port = 5432\n"
         'database = "mnemos"\n'
         'user = "mnemos_user"\n'
         'password = ""\n'  # password expected from env
-        'embedding_dim = 512\n'
+        "embedding_dim = 512\n"
     )
     env_overlay = {"MNEMOS_DB_PASSWORD": "from-env-secret"}
     with patch.dict(os.environ, env_overlay, clear=False):
@@ -315,17 +315,17 @@ def test_load_existing_config_env_overrides_embedding_dim_when_set(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "personal"\n'
-        '\n'
-        '[database]\n'
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
-        'port = 5432\n'
+        "port = 5432\n"
         'database = "mnemos"\n'
         'user = "mnemos_user"\n'
         'password = "test"\n'
-        'embedding_dim = 512\n'
+        "embedding_dim = 512\n"
     )
     env_overlay = {"MNEMOS_EMBEDDING_DIM": "1024"}
     with patch.dict(os.environ, env_overlay, clear=False):
@@ -343,17 +343,17 @@ def test_load_existing_config_password_in_config_takes_precedence(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "personal"\n'
-        '\n'
-        '[database]\n'
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
-        'port = 5432\n'
+        "port = 5432\n"
         'database = "mnemos"\n'
         'user = "mnemos_user"\n'
         'password = "from-config"\n'
-        'embedding_dim = 512\n'
+        "embedding_dim = 512\n"
     )
     env_overlay = {"MNEMOS_DB_PASSWORD": "from-env"}
     with patch.dict(os.environ, env_overlay, clear=False):
@@ -373,13 +373,13 @@ def test_load_existing_config_garbage_embedding_dim_fails_closed(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "personal"\n'
-        '\n'
-        '[database]\n'
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "localhost"\n'
-        'port = 5432\n'
+        "port = 5432\n"
         'database = "mnemos"\n'
         'user = "mnemos_user"\n'
         'password = "test"\n'
@@ -399,14 +399,14 @@ def test_load_existing_config_infers_server_profile_from_postgres_backend(tmp_pa
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "192.0.2.67"\n'
-        'port = 5432\n'
+        "port = 5432\n"
         'database = "mnemos_prod"\n'
         'user = "mnemos_user"\n'
         'password = "real-secret"\n'
-        'embedding_dim = 768\n'
+        "embedding_dim = 768\n"
     )
     cfg = _load_existing_config(str(tmp_path))
     assert cfg is not None
@@ -420,13 +420,13 @@ def test_load_existing_config_infers_server_profile_from_explicit_postgres_field
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database]\n'
+        "[database]\n"
         'host = "192.0.2.67"\n'
-        'port = 5433\n'  # non-default port — clear postgres signal
+        "port = 5433\n"  # non-default port — clear postgres signal
         'database = "mnemos_prod"\n'
         'user = "real_user"\n'
         'password = "real-secret"\n'
-        'embedding_dim = 768\n'
+        "embedding_dim = 768\n"
     )
     cfg = _load_existing_config(str(tmp_path))
     assert cfg is not None
@@ -440,10 +440,7 @@ def test_load_existing_config_keeps_edge_when_only_sqlite_fields_present(tmp_pat
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database]\n'
-        'backend = "sqlite"\n'
-        'sqlite_path = "/var/lib/mnemos/mnemos.db"\n'
-        'embedding_dim = 512\n'
+        "[database]\n" 'backend = "sqlite"\n' 'sqlite_path = "/var/lib/mnemos/mnemos.db"\n' "embedding_dim = 512\n"
     )
     cfg = _load_existing_config(str(tmp_path))
     assert cfg is not None
@@ -457,13 +454,13 @@ def test_load_existing_config_explicit_profile_wins_over_inference(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "dev"\n'
-        '\n'
-        '[database]\n'
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "remote-pg"\n'
-        'embedding_dim = 768\n'
+        "embedding_dim = 768\n"
     )
     cfg = _load_existing_config(str(tmp_path))
     assert cfg is not None
@@ -478,23 +475,23 @@ def test_patch_config_toml_embedding_dim_replaces_existing_field(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "personal"\n'
-        'port = 5002\n'
-        '\n'
-        '[database]\n'
+        "port = 5002\n"
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "192.0.2.67"\n'
-        'port = 5432\n'
+        "port = 5432\n"
         'database = "mnemos_prod"\n'
         'user = "mnemos_user"\n'
         'password = "production-secret"\n'
-        'embedding_dim = 768\n'
-        '\n'
-        '[rate_limit]\n'
+        "embedding_dim = 768\n"
+        "\n"
+        "[rate_limit]\n"
         'storage_uri = "redis://prod-redis:6379/0"\n'
-        '\n'
-        '[graeae]\n'
+        "\n"
+        "[graeae]\n"
         'mode_default = "full"\n'
     )
 
@@ -523,12 +520,7 @@ def test_patch_config_toml_embedding_dim_appends_when_field_missing(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database]\n'
-        'backend = "postgres"\n'
-        'host = "localhost"\n'
-        '\n'
-        '[server]\n'
-        'profile = "server"\n'
+        "[database]\n" 'backend = "postgres"\n' 'host = "localhost"\n' "\n" "[server]\n" 'profile = "server"\n'
     )
     rc = _patch_config_toml_embedding_dim(str(tmp_path / "config.toml"), 1024)
     assert rc is True
@@ -553,17 +545,17 @@ def test_patch_config_toml_legacy_personal_postgres_survives_upgrade(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "personal"\n'  # legacy
-        '\n'
-        '[database]\n'
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'  # but the DB is real postgres
         'host = "10.0.0.5"\n'
-        'port = 5432\n'
+        "port = 5432\n"
         'database = "mnemos"\n'
         'user = "mnemos"\n'
         'password = "kept-by-upgrade"\n'
-        'embedding_dim = 768\n'
+        "embedding_dim = 768\n"
     )
     rc = _patch_config_toml_embedding_dim(str(tmp_path / "config.toml"), 512)
     assert rc is True
@@ -600,10 +592,7 @@ def test_patch_config_toml_preserves_owner_group_mode(tmp_path):
     from mnemos.installer.__main__ import _patch_config_toml_embedding_dim
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[database]\n'
-        'embedding_dim = 768\n'
-    )
+    config_path.write_text("[database]\n" "embedding_dim = 768\n")
     # Set explicit non-default mode (0644 — group + other readable).
     os.chmod(config_path, 0o644)
     pre_st = os.stat(config_path)
@@ -634,9 +623,7 @@ def test_patch_config_toml_handles_inline_comment_section_header(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database] # production overrides — do not auto-rewrite\n'
-        'backend = "postgres"\n'
-        'embedding_dim = 768\n'
+        "[database] # production overrides — do not auto-rewrite\n" 'backend = "postgres"\n' "embedding_dim = 768\n"
     )
     rc = _patch_config_toml_embedding_dim(str(tmp_path / "config.toml"), 512)
     assert rc is True
@@ -660,17 +647,17 @@ def test_patch_config_toml_does_not_mutate_array_of_tables_after_database(tmp_pa
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database]\n'
+        "[database]\n"
         'backend = "postgres"\n'
-        'embedding_dim = 768\n'
-        '\n'
-        '[[providers]]\n'
+        "embedding_dim = 768\n"
+        "\n"
+        "[[providers]]\n"
         'name = "openai"\n'
-        'embedding_dim = 1536\n'  # provider's own dim — must NOT be touched
-        '\n'
-        '[[providers]]\n'
+        "embedding_dim = 1536\n"  # provider's own dim — must NOT be touched
+        "\n"
+        "[[providers]]\n"
         'name = "cohere"\n'
-        'embedding_dim = 1024\n'  # ditto
+        "embedding_dim = 1024\n"  # ditto
     )
     rc = _patch_config_toml_embedding_dim(str(tmp_path / "config.toml"), 512)
     assert rc is True
@@ -690,11 +677,7 @@ def test_patch_config_toml_handles_indented_section_header(tmp_path):
     from mnemos.installer.__main__ import _patch_config_toml_embedding_dim
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '  [database]\n'
-        '  backend = "postgres"\n'
-        '  embedding_dim = 768\n'
-    )
+    config_path.write_text("  [database]\n" '  backend = "postgres"\n' "  embedding_dim = 768\n")
     rc = _patch_config_toml_embedding_dim(str(tmp_path / "config.toml"), 512)
     assert rc is True
     new_content = config_path.read_text()
@@ -709,8 +692,8 @@ def test_patch_config_toml_refuses_unparseable_input(tmp_path, capsys):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[database\n'  # missing closing bracket — invalid TOML
-        'embedding_dim = 768\n'
+        "[database\n"  # missing closing bracket — invalid TOML
+        "embedding_dim = 768\n"
     )
     rc = _patch_config_toml_embedding_dim(str(tmp_path / "config.toml"), 512)
     assert rc is False
@@ -726,7 +709,7 @@ def test_patch_config_toml_refuses_unmappable_database_shape(tmp_path, capsys):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[[database]]\n'  # array-of-tables, not a singular [database] section
+        "[[database]]\n"  # array-of-tables, not a singular [database] section
         'host = "localhost"\n'
     )
     rc = _patch_config_toml_embedding_dim(str(tmp_path / "config.toml"), 512)
@@ -736,8 +719,7 @@ def test_patch_config_toml_refuses_unmappable_database_shape(tmp_path, capsys):
     # legitimate and writes a sibling [database] table. We accept either
     # behavior as long as the result is parseable TOML — but currently
     # our impl refuses with a "cannot map to a safe source span" message.
-    assert ("cannot map" in captured.err or "Refusing" in captured.err
-            or "not parseable" in captured.err)
+    assert "cannot map" in captured.err or "Refusing" in captured.err or "not parseable" in captured.err
 
 
 def test_config_from_env_accepts_pg_password_alias():
@@ -757,8 +739,11 @@ def test_config_from_env_accepts_pg_password_alias():
     with patch.dict(os.environ, env_overlay, clear=False):
         # Make sure MNEMOS_DB_* aren't set (they'd shadow PG_*).
         for k in (
-            "MNEMOS_DB_HOST", "MNEMOS_DB_PORT", "MNEMOS_DB_NAME",
-            "MNEMOS_DB_USER", "MNEMOS_DB_PASSWORD",
+            "MNEMOS_DB_HOST",
+            "MNEMOS_DB_PORT",
+            "MNEMOS_DB_NAME",
+            "MNEMOS_DB_USER",
+            "MNEMOS_DB_PASSWORD",
         ):
             os.environ.pop(k, None)
         cfg = _config_from_env()
@@ -796,16 +781,16 @@ def test_load_existing_config_overlays_all_empty_db_fields_from_env(tmp_path):
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "server"\n'
-        '\n'
-        '[database]\n'
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'
         'host = ""\n'
         'database = ""\n'
         'user = ""\n'
         'password = ""\n'
-        'embedding_dim = 768\n'
+        "embedding_dim = 768\n"
     )
     env_overlay = {
         "PG_HOST": "192.0.2.67",
@@ -834,16 +819,16 @@ def test_load_existing_config_overlays_pg_password_when_config_password_empty(tm
 
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        '[server]\n'
+        "[server]\n"
         'profile = "server"\n'
-        '\n'
-        '[database]\n'
+        "\n"
+        "[database]\n"
         'backend = "postgres"\n'
         'host = "192.0.2.67"\n'
         'database = "mnemos"\n'
         'user = "mnemos_user"\n'
         'password = ""\n'  # documented shape: secret comes from env
-        'embedding_dim = 768\n'
+        "embedding_dim = 768\n"
     )
     env_overlay = {"PG_PASSWORD": "from-pg-env"}
     with patch.dict(os.environ, env_overlay, clear=False):
@@ -881,10 +866,10 @@ def test_patch_config_toml_uses_install_for_metadata_preservation():
     # Must NOT use direct os.replace as the final step (it should only
     # appear, if at all, in commentary).
     import re
+
     no_comments = re.sub(r"#[^\n]*", "", src)
     assert "os.replace(" not in no_comments, (
-        "config patcher must NOT use os.replace — that bypasses "
-        "ownership preservation. Use install with -m -o -g."
+        "config patcher must NOT use os.replace — that bypasses " "ownership preservation. Use install with -m -o -g."
     )
 
 
@@ -915,7 +900,7 @@ def test_patch_service_env_preserves_provider_api_keys(tmp_path):
         "TOGETHER_API_KEY=tog-prod-DDDD\n"
         "OPERATOR_CUSTOM_VAR=keep-me\n"  # operator-managed line
     )
-    rc = _patch_service_env_embedding_dim(str(env_path), 512)
+    rc = _patch_service_env_embedding_dim(str(env_path), 512, expected_base=str(tmp_path))
     assert rc is True
 
     new_content = env_path.read_text()
@@ -938,11 +923,8 @@ def test_patch_service_env_appends_dim_when_missing(tmp_path):
     from mnemos.installer.__main__ import _patch_service_env_embedding_dim
 
     env_path = tmp_path / "mnemos.env"
-    env_path.write_text(
-        "MNEMOS_PROFILE=edge\n"
-        "OPENAI_API_KEY=sk-test\n"
-    )
-    rc = _patch_service_env_embedding_dim(str(env_path), 512)
+    env_path.write_text("MNEMOS_PROFILE=edge\n" "OPENAI_API_KEY=sk-test\n")
+    rc = _patch_service_env_embedding_dim(str(env_path), 512, expected_base=str(tmp_path))
     assert rc is True
     new_content = env_path.read_text()
     assert "MNEMOS_EMBEDDING_DIM=512" in new_content
@@ -981,7 +963,7 @@ def test_patch_service_env_stages_in_system_temp_not_target_dir(tmp_path):
     # sudo install destination, but not for tempfile creation.
     assert "dir=os.path.dirname(env_path)" not in src.replace(" ", "")
     assert "dir=dirpath" not in src
-    assert 'dir=dirname' not in src.replace(" ", "")
+    assert "dir=dirname" not in src.replace(" ", "")
 
 
 def test_upgrade_handles_missing_config_toml_with_matching_env():
@@ -1026,8 +1008,7 @@ def test_upgrade_skips_env_patch_when_file_absent(tmp_path, capsys):
     # And there must be a no-fail path when the env file is absent.
     # Look for "skipping" wording in the env section.
     assert "skipping" in upgrade_block.lower(), (
-        "--upgrade must skip env patch when no env file is present, "
-        "not return 1"
+        "--upgrade must skip env patch when no env file is present, " "not return 1"
     )
 
 
@@ -1056,6 +1037,7 @@ def test_upgrade_branch_uses_surgical_env_patcher_not_full_rewrite():
     # refactors not to call it). Strip comments before searching so a
     # comment that says "_write_env_file()" doesn't trip the check.
     import re
+
     no_comments = re.sub(r"#[^\n]*", "", upgrade_block)
     call_re = re.compile(r"(?<![._a-zA-Z])_write_env_file\s*\(")
     assert not call_re.search(no_comments), (
@@ -1070,9 +1052,7 @@ def test_verify_config_toml_embedding_dim_round_trip(tmp_path):
     from mnemos.installer.__main__ import _verify_config_toml_embedding_dim
 
     config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        '[database]\nembedding_dim = 512\n'
-    )
+    config_path.write_text("[database]\nembedding_dim = 512\n")
     assert _verify_config_toml_embedding_dim(str(tmp_path / "config.toml"), 512) is True
     assert _verify_config_toml_embedding_dim(str(tmp_path / "config.toml"), 768) is False
 
@@ -1120,9 +1100,9 @@ def test_upgrade_branch_treats_persistence_failure_as_fatal():
     assert upgrade_idx > 0
     upgrade_block = src[upgrade_idx:]
     # Must call the verifier and treat its False return as fatal.
-    assert "_verify_config_toml_embedding_dim" in upgrade_block, (
-        "--upgrade must verify config.toml round-tripped the new dim"
-    )
+    assert (
+        "_verify_config_toml_embedding_dim" in upgrade_block
+    ), "--upgrade must verify config.toml round-tripped the new dim"
     # Must check _write_env_file's bool return — finding a `return 1`
     # close to the env_ok check, or the ENV-failure return 1 sentinels.
     # (We grep for the env_ok variable name AND `if not env_ok` shape.)
@@ -1154,12 +1134,8 @@ def test_upgrade_path_refreshes_config_after_migrations():
     # service restart.
     write_config_idx = upgrade_block.find("_write_config_toml")
     write_env_idx = upgrade_block.find("_write_env_file")
-    assert write_config_idx > run_idx, (
-        "_write_config_toml must be called AFTER run_migrations in --upgrade"
-    )
-    assert write_env_idx > run_idx, (
-        "_write_env_file must be called AFTER run_migrations in --upgrade"
-    )
+    assert write_config_idx > run_idx, "_write_config_toml must be called AFTER run_migrations in --upgrade"
+    assert write_env_idx > run_idx, "_write_env_file must be called AFTER run_migrations in --upgrade"
 
 
 def test_main_module_calls_apply_helper_in_wizard_path():

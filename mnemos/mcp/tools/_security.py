@@ -242,6 +242,20 @@ def _schedule_audit_persist(
         # persistence; the logger record covers this case.
         return
 
+    # Replica mode: the durable mirror is an INSERT into mcp_audit_log.
+    # A hot standby cannot execute it ("read-only transaction"), and every
+    # tool call — reads and 503 rejections alike — would schedule a doomed
+    # write (or a loopback POST into our own guarded 503 route). Skip the
+    # persist entirely; the logger entry emitted by the caller remains the
+    # always-on audit surface on a replica.
+    try:
+        from mnemos.core.replica_mode import replica_mode_enabled
+
+        if replica_mode_enabled():
+            return
+    except Exception:  # noqa: BLE001 - never let the guard break auditing
+        pass
+
     try:
         from mnemos.domain.mcp_audit_repo import persist_audit_record
     except Exception:  # pragma: no cover — defensive import guard

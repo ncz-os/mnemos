@@ -1571,7 +1571,7 @@ class MariadbBackend(MysqlBackend):
                 )
                 await _ensure_mysql_oauth_schema(conn)
                 await _ensure_mysql_webhook_schema(conn)
-                await _ensure_mysql_federation_journal(conn)
+                await _ensure_mysql_federation_journal(conn, separate_embeddings=True)
                 await _ensure_mysql_federation_replica_health(conn)
                 await _ensure_mysql_columns(
                     conn,

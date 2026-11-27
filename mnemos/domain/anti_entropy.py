@@ -45,6 +45,7 @@ from mnemos.domain.replication_digest import (
     DEFAULT_BUCKET_SIZE,
     build_namespace_digest,
     diff_digests,
+    complete_digest,
     normalize_bucket_size,
 )
 
@@ -117,7 +118,8 @@ async def _fetch_peer_digest(
             await client.aclose()
     if not isinstance(document, dict):
         raise AntiEntropyError("peer digest response must be a JSON object")
-    document.setdefault("buckets", [])
+    if not complete_digest(document):
+        raise AntiEntropyError("peer digest membership is incomplete")
     return document
 
 
@@ -170,11 +172,15 @@ async def repair_namespace(
         raise AntiEntropyError(f"peer {peer_id} not found")
 
     repair_ids: List[str] = list(dict.fromkeys(str(mid) for mid in diff.get("repair_ids") or []))
+    if diff.get("source_complete") is True:
+        repair_ids = list(dict.fromkeys([*repair_ids, *diff.get("replica_only_bucket_ids", [])]))
+    max_ids = max(0, min(int(max_ids), MAX_REPAIR_IDS))
     truncated = len(repair_ids) > max_ids
     repair_ids = repair_ids[:max_ids]
 
     pulled = 0
     restored = 0
+    withdrawn = 0
     failed: List[str] = []
     for remote_id in repair_ids:
         try:
@@ -190,8 +196,14 @@ async def repair_namespace(
             failed.append(remote_id)
             continue
         if not memories:
-            # The row is no longer published (withdrawn/archived/narrowed).
-            # That is a legitimate replica-only difference, not a failure.
+            if diff.get("source_complete") is True:
+                from mnemos.domain.federation import _apply_withdrawal
+
+                async with backend.transactional() as tx:
+                    withdrawn += await _apply_withdrawal(
+                        repo, tx, peer["name"], {"id": remote_id, "type": "withdrawal"},
+                        accepted=True,
+                    )
             continue
         async with backend.transactional() as tx:
             new_n, upd_n = await _store_memories(repo, tx, peer["name"], memories, backend=backend)
@@ -204,6 +216,7 @@ async def repair_namespace(
         "checked_ids": len(repair_ids),
         "pulled": pulled,
         "restored": restored,
+        "withdrawn": withdrawn,
         "failed": failed,
         "truncated": truncated,
         "repaired_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

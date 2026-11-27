@@ -387,6 +387,7 @@ class _WebhookSettings(BaseSettings):
         validation_alias="WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS",
     )
     max_concurrent_sends: int = Field(64, validation_alias="WEBHOOK_MAX_CONCURRENT_SENDS")
+    pending_limit: int = Field(128, ge=1, validation_alias="MNEMOS_WEBHOOK_PENDING_LIMIT")
     repair_burst_seconds: float = Field(60.0, validation_alias="WEBHOOK_REPAIR_BURST_SECONDS")
     repair_burst_interval: float = Field(5.0, validation_alias="WEBHOOK_REPAIR_BURST_INTERVAL")
     repair_periodic_interval: float = Field(300.0, validation_alias="WEBHOOK_REPAIR_PERIODIC_INTERVAL")
@@ -2505,6 +2506,71 @@ def mcp_nats_raw_enabled() -> bool:
     of being re-shaped into a {subject, summary} envelope.
     """
     return runtime_env_bool("MNEMOS_MCP_NATS_RAW", False)
+
+
+def mcp_max_sessions_env() -> int:
+    """Max concurrent MCP streamable-HTTP sessions (clamped >= 1)."""
+    return max(1, int(runtime_env_value("MNEMOS_MCP_MAX_SESSIONS", "256")))
+
+
+def mcp_max_principal_sessions_env() -> int:
+    """Max concurrent MCP sessions per principal (clamped >= 1)."""
+    return max(1, int(runtime_env_value("MNEMOS_MCP_MAX_PRINCIPAL_SESSIONS", "16")))
+
+
+def mcp_max_initial_body_bytes_env() -> int:
+    """Max initial HTTP body bytes for MCP streamable requests (clamped >= 1)."""
+    return max(1, int(runtime_env_value("MNEMOS_MCP_MAX_INITIAL_BODY_BYTES", "1048576")))
+
+
+def mcp_session_idle_seconds_env() -> float:
+    """MCP session idle timeout in seconds (clamped >= 0.01)."""
+    return max(0.01, float(runtime_env_value("MNEMOS_MCP_SESSION_IDLE_SECONDS", "900")))
+
+
+def mcp_session_startup_seconds_env() -> float:
+    """MCP session startup timeout in seconds (clamped >= 0.01)."""
+    return max(0.01, float(runtime_env_value("MNEMOS_MCP_SESSION_STARTUP_SECONDS", "10")))
+
+
+#: The replica-mode switch vocabulary (``mnemos.core.replica_mode``).
+REPLICA_MODE_AUTO = "auto"
+REPLICA_MODE_ON = "on"
+REPLICA_MODE_OFF = "off"
+
+
+def replica_mode_env() -> str:
+    """Read ``MNEMOS_REPLICA_MODE``; default ``auto``. Unknown values warn
+    and fall back to ``auto`` rather than failing startup.
+
+    An explicitly empty value (``MNEMOS_REPLICA_MODE=``) also warns: it
+    means the operator touched the variable but left it blank, which is
+    not the same as "unset".
+    """
+    if "MNEMOS_REPLICA_MODE" in os.environ and not os.environ["MNEMOS_REPLICA_MODE"].strip():
+        logger.warning(
+            "%s is set to an empty value; falling back to %r",
+            "MNEMOS_REPLICA_MODE",
+            REPLICA_MODE_AUTO,
+        )
+    raw = (os.environ.get("MNEMOS_REPLICA_MODE") or "").strip().lower()
+    if raw in {REPLICA_MODE_AUTO, REPLICA_MODE_ON, REPLICA_MODE_OFF}:
+        return raw
+    if raw:
+        logger.warning(
+            "%s=%r is not one of %s; falling back to %r",
+            "MNEMOS_REPLICA_MODE",
+            raw,
+            (REPLICA_MODE_AUTO, REPLICA_MODE_ON, REPLICA_MODE_OFF),
+            REPLICA_MODE_AUTO,
+        )
+    return REPLICA_MODE_AUTO
+
+
+def replica_primary_url_env() -> str | None:
+    """Return ``MNEMOS_PRIMARY_URL`` when set (used for ``primary_hint``)."""
+    value = (os.environ.get("MNEMOS_PRIMARY_URL") or "").strip()
+    return value or None
 
 
 def raw_env(name: str, default: str = "") -> str:

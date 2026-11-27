@@ -16,7 +16,7 @@ from starlette.responses import JSONResponse, RedirectResponse
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.persistence_helpers import require_oauth_backend
+from mnemos.api.persistence_helpers import require_oauth_backend, require_write_allowed
 from mnemos.core import oauth as _oauth
 from mnemos.persistence.base import OAuthPersistence
 from mnemos.domain.models import (
@@ -72,14 +72,20 @@ async def oauth_login(provider: str, request: Request):
     redirect_uri = str(request.url_for("oauth_callback", provider=provider))
     try:
         return await _oauth.start_login(request, provider_row, redirect_uri)
-    except Exception as e:
-        logger.exception("oauth login start failed for provider=%s", provider)
-        raise HTTPException(status_code=502, detail=f"OAuth provider error: {e}")
+    except Exception:
+        logger.warning("OAuth login start failed")
+        raise HTTPException(status_code=502, detail="OAuth provider unavailable")
 
 
 @router.get("/{provider}/callback", name="oauth_callback")
 async def oauth_callback(provider: str, request: Request):
     """Provider redirect target. Exchanges code, provisions user, sets cookie."""
+    # Replica mode: the callback provisions/links a user and INSERTs an
+    # oauth_sessions row — a mutation even though the route is a GET
+    # (OAuth providers redirect back with GET). Guard BEFORE the try
+    # block below: that block maps every Exception to a 502, which would
+    # swallow the machine-readable 503 replica_read_only rejection.
+    require_write_allowed()
     provider_row = await _load_provider(provider)
 
     try:
@@ -94,8 +100,8 @@ async def oauth_callback(provider: str, request: Request):
         if not claims:
             try:
                 claims = dict(await client.userinfo(token=token))
-            except Exception as e:
-                logger.warning("userinfo fetch failed for %s: %s", provider_row["name"], e)
+            except Exception:
+                logger.warning("OAuth user information unavailable")
                 claims = {}
         external_id = _oauth._extract_external_id(provider_row["name"], claims)
         if not external_id:
@@ -123,9 +129,9 @@ async def oauth_callback(provider: str, request: Request):
                 user_agent=user_agent,
                 ip_address=ip,
             )
-    except Exception as e:
-        logger.exception("oauth callback failed for provider=%s", provider)
-        raise HTTPException(status_code=502, detail=f"OAuth callback error: {e}")
+    except Exception:
+        logger.warning("oauth callback failed")
+        raise HTTPException(status_code=502, detail="OAuth callback failed")
 
     # Where to send the browser now.
     post_login_redirect = request.query_params.get("next") or "/"
@@ -179,6 +185,7 @@ async def oauth_logout(
     user: UserContext = Depends(get_current_user),
 ):
     """Invalidate the current session cookie (or all sessions for the user)."""
+    require_write_allowed()
     backend = require_oauth_backend()
     sessions_revoked = 0
     async with backend.transactional() as tx:

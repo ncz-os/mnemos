@@ -171,6 +171,7 @@ def test_canonical_registry_declares_expected_tools():
         "create_memory", "update_memory", "delete_memory",
         "list_deletions", "kg_search", "kg_timeline",
         "log_memory", "branch_memory", "checkout_memory",
+        "list_memory_versions", "get_memory_version",
         "recommend_model", "pantheon_list_models",
         "pantheon_route_explain", "kronos_anomalies",
         "kronos_forecast",

@@ -40,10 +40,12 @@ import hmac
 import json
 import logging
 import secrets
+import time
 import sys
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import parse_qs, quote
 from uuid import UUID, uuid4
 
@@ -63,7 +65,17 @@ except ImportError:  # pragma: no cover - exercised only by lightweight test stu
     StreamingResponse = None  # type: ignore[assignment]
 from starlette.routing import BaseRoute, Match, Mount, NoMatchFound, Route
 
-from mnemos.core.config import get_settings, mcp_nats_raw_enabled
+from mnemos.core.config import (
+    get_settings,
+    mcp_max_initial_body_bytes_env,
+    mcp_max_principal_sessions_env,
+    mcp_max_sessions_env,
+    mcp_nats_raw_enabled,
+    mcp_session_idle_seconds_env,
+    mcp_session_startup_seconds_env,
+)
+from mnemos.core.roles import OPERATOR_ROLES
+from mnemos.core.visibility import ACL_READ_BIT as READ_BIT
 from mnemos.mcp.oauth import (
     authorize_post_route,
     authorize_route,
@@ -85,6 +97,7 @@ from mnemos.mcp.tools import (
 )
 from mnemos.persistence.base import OAuthPersistence
 from mnemos.persistence.nats_events import safe_subject_segment
+from mnemos.persistence.visibility import VisibilityScope
 
 # stderr logging — matches mcp_server.py convention so log shipping
 # from container stdout/stderr stays consistent.
@@ -313,6 +326,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 sse = SseServerTransport("/messages/")
 _sse_session_principals: dict[str, str] = {}
 _sse_session_bind_lock = asyncio.Lock()
+_sse_tasks: set[asyncio.Task] = set()
 
 
 class _RawASGIRoute(BaseRoute):
@@ -351,6 +365,8 @@ class _StreamableSession:
     context: MCPUserContext
     ready: asyncio.Future[None]
     task: asyncio.Task[None] | None = None
+    last_activity: float = 0.0
+    active_requests: int = 0
 
 
 class _StreamableHTTPMCP:
@@ -359,6 +375,43 @@ class _StreamableHTTPMCP:
     def __init__(self) -> None:
         self._sessions: dict[str, _StreamableSession] = {}
         self._lock = asyncio.Lock()
+        self.max_sessions = mcp_max_sessions_env()
+        self.max_principal_sessions = mcp_max_principal_sessions_env()
+        self.max_body_bytes = mcp_max_initial_body_bytes_env()
+        self.idle_seconds = mcp_session_idle_seconds_env()
+        self.startup_seconds = mcp_session_startup_seconds_env()
+        self._reaper = None
+        self._closing = False
+
+    async def _stop_sessions(self, sessions):
+        tasks = [session.task for session in sessions if session.task is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _expire_idle(self):
+        async with self._lock:
+            expired = [key for key, session in self._sessions.items()
+                       if not session.active_requests and time.monotonic() - session.last_activity >= self.idle_seconds]
+            sessions = [self._sessions.pop(key) for key in expired]
+        await self._stop_sessions(sessions)
+
+    async def _reap(self):
+        while True:
+            await asyncio.sleep(min(self.idle_seconds, 30))
+            await self._expire_idle()
+
+    async def shutdown(self):
+        self._closing = True
+        if self._reaper is not None:
+            self._reaper.cancel()
+            await asyncio.gather(self._reaper, return_exceptions=True)
+            self._reaper = None
+        async with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        await self._stop_sessions(sessions)
 
     async def _run_session(self, session_id: str, session: _StreamableSession) -> None:
         context_tokens = set_mcp_backend_context(
@@ -394,18 +447,30 @@ class _StreamableHTTPMCP:
         except PermissionError:
             return PlainTextResponse("unauthorized", status_code=403)
 
-        session_id = uuid4().hex
-        loop = asyncio.get_running_loop()
-        ready: asyncio.Future[None] = loop.create_future()
-        transport = StreamableHTTPServerTransport(session_id)
-        session = _StreamableSession(transport, principal_id, principal, context, ready)
+        await self._expire_idle()
         async with self._lock:
+            if self._closing:
+                return PlainTextResponse("MCP session unavailable", status_code=503)
+            if len(self._sessions) >= self.max_sessions or sum(
+                item.principal_id == principal_id for item in self._sessions.values()
+            ) >= self.max_principal_sessions:
+                return PlainTextResponse("MCP session limit reached", status_code=429)
+            session_id = uuid4().hex
+            ready = asyncio.get_running_loop().create_future()
+            transport = StreamableHTTPServerTransport(session_id)
+            session = _StreamableSession(transport, principal_id, principal, context, ready,
+                                         last_activity=time.monotonic())
             self._sessions[session_id] = session
-        session.task = asyncio.create_task(self._run_session(session_id, session))
+            session.task = asyncio.create_task(self._run_session(session_id, session))
+            if self._reaper is None:
+                self._reaper = asyncio.create_task(self._reap())
         try:
-            await ready
+            await asyncio.wait_for(asyncio.shield(ready), self.startup_seconds)
         except BaseException:
             self._sessions.pop(session_id, None)
+            await self._stop_sessions([session])
+            if ready.done() and not ready.cancelled():
+                ready.exception()
             raise
         return session
 
@@ -432,7 +497,13 @@ class _StreamableHTTPMCP:
                 response = PlainTextResponse("MCP session id is required", status_code=400)
                 await response(scope, receive, send)
                 return
-            body = await request.body()
+            body_buffer = bytearray()
+            async for chunk in request.stream():
+                if len(body_buffer) + len(chunk) > self.max_body_bytes:
+                    await PlainTextResponse("initialize body exceeds limit", status_code=413)(scope, receive, send)
+                    return
+                body_buffer.extend(chunk)
+            body = bytes(body_buffer)
             try:
                 initial_request = json.loads(body)
             except json.JSONDecodeError:
@@ -442,7 +513,7 @@ class _StreamableHTTPMCP:
                 await response(scope, receive, send)
                 return
 
-            # ``Request.body()`` consumed the original ASGI receive callable.
+            # The bounded stream consumed the original ASGI receive callable.
             # Replay its exact bytes so the SDK still owns JSON-RPC parsing and
             # response framing below.  Refusing non-initialize requests before
             # allocating a transport also prevents session-map growth from
@@ -469,7 +540,21 @@ class _StreamableHTTPMCP:
                 await session(scope, receive, send)
                 return
 
-        await session.transport.handle_request(scope, receive, send)
+        # An open GET is the server-to-client notification stream and can stay
+        # open indefinitely; counting it as an active request made the idle
+        # reaper skip the session forever and exhausted the per-principal cap.
+        # Only client-driven requests keep a session alive; a client that
+        # holds a silent stream past the idle window re-initialises on 404.
+        is_stream = scope["method"] == "GET"
+        if not is_stream:
+            session.active_requests += 1
+        session.last_activity = time.monotonic()
+        try:
+            await session.transport.handle_request(scope, receive, send)
+        finally:
+            if not is_stream:
+                session.active_requests -= 1
+            session.last_activity = time.monotonic()
 
 
 streamable_mcp = _StreamableHTTPMCP()
@@ -629,6 +714,11 @@ async def handle_sse(request):
         role=principal_context.role,
         namespace=principal_context.namespace,
     )
+    task = asyncio.current_task()
+    if streamable_mcp._closing:
+        reset_mcp_backend_context(context_tokens)
+        return PlainTextResponse("MCP session unavailable", status_code=503)
+    _sse_tasks.add(task)
     try:
         async with _bound_sse_connection(request, principal_id or "unknown") as streams:
             read_stream, write_stream = streams
@@ -638,6 +728,7 @@ async def handle_sse(request):
                 app.create_initialization_options(),
             )
     finally:
+        _sse_tasks.discard(task)
         reset_mcp_backend_context(context_tokens)
 
 
@@ -650,7 +741,9 @@ async def handle_sse_asgi(scope, receive, send) -> None:
     """
     from starlette.requests import Request
 
-    await handle_sse(Request(scope, receive, send))
+    response = await handle_sse(Request(scope, receive, send))
+    if response is not None:
+        await response(scope, receive, send)
 
 
 # MCP principal context cache (entry → resolved MCPUserContext +
@@ -702,6 +795,9 @@ def principal_cache_invalidate(generation: int | None = None) -> None:
             return
         _principal_cache_generation = generation
     _principal_context_cache.clear()
+    # The SSE row-visibility envelopes are derived from the same authz inputs
+    # (role / namespace / group membership), so they narrow together.
+    _reset_row_visibility_cache()
 
 
 _PRINCIPAL_CACHE_TTL_SECONDS = 300.0  # 5 min — short enough that
@@ -729,6 +825,8 @@ def _principal_cache_get(principal_id: str) -> MCPUserContext | None:
         ctx, expires_at = entry
         if _monotonic() >= expires_at:
             _principal_context_cache.pop(principal_id, None)
+            # The expiration sweeps below run from the hot authz read path.
+            _sweep_expired_row_visibility()
             return None
         return ctx
     # Backward-compat: bare MCPUserContext (test helper / direct
@@ -780,14 +878,17 @@ def _safe_subject_token(value: str, *, label: str) -> str:
 def _safe_namespace(namespace: str | None) -> str:
     """Namespace token for a NATS subject segment (CF-35/MN-17).
 
-    Uses the shared encoder so ``"a.b"`` and ``"a_b"`` no longer collapse
-    onto the same subject and leak each other's events into this stream.
+    Routes through the shared encoder (:func:`safe_subject_segment`) so
+    distinct namespaces always map to distinct subjects; a stream only
+    receives its own namespace's events. The mapping is injective
+    (``.`` -> ``_``, ``_`` -> ``%5F``, ``%`` -> ``%25``); the established
+    ``alice.ns`` -> ``alice_ns`` shape is unchanged.
     """
     return safe_subject_segment(namespace)
 
 
 def _is_operator_context(context: MCPUserContext) -> bool:
-    return context.role in {"root", "operator"}
+    return context.role in OPERATOR_ROLES
 
 
 async def _resolve_mcp_user_context(request) -> MCPUserContext:
@@ -882,6 +983,55 @@ def _nats_sse_raw_enabled() -> bool:
     return mcp_nats_raw_enabled()
 
 
+def _nats_sse_is_delete(subject: Any) -> bool:
+    """Whether ``subject`` is a well-formed ``mnemos.memory.deleted.<ns>`` subject.
+
+    A pure SHAPE helper: the subject must be exactly four segments
+    (``mnemos.memory.deleted.<ns>``) with a non-empty namespace segment,
+    matching the namespace gate precisely. A subject without a namespace
+    (``mnemos.memory.deleted``), with an empty namespace, or with extra
+    trailing segments is not a delete event this bridge publishes.
+
+    The namespace segment is NOT required to be a fixed point of the encoder:
+    ``safe_subject_segment`` maps ``.`` -> ``_`` and ``_`` -> ``%5F``, so a
+    dotted/underscored namespace never re-encodes to itself. Requiring a
+    fixed point rejected the common case (``shared.ns`` publishes as
+    ``shared_ns``). It is also NOT required to be free of ``*``/``>``/
+    whitespace: the encoder percent-encodes those in the published segment
+    (``*`` -> ``%2A``, ``a b`` -> ``a%20b``), so a caller whose own namespace
+    IS ``*`` legitimately publishes ``mnemos.memory.deleted.%2A``.
+
+    This helper deliberately carries no security decision. The category
+    strip in ``_nats_sse_data`` holds for *every* memory-class delete frame
+    the bridge emits, including raw/unencoded subjects and wildcard
+    namespaces, so it compares the subject segments
+    (``mnemos.memory.deleted``) and never consults this helper.
+    """
+    segments = str(subject or "").split(".")
+    if len(segments) != 4 or segments[0] != "mnemos" or segments[1] != "memory" or segments[2] != "deleted":
+        return False
+    return bool(segments[3])
+
+
+def _nats_sse_is_delete_subject(subject: Any) -> bool:
+    """Whether ``subject`` addresses the memory-delete CLASS (``mnemos.memory.deleted.*``).
+
+    This is a prefix/segment test only -- it says an event concerns the
+    deletion of a memory row, not that its subject is well-formed. It is the
+    predicate ``_nats_sse_data`` uses to decide that a frame is a delete
+    notification and must therefore drop the row ``category``: a delete is
+    authorized against the bounded allow-cache, never the (vanished) row, so
+    the category was never visibility-checked and shipping it would disclose
+    the topic of another owner's private row. Using a prefix test (rather
+    than a shape test on the exact four-segment subject) means the strip can
+    never be defeated by an unusual but still-delete-shaped subject such as a
+    percent-encoded wildcard namespace (``mnemos.memory.deleted.%2A``) or a
+    raw/unencoded one.
+    """
+    segments = str(subject or "").split(".")
+    return len(segments) >= 3 and segments[0] == "mnemos" and segments[1] == "memory" and segments[2] == "deleted"
+
+
 def _nats_sse_data(msg: Any) -> str:
     raw = _nats_msg_data(msg)
     if _nats_sse_raw_enabled():
@@ -899,7 +1049,687 @@ def _nats_sse_data(msg: Any) -> str:
         "category": payload.get("category"),
         "source_node": payload.get("source_node"),
     }
+    if _nats_sse_is_delete_subject(getattr(msg, "subject", "")):
+        # A delete event is authorized against the bounded allow-cache, not
+        # against the row (which is gone, so the visibility-filtered lookup
+        # returns ``None``). The row's ``category`` was therefore never
+        # visibility-checked for this frame: the publisher includes it, but
+        # shipping it would disclose the topic of another owner's
+        # (now-deleted) private row to callers sharing the namespace. The
+        # delete notification only needs the id + namespace to invalidate
+        # caches, so the category is dropped.
+        summary["category"] = None
     return json.dumps({k: v for k, v in summary.items() if v is not None})
+
+
+@dataclass(frozen=True)
+class _SSERowVisibility:
+    """Which rows the caller of one SSE stream may see event metadata for.
+
+    Built from the same ``VisibilityFilter`` the REST read paths use, so the
+    bridge cannot be wider than ``GET /v1/memories/{id}``.
+    """
+
+    bypass: bool
+    user_id: str | None
+    group_ids: tuple[str, ...]
+    namespace: str
+    exclude_namespaces: tuple[str, ...]
+    # True ONLY for the trusted-network / shared-MNEMOS_MCP_TOKEN edge: MCP
+    # auth is disabled (or the caller presented the single shared token), so
+    # the principal has no per-user REST identity of its own. This is an
+    # explicit auth-state flag, not an inference from ``user_id`` being
+    # empty -- a non-root caller with an unresolved identity (role=admin/
+    # monitor, user_id=None) carries user_id="" but is NOT legacy, and must
+    # fail closed on every row gate.
+    legacy_principal: bool = False
+
+    def allows_row(self, row: Mapping[str, Any] | None) -> bool:
+        """True when the caller may read ``row``.
+
+        Mirrors ``visibility.read_visibility_predicate`` for the row
+        disjuncts that need nothing but the row itself: same namespace,
+        owner, federation-replicated, world-readable and (where the row
+        carries a single ``group_id``) group-readable.
+
+        The per-principal ACL disjunct needs ``memory_acl`` and is
+        deliberately NOT evaluated here -- applying this gate can therefore
+        only ever narrow the bridge, never widen it.
+        """
+        if row is None:
+            return False
+        row_ns = row.get("namespace")
+        if row_ns in self.exclude_namespaces:
+            return False
+        if self.bypass:
+            return True
+        if row_ns != self.namespace:
+            return False
+        if self.user_id is not None and row.get("owner_id") == self.user_id:
+            return True
+        if row.get("federation_source") is not None:
+            return True
+        try:
+            permission_mode = int(row.get("permission_mode") or 0)
+        except (TypeError, ValueError):
+            return False
+        # Permission modes are stored as DECIMAL integers whose digits are
+        # octal (e.g. 755 means "octal 755" = owner rwx, group r-x, world r-x;
+        # 600 = owner rw only). This is NOT a Unix bitmask (0o755 == 493).
+        # The validator ``_validate_permission_mode`` (mnemos/api/read_policy.py)
+        # enforces 0-777 with every digit in "01234567". The REST read path
+        # (mnemos/core/visibility.py ``read_visibility_predicate``) extracts
+        # world/group bits with exactly these digit operations:
+        #   world:  (permission_mode % 10) >= 4
+        #   group:  ((permission_mode // 10) % 10) >= 4 AND group_id IS NOT NULL
+        # and compares against the constant 4. We mirror that extraction here
+        # and compare against READ_BIT (== 4, imported from
+        # mnemos.core.visibility as ACL_READ_BIT) so group/world-readable rows
+        # match here exactly when they match the REST visibility predicate.
+        # Do NOT switch to bitmask operators (e.g. ``& 0o004``): that would
+        # diverge from the REST path and desync the bridge from ``GET
+        # /v1/memories/{id}``.
+        if permission_mode % 10 >= READ_BIT:
+            return True
+        group_id = row.get("group_id")
+        if (permission_mode // 10) % 10 >= READ_BIT and group_id is not None:
+            return group_id in self.group_ids
+        return False
+
+
+def principal_api_key_is_shared_token() -> bool:
+    """Whether the legacy single-token principal is in use.
+
+    True when MCP auth is enabled and the token map holds exactly one
+    entry mapped to ``_trusted_network_principal`` -- i.e. the operator
+    configured a single shared ``MNEMOS_MCP_TOKEN`` rather than the
+    per-user ``MNEMOS_MCP_TOKENS=user:token`` map. A caller that presented
+    that token has no per-user REST identity (the shared token is not a
+    valid backend API key), so it rides the legacy principal exactly as
+    the auth-disabled edge does.
+
+    This is an explicit auth-config signal, not an inference from the
+    caller's resolved identity: a non-root context with ``user_id=None``
+    (role=admin/monitor, or a token user whose OAuth lookup failed) is
+    still NOT legacy even when this returns True.
+    """
+    return bool(TOKEN_PRINCIPALS) and all(
+        principal is _trusted_network_principal() for principal in TOKEN_PRINCIPALS.values()
+    )
+
+
+def _sse_row_visibility(context: MCPUserContext) -> _SSERowVisibility:
+    """Resolve the caller's row-visibility envelope for the SSE bridge.
+
+    ``MCPUserContext`` carries only ``user_id``/``role``/``namespace`` -- the
+    MCP auth path never resolves group membership, so ``group_ids`` is empty
+    here by construction, not by omission. That makes the bridge strictly
+    NARROWER than the REST read path (which knows the caller's groups): a row
+    readable solely through group membership will not surface its metadata
+    here. Narrow is the safe direction for an authorization input, so this is
+    deliberate rather than a defect -- widening it would require the MCP auth
+    path to start resolving groups, which is a separate change.
+    """
+    from mnemos.core.auth_context import UserContext
+    from mnemos.persistence.visibility import VisibilityFilter
+
+    user = UserContext(
+        user_id=context.user_id or "",
+        group_ids=[],
+        role=context.role,
+        namespace=context.namespace or "default",
+        authenticated=bool(context.user_id),
+    )
+    visibility = VisibilityFilter.for_read(user, namespace=user.namespace)
+    # Legacy principal = an explicit auth-state fact, never an empty-id
+    # inference. It is true ONLY when the MCP edge resolved this caller with
+    # no REST identity at all -- MCP auth disabled (every caller rides the
+    # shared backend identity) or the single shared MNEMOS_MCP_TOKEN
+    # presented with MCP auth enabled. A non-root context whose user_id is
+    # empty for a different reason (role=admin/monitor with user_id=None, or
+    # a token user whose OAuth lookup failed) is NOT legacy: the row gate
+    # must apply to them, not skip it.
+    legacy_principal = (
+        not context.user_id
+        and not (visibility.scope == VisibilityScope.ROOT_BYPASS)
+        and (not _mcp_auth_enabled() or principal_api_key_is_shared_token())
+    )
+    return _SSERowVisibility(
+        bypass=visibility.scope == VisibilityScope.ROOT_BYPASS,
+        user_id=visibility.user_id,
+        group_ids=tuple(visibility.group_ids or ()),
+        namespace=visibility.namespace or "default",
+        exclude_namespaces=tuple(visibility.exclude_namespaces or ()),
+        legacy_principal=legacy_principal,
+    )
+
+
+_ROW_VISIBILITY_CACHE_TTL_SECONDS = 60.0
+_row_visibility_cache: dict[tuple[Any, ...], tuple[_SSERowVisibility, float]] = {}
+
+_SSE_ROW_CACHE_TTL_SECONDS = 60.0
+_SSE_ROW_CACHE_MAX = 1024
+# Bounded allow-cache for delete frames (review finding 2). A ``memory.deleted``
+# event carries only an id the publisher claims; the row gate never sees that
+# row (the visibility-filtered lookup returns None for a deleted row on
+# purpose). The delete frame is therefore authorised by an allow-set: per
+# (caller, namespace) we record the ids for which a created/updated frame was
+# ALREADY row-gated and allowed for THIS caller, and ship a delete only for an
+# id in that cache. Ids of rows never delivered to the caller are not shipped.
+#
+# The allow key is ``(caller, namespace)`` and does NOT embed the visibility
+# epoch, because the epoch is an in-process, lazily-refreshed high-water mark
+# that never reads the shared store, and in degraded mode it advances from a
+# wall-clock bucket every few seconds -- keying the cache on it would expire
+# every entry far inside the TTL and silently stop delete frames for
+# still-readable rows. Instead each map entry carries the epoch observed when
+# the entry was (re)written. On read, an entry whose stored epoch differs from
+# the current epoch is dropped and the id denied: a visibility bump that was
+# observed out-of-band (e.g. another process picked it up via
+# ``visibility_epoch_cached``) can therefore never keep serving deletes for
+# ids authorized under the old visibility. On write, the entry is always
+# stamped with the current epoch. The TTL below and
+# ``principal_cache_invalidate()`` (fired on every local visibility bump,
+# which clears this cache outright) provide the remaining bounds. Both
+# directions are safe: a dropped entry can only delay a delete notification,
+# never widen it, because an entry exists only for an id this caller was
+# already allowed a row-gated frame for.
+#
+# Both levels use ``collections.OrderedDict`` (guaranteed insertion order,
+# unlike ``set``/``frozenset`` iteration which is CPython implementation detail):
+#   * the map is bounded by ``_SSE_DELETE_ALLOW_CACHE_MAX`` via surgical
+#     ``popitem(last=False)`` -- no ``clear()``/``update()`` gap, so a concurrent
+#     reader never sees an empty cache between eviction steps;
+#   * each per-caller id set is an ``OrderedDict`` keyed by id (empty values),
+#     capped at the same constant, evicting the OLDEST ids deterministically.
+_SSE_DELETE_ALLOW_CACHE_TTL_SECONDS = 300.0
+_SSE_DELETE_ALLOW_CACHE_MAX = 1024
+# Map value is ``(ids, expires_at, epoch_at_write)``: the per-caller id set,
+# its TTL expiry, and the visibility epoch observed when the entry was
+# (re)written. The epoch is never part of the key (see the block comment
+# above), but it is carried with every entry so an out-of-band epoch advance
+# can invalidate it on the next read or write.
+_sse_delete_allowed_ids: OrderedDict[tuple[Any, ...], tuple["OrderedDict[str, None]", float, int]] = OrderedDict()
+# The visibility-filtered repository lookup in the row gate runs inline in the
+# SSE generator loop. A hung backend must not stall every stream, so the call
+# is bounded.
+_SSE_ROW_LOOKUP_TIMEOUT_SECONDS = 2.0
+_sse_row_cache: dict[tuple[Any, ...], tuple[Mapping[str, Any] | None, float]] = {}
+_sse_row_cache_lock = asyncio.Lock()
+
+
+# Indirection so tests can drive the invalidation path without a live epoch
+# store. ``None`` = "no broad invalidation seen yet".
+_visibility_epoch_seen: int | None = None
+
+
+def _visibility_epoch() -> int:
+    """Best-effort read of the shared visibility epoch.
+
+    Reached lazily (never at import) so importing this module does not open a
+    NATS connection. Any failure returns a non-advancing value: a broken epoch
+    source must not silently widen anything, because the TTL below still
+    bounds staleness. Reads/writes of ``_visibility_epoch_seen`` are plain
+    loads/stores of one immutable int -- atomic under the GIL -- and the
+    value only ever advances (``max`` with the previous high-water mark),
+    so concurrent SSE tasks can at worst recompute a visibility envelope
+    one extra time, never read a widened one.
+    """
+    global _visibility_epoch_seen
+    try:
+        from mnemos.core.lifecycle import visibility_epoch_cached
+
+        _visibility_epoch_seen = max(_visibility_epoch_seen or 0, int(visibility_epoch_cached()))
+    except Exception:
+        # visibility_epoch_cached is a synchronous in-process high-water
+        # mark with no I/O, so this path fires only when core itself is
+        # unimportable -- nothing actionable, and the TTL still bounds
+        # staleness on the cached value.
+        pass
+    return _visibility_epoch_seen or 0
+
+
+def _reset_row_visibility_cache() -> None:
+    _row_visibility_cache.clear()
+    _sse_row_cache.clear()
+    _sse_delete_allowed_ids.clear()
+
+
+def _enforce_sse_row_cache_limit() -> None:
+    """Evict oldest entries if the SSE row cache exceeds the max size.
+
+    The cache is bounded to prevent unbounded growth. We sweep expired
+    entries first, then evict the oldest half if still over limit.
+    """
+    if len(_sse_row_cache) <= _SSE_ROW_CACHE_MAX:
+        return
+    _sweep_expired_row_visibility()
+    if len(_sse_row_cache) <= _SSE_ROW_CACHE_MAX:
+        return
+    # Evict oldest entries by expiration time using a single pass.
+    # This avoids sorting the whole dict on every insertion.
+    # We keep the newest _SSE_ROW_CACHE_MAX entries.
+    # Build a list of (expires_at, key) for the current items.
+    # For small max (1024) this is acceptable and avoids O(N log N) sort.
+    # Use heapq.nsmallest for O(N log K) where K is max.
+    import heapq
+    items = list(_sse_row_cache.items())
+    # Keep the newest entries: those with largest expires_at.
+    # nsmallest on negative expires_at gives largest expires_at.
+    keep = heapq.nlargest(_SSE_ROW_CACHE_MAX, items, key=lambda kv: kv[1][1])
+    # Rebuild cache from kept items.
+    new_cache = {k: v for k, v in keep}
+    _sse_row_cache.clear()
+    _sse_row_cache.update(new_cache)
+
+
+def _sweep_expired_row_visibility() -> None:
+    """Drop expired entries from the bounded row-visibility cache.
+
+    The snapshot-then-pop pattern is deliberate: iterating ``list(...)``
+    avoids mutating during iteration, and ``pop(key, None)`` tolerates a
+    concurrent task having already evicted or replaced the key. Dict
+    operations are individually atomic under the GIL, so the worst case
+    under concurrent SSE tasks is a redundant recompute or a re-insert of
+    a just-swept key -- both safe directions for a TTL cache.
+    """
+    now = _monotonic()
+    for key, (_visibility, expires_at) in list(_row_visibility_cache.items()):
+        if now >= expires_at:
+            _row_visibility_cache.pop(key, None)
+    for key, (_row, expires_at) in list(_sse_row_cache.items()):
+        if now >= expires_at:
+            _sse_row_cache.pop(key, None)
+    # The delete-allow map stores a 3-tuple ``(ids, expires_at, epoch)``; the
+    # epoch is read-validated in ``_sse_delete_allowed``, so only the TTL is
+    # relevant to the sweep here.
+    for key, (_ids, expires_at, _epoch) in list(_sse_delete_allowed_ids.items()):
+        if now >= expires_at:
+            _sse_delete_allowed_ids.pop(key, None)
+
+
+def _sse_delete_allow_key(visibility: "_SSERowVisibility") -> tuple[Any, ...]:
+    """Cache key for the delete allow-set: the caller and their namespace.
+
+    Deliberately epoch-free -- see the block comment above
+    ``_SSE_DELETE_ALLOW_CACHE_TTL_SECONDS``.
+    """
+    return (
+        visibility.user_id,
+        visibility.namespace,
+    )
+
+
+def _sse_delete_allowed(memory_id: str, visibility: "_SSERowVisibility | None") -> bool:
+    """Whether this caller was previously allowed a frame for ``memory_id``.
+
+    Consulted ONLY for ``memory.deleted`` frames (see the row gate): a delete
+    must not carry an id the caller was never shown, because the publisher
+    controls that field and the vanished row offers no authorization check.
+    """
+    if visibility is None:
+        return False
+    key = _sse_delete_allow_key(visibility)
+    entry = _sse_delete_allowed_ids.get(key)
+    now = _monotonic()
+    if entry is None:
+        return False
+    if now >= entry[1]:
+        # TTL expired: drop it so the map cannot hold stale allow-sets for
+        # departed callers, then deny (fail closed).
+        _sse_delete_allowed_ids.pop(key, None)
+        return False
+    if entry[2] != _visibility_epoch():
+        # Epoch advanced since the entry was written: the allow-set may grant
+        # access to rows the caller can no longer see, so deny and drop.
+        _sse_delete_allowed_ids.pop(key, None)
+        return False
+    return memory_id in entry[0]
+
+
+def _record_sse_delete_allowed(memory_id: str, visibility: "_SSERowVisibility | None") -> None:
+    """Remember that ``memory_id`` was row-gated and allowed for this caller.
+
+    The entry is per (caller, namespace) and carries the visibility epoch at
+    write time. If the epoch advances before the TTL expires, the entry is
+    treated as stale: the caller's visibility may have narrowed, so the
+    allow-set is replaced rather than reused. Both dimensions are bounded —
+    the TTL and ``principal_cache_invalidate()`` clears this cache on epoch
+    change — with surgical (never emptying) eviction:
+
+    * **Per-caller id set** -- an insertion-ordered ``OrderedDict`` keyed by
+      id. When the cap is hit the OLDEST id (``popitem(last=False)``) is
+      dropped deterministically; the bridge only ever narrows.
+    * **Per-caller map** -- an insertion-ordered ``OrderedDict``. On every
+      write expired entries are swept; if the map is still over
+      ``_SSE_DELETE_ALLOW_CACHE_MAX`` the oldest callers
+      (``popitem(last=False)``) are dropped one by one. Each ``popitem`` is
+      individually atomic under the GIL, so a concurrent reader never sees
+      the map emptied between steps.
+    """
+    if visibility is None:
+        return
+    key = _sse_delete_allow_key(visibility)
+    now = _monotonic()
+    epoch = _visibility_epoch()
+    entry = _sse_delete_allowed_ids.get(key)
+    if entry is None or now >= entry[1] or entry[2] != epoch:
+        # Expired, absent, or stale (epoch advanced since write): start a
+        # fresh allow-set stamped with the current epoch.
+        ids: OrderedDict[str, None] = OrderedDict()
+        ids[memory_id] = None
+    else:
+        ids = entry[0]
+        if memory_id not in ids:
+            ids[memory_id] = None
+            while len(ids) > _SSE_DELETE_ALLOW_CACHE_MAX:
+                # Deterministic LRU eviction: drop the oldest id first.
+                ids.popitem(last=False)
+    _sse_delete_allowed_ids[key] = (
+        ids,
+        now + _SSE_DELETE_ALLOW_CACHE_TTL_SECONDS,
+        epoch,
+    )
+    _sse_delete_allowed_ids.move_to_end(key)
+    if len(_sse_delete_allowed_ids) > _SSE_DELETE_ALLOW_CACHE_MAX:
+        # Bound the per-caller map itself: sweep expired entries first, then
+        # drop the oldest remaining callers one at a time (narrow, never empty).
+        _sweep_expired_row_visibility()
+        while len(_sse_delete_allowed_ids) > _SSE_DELETE_ALLOW_CACHE_MAX:
+            _sse_delete_allowed_ids.popitem(last=False)
+
+
+def _cached_row_visibility(context: MCPUserContext) -> _SSERowVisibility:
+    key = (
+        context.user_id,
+        context.role,
+        context.namespace,
+        _visibility_epoch(),
+    )
+    cached = _row_visibility_cache.get(key)
+    if cached is not None and _monotonic() < cached[1]:
+        return cached[0]
+    visibility = _sse_row_visibility(context)
+    if len(_row_visibility_cache) >= _PRINCIPAL_CACHE_MAX:
+        # Evict only what has actually expired first; a full clear would drop
+        # every live entry and stampede the authz path on the next event.
+        _sweep_expired_row_visibility()
+        if len(_row_visibility_cache) >= _PRINCIPAL_CACHE_MAX:
+            _row_visibility_cache.clear()
+    _row_visibility_cache[key] = (visibility, _monotonic() + _ROW_VISIBILITY_CACHE_TTL_SECONDS)
+    return visibility
+
+
+async def _fetch_sse_row(
+    memory_id: str,
+    visibility: _SSERowVisibility | None = None,
+    *,
+    cache_negative: bool = True,
+) -> Mapping[str, Any] | None:
+    """Load the row a NATS event refers to, or ``None``.
+
+    Read through the repository ABC (never a raw pool handle). Any failure
+    returns ``None``: a missing decision is a missing event, which is the
+    only safe direction for an authorization input.
+
+    The persistence backend is imported locally (not at module level) to
+    avoid a circular import: ``mnemos.core.lifecycle`` pulls in persistence
+    facades that, in turn, import this module's visibility helpers. The call
+    itself is cheap -- ``get_persistence_backend()`` returns a cached singleton
+    -- and this function is invoked only for messages that pass the namespace
+    gate and carry a row id, so it is already bounded by the row-visibility
+    cache upstream.
+    """
+    # Snapshot epoch once to avoid race between get and set.
+    epoch = _visibility_epoch()
+    user_id = visibility.user_id if visibility else None
+    namespace = visibility.namespace if visibility else None
+    key = (memory_id, user_id, namespace, epoch)
+    now = _monotonic()
+
+    # Fast path: check cache under lock to avoid duplicate DB work.
+    async with _sse_row_cache_lock:
+        cached = _sse_row_cache.get(key)
+        if cached is not None and now < cached[1]:
+            return cached[0]
+        # Ensure we don't exceed max before inserting.
+        _enforce_sse_row_cache_limit()
+
+    try:
+        from mnemos.core.lifecycle import get_persistence_backend
+
+        backend = get_persistence_backend()
+    except Exception:
+        return None
+    try:
+        async with backend.transactional() as tx:
+            if visibility is not None:
+                # Use the visibility-filtered ABC path so the row is only
+                # returned when the caller may read it. This collapses
+                # "deleted" and "invisible" to None, which is the safe
+                # direction for the SSE bridge.
+                from mnemos.core.auth_context import UserContext
+                from mnemos.persistence.visibility import VisibilityFilter
+
+                user = UserContext(
+                    user_id=visibility.user_id or "",
+                    group_ids=visibility.group_ids,
+                    role="user",
+                    namespace=visibility.namespace,
+                    authenticated=bool(visibility.user_id),
+                )
+                vfilter = VisibilityFilter.for_read(user, namespace=visibility.namespace)
+                row = await backend.memories.get_memory(tx, memory_id, visibility=vfilter)
+            else:
+                row = await backend.memories.fetch_memory_by_id(tx, memory_id)
+    except Exception as exc:
+        logger.warning("NATS SSE row lookup failed for %s: %s", memory_id, exc)
+        return None
+    if row is None:
+        # Negative caching is skipped for write events (``created`` and
+        # ``updated``): a row that was just written may not be visible to
+        # ``get_memory`` yet (commit/replication lag), and caching ``None``
+        # would suppress every subsequent event for that id for up to the
+        # full TTL even after the row exists. Only a class that is not
+        # racing a write keeps the negative entry.
+        if cache_negative:
+            async with _sse_row_cache_lock:
+                _sse_row_cache[key] = (None, now + _SSE_ROW_CACHE_TTL_SECONDS)
+                _enforce_sse_row_cache_limit()
+        return None
+    if isinstance(row, Mapping):
+        result = row
+    else:
+        try:
+            result = dict(row)
+        except (TypeError, ValueError):
+            result = None
+    async with _sse_row_cache_lock:
+        _sse_row_cache[key] = (result, now + _SSE_ROW_CACHE_TTL_SECONDS)
+        _enforce_sse_row_cache_limit()
+    return result
+
+
+def _nats_sse_event_payload(msg: Any) -> dict[str, Any]:
+    """The JSON object a message body carries, or ``{}``."""
+    try:
+        payload = json.loads(_nats_msg_data(msg))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _namespace_gate(msg: Any, visibility: _SSERowVisibility) -> bool:
+    """Whether the subject an event arrived on belongs to the caller.
+
+    The namespace encoding is injective, so ``a.b`` and ``a_b`` map to
+    different segments and the comparison below cannot be satisfied by two
+    different namespaces.
+
+    The subject an event arrives on is ``mnemos.<class>.<action>.<namespace>``
+    (four segments, three dots), so the namespace is the LAST segment. Only
+    subjects with exactly that shape naming the caller's own namespace pass;
+    anything else is rejected. In particular a subject carrying ``*`` or ``>``
+    can never carry a valid encoded namespace token (``_safe_subject_token``
+    rejects them outside the operator path, and operators bypass this gate
+    via the short-circuit above), so wildcarded subjects fail closed here
+    rather than passing through to the row gate on a guess. Unknown shapes
+    this bridge does not publish are likewise rejected, not deferred.
+    """
+    if visibility.bypass:
+        return True
+    subject = str(getattr(msg, "subject", "") or "")
+    segments = subject.split(".")
+    if len(segments) != 4 or segments[0] != "mnemos":
+        return False
+    return segments[3] == _safe_namespace(visibility.namespace)
+
+
+async def _nats_sse_row_allowed(msg: Any, visibility: _SSERowVisibility) -> bool:
+    """Whether this message may be delivered to the stream's caller.
+
+    Two gates, both required:
+
+    1. **Namespace gate** (:func:`_namespace_gate`). The subject
+       the message arrived on must name the caller's own namespace, so
+       ``a.b`` no longer shares a subject with ``a_b``.
+    2. **Row gate.** Memory events summarize row ids + categories. Those are
+       metadata about rows that may simply be *readable* (world/group/ACL)
+       rather than owned, so each event's row is resolved through the same
+       visibility predicate as the REST read path before anything is sent.
+
+    Fail-closed: a memory-class message that names no row cannot be row-gated,
+    so it is dropped. The row gate applies ONLY to the memory class and ONLY
+    to the ``memory_id`` payload key -- a generic ``id`` field on any other
+    class (consultation frames, control frames) is not a memory-row reference
+    and must never be looked up in the memories table. Non-memory classes
+    have no row to gate, so they are allowed once the namespace gate has
+    pinned them to the caller's own namespace (e.g. namespace-scoped control
+    frames).
+
+    Two callers are exempt from the row gate, both for the same reason: there
+    is no per-row authorization decision to make.
+
+    * **Operators** (``visibility.bypass``) -- cross-tenant reads are the point
+      of the role.
+    * **The legacy shared-token principal** (``visibility.legacy_principal``) --
+      an EXPLICIT flag set only by the trusted-network / shared-token edge:
+      MCP auth is disabled, or the caller presented the single shared
+      ``MNEMOS_MCP_TOKEN`` (which is not a valid REST API key), so the caller
+      shares one backend identity and reads exactly what that identity reads
+      over REST. Gating rows here would drop every non-world-readable event
+      and silently regress trusted-network deployments. The namespace gate
+      still applies.
+
+      This flag is NEVER inferred from ``user_id`` being empty: a non-root
+      caller with an unresolved identity (``role=admin``/``monitor`` with
+      ``user_id=None``, or a token user whose OAuth lookup failed) carries
+      ``user_id=""`` but ``legacy_principal=False``, and must fail closed
+      through the row gate below rather than skipping it.
+
+    Deletion notifications flow for ids the caller already knows: the payload
+    ``memory_id`` on a delete is publisher-controlled and the vanished row
+    offers no repository check, so per-row authorization comes from the
+    bounded allow-cache -- the id must have been row-gated and allowed for
+    this caller on a prior ``created``/``updated`` frame. Uncached delete ids
+    fail closed. Because that decision never consults the row, the shipped
+    frame must not carry row metadata beyond the id + namespace the caller
+    already has; ``_nats_sse_data`` drops the category for delete frames
+    accordingly.
+    """
+    if not _namespace_gate(msg, visibility):
+        return False
+    if visibility.bypass:
+        return True
+    if visibility.legacy_principal:
+        # Explicit trusted-network / shared-token principal (see flag docs on
+        # ``_SSERowVisibility``): the caller has no per-user REST identity --
+        # MCP auth is disabled or it presented the single shared
+        # MNEMOS_MCP_TOKEN -- so there is no per-row decision to make, and
+        # every caller already shares the one backend identity that this
+        # bridge can read over REST. The row gate is skipped ONLY on that
+        # explicit flag, never on an empty ``user_id``: a non-root caller
+        # whose identity was not resolved (e.g. role=admin/monitor with
+        # user_id=None) falls through to the gate below and fails closed.
+        return True
+
+    event_class = str(getattr(msg, "subject", "") or "").split(".")[1:2]
+    payload = _nats_sse_event_payload(msg)
+    # The row gate is class-specific: only memory-class events reference a
+    # row in the memories table, and only via the ``memory_id`` key. Applying
+    # the lookup to every event class (or accepting a generic ``id`` key)
+    # would miss and drop non-memory payloads that carry an unrelated ``id``.
+    if event_class != ["memory"]:
+        return True
+    memory_id = payload.get("memory_id")
+    if not memory_id:
+        # Row-less message on a memory subject: nothing to gate on, so drop.
+        # All current memory publishers (created/updated/deleted) carry the
+        # id; the fail-closed direction for an authorization input is to
+        # deny.
+        return False
+
+    memory_id = str(memory_id)
+    action = str(getattr(msg, "subject", "") or "").split(".")[2:3] or [""]
+    if action[0] == "deleted":
+        # Deleted rows cannot be read back: the visibility-filtered lookup
+        # returns None for them by design (it collapses "deleted" and
+        # "invisible" on purpose). But the payload ``memory_id`` is
+        # publisher-controlled -- any publisher can emit an arbitrary id on a
+        # shared namespace subject (NATS federates the family, so origin is
+        # not trustworthy). A frame for an id this caller was never shown
+        # must not be delivered: it would disclose the id (and the
+        # fact of deletion) to co-tenants who cannot read the row over REST.
+        #
+        # The namespace gate above already pins the subject to the caller's
+        # own namespace. Per-row authorization for a delete therefore comes
+        # from the bounded allow-cache: the id must have been row-gated and
+        # allowed for THIS caller on a prior created/updated frame
+        # (``_record_sse_delete_allowed``). Uncached ids fail closed; this is
+        # the fail-closed direction for an authorization input, so a missing
+        # allow entry -- stale epoch, first stream, or forged id -- is a drop,
+        # never a hang or a delivery. The shipped frame still carries only
+        # the id + namespace (``_nats_sse_data`` drops the category).
+        return _sse_delete_allowed(memory_id, visibility)
+
+    # Bounded lookup: a hung backend must not stall the stream. A timeout
+    # (or any failure inside ``_fetch_sse_row``) yields None, which the
+    # fail-closed check below turns into a drop -- never a hang.
+    #
+    # A miss for a ``created`` OR ``updated`` event is a write that just
+    # happened, so it races read-replica/commit lag the same way: the row may
+    # not be visible yet. Negative-caching that miss would suppress every
+    # subsequent event for the id for a full TTL even after the write lands,
+    # so it is skipped for both mutation classes.
+    try:
+        row = await asyncio.wait_for(
+            _fetch_sse_row(
+                memory_id,
+                visibility,
+                cache_negative=action[0] not in ("created", "updated"),
+            ),
+            timeout=_SSE_ROW_LOOKUP_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        row = None
+    if row is None:
+        # No such row: either it was deleted, or it is invisible to this
+        # caller -- the visibility-filtered repository lookup collapses both to
+        # ``None`` on purpose, so the bridge cannot distinguish them. The
+        # row gate below already withholds the ids and categories of other
+        # users' rows whenever the row IS resolvable, and the events whose
+        # row has vanished carry nothing beyond the namespace (already
+        # gated) plus the vanished id. Returning False here fails closed:
+        # a missing authorization decision is never an allowed event.
+        return False
+    if not visibility.allows_row(row):
+        return False
+    # This caller was just allowed a row-gated frame for ``memory_id``.
+    # Remember it so a later ``memory.deleted`` event for the same row can be
+    # authorized against the bounded allow-cache instead of shipping an
+    # id the caller was never shown (see the ``deleted`` branch above).
+    _record_sse_delete_allowed(memory_id, visibility)
+    return True
 
 
 async def _subscribe_nats_sse_subject(js: Any, subject: str) -> Any:
@@ -966,7 +1796,10 @@ async def _unsubscribe_nats_sse(sub: Any) -> None:
         await result
 
 
-async def _nats_sse_event_source(subscriptions: list[Any]):
+async def _nats_sse_event_source(
+    subscriptions: list[Any],
+    visibility: _SSERowVisibility | None = None,
+):
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=NATS_SSE_QUEUE_MAXSIZE)
     dropped_total = 0
 
@@ -1019,6 +1852,8 @@ async def _nats_sse_event_source(subscriptions: list[Any]):
                     return
                 continue
             consecutive_drops = 0
+            if visibility is not None and not await _nats_sse_row_allowed(item, visibility):
+                continue
             yield _sse_frame(getattr(item, "subject", "mnemos.event"), _nats_sse_data(item))
     finally:
         for task in tasks:
@@ -1045,6 +1880,11 @@ async def handle_nats_event_stream(request):
         except PermissionError:
             return PlainTextResponse("unauthorized", status_code=403)
         subjects = _parse_nats_sse_subjects(request, context)
+        # One envelope for the whole stream: operators are exempt from both
+        # gates (explicit subject filters + cross-tenant reads are the point
+        # of the operator role), everyone else is bounded by the same
+        # VisibilityFilter the REST read paths render.
+        visibility = None if _is_operator_context(context) else _cached_row_visibility(context)
     except ValueError as exc:
         return PlainTextResponse(str(exc), status_code=400)
 
@@ -1067,7 +1907,7 @@ async def handle_nats_event_stream(request):
         return PlainTextResponse("NATS unavailable", status_code=503)
 
     return StreamingResponse(
-        _nats_sse_event_source(subscriptions),
+        _nats_sse_event_source(subscriptions, visibility),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -1123,33 +1963,16 @@ def _budget_cap_configured(settings) -> bool:
 
 
 async def _register_budget_ledger(_app: Starlette, settings, reusable_backend):
-    """Give in-process GRAEAE the KNEMON spend ledger.
-
-    graeae_consult runs the engine in THIS process, and its budget gate reads
-    lifecycle._persistence_backend. The REST lifespan sets that; this one did
-    not, so with a weekly cap configured every MCP consultation failed closed
-    with "budget ledger unavailable" (ProviderBudgetExceeded) while the same
-    request over /v1/consultations succeeded. Opened only when a cap is
-    configured -- without one the gate allows everything and needs no ledger.
-
-    Returns a backend this call opened (the caller owns and closes it), or None.
-    """
+    """Register persistence for standalone tools and the shared budget ledger."""
     global _registered_ledger_backend
     from mnemos.core import lifecycle
 
-    if lifecycle._persistence_backend is not None or not _budget_cap_configured(settings):
+    if lifecycle._persistence_backend is not None:
         return None
     backend = reusable_backend or getattr(_app.state, "persistence_backend", None)
     opened = None
     if backend is None:
-        try:
-            _backend_type, backend = await lifecycle.build_configured_persistence_backend(settings)
-        except Exception:
-            logger.exception(
-                "KNEMON budget cap configured but the ledger backend could not be "
-                "opened; MCP GRAEAE consultations will be refused"
-            )
-            return None
+        _backend_type, backend = await lifecycle.build_configured_persistence_backend(settings)
         opened = backend
     lifecycle._persistence_backend = backend
     _registered_ledger_backend = backend
@@ -1177,8 +2000,12 @@ async def _mcp_http_lifespan(_app: Starlette):
     from mnemos.mcp import oauth as oauth_module
 
     owned_backend = None
+    previous_oauth_service = oauth_module._service
+    registered_oauth_service = None
     attached_backend = None
+    registered_backend = None
     settings = get_settings()
+    streamable_mcp._closing = False
     try:
         if settings.oauth.database_url.strip():
             raise RuntimeError(
@@ -1219,15 +2046,29 @@ async def _mcp_http_lifespan(_app: Starlette):
                 admin_passphrase=settings.oauth.admin_passphrase,
             )
             oauth_module.set_oauth_service(service)
+            registered_oauth_service = service
             logger.info("OAuth store wired to %s (MNEMOS_DATABASE_DSN).", type(backend).__name__)
+        from mnemos.core import lifecycle
+
+        prior_backend = lifecycle._persistence_backend
         ledger_backend = await _register_budget_ledger(_app, settings, owned_backend)
+        if prior_backend is None:
+            registered_backend = lifecycle._persistence_backend
         if ledger_backend is not None and owned_backend is None:
             owned_backend = ledger_backend
         yield
     finally:
-        _unregister_budget_ledger()
-        oauth_module.set_oauth_service(None)
+        await streamable_mcp.shutdown()
+        sse_tasks = list(_sse_tasks)
+        for task in sse_tasks:
+            task.cancel()
+        if sse_tasks:
+            await asyncio.gather(*sse_tasks, return_exceptions=True)
         await _drain_audit_tasks_on_shutdown()
+        if registered_backend is not None and _registered_ledger_backend is registered_backend:
+            _unregister_budget_ledger()
+        if registered_oauth_service is not None and oauth_module._service is registered_oauth_service:
+            oauth_module.set_oauth_service(previous_oauth_service)
         try:
             if owned_backend is not None:
                 await owned_backend.close()

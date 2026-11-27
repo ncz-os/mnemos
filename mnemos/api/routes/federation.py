@@ -15,7 +15,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
-from mnemos.api.dependencies import UserContext, get_current_user, require_root
+from mnemos.api.dependencies import UserContext, get_current_user, require_root, require_root_or_monitor
 from mnemos.api.errors import database_disconnected_detail, is_db_disconnect as _is_db_disconnect
 from mnemos.api.persistence_helpers import require_federation_backend
 from mnemos.core.ids import parse_uuid_or_404
@@ -489,6 +489,9 @@ async def register_peer(
     _: UserContext = Depends(require_root),
 ):
     """Register a remote peer to pull from."""
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     await _validate_peer_base_url(request.base_url)
     # #168: compat_mode is now Literal["strict", "permissive"] in
     # the request model — Pydantic auto-422s before we get here.
@@ -542,8 +545,20 @@ async def update_peer(
     request: FederationPeerUpdateRequest,
     _: UserContext = Depends(require_root),
 ):
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    updates = {k: v for k, v in request.model_dump().items() if v is not None}
+    # NG2-MN-017: use exclude_unset so an explicit null clears the
+    # nullable filter columns while an absent field stays untouched.
+    # Only namespace_filter / category_filter are nullable; a null for
+    # any other column (name/base_url/auth_token/...) is a 422, never a
+    # silent wipe of a required credential.
+    updates = request.model_dump(exclude_unset=True)
+    _NULLABLE_PEER_COLS = {"namespace_filter", "category_filter"}
+    null_others = sorted(k for k, v in updates.items() if v is None and k not in _NULLABLE_PEER_COLS)
+    if null_others:
+        raise HTTPException(status_code=422, detail=f"cannot clear required fields: {null_others}")
     if not updates:
         raise HTTPException(status_code=422, detail="no fields to update")
     if "base_url" in updates:
@@ -577,6 +592,9 @@ async def update_peer(
 
 @router.delete("/peers/{peer_id}", status_code=204)
 async def delete_peer(peer_id: str, _: UserContext = Depends(require_root)):
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     peer_id = parse_uuid_or_404(peer_id, "peer")
     backend = require_federation_backend()
     async with backend.transactional() as tx:
@@ -591,6 +609,9 @@ async def trigger_sync(
     _: UserContext = Depends(require_root),
 ):
     """Run a sync against a peer right now (blocks on completion)."""
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     peer_id = parse_uuid_or_404(peer_id, "peer")
     backend = require_federation_backend()
     try:
@@ -642,6 +663,9 @@ async def trigger_anti_entropy(
     logs. It never advances the sync cursor — repaired rows are outside the
     feed's sequence order and advancing to them would skip real events.
     """
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     from mnemos.domain.anti_entropy import AntiEntropyError, run_anti_entropy
 
     peer_id = parse_uuid_or_404(peer_id, "peer")
@@ -727,7 +751,7 @@ def _opt_int(row, key, default: int = 0) -> int:
 
 
 @router.get("/status", response_model=FederationStatusResponse)
-async def federation_status(_: UserContext = Depends(require_root)):
+async def federation_status(_: UserContext = Depends(require_root_or_monitor)):
     backend = require_federation_backend()
     async with backend.transactional() as tx:
         rows = await backend.federation.list_peers(tx)
@@ -1114,6 +1138,9 @@ async def federation_redispatch(
     a withdrawn, archived, consolidated, vault or replicated row yields no
     event at all, so a revocation can never be replayed as live data.
     """
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     backend = require_federation_backend()
 
     try:
@@ -1174,6 +1201,9 @@ async def federation_peer_reconcile(
     limit: Optional[int] = Query(None, ge=1, description="Cap the ids requested this run"),
 ):
     """Re-pull the ids the parity report calls missing. Dry run by default."""
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     from mnemos.domain.federation.parity import reconcile_peer
 
     backend = require_federation_backend()
@@ -1214,6 +1244,9 @@ async def federation_peer_repair(
     ``detached_pointers``); a LOCAL row's pointer is never touched -- if
     it still blocks the DELETE the row is reported in ``failed``.
     """
+    from mnemos.api.persistence_helpers import require_write_allowed
+
+    require_write_allowed()
     from mnemos.domain.federation.repair import repair_fenced_replicas
 
     backend = require_federation_backend()

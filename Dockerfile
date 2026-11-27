@@ -23,8 +23,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ libpq-dev curl git && \
     rm -rf /var/lib/apt/lists/*
 
-# Install uv (fast Python package installer)
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+# Install a versioned uv installer and verify its bytes before execution.
+ARG UV_INSTALLER_SHA256=505407eb4b5bec00e0b231c8c86e968ee3f5aa0136d49dd8a541179e7f76ce7d
+RUN curl -fsSL -o /tmp/uv-install.sh https://astral.sh/uv/0.5.11/install.sh && \
+    echo "${UV_INSTALLER_SHA256}  /tmp/uv-install.sh" | sha256sum -c - && \
+    sh /tmp/uv-install.sh && rm /tmp/uv-install.sh
 ENV PATH="/root/.local/bin:$PATH"
 
 # Copy pyproject.toml (uv will handle dependency resolution)
@@ -68,6 +71,14 @@ RUN set -eux; \
     curl -fsSLO "${BASE_CR}/libigdgmm12_22.10.0_amd64.deb"; \
     curl -fsSLO "${BASE_IGC}/intel-igc-core-2_${INTEL_IGC}+${INTEL_IGC_BUILD}_amd64.deb"; \
     curl -fsSLO "${BASE_IGC}/intel-igc-opencl-2_${INTEL_IGC}+${INTEL_IGC_BUILD}_amd64.deb"; \
+    printf '%s\n' \
+      "0ce1e715ec5bf30b1304b42acfbda34cc514a0f616dd48c6a31973c4075d8d09  intel-igc-core-2_${INTEL_IGC}+${INTEL_IGC_BUILD}_amd64.deb" \
+      "09a71e8b6ad432ed0511b09fa4f580c1b44534a60ccb0545212507bf67dc0d1b  intel-igc-opencl-2_${INTEL_IGC}+${INTEL_IGC_BUILD}_amd64.deb" \
+      "f36cb8a6899353c61cc7261b650f287f4a652acadaad859103bdfc51f93b6e8a  intel-ocloc_${INTEL_COMPUTE_RUNTIME}-0_amd64.deb" \
+      "b2d0c924e56b3f9e5837774d68b0c67461b8633035d93ca18b1a8e3e5ead15fa  intel-opencl-icd_${INTEL_COMPUTE_RUNTIME}-0_amd64.deb" \
+      "6031a63d6e8a12ce61c14efc15f2c8e727061286e3820b8594e6d00615e04d54  libigdgmm12_22.10.0_amd64.deb" \
+      "12b8254e6d3415c32cee9cd13943030b991d91212445c79fe1cc27176a72eca4  libze-intel-gpu1_${INTEL_COMPUTE_RUNTIME}-0_amd64.deb" \
+      | sha256sum -c -; \
     apt-get update && apt-get install -y --no-install-recommends ocl-icd-libopencl1; \
     dpkg -i \
       intel-igc-core-2_${INTEL_IGC}+${INTEL_IGC_BUILD}_amd64.deb \
@@ -99,11 +110,16 @@ RUN python -m pip install --no-deps --no-build-isolation .
 # generation is in-process — no Ollama, no llama-server HTTP. The
 # default GGUF is nomic-embed-text-v1.5.Q8_0 (768-dim), matching the
 # existing `memories.embedding vector(768)` pgvector column. Override
-# via MNEMOS_EMBED_MODEL_PATH at runtime; bake an alternate model into
-# the image at build time by replacing this layer.
+# via MNEMOS_EMBED_MODEL_PATH at runtime (and bake an alternate model
+# into the image at build time by replacing this layer) — but if the
+# replacement model does not emit 768 dimensions, MNEMOS_EMBEDDING_DIM
+# must be overridden to match it, or the vector column width will not
+# match the embeddings being written.
+ARG MNEMOS_EMBED_MODEL_SHA256=3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7
 RUN mkdir -p /opt/mnemos/models && \
     curl -fsSL -o /opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf \
-      https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf
+      https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/nomic-embed-text-v1.5.Q8_0.gguf && \
+    echo "${MNEMOS_EMBED_MODEL_SHA256}  /opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf" | sha256sum -c -
 
 # Environment variables. MNEMOS_EMBED_OV_DEVICE defaults to AUTO so the
 # in-process embedder picks GPU > NPU > CPU at startup. Operator overrides
@@ -117,12 +133,21 @@ RUN mkdir -p /opt/mnemos/models && \
 ENV PG_USER=mnemos_user \
     PG_DATABASE=mnemos \
     PG_HOST=postgres \
+    MNEMOS_EMBEDDING_DIM=768 \
     MNEMOS_EMBED_MODEL_PATH=/opt/mnemos/models/nomic-embed-text-v1.5.Q8_0.gguf \
     MNEMOS_EMBED_OV_DEVICE=AUTO \
     OV_CACHE_DIR=/opt/mnemos/ov_cache \
     MNEMOS_BIND=0.0.0.0 \
     MNEMOS_PORT=5002 \
     PYTHONUNBUFFERED=1
+
+RUN useradd --uid 10001 --gid 0 --no-create-home --home-dir /home/mnemos \
+      --shell /usr/sbin/nologin mnemos && \
+    mkdir -p /home/mnemos /data /opt/mnemos && \
+    chown -R 10001:0 /app /home/mnemos /data /opt/mnemos && \
+    chmod -R g=u /app /home/mnemos /data /opt/mnemos
+USER 10001:0
+ENV HOME=/home/mnemos
 
 EXPOSE 5002
 

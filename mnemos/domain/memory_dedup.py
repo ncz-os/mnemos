@@ -225,9 +225,8 @@ async def dedup_exact_content(backend: Any, *, namespace: str | None = None, app
 
     Groups are active rows keyed by ``(content_hash, owner_id, namespace)``.
     The repository orders each group so the keeper is newest ``created`` with a
-    higher ``quality_rating`` tie-break. Apply mode uses ``delete_memory`` per
-    loser row rather than raw SQL so the mutation remains reversible and app
-    side effects can be emitted.
+    higher ``quality_rating`` tie-break. Apply mode validates locked groups
+    through the repository and records side effects only for changed rows.
     """
     delivery_ids: list[str] = []
     nats_intents: list[tuple[str, dict[str, Any], str]] = []
@@ -237,20 +236,13 @@ async def dedup_exact_content(backend: Any, *, namespace: str | None = None, app
         groups = [group for row in rows if (group := _group_from_row(row)) is not None]
         if apply:
             for group in groups:
-                visibility = _root_mutation_visibility(group.namespace)
-                for duplicate_id in group.duplicate_ids:
-                    row = await backend.memories.soft_delete_memory(
-                        tx,
-                        duplicate_id,
-                        visibility=visibility,
-                        requested_by=_DEDUP_USER_ID,
-                        requested_at=None,
-                        request_kind="dedup_exact_content",
-                        reason=_DEDUP_REASON,
-                        source=["mnemos.cli.memory-dedup"],
-                    )
-                    if not row:
-                        continue
+                changed = await backend.memories.mutate_exact_duplicates(
+                    tx, canonical_id=group.keep_id, duplicate_ids=group.duplicate_ids,
+                    owner_id=group.owner_id, namespace=group.namespace,
+                    content_hash=group.content_hash,
+                )
+                for row in changed:
+                    duplicate_id = row["id"]
                     deleted_count += 1
                     await _maybe_write_delete_audit(backend, tx, row, duplicate_id)
                     item_delivery_ids, item_nats_intents = await _dispatch_delete_side_effects(backend, tx, row)

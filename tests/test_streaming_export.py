@@ -1,7 +1,10 @@
 """Snapshot orchestration and bounded, fail-closed disk export regressions."""
 
+import fnmatch
 import io
 import json
+import os
+import tracemalloc
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -9,7 +12,13 @@ from typing import ClassVar
 
 import pytest
 
-from mnemos.tools.export_stream import DiskMemories, iter_pages, write_export
+from mnemos.tools.export_stream import (
+    ExportValidationError,
+    DiskMemories,
+    iter_pages,
+    stream_identity_spool,
+    write_export,
+)
 
 
 def record(number):
@@ -686,3 +695,165 @@ def test_per_record_spool_batches_disk_commits(monkeypatch, tmp_path):
     stream = chain(data, [{"export_complete": True, "record_count": 2500}])
     assert write_export(stream, tmp_path / "export.json") == 2500
     assert len(commits) == 3
+
+
+# ── T-010: disk-backed identity spool (no corpus-sized RAM retention) ──────
+
+
+def test_identity_spool_tracks_first_sight_and_dedupes_identical_repeats(tmp_path):
+    """add_identity reports True only on first sight, False on an
+    identical repeat, and keeps every payload on disk, not in a dict."""
+    add, finish = stream_identity_spool(tmp_path, page_commit_entries=2)
+    assert add("records", "a", '{"id":"a","v":1}') is True
+    assert add("records", "a", '{"id":"a","v":1}') is False
+    assert add("records", "b", '{"id":"b"}') is True
+    with pytest.raises(ExportValidationError, match="divergent duplicate records identity: a"):
+        add("records", "a", '{"id":"a","v":2}')
+    finish()
+    finish()  # idempotent
+
+
+def test_identity_spool_commits_in_pages(tmp_path, monkeypatch):
+    import sqlite3
+
+    real_connect = sqlite3.connect
+    commits = []
+
+    class Connection(sqlite3.Connection):
+        def commit(self):
+            commits.append(True)
+            return super().commit()
+
+    monkeypatch.setattr(
+        sqlite3,
+        "connect",
+        lambda *args, **kw: real_connect(*args, factory=Connection, **kw),
+    )
+    add, finish = stream_identity_spool(tmp_path, page_commit_entries=1000)
+    for i in range(2500):
+        add("records", f"mem_{i}", json.dumps({"id": f"mem_{i}"}))
+    finish()
+    # one commit for the table, two page-boundary commits, one final commit
+    assert len(commits) == 4, "page-batched commits, not one per record"
+
+
+def test_identity_spool_isolation_between_surfaces(tmp_path):
+    add, finish = stream_identity_spool(tmp_path)
+    assert add("records", "x", '{"id":"x"}') is True
+    assert add("kg_triples", "x", '{"id":"x"}') is True
+    assert add("kg_triples", "x", '{"id":"x"}') is False
+    finish()
+
+
+def test_identity_spool_rejects_add_after_finish_and_cleans_spool(tmp_path):
+    """Calling add after finish raises instead of touching a closed handle,
+    and finish removes the spool directory even when called twice."""
+    add, finish = stream_identity_spool(tmp_path)
+    assert add("records", "a", '{"id":"a"}') is True
+    finish()
+    finish()  # idempotent
+    with pytest.raises(ExportValidationError, match="spool is closed"):
+        add("records", "b", '{"id":"b"}')
+    leftovers = fnmatch.filter(os.listdir(tmp_path), ".mnemos-identity-spool-*")
+    assert not leftovers, f"identity spool leaked: {leftovers}"
+
+
+def test_identity_spool_repeated_identical_repeat_returns_false(tmp_path):
+    """A third and fourth identical sighting still return False (not True),
+    and count as one seen identity — the spool dedupes, not just the first
+    repeat."""
+    add, finish = stream_identity_spool(tmp_path, page_commit_entries=2)
+    assert add("records", "a", '{"id":"a"}') is True
+    assert add("records", "a", '{"id":"a"}') is False
+    assert add("records", "a", '{"id":"a"}') is False
+    assert add("records", "a", '{"id":"a"}') is False
+    finish()
+
+
+# Documented working-set budget for the streaming validator (T-010): the
+# identity spool lives on disk, so peak traced Python memory must not grow
+# with the serialized corpus (before the fix: ~2.3MB at 1k records and
+# ~22MB at 10k with 2KB payloads — linear in corpus bytes).
+_VALIDATOR_PEAK_BUDGET_BYTES = 16 * 1024 * 1024
+
+
+def _write_validator_corpus(path, count):
+    body = "y" * 2048
+    with path.open("w", encoding="utf-8") as handle:
+        for i in range(count):
+            entry = {"id": f"mem_{i}", "payload": {"content": body}}
+            handle.write(json.dumps({"records": [entry]}, separators=(",", ":")) + "\n")
+        handle.write(json.dumps({"export_complete": True, "record_count": count}) + "\n")
+
+
+@pytest.mark.parametrize("count", [1_000, 10_000, 100_000])
+def test_styx_validator_memory_does_not_scale_with_corpus(count, tmp_path):
+    """1k/10k/100k records, identical 2KB payloads: tracemalloc peak and
+    process RSS must both stay within the fixed working-set budget."""
+    from mnemos.tools.styx.source import _validate_http_export
+
+    payload = tmp_path / "export.ndjson"
+    _write_validator_corpus(payload, count)
+    file_size = payload.stat().st_size
+    assert file_size > 2_000_000, f"test corpus too small to prove flatness ({count} records)"
+
+    def rss_bytes():
+        with open(f"/proc/{os.getpid()}/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+
+    baseline_rss = rss_bytes()
+    tracemalloc.start()
+    try:
+        assert _validate_http_export(payload) == count
+    finally:
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+    assert peak < _VALIDATOR_PEAK_BUDGET_BYTES, (
+        f"validator retained {peak / 1e6:.1f}MB for a {file_size / 1e6:.0f}MB corpus "
+        f"({count} records); must stay flat within the budget"
+    )
+    assert (rss_bytes() - baseline_rss) < _VALIDATOR_PEAK_BUDGET_BYTES, "RSS grew with the corpus"
+
+
+def test_styx_validator_100k_peek_not_10x_1k(tmp_path):
+    """Direct comparison: 100k records must not take 10x the peak memory of
+    1k records (the old dict implementation grew linearly)."""
+    from mnemos.tools.styx.source import _validate_http_export
+
+    peaks = {}
+    for count in (1_000, 100_000):
+        payload = tmp_path / f"corpus-{count}.ndjson"
+        _write_validator_corpus(payload, count)
+        tracemalloc.start()
+        try:
+            _validate_http_export(payload)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        peaks[count] = peak
+        payload.unlink()
+
+    baseline = max(peaks[1_000], 1_000_000)
+    assert peaks[100_000] < baseline * 10, (
+        f"peak memory scaled with corpus size: {peaks[1_000] / 1e6:.2f}MB at 1k vs {peaks[100_000] / 1e6:.2f}MB at 100k"
+    )
+
+
+def test_styx_validator_cleans_its_spool_directory_on_success_and_failure(tmp_path):
+    from mnemos.tools.styx.source import _validate_http_export
+    from mnemos.tools.styx.errors import StyxError
+
+    payload = tmp_path / "ok.ndjson"
+    _write_validator_corpus(payload, 50)
+    _validate_http_export(payload)
+    leftovers = fnmatch.filter(os.listdir(tmp_path), ".mnemos-styx-validate-*")
+    assert not leftovers, f"spool directories left behind on success: {leftovers}"
+
+    bad = tmp_path / "bad.ndjson"
+    bad.write_text('{"records":[{"id":"mem_1"}]}\n', encoding="utf-8")
+    with pytest.raises(StyxError):
+        _validate_http_export(bad)
+    leftovers = fnmatch.filter(os.listdir(tmp_path), ".mnemos-styx-validate-*")
+    assert not leftovers, f"spool directories left behind on failure: {leftovers}"

@@ -54,6 +54,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -66,6 +67,7 @@ from mnemos.core.auth_context import UserContext
 from mnemos.core import eligibility as _eligibility
 from mnemos.core.config import embedding_dim_env, runtime_env_float, runtime_env_int, runtime_env_value_stripped
 from mnemos.core.secret_detection import VAULT_NAMESPACE
+from mnemos.core.visibility import ACL_READ_BIT, acl_principals
 from mnemos.persistence.base import (
     BranchRepository,
     ClusterCandidateRow,
@@ -237,6 +239,69 @@ def _content_hash(content: Any) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _version_where_nonroot(user: Any) -> tuple[str, list[Any]]:
+    """Per-version owner/world/group predicate for MySQL (NG2-MN-020).
+
+    MySQL/MariaDB ship no ``memory_acl`` table (unlike postgres /
+    sqlite / oracle / db2 via 0043), so there is no ACL disjunct to
+    render — ACL history access on this backend follows the live-row
+    assert gate only. Owner / world / group mirror the
+    ``_render_visibility`` shape; the namespace pin and vault
+    subtraction are applied by the caller alongside this fragment.
+    """
+    group_ids = list(getattr(user, "group_ids", []) or [])
+    params: list[Any] = [getattr(user, "user_id", None)]
+    if group_ids:
+        placeholders = ", ".join(["%s"] * len(group_ids))
+        group_clause = f"group_id IN ({placeholders})"
+        params += group_ids
+    else:
+        group_clause = "0=1"
+    clause = (
+        "(owner_id = %s"
+        " OR (MOD(permission_mode, 10) >= 4)"
+        " OR (MOD(FLOOR(COALESCE(permission_mode, 0) / 10), 10) >= 4"
+        f" AND group_id IS NOT NULL AND {group_clause}))"
+    )
+    return clause, params
+
+
+def _snapshot_visible(row: Row, user: Any) -> bool:
+    """Python-side re-check of the version-visibility contract (NG2-MN-020).
+
+    The SQL predicate (``_version_where_nonroot``) covers owner / world
+    / group plus the namespace pin, but the vault subtraction
+    (``namespace <> 'vault'``) lives in
+    ``VisibilityFilter.exclude_namespaces`` and must be honoured here
+    too so a vault-namespace snapshot row is never returned to a
+    non-root caller even if it carries a permissive permission_mode.
+    MySQL/MariaDB ship no ``memory_acl`` table, so there is no ACL
+    disjunct: ACL history access on this backend follows the live-row
+    assert gate only (documented scope limit, not a silent split —
+    postgres / sqlite / oracle / db2 render the ACL EXISTS term in
+    SQL).
+    """
+    from mnemos.core.security import is_root
+    from mnemos.core.secret_detection import VAULT_NAMESPACE
+
+    if is_root(user):
+        return True
+    if row.get("namespace") == VAULT_NAMESPACE:
+        return False
+    try:
+        mode = int(row.get("permission_mode") or 0)
+    except (TypeError, ValueError):
+        return False
+    if str(row.get("owner_id")) == str(getattr(user, "user_id", None)):
+        return True
+    if mode % 10 >= 4:
+        return True
+    group_ids = {str(g) for g in (list(getattr(user, "group_ids", []) or []))}
+    group_id = row.get("group_id")
+    tens = (mode // 10) % 10
+    return bool(tens >= 4 and group_id is not None and str(group_id) in group_ids)
+
+
 def _json_array_text(value: Sequence[Any] | None) -> str | None:
     if value is None:
         return None
@@ -397,6 +462,148 @@ def _parse_mysql_dsn(dsn: str) -> dict[str, Any]:
     if parsed.password:
         kwargs["password"] = unquote(parsed.password)
     return kwargs
+
+
+#: Strict identifier check for table aliases interpolated into rendered
+#: SQL fragments (``table_alias``). Only bare SQL identifiers are allowed;
+#: anything with spaces, quotes, or special characters is rejected with a
+#: ``ValueError`` rather than being spliced into a query string.
+_TABLE_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validated_table_prefix(table_alias: str) -> str:
+    """Return ``"{alias}."`` for a validated SQL identifier alias, else ``""``.
+
+    Raises ``ValueError`` if ``table_alias`` is not a bare SQL identifier
+    matching ``^[A-Za-z_][A-Za-z0-9_]*$`` — i.e. it must start with a
+    letter or underscore. Digit-leading names (e.g. ``123bad``) are
+    rejected: in MySQL / Postgres they are only legal as *quoted*
+    identifiers, and Oracle's ``IS_IDENTIFIER`` treats them as reserved
+    words. Quoting is not part of this fragment's contract, so the
+    strict bare form is required.
+
+    This is the single choke-point for every SQL fragment built with an
+    optional table alias in this module; the builders (``_version_visibility_clause``
+    and friends) call it once and interpolate the result.
+    """
+    if not table_alias:
+        return ""
+    if not _TABLE_ALIAS_RE.match(table_alias):
+        raise ValueError(
+            f"Invalid table alias {table_alias!r}: must match "
+            "^[A-Za-z_][A-Za-z0-9_]*$ (bare SQL identifier only)"
+        )
+    return f"{table_alias}."
+
+
+def _version_visibility_clause(
+    user_id: str | None,
+    group_ids: Sequence[str],
+    *,
+    table_alias: str = "",
+    namespace: str | None = None,
+    exclude_namespaces: Sequence[str] = (),
+) -> tuple[str, list[Any]]:
+    """Per-snapshot tenancy predicate for ``memory_versions`` rows (MySQL).
+
+    Mirrors ``mnemos.core.visibility.version_visibility_predicate``
+    (Postgres ``$N`` form), the SQLite ``_version_visibility_clause``,
+    and the Oracle ``_version_visibility_clause`` in ``%s`` positional
+    form: tenancy is evaluated against THE SNAPSHOT's own
+    ``owner_id`` / ``namespace`` / ``permission_mode`` / ``group_id``
+    columns, with the ACL escape hatch joined on the parent
+    ``memory_id`` where the schema provisions ``memory_acl`` (migration
+    0073 for MySQL / MariaDB — see the ``acl_clause`` render below).
+    Deliberately NOT the generic
+    ``_render_visibility`` live-memory predicate: ``memory_versions``
+    has no ``federation_source`` column (a federation term would 500),
+    and the ACL join must use ``memory_id`` (not the snapshot row id)
+    where the table exists.
+
+    ``table_alias`` is validated by ``_validated_table_prefix``; only
+    bare SQL identifiers are accepted, so the rendered fragment is safe
+    to splice into a query (no interpolation of untrusted input).
+
+    When ``table_alias`` is empty (the default), ``p`` falls back to
+    ``"memory_versions."`` — the canonical table name every call site
+    uses unaliased. This is required, not stylistic: an empty prefix
+    would render the ACL EXISTS correlation as
+    ``WHERE macl.memory_id = memory_id``, and inside the subquery the
+    unqualified ``memory_id`` resolves to ``macl.memory_id`` itself —
+    a tautology that bypasses per-snapshot tenancy. The Oracle builder
+    applies the same ``"memory_versions."`` fallback; the Db2 builder
+    writes the qualified form literally (it takes no alias parameter).
+    """
+    p = (
+        _validated_table_prefix(table_alias)
+        if table_alias
+        else "memory_versions."
+    )
+    params: list[Any] = [user_id]
+    group_list = list(group_ids or [])
+    if group_list:
+        group_clause = f"{p}group_id IN ({', '.join(['%s'] * len(group_list))})"
+        params += group_list
+    else:
+        group_clause = "0=1"
+    # ACL escape hatch: MySQL / MariaDB now provision ``memory_acl``
+    # (migration 0073, mirroring 0043 on the other four backends), so
+    # version-history reads honour per-principal grants exactly like
+    # SQLite / Oracle / Db2 / Postgres — the disjunct joins on the
+    # parent ``memory_id`` (not the snapshot row id) with the qualified
+    # ``macl.`` correlation. Unconditional for non-root callers (the
+    # route never invokes this builder for root), matching the other
+    # backends; deployments that have not run migration 0073 fail closed
+    # with a table-missing error, the standard migration gap.
+    # MIGRATION ORDERING: ``0073_memory_acl.sql`` must be applied BEFORE
+    # upgrading the application code — every non-root version read now
+    # embeds this EXISTS term, so an un-migrated deployment errors
+    # (fail-closed) rather than silently returning pre-0073 results.
+    # The live-memory ``_render_visibility`` path remains ACL-less — a
+    # documented parity gap kept separate from history reads.
+    principals = acl_principals(user_id or "", group_ids)
+    if principals:
+        acl_placeholders = ", ".join(["%s"] * len(principals))
+        acl_clause = (
+            " OR EXISTS (SELECT 1 FROM memory_acl macl "
+            f"WHERE macl.memory_id = {p}memory_id "
+            f"AND macl.principal IN ({acl_placeholders}) "
+            f"AND (macl.perm & {ACL_READ_BIT}) > 0)"
+        )
+        params += principals
+    else:
+        acl_clause = ""
+    # ``permission_mode`` comparisons are wrapped in
+    # ``COALESCE(permission_mode, 0)`` to match the Db2 / Oracle builders
+    # and the live-memory ``_render_visibility`` renderer: a snapshot with
+    # NULL ``permission_mode`` must evaluate the world/group bits as 0 so
+    # it is reachable through the owner / ACL disjuncts, never through a
+    # NULL arithmetic comparison that would silently hide it.
+    clause = (
+        "("
+        f"{p}owner_id = %s"
+        f" OR COALESCE({p}permission_mode, 0) % 10 >= 4"
+        f" OR (COALESCE({p}permission_mode, 0) / 10 % 10 >= 4 "
+        f"AND {p}group_id IS NOT NULL AND {group_clause})"
+        f"{acl_clause})"
+    )
+    # The caller filter's namespace pin is applied alongside this
+    # fragment (see ``list_memory_versions`` / ``get_memory_version``):
+    # a NULL namespace in the filter never reaches the SQL layer —
+    # non-root callers with an unresolved namespace fail closed before
+    # execution, so the bind here is always a concrete value and
+    # ``namespace = %s`` never degenerates to a NULL comparison.
+    clause = f"{clause} AND {p}namespace = %s"
+    params.append(namespace)
+    excl = tuple(exclude_namespaces or ())
+    if excl:
+        placeholders = ", ".join(["%s"] * len(excl))
+        clause = (
+            f"{clause} AND ({p}namespace IS NULL "
+            f"OR {p}namespace NOT IN ({placeholders}))"
+        )
+        params += list(excl)
+    return clause, params
 
 
 def _render_visibility(
@@ -2685,7 +2892,7 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
         visibility = VisibilityFilter.for_read(user, namespace=namespace)
         row = await self.get_memory(tx, memory_id, visibility=visibility, include_archived=True)
         if row is None:
-            raise PermissionError("Memory not found")
+            raise PermissionError("Access denied")
 
     async def fetch_memory_log(
         self,
@@ -2756,6 +2963,105 @@ class MysqlMemoryRepository(HotSearchMixin, MemoryRepository):
                 (memory_id, commit_hash),
             )
             return await _fetchone_dict(cursor)
+
+    async def fetch_memory_versions(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        user: UserContext,
+    ) -> list[Row]:
+        # NG2-MN-020: mirror of GET /v1/memories/{id}/versions (oldest
+        # first). Same simplification as fetch_memory_log on this
+        # backend: return the branch rows and rely on the
+        # higher-level assert_memory_readable gate; per-version rows
+        # carry the same owner/namespace as the live memory.
+        from mnemos.core.security import is_root
+
+        conn = tx.conn
+        if is_root(user):
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT version_num, snapshot_at, snapshot_by, change_type,
+                           content, branch, commit_hash, owner_id, namespace,
+                           permission_mode, group_id
+                      FROM memory_versions
+                     WHERE memory_id = %s AND branch = %s AND deleted_at IS NULL
+                     ORDER BY version_num ASC
+                    """,
+                    (memory_id, branch),
+                )
+                return await _fetch_all_dicts(cursor)
+        vis_clause, vis_params = _version_where_nonroot(user)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT version_num, snapshot_at, snapshot_by, change_type,
+                       content, branch, commit_hash, owner_id, namespace,
+                       permission_mode, group_id
+                  FROM memory_versions
+                 WHERE memory_id = %s AND branch = %s AND deleted_at IS NULL
+                """
+                f"AND {vis_clause} AND namespace = %s "
+                """
+                 ORDER BY version_num ASC
+                """,
+                (memory_id, branch, *vis_params, user.namespace),
+            )
+            rows = await _fetch_all_dicts(cursor)
+        return [row for row in rows if _snapshot_visible(row, user)]
+
+    async def fetch_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        user: UserContext,
+    ) -> Row | None:
+        # NG2-MN-020: mirror of GET /v1/memories/{id}/versions/{n}.
+        from mnemos.core.security import is_root
+
+        conn = tx.conn
+        if is_root(user):
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    """
+                    SELECT id, memory_id, version_num, content, category,
+                           subcategory, metadata, verbatim_content, owner_id,
+                           namespace, permission_mode, source_model,
+                           source_provider, source_session, source_agent,
+                           snapshot_at, snapshot_by, change_type, commit_hash,
+                           branch, group_id
+                      FROM memory_versions
+                     WHERE memory_id = %s AND version_num = %s AND branch = %s
+                       AND deleted_at IS NULL
+                    """,
+                    (memory_id, version_num, branch),
+                )
+                return await _fetchone_dict(cursor)
+        vis_clause, vis_params = _version_where_nonroot(user)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                """
+                SELECT id, memory_id, version_num, content, category,
+                       subcategory, metadata, verbatim_content, owner_id,
+                       namespace, permission_mode, source_model,
+                       source_provider, source_session, source_agent,
+                       snapshot_at, snapshot_by, change_type, commit_hash,
+                       branch, group_id
+                  FROM memory_versions
+                 WHERE memory_id = %s AND version_num = %s AND branch = %s
+                   AND deleted_at IS NULL
+                """
+                f"AND {vis_clause} AND namespace = %s",
+                (memory_id, version_num, branch, *vis_params, user.namespace),
+            )
+            row = await _fetchone_dict(cursor)
+        if row is None or not _snapshot_visible(row, user):
+            return None
+        return row
 
     async def fetch_memory_export(
         self,
@@ -3511,6 +3817,58 @@ class MysqlVersionRepository(VersionRepository):
             )
             return await _fetch_all_dicts(cursor)
 
+    async def fetch_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        user: UserContext,
+    ) -> Row | None:
+        """Fetch one version snapshot with per-snapshot tenancy applied."""
+        from mnemos.core.security import is_root
+        from mnemos.persistence.visibility import VisibilityFilter
+
+        conn = tx.conn
+        cols = (
+            "id, memory_id, version_num, content, category, subcategory, metadata, "
+            "verbatim_content, owner_id, namespace, permission_mode, "
+            "source_model, source_provider, source_session, source_agent, "
+            "snapshot_at, snapshot_by, change_type"
+        )
+        async with conn.cursor() as cursor:
+            if is_root(user):
+                await cursor.execute(
+                    f"SELECT {cols} FROM memory_versions "
+                    "WHERE memory_id = %s AND version_num = %s AND branch = %s "
+                    "AND deleted_at IS NULL",
+                    (memory_id, version_num, branch),
+                )
+                return await _fetchone_dict(cursor)
+            ns = getattr(user, "namespace", None)
+            if ns is None:
+                # Uniform fail-closed contract (all six backends, every
+                # version-read path): namespace-None non-root principals
+                # never reach SQL — list/fetch return [], get returns None,
+                # and PermissionError raises only at the shared facade
+                # boundary (`_visibility_to_user`) where exception handling
+                # is explicit. No default-namespace widening is ever applied.
+                raise PermissionError("Access denied: namespace required")
+            visibility = VisibilityFilter.for_read(user, namespace=ns)
+            clause, vis_params = _version_visibility_clause(
+                visibility.user_id,
+                visibility.group_ids,
+                namespace=ns,
+                exclude_namespaces=visibility.exclude_namespaces,
+            )
+            where = "memory_id = %s AND version_num = %s AND branch = %s AND deleted_at IS NULL"
+            params: list[Any] = [memory_id, version_num, branch]
+            if clause:
+                where += f" AND ({clause})"
+                params += list(vis_params)
+            await cursor.execute(f"SELECT {cols} FROM memory_versions WHERE {where}", params)
+            return await _fetchone_dict(cursor)
+
     async def insert_memory_version(
         self,
         tx: Transaction,
@@ -3615,6 +3973,177 @@ class MysqlVersionRepository(VersionRepository):
                 (version_id,),
             )
             return await _fetchone_dict(cursor)
+
+
+    async def list_memory_versions(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        """List version summaries for ``memory_id`` on ``branch`` (oldest first).
+
+        ABC surface: per-snapshot tenancy via ``_version_visibility_clause``
+        (owner / world / group / ACL + namespace pin + vault subtraction
+        from ``visibility.exclude_namespaces``).
+        """
+        cols = "version_num, snapshot_at, snapshot_by, change_type, content, branch"
+        conn = tx.conn
+        if visibility.scope == VisibilityScope.ROOT_BYPASS:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"SELECT {cols} FROM memory_versions "
+                    "WHERE memory_id = %s AND branch = %s AND deleted_at IS NULL "
+                    "ORDER BY version_num ASC",
+                    (memory_id, branch),
+                )
+                return await _fetch_all_dicts(cursor)
+        if visibility.namespace is None:
+            # Uniform fail-closed contract (all six backends, every
+            # version-read path): namespace-None non-root principals never
+            # reach SQL — list/fetch return [], get returns None, and
+            # PermissionError raises only at the shared facade boundary
+            # (`_visibility_to_user`). No default-namespace widening.
+            return []
+        ns = visibility.namespace
+        clause, vis_params = _version_visibility_clause(
+            visibility.user_id,
+            visibility.group_ids,
+            namespace=ns,
+            exclude_namespaces=visibility.exclude_namespaces,
+        )
+        where = "memory_id = %s AND branch = %s AND deleted_at IS NULL"
+        params: list[Any] = [memory_id, branch]
+        if clause:
+            where += f" AND ({clause})"
+            params += list(vis_params)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"SELECT {cols} FROM memory_versions WHERE {where} ORDER BY version_num ASC",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
+
+    async def get_memory_version(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_num: int,
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        """Fetch one version snapshot with per-snapshot tenancy applied.
+
+        ABC surface: mirrors :meth:`list_memory_versions` for a single
+        ``version_num``.
+        """
+        cols = (
+            "id, memory_id, version_num, content, category, subcategory, metadata, "
+            "verbatim_content, owner_id, namespace, permission_mode, "
+            "source_model, source_provider, source_session, source_agent, "
+            "snapshot_at, snapshot_by, change_type"
+        )
+        conn = tx.conn
+        if visibility.scope == VisibilityScope.ROOT_BYPASS:
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"SELECT {cols} FROM memory_versions "
+                    "WHERE memory_id = %s AND version_num = %s AND branch = %s "
+                    "AND deleted_at IS NULL",
+                    (memory_id, version_num, branch),
+                )
+                return await _fetchone_dict(cursor)
+        if visibility.namespace is None:
+            # Uniform fail-closed contract (all six backends, every
+            # version-read path): namespace-None non-root principals never
+            # reach SQL — list/fetch return [], get returns None, and
+            # PermissionError raises only at the shared facade boundary
+            # (`_visibility_to_user`). No default-namespace widening.
+            return None
+        ns = visibility.namespace
+        clause, vis_params = _version_visibility_clause(
+            visibility.user_id,
+            visibility.group_ids,
+            namespace=ns,
+            exclude_namespaces=visibility.exclude_namespaces,
+        )
+        where = (
+            "memory_id = %s AND version_num = %s AND branch = %s "
+            "AND deleted_at IS NULL"
+        )
+        params: list[Any] = [memory_id, version_num, branch]
+        if clause:
+            where += f" AND ({clause})"
+            params += list(vis_params)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"SELECT {cols} FROM memory_versions WHERE {where}",
+                params,
+            )
+            return await _fetchone_dict(cursor)
+
+    async def fetch_version_contents(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        version_nums: Sequence[int],
+        branch: str,
+        visibility: VisibilityFilter,
+    ) -> list[Row]:
+        """Return ``(version_num, content)`` rows for ``version_nums``.
+
+        ABC-first delivery (was ``NotImplementedError`` -> route 503 on
+        MySQL / MariaDB): same per-snapshot tenancy as
+        :meth:`list_memory_versions` — root bypass, namespace-None
+        fail-closed, then the visibility clause plus the namespace pin.
+        """
+        cols = "version_num, content"
+        conn = tx.conn
+        nums = list(version_nums)
+        if not nums:
+            return []
+        if visibility.scope == VisibilityScope.ROOT_BYPASS:
+            ph = ", ".join(["%s"] * len(nums))
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    f"SELECT {cols} FROM memory_versions "
+                    f"WHERE memory_id = %s AND branch = %s "
+                    f"AND version_num IN ({ph}) AND deleted_at IS NULL "
+                    "ORDER BY version_num ASC",
+                    (memory_id, branch, *nums),
+                )
+                return await _fetch_all_dicts(cursor)
+        if visibility.namespace is None:
+            # Uniform fail-closed contract (all six backends, every
+            # version-read path): namespace-None non-root principals
+            # never reach SQL — list/fetch return [], get returns None,
+            # and PermissionError raises only at the shared facade
+            # boundary (`_visibility_to_user`). No default-namespace
+            # widening is ever applied.
+            return []
+        ns = visibility.namespace
+        clause, vis_params = _version_visibility_clause(
+            visibility.user_id,
+            visibility.group_ids,
+            namespace=ns,
+            exclude_namespaces=visibility.exclude_namespaces,
+        )
+        ph = ", ".join(["%s"] * len(nums))
+        where = (
+            "memory_id = %s AND branch = %s "
+            f"AND version_num IN ({ph}) AND deleted_at IS NULL"
+        )
+        params: list[Any] = [memory_id, branch, *nums]
+        if clause:
+            where += f" AND ({clause})"
+            params += list(vis_params)
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                f"SELECT {cols} FROM memory_versions WHERE {where} ORDER BY version_num ASC",
+                params,
+            )
+            return await _fetch_all_dicts(cursor)
 
 
 class MysqlBranchRepository(BranchRepository):

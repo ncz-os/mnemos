@@ -34,6 +34,16 @@ except Exception:  # pragma: no cover — driver not installed
 
 runner = CliRunner()
 
+
+@pytest.mark.parametrize("profile", ["edge", "server", "dev"])
+def test_audit_sealer_profile_and_override(profile: str) -> None:
+    from mnemos.core.services import resolve_profile_services
+
+    assert resolve_profile_services(profile=profile, managed=True).enabled("audit_sealer_worker")
+    assert not resolve_profile_services(
+        profile=profile, managed=True, env={"MNEMOS_AUDIT_SEALER_ENABLED": "false"}
+    ).enabled("audit_sealer_worker")
+
 _ENV_KEYS = (
     "MNEMOS_CONFIG_PATH",
     "MNEMOS_PROFILE",

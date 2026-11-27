@@ -31,7 +31,9 @@
 # Selects a backend at runtime via MNEMOS_DATABASE_DSN; defaults to Oracle to
 # match the canonical PYTHIA deployment.
 # ─────────────────────────────────────────────────────────────────────────────
-ARG MNEMOS_EVERYTHING_IMAGE=ghcr.io/ncz-os/mnemos:latest
+# Supply a versioned digest for standalone builds. Release builds provide the
+# in-graph everything target through the named context below.
+ARG MNEMOS_EVERYTHING_IMAGE
 FROM ${MNEMOS_EVERYTHING_IMAGE}
 
 ARG MNEMOS_CORE_REF=unknown

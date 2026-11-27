@@ -16,7 +16,6 @@ import pytest
 from starlette.requests import Request
 
 from mnemos.mcp import oauth as mcp_oauth
-from tests.oauth_backend_helpers import oauth_database as oauth_database
 
 
 def _build_service(**overrides):

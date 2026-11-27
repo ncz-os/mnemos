@@ -44,8 +44,8 @@ core layer (Dockerfile.core)              kernel + CHARON/STYX             build
 Only the final enterprise image is pushed. The core and everything layers are
 passed between BuildKit Bake targets as in-memory named contexts and are never
 pushed or tagged as their own packages; `ghcr.io/ncz-os/mnemos-core` and
-`ghcr.io/ncz-os/mnemos` exist in the registry but stopped being published at
-6.2.5. STIPHOS has no container image at all -- it is pip-only
+`ghcr.io/ncz-os/mnemos` were last published at 6.2.5 and are removed from the
+registry. STIPHOS has no container image at all -- it is pip-only
 (`mnemos-stiphos`) and runs as its own service on port 8080.
 
 Why not a separate "core+graeae" image tier? graeae/pantheon/knemon all

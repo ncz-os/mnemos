@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 
 # Checking the top-level package spec avoids importing Docling's document/ML
 # dependency graph on every API startup.  The concrete classes are loaded by
-# ``_load_docling`` only when the first document request constructs an importer.
+# ``_load_docling`` when a document is parsed.
 try:
     DOCLING_AVAILABLE = importlib.util.find_spec("docling") is not None
 except (ImportError, ValueError):
@@ -52,10 +52,11 @@ def _docling_max_concurrency() -> int:
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.memory_mutations import _assert_no_active_deletion
-from mnemos.api.persistence_helpers import backend_or_503
+from mnemos.api.persistence_helpers import backend_or_503, require_write_allowed
 from mnemos.api.read_policy import _redacted_for_webhook, _validate_permission_mode
 from mnemos.core.config import get_settings, runtime_env_value
 from mnemos.core.ids import new_memory_id
+from mnemos.core.pool import is_infrastructure_error
 from mnemos.domain.document_repo import (
     DocumentChunkSoftDeletedConflictError,
     DocumentRepository,
@@ -107,6 +108,32 @@ def _positive_int(raw: Any) -> int | None:
 _docling_conversion_semaphore = asyncio.Semaphore(_docling_max_concurrency())
 
 
+async def _convert_document_off_loop(
+    importer: Any,
+    content: bytes,
+    filename: str,
+) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
+    """Wait for admission on the event loop and run the parse in a thread."""
+    semaphore = _docling_conversion_semaphore
+    await semaphore.acquire()
+    try:
+        task = asyncio.create_task(asyncio.to_thread(importer.parse_document, content, filename))
+    except BaseException:
+        semaphore.release()
+        raise
+
+    def release_slot(completed: asyncio.Task) -> None:
+        semaphore.release()
+        # Retrieve exceptions even if the request was cancelled during parsing.
+        if not completed.cancelled():
+            completed.exception()
+
+    task.add_done_callback(release_slot)
+    # A cancelled request cannot stop a synchronous parse; retain its slot
+    # until the worker finishes.
+    return await asyncio.shield(task)
+
+
 def _document_import_max_bytes() -> int:
     env_limit = _positive_int(runtime_env_value("MNEMOS_DOCUMENT_IMPORT_MAX_BYTES"))
     if env_limit is not None:
@@ -147,11 +174,10 @@ def _archive_snapshot_reason(*values: str | None) -> str | None:
 class DoclingImporter:
     """Handles document parsing and memory extraction via Docling."""
 
-    def __init__(self):
-        if not DOCLING_AVAILABLE:
+    def __init__(self, converter: Optional[Any] = None):
+        if not DOCLING_AVAILABLE and converter is None:
             raise ImportError("Docling not installed. Install with: pip install 'mnemos-core[docling]'")
-        _load_docling()
-        self.converter = DocumentConverter()
+        self.converter = converter
 
     def parse_document(self, file_content: bytes, filename: str) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
         """Parse document and extract content, metadata, and chunks.
@@ -159,12 +185,16 @@ class DoclingImporter:
         Returns:
             (full_text, metadata, chunks) where chunks are memory-sized segments
         """
+        converter = self.converter
+        if converter is None:
+            _load_docling()
+            converter = DocumentConverter()
         try:
             # Parse document with Docling. DocumentConverter has no
             # convert_bytes() method (never did - not in docling's public
             # API); convert() takes a DocumentStream wrapping the bytes, and
             # infers the format from the stream's name.
-            doc = self.converter.convert(DocumentStream(name=filename, stream=BytesIO(file_content)))
+            doc = converter.convert(DocumentStream(name=filename, stream=BytesIO(file_content)))
 
             # Extract full text
             full_text = doc.document.export_to_markdown()
@@ -383,12 +413,17 @@ async def import_memories_from_document(
             status_code=501,
             detail="Docling not installed. Install with: pip install 'mnemos-core[docling]'",
         ) from exc
-    async with _docling_conversion_semaphore:
-        full_text, doc_metadata, chunks = await asyncio.to_thread(
-            importer.parse_document,
+    try:
+        full_text, doc_metadata, chunks = await _convert_document_off_loop(
+            importer,
             content,
             file.filename or "document",
         )
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=501,
+            detail="Docling not installed. Install with: pip install 'mnemos-core[docling]'",
+        ) from exc
     archive_reason = _archive_snapshot_reason(
         file.filename,
         full_text,
@@ -452,8 +487,6 @@ async def import_memories_from_document(
     # 'pending' for the worker to pick up. Closes
     # corpus-review-2026-04-29 #2 for this route.
     pending_delivery_ids: list[str] = []
-
-    from mnemos.core.pool import is_infrastructure_error
 
     # Infrastructure errors (asyncio.TimeoutError + asyncpg
     # connection family) at acquire time OR mid-loop AFTER one or
@@ -831,6 +864,7 @@ async def import_document(
         total_text_length: total character count
     }
     """
+    require_write_allowed()
     payload, status_code = await import_memories_from_document(
         file,
         category,
@@ -860,6 +894,7 @@ async def batch_import_documents(
 
     Returns list of import results (one per document).
     """
+    require_write_allowed()
     # Validate permission_mode at the batch boundary so an invalid value
     # fails the whole request fast — otherwise the per-file try/except
     # below would swallow the 422 into a per-file error result.

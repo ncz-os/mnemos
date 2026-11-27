@@ -76,6 +76,10 @@ def qi(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def sequence_sync_query(table: str, column: str) -> str:
+    return f"select setval($1, coalesce((select max({qi(column)}) from {qi(table)}), 0) + 1, false)"
+
+
 # A Postgres identifier as accepted in ``--drop-constraints``: unquoted
 # letters/digits/underscore (cannot start with a digit) plus the $
 # continuation character Postgres allows. Anything else -- a dot, a quoting
@@ -98,9 +102,7 @@ def parse_drop_constraint(spec: str) -> tuple[str, str]:
     spec = spec.strip()
     table, dot, cname = spec.partition(".")
     if not dot or not table or not cname:
-        raise ValueError(
-            f"--drop-constraints entry {spec!r} is not 'table.constraint'"
-        )
+        raise ValueError(f"--drop-constraints entry {spec!r} is not 'table.constraint'")
     for part, label in ((table, "table"), (cname, "constraint")):
         if not _IDENT_RE.match(part):
             raise ValueError(
@@ -321,7 +323,8 @@ async def copy_table(conn, ocur, pg_table: str, ora_table: str, dry: bool) -> di
         seq = await conn.fetchval("select pg_get_serial_sequence($1, $2)", qi(pg_table), name)
         if seq:
             await conn.execute(
-                f"select setval('{seq}', coalesce((select max({qi(name)}) from {qi(pg_table)}), 0) + 1, false)"
+                sequence_sync_query(pg_table, name),
+                seq,
             )
     pg_n = await conn.fetchval(f"select count(*) from {qi(pg_table)}")
     res.update(
