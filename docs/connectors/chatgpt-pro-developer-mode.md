@@ -93,7 +93,7 @@ Add to your `docker-compose.override.yml` (<pg-host> prod example):
 ```yaml
 services:
   mnemos-mcp-http:
-    image: ghcr.io/ncz-os/mnemos-enterprise:7.3.0
+    image: ghcr.io/ncz-os/mnemos-enterprise:7.3.1
     depends_on:
       - mnemos
     restart: unless-stopped

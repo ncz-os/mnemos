@@ -84,9 +84,9 @@ RUN python -m pip install --no-cache-dir \
 #
 # cloudflared: version-pinned with a per-arch sha256, since Cloudflare publishes
 # immutable per-release GitHub assets.
-ARG CLOUDFLARED_VERSION=2026.9.1
-ARG CLOUDFLARED_SHA256_amd64=03f1f25d1cc93b9ad6c60569d44060bc4f17ed97075760ed8cfca4b12dcd68cc
-ARG CLOUDFLARED_SHA256_arm64=3d97437c71848bd8df68041e12436b484a661d95073ea1937f01a845ce88faa3
+ARG CLOUDFLARED_VERSION=2026.11.2
+ARG CLOUDFLARED_SHA256_amd64=56f13335143ec0e22772963290683a84a04114a35ec64cbc794a4d39ff9bb8cf
+ARG CLOUDFLARED_SHA256_arm64=04a7b7f08bce85d56b26ffe1fdbfbb21a074495a363d16f0783c40e25b5c5281
 RUN set -eux; \
     arch="${TARGETARCH:-amd64}"; \
     case "$arch" in \
@@ -128,9 +128,9 @@ RUN set -eux; \
 # check below) fails: "invalid argument "1.75.1" for "--version" flag:
 # strconv.ParseBool". Confirmed by a real build failure on both arches before
 # this rename.
-ARG RCLONE_PIN_VERSION=1.75.1
-ARG RCLONE_SHA256_amd64=982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab
-ARG RCLONE_SHA256_arm64=03f2504174034b6d004152ed7369251c9a9ec1f7e0836eda420f5c7a5ec0dff9
+ARG RCLONE_PIN_VERSION=1.76.0
+ARG RCLONE_SHA256_amd64=b00f00b3266c3764413afe599d3ec316f6f43b3e0ea8a0bc1d186d2133e46df7
+ARG RCLONE_SHA256_arm64=ee169016675e23a69d77240565133ff7dbc9b33d16fa8f7053d4af39f1eaeb78
 RUN set -eux; \
     arch="${TARGETARCH:-amd64}"; \
     case "$arch" in \

@@ -4,6 +4,12 @@ All notable changes to MNEMOS are documented here.
 
 ## Unreleased
 
+## 7.3.1 — 2026-11-27
+
+### Changed
+
+- **Image** — refreshed the bundled rclone (1.76.0) and cloudflared (2026.11.2) tool binaries; no application changes.
+
 ## 7.3.0 — 2026-11-26
 
 ### Added
