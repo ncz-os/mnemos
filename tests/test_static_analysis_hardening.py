@@ -203,6 +203,7 @@ def test_release_download_artifact_action_uses_full_sha():
 
     workflow = Path(".github/workflows/release-images.yml").read_text(encoding="utf-8")
     action_lines = [line.strip() for line in workflow.splitlines() if "actions/download-artifact@" in line]
-    assert len(action_lines) == 1
-    assert len(action_lines[0].split("@", 1)[1].split()[0]) == 40
-    assert "# v4." in action_lines[0]
+    assert action_lines
+    for line in action_lines:
+        assert len(line.split("@", 1)[1].split()[0]) == 40
+        assert "# v4." in line

@@ -41,9 +41,9 @@ from mnemos.core.secret_detection import (
 # Real-shaped but non-functional credentials (Stripe's and AWS's published
 # documentation examples, and JWT fixtures) — never live values.
 STRIPE_KEYS = [
-    "sk_" "live_51H8xvBKLk3jwFmvNQ2Yz8ZcKQwErTyUiOpAsDfGh",
-    "sk_" "test_4eC39HqLyjWDarjtT1zdp7dc",
-    "rk_" "live_51H8xvBKLk3jwFmvNQ2Yz8ZcKQwErTyUi",
+    "sk_live" "_51H8xvBKLk3jwFmvNQ2Yz8ZcKQwErTyUiOpAsDfGh",
+    "sk_test" "_4eC39HqLyjWDarjtT1zdp7dc",
+    "rk_live" "_51H8xvBKLk3jwFmvNQ2Yz8ZcKQwErTyUi",
 ]
 
 JWT_TOKENS = [
@@ -121,7 +121,7 @@ SPLIT_TOKEN_TEXTS = [
     # two halves of a JWT separated by whitespace
     "jwt eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 eyJzdWIiOiIxMjM0NTY3ODkwIn0 SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
     # a Stripe key split after the prefix
-    "stripe secret: sk_" "live_51H8xvBKLk3jwFmvNQ2Yz8ZcKQwErTyU iOpAsDfGh",
+    "stripe secret: sk_live" "_51H8xvBKLk3jwFmvNQ2Yz8ZcKQwErTyU iOpAsDfGh",
 ]
 
 
@@ -192,8 +192,8 @@ def test_aws_secret_detector_is_direction_independent():
 # survive retrieval, and the corpus above (sk_live_*) already proves the
 # live shape.
 STRIPE_DOC_TEST_KEYS = [
-    "sk_" "test_4eC39HqLyjWDarjtT1zdp7dc",
-    "pk_" "test_TYooMQauvdEDq54NiTphI7jx",
+    "sk_test" "_4eC39HqLyjWDarjtT1zdp7dc",
+    "pk_test" "_TYooMQauvdEDq54NiTphI7jx",
 ]
 
 

@@ -347,6 +347,47 @@ jobs:
       - name: Validate native image runtime
         run: bash scripts/smoke_release_image.sh '${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}' '${{ matrix.slug }}'
 
+      # Supply-chain gate. The image is already pushed by digest but carries no
+      # release tag yet, so a failure here stops the tagged manifest below from
+      # being created. Fixable Critical/High findings fail the build unless an
+      # unexpired entry in .github/sbom-accepted-risk.json covers them.
+      - name: Generate SBOM and enforce the security scan gate
+        env:
+          SYFT_VERSION: "1.57.2"
+          GRYPE_VERSION: "0.122.1"
+          SYFT_SHA256_AMD64: ad92bd3ec1b94a3df01d4d0aec199afa9c42b72e86da436ff5f837914d32706b
+          SYFT_SHA256_ARM64: 8efe605309c98798e1ee0cffdcf8c05ca26819b4cd44c0b03650f1e963e9bdb6
+          GRYPE_SHA256_AMD64: f1ba7e2917ee1395618de20a98da0aa7c0fb1788927797651047c50502a37538
+          GRYPE_SHA256_ARM64: 819e5be3d9516432fedb7b6b56df7306c3a16607606dfc05826eefbb00e471da
+          IMAGE_REF: ${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+          SLUG: ${{ matrix.slug }}
+        run: |
+          set -euo pipefail
+          case "${SLUG}" in
+            amd64) syft_sha="${SYFT_SHA256_AMD64}"; grype_sha="${GRYPE_SHA256_AMD64}" ;;
+            arm64) syft_sha="${SYFT_SHA256_ARM64}"; grype_sha="${GRYPE_SHA256_ARM64}" ;;
+            *) echo "unsupported slug ${SLUG}" >&2; exit 1 ;;
+          esac
+          tools="${RUNNER_TEMP}/scan-tools"
+          mkdir -p "${tools}" sbom
+          curl -fsSL -o "${tools}/syft.tgz" "https://github.com/anchore/syft/releases/download/v${SYFT_VERSION}/syft_${SYFT_VERSION}_linux_${SLUG}.tar.gz"
+          echo "${syft_sha}  ${tools}/syft.tgz" | sha256sum -c -
+          curl -fsSL -o "${tools}/grype.tgz" "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_${SLUG}.tar.gz"
+          echo "${grype_sha}  ${tools}/grype.tgz" | sha256sum -c -
+          tar -xzf "${tools}/syft.tgz" -C "${tools}" syft
+          tar -xzf "${tools}/grype.tgz" -C "${tools}" grype
+          "${tools}/syft" "registry:${IMAGE_REF}" -o "spdx-json=sbom/mnemos-enterprise-${SLUG}.spdx.json"
+          "${tools}/grype" "sbom:sbom/mnemos-enterprise-${SLUG}.spdx.json" --only-fixed -o json > "sbom/mnemos-enterprise-${SLUG}.grype.json"
+          python3 scripts/sbom_gate.py --grype "sbom/mnemos-enterprise-${SLUG}.grype.json" --accepted .github/sbom-accepted-risk.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sbom-${{ matrix.slug }}
+          path: sbom/*
+          if-no-files-found: warn
+          retention-days: 30
+
       # Artifact filenames omit the sha256: prefix because colons are invalid.
       - name: Export digest
         run: |
@@ -430,6 +471,32 @@ jobs:
           echo "published manifest: $tag -> $digest"
           docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' \
             | jq -r '.manifests[]? | "  platform: \(.platform.os)/\(.platform.architecture)"'
+
+  # Attach the per-architecture SPDX documents and scan reports to the GitHub
+  # release for the tag that was just published.
+  sbom-release:
+    needs: enterprise
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: sbom
+          pattern: sbom-*
+          merge-multiple: true
+
+      - name: Attach SBOMs to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release view "${TAG}" --repo "${REPO}" >/dev/null 2>&1 \
+            || gh release create "${TAG}" --repo "${REPO}" --verify-tag --title "${TAG}" --notes "MNEMOS ${TAG}"
+          gh release upload "${TAG}" sbom/* --repo "${REPO}" --clobber
 
   summary:
     needs: [build, enterprise]

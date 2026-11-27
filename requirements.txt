@@ -18,7 +18,7 @@ cryptography>=50.0.2
 
 # Database
 asyncpg>=0.29.0          # async API path (lifecycle.py + handlers)
-PyJWT>=2.14.0             # OAuth 2.1 MCP bearer signing and verification
+PyJWT>=2.15.0             # OAuth 2.1 MCP bearer signing and verification
 # psycopg / psycopg2 deliberately NOT here — both are LGPL-3.0.
 # mnemos's runtime closure stays on permissive licenses
 # (Apache/MIT/BSD/MPL). The installer's create-API-key path falls
@@ -62,7 +62,10 @@ python-dotenv>=1.0.0
 mcp>=1.30.0,<2
 
 # Async utilities (transitive, pinned for stability)
-anyio>=4.4.0
+anyio>=4.14.2
+certifi>=2026.10.18
+idna>=3.15
+protobuf>=6.33.5
 
 # Utilities
 # psutil dropped 2026-05-01 (zero imports in mnemos/ source)

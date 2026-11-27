@@ -76,7 +76,10 @@ dependencies = [
   # psutil dropped 2026-05-01: zero import sites in mnemos/ source
   # (was a leftover from an earlier health-check experiment).
   "authlib>=1.9.0",
-  "PyJWT>=2.14.0",
+  "PyJWT>=2.15.0",
+  "anyio>=4.14.2",
+  "certifi>=2026.10.18",
+  "idna>=3.15",
   "itsdangerous>=2.2.0",
   "typer>=0.9.0",
   # CHARON portability and STYX are first-party core capabilities.  Keep the
