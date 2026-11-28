@@ -78,6 +78,9 @@ def stamp_provenance(
     block is stamped unsigned (``signed=false``), the documented degraded mode.
     """
     at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # Backends may hand the key id back as a native UUID object; the block is
+    # stored as JSON and signed as text, so normalise it to a string here.
+    key_id = None if key_id is None else str(key_id)
     sign_key = sign_key if sign_key else provenance_signing_key()
     if sign_key:
         sig = hmac.new(

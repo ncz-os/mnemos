@@ -522,7 +522,7 @@ async def get_current_user(
             )
             # The id is what revoke_api_key is given; keeping it on the context
             # lets the revoke route drop exactly this cache entry.
-            fresh.api_key_id = row["id"]
+            fresh.api_key_id = str(row["id"]) if row["id"] is not None else None
             _cache_put(key_hash, fresh, time.monotonic())
             context = fresh
         # Never hand out the cached object itself — neither on a hit nor on

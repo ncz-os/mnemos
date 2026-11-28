@@ -4,6 +4,12 @@ All notable changes to MNEMOS are documented here.
 
 ## Unreleased
 
+## 7.3.2 — 2026-11-28
+
+### Fixed
+
+- **Write provenance** — the API key id is normalised to text before it is stamped, so writes made with a database-backed API key no longer fail when the backend returns the id as a native UUID.
+
 ## 7.3.1 — 2026-11-27
 
 ### Changed
